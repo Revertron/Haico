@@ -121,6 +121,18 @@ struct WebSearchParams {
     max_results: Option<usize>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct LSParams {
+    path: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct BashParams {
+    command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<u64>,
+}
+
 // MCP Server with tools
 #[derive(Clone)]
 struct MyMcpServer {
@@ -597,6 +609,168 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
+    #[tool(description = "Lists directory contents with file/folder information")]
+    async fn ls(&self, params: Parameters<LSParams>) -> Result<CallToolResult, McpError> {
+        let path = PathBuf::from(&params.0.path);
+
+        if !path.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Path not found: {}",
+                params.0.path
+            ))]));
+        }
+
+        if !path.is_dir() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Path is not a directory: {}",
+                params.0.path
+            ))]));
+        }
+
+        let mut entries = Vec::new();
+
+        match fs::read_dir(&path) {
+            Ok(dir_entries) => {
+                for entry in dir_entries {
+                    if let Ok(entry) = entry {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        let metadata = entry.metadata().ok();
+
+                        let entry_type = if entry.path().is_dir() {
+                            "DIR "
+                        } else {
+                            "FILE"
+                        };
+
+                        let size = metadata
+                            .as_ref()
+                            .map(|m| m.len())
+                            .map(|s| {
+                                if s < 1024 {
+                                    format!("{} B", s)
+                                } else if s < 1024 * 1024 {
+                                    format!("{:.1} KB", s as f64 / 1024.0)
+                                } else if s < 1024 * 1024 * 1024 {
+                                    format!("{:.1} MB", s as f64 / (1024.0 * 1024.0))
+                                } else {
+                                    format!("{:.1} GB", s as f64 / (1024.0 * 1024.0 * 1024.0))
+                                }
+                            })
+                            .unwrap_or_else(|| "?".to_string());
+
+                        entries.push(format!("{} {:>10}  {}", entry_type, size, file_name));
+                    }
+                }
+            }
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to read directory: {}",
+                    e
+                ))]));
+            }
+        }
+
+        entries.sort();
+
+        let output = if entries.is_empty() {
+            format!("Directory is empty: {}", params.0.path)
+        } else {
+            format!("Contents of {}:\n\n{}", params.0.path, entries.join("\n"))
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(description = "Executes a bash command with optional timeout (default 120s, max 600s)")]
+    async fn bash(&self, params: Parameters<BashParams>) -> Result<CallToolResult, McpError> {
+        let command = params.0.command.clone();
+        let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
+
+        use tokio::process::Command;
+        use std::time::Duration;
+
+        // Determine shell based on platform
+        let (shell, shell_arg) = if cfg!(target_os = "windows") {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+
+        let child = Command::new(shell)
+            .arg(shell_arg)
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to spawn command: {}", e), None)
+            })?;
+
+        // Wait with timeout
+        let output_result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output()
+        ).await;
+
+        match output_result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                let mut result_text = String::new();
+
+                if !stdout.is_empty() {
+                    result_text.push_str(&stdout);
+                }
+
+                if !stderr.is_empty() {
+                    if !result_text.is_empty() {
+                        result_text.push_str("\n--- stderr ---\n");
+                    }
+                    result_text.push_str(&stderr);
+                }
+
+                if result_text.is_empty() {
+                    result_text = format!("Command completed successfully (exit code: {})", output.status.code().unwrap_or(0));
+                }
+
+                // Truncate if too long
+                const MAX_OUTPUT: usize = 30000;
+                if result_text.len() > MAX_OUTPUT {
+                    result_text = format!(
+                        "{}\n\n[Output truncated - {} of {} characters shown]",
+                        &result_text[..MAX_OUTPUT],
+                        MAX_OUTPUT,
+                        result_text.len()
+                    );
+                }
+
+                if output.status.success() {
+                    Ok(CallToolResult::success(vec![Content::text(result_text)]))
+                } else {
+                    Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Command failed with exit code: {}\n\n{}",
+                        output.status.code().unwrap_or(-1),
+                        result_text
+                    ))]))
+                }
+            }
+            Ok(Err(e)) => {
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to execute command: {}",
+                    e
+                ))]))
+            }
+            Err(_) => {
+                // Timeout - the child is already consumed, just return error
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Command timed out after {} seconds",
+                    timeout_secs
+                ))]))
+            }
+        }
+    }
+
     // Helper to execute tools by name
     async fn execute_tool(&self, name: &str, arguments: Value) -> Result<String> {
         let result = match name {
@@ -631,6 +805,14 @@ impl MyMcpServer {
             "web_search" => {
                 let params: WebSearchParams = serde_json::from_value(arguments)?;
                 self.web_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "ls" => {
+                let params: LSParams = serde_json::from_value(arguments)?;
+                self.ls(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "bash" => {
+                let params: BashParams = serde_json::from_value(arguments)?;
+                self.bash(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             _ => return Err(anyhow::anyhow!("Unknown tool: {}", name)),
         };
