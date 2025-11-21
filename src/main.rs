@@ -9,7 +9,88 @@ use schemars::JsonSchema;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::collections::HashSet;
 use tokio;
+use crossterm::{
+    terminal::{disable_raw_mode, enable_raw_mode},
+    event::{self, Event, KeyCode},
+};
+
+// Permission tracking system
+#[derive(Debug, Clone)]
+struct PermissionManager {
+    allowed_tools: HashSet<String>, // Tools that are always allowed
+}
+
+impl PermissionManager {
+    fn new() -> Self {
+        Self {
+            allowed_tools: HashSet::new(),
+        }
+    }
+
+    fn is_allowed(&self, tool_name: &str) -> bool {
+        self.allowed_tools.contains(tool_name)
+    }
+
+    fn allow_tool(&mut self, tool_name: String) {
+        self.allowed_tools.insert(tool_name);
+    }
+}
+
+enum PermissionResponse {
+    Allow,
+    AllowAll,
+    Reject(String),
+}
+
+// Ask user for permission to execute a tool
+fn ask_permission(tool_name: &str, description: &str) -> Result<PermissionResponse> {
+    println!("\n🔒 Allow this tool usage?");
+    println!("{}\n", description);
+    println!("1. Allow once");
+    println!("2. Allow all '{}' tool usage", tool_name);
+    println!("3. Reject and provide alternative");
+    io::stdout().flush()?;
+
+    // Enable raw mode
+    enable_raw_mode()?;
+
+    let response = loop {
+        if let Event::Key(key_event) = event::read()? {
+            match key_event.code {
+                KeyCode::Char('1') => {
+                    break PermissionResponse::Allow;
+                }
+                KeyCode::Char('2') => {
+                    break PermissionResponse::AllowAll;
+                }
+                KeyCode::Char('3') => {
+                    // Disable raw mode to get text input
+                    disable_raw_mode()?;
+                    println!("3\n");
+
+                    print!("> ");
+                    io::stdout().flush()?;
+
+                    let mut alternative = String::new();
+                    io::stdin().read_line(&mut alternative)?;
+
+                    break PermissionResponse::Reject(alternative.trim().to_string());
+                }
+                _ => {
+                    // Invalid key, continue waiting
+                    continue;
+                }
+            }
+        }
+    };
+
+    // Disable raw mode if not already disabled
+    let _ = disable_raw_mode();
+
+    Ok(response)
+}
 
 // LM Studio client
 struct LMStudioClient {
@@ -27,11 +108,7 @@ impl LMStudioClient {
         }
     }
 
-    async fn chat_completion(
-        &self,
-        messages: Vec<Value>,
-        tools: Vec<Value>,
-    ) -> Result<Value> {
+    async fn chat_completion(&self,messages: Vec<Value>, tools: Vec<Value>) -> Result<Value> {
         let response = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
@@ -873,6 +950,9 @@ async fn main() -> Result<()> {
     // Conversation history
     let mut messages: Vec<Value> = vec![];
 
+    // Permission manager
+    let mut perm_manager = PermissionManager::new();
+
     // Main loop
     loop {
         // Read user input
@@ -962,6 +1042,84 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+
+                    // Check if permission is needed for this tool
+                    let needs_permission = matches!(
+                        tool_name,
+                        "web_search" | "web_fetch" | "read" | "write_file" | "edit" | "bash" | "ls"
+                    );
+
+                    if needs_permission && !perm_manager.is_allowed(tool_name) {
+                        // Create human-readable description
+                        let description = match tool_name {
+                            "web_search" => {
+                                let query = arguments["query"].as_str().unwrap_or("unknown");
+                                format!("Search the web for: '{}'", query)
+                            }
+                            "web_fetch" => {
+                                let url = arguments["url"].as_str().unwrap_or("unknown");
+                                format!("Fetch content from URL: {}", url)
+                            }
+                            "read" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                format!("Read file: {}", file_path)
+                            }
+                            "write_file" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                let size = arguments["content"].as_str().map(|s| s.len()).unwrap_or(0);
+                                format!("Write {} bytes to file: {}", size, file_path)
+                            }
+                            "edit" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                let from = arguments["old_string"].as_str().unwrap_or("unknown");
+                                let to = arguments["new_string"].as_str().unwrap_or("unknown");
+                                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
+                                if replace_all {
+                                    format!("Edit file (replace all '${from}'->'${to}') in {}", file_path)
+                                } else {
+                                    format!("Edit file (replace once '${from}'->'${to}') in {}", file_path)
+                                }
+                            }
+                            "bash" => {
+                                let command = arguments["command"].as_str().unwrap_or("unknown");
+                                let cmd_display = if command.len() > 50 {
+                                    format!("{}...", &command[..50])
+                                } else {
+                                    command.to_string()
+                                };
+                                format!("Execute command: {}", cmd_display)
+                            }
+                            "ls" => {
+                                let path = arguments["path"].as_str().unwrap_or("unknown");
+                                format!("List directory contents: {}", path)
+                            }
+                            _ => format!("Execute '{}' tool", tool_name)
+                        };
+
+                        // Ask for permission
+                        match ask_permission(tool_name, &description)? {
+                            PermissionResponse::Allow => {
+                                // Allow once, proceed with execution
+                                println!("✓ Permission granted for this request\n");
+                            }
+                            PermissionResponse::AllowAll => {
+                                // Allow all future uses
+                                perm_manager.allow_tool(tool_name.to_string());
+                                println!("✓ Permission granted for all future '{}' requests\n", tool_name);
+                            }
+                            PermissionResponse::Reject(alternative) => {
+                                // User rejected, send alternative to LLM
+                                println!("✗ Permission denied. User suggestion: {}\n", alternative);
+
+                                messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "content": format!("Permission denied by user. User suggests: {}", alternative)
+                                }));
+                                continue;
+                            }
+                        }
+                    }
 
                     println!("\n[Calling tool: {} with args: {}]", tool_name, arguments);
 
