@@ -110,27 +110,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coding-mcp-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "glob",
- "html2text",
- "regex",
- "reqwest",
- "rmcp",
- "schemars",
- "scraper",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "urlencoding",
- "walkdir",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -538,6 +517,28 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "haico"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "glob",
+ "html2text",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "scraper",
+ "serde",
+ "serde_json",
+ "similar",
+ "tokio",
+ "url",
+ "urlencoding",
+ "walkdir",
 ]
 
 [[package]]
@@ -1646,6 +1647,12 @@ checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "siphasher"

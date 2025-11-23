@@ -12,9 +12,26 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 use tokio;
 use crossterm::{
-    terminal::{disable_raw_mode, enable_raw_mode},
-    event::{self, Event, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    event::{self, Event, KeyCode, KeyEventKind},
+    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    execute,
+    cursor,
 };
+use similar::{ChangeTag, TextDiff};
+
+const LLM_URL: &str = "http://127.0.0.1:15200";
+
+// Model response structures
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelInfo {
+    id: String,
+}
 
 // Permission tracking system
 #[derive(Debug, Clone)]
@@ -44,10 +61,74 @@ enum PermissionResponse {
     Reject(String),
 }
 
+// Generate a colored diff with line numbers
+fn generate_diff(file_path: &str, old_content: &str, new_content: &str) -> Result<String> {
+    let diff = TextDiff::from_lines(old_content, new_content);
+    let mut output = Vec::new();
+
+    writeln!(&mut output, "File: {}", file_path)?;
+
+    let mut old_line_num = 1;
+    let mut new_line_num = 1;
+
+    for change in diff.iter_all_changes() {
+        // Get the text without trailing newline
+        let text = change.as_str().unwrap_or("");
+        let text_trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+
+        match change.tag() {
+            ChangeTag::Delete => {
+                // Line number in grey
+                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                write!(&mut output, "{:6}", old_line_num)?;
+                execute!(&mut output, ResetColor)?;
+                write!(&mut output, " ")?;
+                // Line content with red background
+                execute!(&mut output, SetBackgroundColor(Color::Red))?;
+                write!(&mut output, "- {}", text_trimmed)?;
+                execute!(&mut output, ResetColor)?;
+                writeln!(&mut output)?;
+                old_line_num += 1;
+            }
+            ChangeTag::Insert => {
+                // Line number in grey
+                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                write!(&mut output, "{:6}", new_line_num)?;
+                execute!(&mut output, ResetColor)?;
+                write!(&mut output, " ")?;
+                // Line content with green background
+                execute!(&mut output, SetBackgroundColor(Color::Green))?;
+                write!(&mut output, "+ {}", text_trimmed)?;
+                execute!(&mut output, ResetColor)?;
+                writeln!(&mut output)?;
+                new_line_num += 1;
+            }
+            ChangeTag::Equal => {
+                // Line number in grey
+                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                write!(&mut output, "{:6}", old_line_num)?;
+                execute!(&mut output, ResetColor)?;
+                write!(&mut output, " ")?;
+                // Line content without background
+                writeln!(&mut output, "  {}", text_trimmed)?;
+                old_line_num += 1;
+                new_line_num += 1;
+            }
+        };
+    }
+
+    Ok(String::from_utf8(output)?)
+}
+
 // Ask user for permission to execute a tool
-fn ask_permission(tool_name: &str, description: &str) -> Result<PermissionResponse> {
-    println!("\n🔒 Allow this tool usage?");
+fn ask_permission(tool_name: &str, description: &str, diff: Option<&str>) -> Result<PermissionResponse> {
+    println!("🔒 Allow this tool usage?");
     println!("{}\n", description);
+
+    if let Some(diff_content) = diff {
+        println!("{}", diff_content);
+    }
+
     println!("1. Allow once");
     println!("2. Allow all '{}' tool usage", tool_name);
     println!("3. Reject and provide alternative");
@@ -58,6 +139,11 @@ fn ask_permission(tool_name: &str, description: &str) -> Result<PermissionRespon
 
     let response = loop {
         if let Event::Key(key_event) = event::read()? {
+            // Only process key press events, ignore key release
+            if key_event.kind != KeyEventKind::Press {
+                continue;
+            }
+
             match key_event.code {
                 KeyCode::Char('1') => {
                     break PermissionResponse::Allow;
@@ -88,6 +174,12 @@ fn ask_permission(tool_name: &str, description: &str) -> Result<PermissionRespon
 
     // Disable raw mode if not already disabled
     let _ = disable_raw_mode();
+
+    // Drain any remaining events from the input buffer to prevent key queue issues
+    use std::time::Duration;
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
 
     Ok(response)
 }
@@ -926,15 +1018,121 @@ fn mcp_tools_to_openai_format(server: &MyMcpServer) -> Vec<Value> {
         .collect()
 }
 
+// Fetch available models from LLM server
+async fn fetch_available_models(base_url: &str) -> Result<Vec<String>> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/v1/models", base_url))
+        .send()
+        .await
+        .context("Failed to fetch models from server")?;
+
+    let models_response: ModelsResponse = response
+        .json()
+        .await
+        .context("Failed to parse models response")?;
+
+    let model_ids: Vec<String> = models_response
+        .data
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+
+    Ok(model_ids)
+}
+
+// Interactive model selection using arrow keys
+fn select_model_interactive(models: Vec<String>) -> Result<String> {
+    if models.is_empty() {
+        return Err(anyhow::anyhow!("No models available"));
+    }
+
+    let mut selected_index = 0;
+
+    println!("Select a model (use Up/Down arrows, Enter to confirm):\n");
+
+    // Enable raw mode for key events
+    enable_raw_mode()?;
+
+    loop {
+        // Clear screen and move cursor to top
+        execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+
+        println!("Select a model (use Up/Down arrows, Enter to confirm):\n");
+
+        // Display models
+        for (index, model) in models.iter().enumerate() {
+            if index == selected_index {
+                println!("> {} <", model);
+            } else {
+                println!("  {}  ", model);
+            }
+        }
+
+        io::stdout().flush()?;
+
+        // Read key event
+        if let Event::Key(key_event) = event::read()? {
+            // Only process key press events, ignore key release
+            if key_event.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match key_event.code {
+                KeyCode::Up => {
+                    if selected_index > 0 {
+                        selected_index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if selected_index < models.len() - 1 {
+                        selected_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Selection confirmed
+                    break;
+                }
+                KeyCode::Esc => {
+                    disable_raw_mode()?;
+                    return Err(anyhow::anyhow!("Model selection cancelled"));
+                }
+                _ => {
+                    // Ignore other keys
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+
+    // Clear screen one final time and show selection
+    execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    println!("Selected model: {}\n", models[selected_index]);
+
+    Ok(models[selected_index].clone())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("LM Studio + MCP Tool Calling Example");
     println!("=====================================\n");
 
-    // Initialize LM Studio client
+    // Fetch available models
+    println!("Fetching available models...");
+    let models = fetch_available_models(LLM_URL).await?;
+
+    if models.is_empty() {
+        return Err(anyhow::anyhow!("No models available from server"));
+    }
+
+    // Let user select a model
+    let selected_model = select_model_interactive(models)?;
+
+    // Initialize LM Studio client with selected model
     let lm_client = LMStudioClient::new(
-        "http://127.0.0.1:15200".to_string(),
-        "openai/gpt-oss-120b".to_string(), // Replace with actual model name
+        LLM_URL.to_string(),
+        selected_model,
     );
 
     // Initialize MCP server with tools
@@ -985,7 +1183,7 @@ async fn main() -> Result<()> {
 
         // Get LLM response and handle tool call chains
         loop {
-            println!("[DEBUG] Getting response from LLM...");
+            println!("Fancying around...");
             let response = lm_client
                 .chat_completion(messages.clone(), openai_tools.clone())
                 .await?;
@@ -1007,9 +1205,17 @@ async fn main() -> Result<()> {
                 if tool_calls_array.is_empty() {
                     // No actual tool calls, this is the final response
                     let assistant_reply = message["content"].as_str().unwrap_or("");
-                    println!("\n ● {}\n", assistant_reply);
+                    println!("\n● {}\n", assistant_reply);
                     messages.push(message.clone());
                     break;
+                }
+
+                // Display assistant's reasoning/content before tool calls if present
+                let content = message.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty());
+                let reasoning = message.get("reasoning").and_then(|r| r.as_str()).filter(|s| !s.is_empty());
+
+                if let Some(text) = content.or(reasoning) {
+                    println!("\n● {}", text.trim());
                 }
 
                 // Add assistant message with tool call first
@@ -1050,6 +1256,53 @@ async fn main() -> Result<()> {
                     );
 
                     if needs_permission && !perm_manager.is_allowed(tool_name) {
+                        // Generate diff if needed
+                        let diff_content: Option<String> = match tool_name {
+                            "write_file" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("");
+                                let new_content = arguments["content"].as_str().unwrap_or("");
+
+                                // Check if file exists and read old content
+                                if PathBuf::from(file_path).exists() {
+                                    if let Ok(old_content) = fs::read_to_string(file_path) {
+                                        generate_diff(file_path, &old_content, new_content).ok()
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    // New file - show all as additions
+                                    generate_diff(file_path, "", new_content).ok()
+                                }
+                            }
+                            "edit" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("");
+                                let old_string = arguments["old_string"].as_str().unwrap_or("");
+                                let new_string = arguments["new_string"].as_str().unwrap_or("");
+                                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
+
+                                // Read current content and generate preview
+                                if let Ok(content) = fs::read_to_string(file_path) {
+                                    let new_content = if replace_all {
+                                        content.replace(old_string, new_string)
+                                    } else {
+                                        if let Some(pos) = content.find(old_string) {
+                                            let mut result = String::with_capacity(content.len());
+                                            result.push_str(&content[..pos]);
+                                            result.push_str(new_string);
+                                            result.push_str(&content[pos + old_string.len()..]);
+                                            result
+                                        } else {
+                                            content.clone()
+                                        }
+                                    };
+                                    generate_diff(file_path, &content, &new_content).ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None
+                        };
+
                         // Create human-readable description
                         let description = match tool_name {
                             "web_search" => {
@@ -1075,9 +1328,9 @@ async fn main() -> Result<()> {
                                 let to = arguments["new_string"].as_str().unwrap_or("unknown");
                                 let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
                                 if replace_all {
-                                    format!("Edit file (replace all '${from}'->'${to}') in {}", file_path)
+                                    format!("Edit file (replace all '{from}'->'{to}') in {}", file_path)
                                 } else {
-                                    format!("Edit file (replace once '${from}'->'${to}') in {}", file_path)
+                                    format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
                                 }
                             }
                             "bash" => {
@@ -1096,8 +1349,8 @@ async fn main() -> Result<()> {
                             _ => format!("Execute '{}' tool", tool_name)
                         };
 
-                        // Ask for permission
-                        match ask_permission(tool_name, &description)? {
+                        // Ask for permission with diff if available
+                        match ask_permission(tool_name, &description, diff_content.as_deref())? {
                             PermissionResponse::Allow => {
                                 // Allow once, proceed with execution
                                 println!("✓ Permission granted for this request\n");
@@ -1121,7 +1374,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    println!("\n[Calling tool: {} with args: {}]", tool_name, arguments);
+                    //println!("\n[Calling tool: {} with args: {}]", tool_name, arguments);
 
                     // Execute the tool
                     let tool_result = server.execute_tool(tool_name, arguments).await.unwrap_or_else(|e| {
