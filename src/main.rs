@@ -14,7 +14,7 @@ use tokio;
 use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
     event::{self, Event, KeyCode, KeyEventKind},
-    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor, Attribute, SetAttribute},
     execute,
     cursor,
 };
@@ -1041,6 +1041,265 @@ async fn fetch_available_models(base_url: &str) -> Result<Vec<String>> {
     Ok(model_ids)
 }
 
+// Analyze text to determine if it contains Markdown formatting
+fn is_markdown(text: &str) -> bool {
+    let mut markdown_score = 0;
+    let lines: Vec<&str> = text.lines().collect();
+
+    if lines.is_empty() {
+        return false;
+    }
+
+    for line in &lines {
+        let trimmed = line.trim();
+
+        // Check for headers (lines starting with #)
+        if trimmed.starts_with('#') && trimmed.len() > 1 {
+            markdown_score += 2;
+        }
+
+        // Check for unordered list items (lines starting with -)
+        if trimmed.starts_with('-') && trimmed.len() > 1 {
+            markdown_score += 1;
+        }
+
+        // Check for unordered list items (lines starting with *)
+        if trimmed.starts_with('*') && trimmed.len() > 1 && !trimmed.starts_with("**") {
+            markdown_score += 1;
+        }
+
+        // Check for bold text markers (**text**)
+        if line.contains("**") {
+            // Count pairs of **
+            let count = line.matches("**").count();
+            if count >= 2 {
+                markdown_score += 1;
+            }
+        }
+
+        // Check for italic markers (*text* or _text_) - only if they appear in pairs and not part of snake_case
+        // Count underscores only if surrounded by non-word chars to avoid snake_case false positives
+        let underscore_count = line.matches('_').count();
+        if underscore_count >= 2 {
+            // Check if they look like markdown (not snake_case)
+            // Simple heuristic: if there's whitespace around them, they're likely markdown
+            if line.contains(" _") || line.contains("_ ") {
+                markdown_score += 1;
+            }
+        }
+
+        // Check for code blocks (```)
+        if trimmed.starts_with("```") {
+            markdown_score += 3;
+        }
+
+        // Check for inline code (`text`)
+        if line.contains('`') && !trimmed.starts_with("```") {
+            markdown_score += 1;
+        }
+
+        // Check for links ([text](url))
+        if line.contains("[") && line.contains("](") {
+            markdown_score += 2;
+        }
+
+        // Check for ordered list (1. text)
+        if trimmed.len() > 2 {
+            let chars: Vec<char> = trimmed.chars().collect();
+            if chars[0].is_numeric() && chars.len() > 1 && chars[1] == '.' {
+                markdown_score += 1;
+            }
+        }
+    }
+
+    // Determine threshold: if we have enough Markdown indicators relative to text length
+    // Consider it Markdown if score is at least 3, or if score/lines ratio is > 0.2
+    let ratio = markdown_score as f64 / lines.len() as f64;
+    markdown_score >= 3 || ratio > 0.2
+}
+
+// Render Markdown text with colors and formatting for terminal output
+fn render_markdown(text: &str) -> Result<()> {
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Handle code blocks
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                // End of code block
+                in_code_block = false;
+                code_lang.clear();
+            } else {
+                // Start of code block
+                in_code_block = true;
+                code_lang = trimmed.trim_start_matches("```").to_string();
+            }
+            continue;
+        }
+
+        if in_code_block {
+            // Render code with dark grey background
+            execute!(io::stdout(), SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?;
+            print!("  {}", line);
+            execute!(io::stdout(), ResetColor)?;
+            println!();
+            continue;
+        }
+
+        // Handle headers
+        if trimmed.starts_with("# ") {
+            execute!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+            println!("\n{}", trimmed.trim_start_matches("# "));
+            execute!(io::stdout(), ResetColor)?;
+            continue;
+        } else if trimmed.starts_with("## ") {
+            execute!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+            println!("\n{}", trimmed.trim_start_matches("## "));
+            execute!(io::stdout(), ResetColor)?;
+            continue;
+        } else if trimmed.starts_with("### ") {
+            execute!(io::stdout(), SetForegroundColor(Color::Blue))?;
+            println!("\n{}", trimmed.trim_start_matches("### "));
+            execute!(io::stdout(), ResetColor)?;
+            continue;
+        }
+
+        // Process inline formatting
+        render_inline_markdown(line)?;
+    }
+
+    Ok(())
+}
+
+// Render a line with inline Markdown formatting (bold, italic, code, links)
+fn render_inline_markdown(line: &str) -> Result<()> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Check for inline code (`code`)
+        if chars[i] == '`' {
+            if let Some(end) = find_closing('`', &chars, i + 1) {
+                execute!(io::stdout(), SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?;
+                print!(" ");
+                for j in (i + 1)..end {
+                    print!("{}", chars[j]);
+                }
+                print!(" ");
+                execute!(io::stdout(), ResetColor)?;
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Check for bold (**text**)
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double_closing("**", &chars, i + 2) {
+                execute!(io::stdout(), SetAttribute(Attribute::Bold))?;
+                for j in (i + 2)..end {
+                    print!("{}", chars[j]);
+                }
+                execute!(io::stdout(), SetAttribute(Attribute::Reset))?;
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Check for italic (*text* or _text_)
+        if chars[i] == '*' || chars[i] == '_' {
+            let marker = chars[i];
+            if let Some(end) = find_closing(marker, &chars, i + 1) {
+                // Make sure it's not part of **
+                if marker == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    print!("{}", chars[i]);
+                    i += 1;
+                    continue;
+                }
+                execute!(io::stdout(), SetForegroundColor(Color::Green))?;
+                for j in (i + 1)..end {
+                    print!("{}", chars[j]);
+                }
+                execute!(io::stdout(), ResetColor)?;
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Check for links ([text](url))
+        if chars[i] == '[' {
+            if let Some(close_bracket) = find_closing(']', &chars, i + 1) {
+                if close_bracket + 1 < chars.len() && chars[close_bracket + 1] == '(' {
+                    if let Some(close_paren) = find_closing(')', &chars, close_bracket + 2) {
+                        // Render link text in blue
+                        execute!(io::stdout(), SetForegroundColor(Color::Blue))?;
+                        for j in (i + 1)..close_bracket {
+                            print!("{}", chars[j]);
+                        }
+                        execute!(io::stdout(), ResetColor)?;
+
+                        // Render URL in dark grey
+                        execute!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+                        print!(" (");
+                        for j in (close_bracket + 2)..close_paren {
+                            print!("{}", chars[j]);
+                        }
+                        print!(")");
+                        execute!(io::stdout(), ResetColor)?;
+
+                        i = close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Regular character
+        print!("{}", chars[i]);
+        i += 1;
+    }
+
+    println!();
+    Ok(())
+}
+
+// Find closing character from a starting position
+fn find_closing(marker: char, chars: &[char], start: usize) -> Option<usize> {
+    for i in start..chars.len() {
+        if chars[i] == marker {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// Find closing double-character marker (like **)
+fn find_double_closing(marker: &str, chars: &[char], start: usize) -> Option<usize> {
+    let marker_chars: Vec<char> = marker.chars().collect();
+    if marker_chars.len() != 2 {
+        return None;
+    }
+
+    for i in start..(chars.len() - 1) {
+        if chars[i] == marker_chars[0] && chars[i + 1] == marker_chars[1] {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// Render text (auto-detect Markdown and render accordingly)
+fn render_text(text: &str) -> Result<()> {
+    if is_markdown(text) {
+        render_markdown(text)
+    } else {
+        println!("{}", text);
+        Ok(())
+    }
+}
+
 // Interactive model selection using arrow keys
 fn select_model_interactive(models: Vec<String>) -> Result<String> {
     if models.is_empty() {
@@ -1205,7 +1464,9 @@ async fn main() -> Result<()> {
                 if tool_calls_array.is_empty() {
                     // No actual tool calls, this is the final response
                     let assistant_reply = message["content"].as_str().unwrap_or("");
-                    println!("\n● {}\n", assistant_reply);
+                    print!("\n● ");
+                    let _ = render_text(assistant_reply);
+                    println!();
                     messages.push(message.clone());
                     break;
                 }
@@ -1215,7 +1476,9 @@ async fn main() -> Result<()> {
                 let reasoning = message.get("reasoning").and_then(|r| r.as_str()).filter(|s| !s.is_empty());
 
                 if let Some(text) = content.or(reasoning) {
-                    println!("\n● {}", text.trim());
+                    print!("\n● ");
+                    let _ = render_text(text.trim());
+                    println!();
                 }
 
                 // Add assistant message with tool call first
@@ -1397,7 +1660,9 @@ async fn main() -> Result<()> {
             } else {
                 // No tool call, this is the final response
                 let assistant_reply = message["content"].as_str().unwrap_or("");
-                println!("\n ● {}\n", assistant_reply);
+                print!("\n● ");
+                let _ = render_text(assistant_reply);
+                println!();
                 messages.push(message.clone());
                 break;
             }
