@@ -10,6 +10,9 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::collections::HashSet;
+use std::process::Command;
+use std::env;
+use chrono;
 use tokio;
 use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
@@ -21,6 +24,100 @@ use crossterm::{
 use similar::{ChangeTag, TextDiff};
 
 const LLM_URL: &str = "http://127.0.0.1:15200";
+const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
+
+fn run_git_command(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+}
+
+fn get_main_branch() -> String {
+    // Try to get the default branch from the remote
+    if let Some(remote_head) = run_git_command(&["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        // Output format: "refs/remotes/origin/main"
+        if let Some(branch) = remote_head.strip_prefix("refs/remotes/origin/") {
+            return branch.to_string();
+        }
+    }
+
+    // Try to get from git config
+    if let Some(default_branch) = run_git_command(&["config", "--get", "init.defaultBranch"]) {
+        if !default_branch.is_empty() {
+            return default_branch;
+        }
+    }
+
+    // Fallback: check if common branches exist
+    for branch in &["main", "master"] {
+        if run_git_command(&["rev-parse", "--verify", branch]).is_some() {
+            return branch.to_string();
+        }
+    }
+
+    // Ultimate fallback
+    "main".to_string()
+}
+
+fn build_system_prompt() -> String {
+    let pwd = env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| ".".to_string());
+
+    let is_repo = run_git_command(&["rev-parse", "--git-dir"]).is_some();
+
+    let platform = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    };
+
+    let os_version = std::env::consts::OS;
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let (branch, git_status, last_5_commits) = if is_repo {
+        let branch = run_git_command(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let status = run_git_command(&["status", "--short"])
+            .unwrap_or_else(|| "".to_string());
+
+        let commits = run_git_command(&["log", "--oneline", "-5"])
+            .unwrap_or_else(|| "".to_string());
+
+        (branch, status, commits)
+    } else {
+        ("N/A".to_string(), "".to_string(), "".to_string())
+    };
+
+    let main_branch = get_main_branch();
+
+    SYSTEM_PROMPT
+        .replace("$pwd", &pwd)
+        .replace("$is_repo", &is_repo.to_string())
+        .replace("$platform", platform)
+        .replace("$os_version", os_version)
+        .replace("$date", &date)
+        .replace("$branch", &branch)
+        .replace("$main_branch", &main_branch)
+        .replace("$git_status", &git_status)
+        .replace("$last_5_commits", &last_5_commits)
+}
 
 // Model response structures
 #[derive(Debug, Deserialize)]
@@ -200,7 +297,7 @@ impl LMStudioClient {
         }
     }
 
-    async fn chat_completion(&self,messages: Vec<Value>, tools: Vec<Value>) -> Result<Value> {
+    async fn chat_completion(&self, messages: Vec<Value>, tools: Vec<Value>) -> Result<Value> {
         let response = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
@@ -1183,7 +1280,7 @@ fn render_inline_markdown(line: &str) -> Result<()> {
         // Check for inline code (`code`)
         if chars[i] == '`' {
             if let Some(end) = find_closing('`', &chars, i + 1) {
-                execute!(io::stdout(), SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?;
+                execute!(io::stdout(), SetBackgroundColor(Color::Grey), SetForegroundColor(Color::Black))?;
                 print!(" ");
                 for j in (i + 1)..end {
                     print!("{}", chars[j]);
@@ -1406,6 +1503,10 @@ async fn main() -> Result<()> {
 
     // Conversation history
     let mut messages: Vec<Value> = vec![];
+    messages.push(json!({
+        "role": "system",
+        "content": build_system_prompt()
+    }));
 
     // Permission manager
     let mut perm_manager = PermissionManager::new();
@@ -1429,8 +1530,12 @@ async fn main() -> Result<()> {
             break;
         }
 
-        if input == "/clear" || input == "/new" {
+        if input == "/clear" || input == "/new" || input == "/reset" {
             messages.clear();
+            messages.push(json!({
+                "role": "system",
+                "content": build_system_prompt()
+            }));
             continue;
         }
 
