@@ -158,60 +158,142 @@ enum PermissionResponse {
     Reject(String),
 }
 
-// Generate a colored diff with line numbers
+// Generate a colored diff with line numbers, showing only context around changes
 fn generate_diff(file_path: &str, old_content: &str, new_content: &str) -> Result<String> {
     let diff = TextDiff::from_lines(old_content, new_content);
     let mut output = Vec::new();
 
     writeln!(&mut output, "File: {}", file_path)?;
 
+    const CONTEXT_LINES: usize = 5;
+
+    // First pass: collect all changes with their positions
+    #[derive(Clone)]
+    struct Change {
+        tag: ChangeTag,
+        text: String,
+        old_line: Option<usize>,
+        new_line: Option<usize>,
+    }
+
+    let mut changes = Vec::new();
     let mut old_line_num = 1;
     let mut new_line_num = 1;
 
     for change in diff.iter_all_changes() {
-        // Get the text without trailing newline
         let text = change.as_str().unwrap_or("");
-        let text_trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+        let text_trimmed = text.trim_end_matches('\n').trim_end_matches('\r').to_string();
 
         match change.tag() {
             ChangeTag::Delete => {
-                // Line number in grey
-                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
-                write!(&mut output, "{:6}", old_line_num)?;
-                execute!(&mut output, ResetColor)?;
-                write!(&mut output, " ")?;
-                // Line content with red background
-                execute!(&mut output, SetBackgroundColor(Color::Red))?;
-                write!(&mut output, "- {}", text_trimmed)?;
-                execute!(&mut output, ResetColor)?;
-                writeln!(&mut output)?;
+                changes.push(Change {
+                    tag: ChangeTag::Delete,
+                    text: text_trimmed,
+                    old_line: Some(old_line_num),
+                    new_line: None,
+                });
                 old_line_num += 1;
             }
             ChangeTag::Insert => {
-                // Line number in grey
-                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
-                write!(&mut output, "{:6}", new_line_num)?;
-                execute!(&mut output, ResetColor)?;
-                write!(&mut output, " ")?;
-                // Line content with green background
-                execute!(&mut output, SetBackgroundColor(Color::Green))?;
-                write!(&mut output, "+ {}", text_trimmed)?;
-                execute!(&mut output, ResetColor)?;
-                writeln!(&mut output)?;
+                changes.push(Change {
+                    tag: ChangeTag::Insert,
+                    text: text_trimmed,
+                    old_line: None,
+                    new_line: Some(new_line_num),
+                });
                 new_line_num += 1;
             }
             ChangeTag::Equal => {
-                // Line number in grey
-                execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
-                write!(&mut output, "{:6}", old_line_num)?;
-                execute!(&mut output, ResetColor)?;
-                write!(&mut output, " ")?;
-                // Line content without background
-                writeln!(&mut output, "  {}", text_trimmed)?;
+                changes.push(Change {
+                    tag: ChangeTag::Equal,
+                    text: text_trimmed,
+                    old_line: Some(old_line_num),
+                    new_line: Some(new_line_num),
+                });
                 old_line_num += 1;
                 new_line_num += 1;
             }
-        };
+        }
+    }
+
+    // Second pass: identify change regions
+    let mut change_indices = Vec::new();
+    for (i, change) in changes.iter().enumerate() {
+        if !matches!(change.tag, ChangeTag::Equal) {
+            change_indices.push(i);
+        }
+    }
+
+    if change_indices.is_empty() {
+        writeln!(&mut output, "No changes")?;
+        return Ok(String::from_utf8(output)?);
+    }
+
+    // Group consecutive changes into regions with context
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut current_start = change_indices[0].saturating_sub(CONTEXT_LINES);
+    let mut current_end = change_indices[0] + CONTEXT_LINES;
+
+    for &idx in &change_indices[1..] {
+        let region_start = idx.saturating_sub(CONTEXT_LINES);
+        let region_end = idx + CONTEXT_LINES;
+
+        // If regions overlap or are adjacent, merge them
+        if region_start <= current_end + 1 {
+            current_end = region_end;
+        } else {
+            // Save current region and start a new one
+            regions.push((current_start, current_end.min(changes.len() - 1)));
+            current_start = region_start;
+            current_end = region_end;
+        }
+    }
+    regions.push((current_start, current_end.min(changes.len() - 1)));
+
+    // Render regions
+    for (region_idx, (start, end)) in regions.iter().enumerate() {
+        if region_idx > 0 {
+            writeln!(&mut output, "       ...")?;
+        }
+
+        for i in *start..=*end {
+            let change = &changes[i];
+            match change.tag {
+                ChangeTag::Delete => {
+                    if let Some(line_num) = change.old_line {
+                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        write!(&mut output, "{:6}", line_num)?;
+                        execute!(&mut output, ResetColor)?;
+                        write!(&mut output, " ")?;
+                        execute!(&mut output, SetBackgroundColor(Color::Red))?;
+                        write!(&mut output, "- {}", change.text)?;
+                        execute!(&mut output, ResetColor)?;
+                        writeln!(&mut output)?;
+                    }
+                }
+                ChangeTag::Insert => {
+                    if let Some(line_num) = change.new_line {
+                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        write!(&mut output, "{:6}", line_num)?;
+                        execute!(&mut output, ResetColor)?;
+                        write!(&mut output, " ")?;
+                        execute!(&mut output, SetBackgroundColor(Color::Green))?;
+                        write!(&mut output, "+ {}", change.text)?;
+                        execute!(&mut output, ResetColor)?;
+                        writeln!(&mut output)?;
+                    }
+                }
+                ChangeTag::Equal => {
+                    if let Some(line_num) = change.old_line {
+                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        write!(&mut output, "{:6}", line_num)?;
+                        execute!(&mut output, ResetColor)?;
+                        write!(&mut output, " ")?;
+                        writeln!(&mut output, "  {}", change.text)?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(String::from_utf8(output)?)
@@ -1683,7 +1765,9 @@ async fn main() -> Result<()> {
                             }
                             "read" => {
                                 let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                format!("Read file: {}", file_path)
+                                let offset = arguments["offset"].as_u64().map(|o| o.to_string()).unwrap_or_else(|| "none".to_string());
+                                let limit = arguments["limit"].as_u64().map(|l| l.to_string()).unwrap_or_else(|| "none".to_string());
+                                format!("Read file: {} (offset: {}, limit: {})", file_path, offset, limit)
                             }
                             "write_file" => {
                                 let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
