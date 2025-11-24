@@ -526,6 +526,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "getopts",
  "glob",
  "html2text",
  "regex",

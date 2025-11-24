@@ -14,6 +14,7 @@ use std::process::Command;
 use std::env;
 use chrono;
 use tokio;
+use getopts::Options;
 use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
     event::{self, Event, KeyCode, KeyEventKind},
@@ -23,7 +24,6 @@ use crossterm::{
 };
 use similar::{ChangeTag, TextDiff};
 
-const LLM_URL: &str = "http://127.0.0.1:15200";
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
 fn run_git_command(args: &[&str]) -> Option<String> {
@@ -1628,25 +1628,126 @@ fn select_model_interactive(models: Vec<String>) -> Result<String> {
     Ok(models[selected_index].clone())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    println!("LM Studio + MCP Tool Calling Example");
-    println!("=====================================\n");
+// Configuration structure
+struct Config {
+    llm_url: String,
+    system_prompt: Option<String>,
+    model: Option<String>,
+}
 
-    // Fetch available models
-    println!("Fetching available models...");
-    let models = fetch_available_models(LLM_URL).await?;
+// Parse configuration from command-line arguments and environment variables
+fn parse_config() -> Result<Config> {
+    let args: Vec<String> = env::args().collect();
+    let program = args[0].clone();
 
-    if models.is_empty() {
-        return Err(anyhow::anyhow!("No models available from server"));
+    let mut opts = Options::new();
+    opts.optopt("u", "url", "LLM server URL (default: http://127.0.0.1:11434 for Ollama)", "URL");
+    opts.optopt("s", "system-prompt", "System prompt (string or path to text file)", "PROMPT");
+    opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
+    opts.optflag("h", "help", "Print this help message");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error parsing arguments: {}", e);
+            print_usage(&program, opts);
+            std::process::exit(1);
+        }
+    };
+
+    if matches.opt_present("h") {
+        print_usage(&program, opts);
+        std::process::exit(0);
     }
 
-    // Let user select a model
-    let selected_model = select_model_interactive(models)?;
+    // Parse LLM URL
+    // Priority: command-line arg > environment variable > default
+    let llm_url = if let Some(url) = matches.opt_str("u") {
+        url
+    } else if let Ok(url) = env::var("LLM_URL") {
+        url
+    } else {
+        // Default to Ollama's port (previously was LM Studio's 15200)
+        "http://127.0.0.1:11434".to_string()
+    };
+
+    // Parse system prompt
+    // Can be a string or a path to a text file
+    let system_prompt = if let Some(prompt_arg) = matches.opt_str("s") {
+        // Check if it's a file path
+        let path = PathBuf::from(&prompt_arg);
+        if path.exists() && path.is_file() {
+            // Read from file
+            Some(fs::read_to_string(&path)
+                .context(format!("Failed to read system prompt from file: {}", prompt_arg))?)
+        } else {
+            // Treat as a string
+            Some(prompt_arg)
+        }
+    } else {
+        None
+    };
+
+    // Parse model
+    let model = matches.opt_str("m");
+
+    Ok(Config {
+        llm_url,
+        system_prompt,
+        model,
+    })
+}
+
+fn print_usage(program: &str, opts: Options) {
+    let brief = format!("Usage: {} [options]", program);
+    print!("{}", opts.usage(&brief));
+    println!("\nEnvironment variables:");
+    println!("  LLM_URL    LLM server URL (overridden by --url)");
+    println!("\nExamples:");
+    println!("  {} --url http://127.0.0.1:15200  # Connect to LM Studio", program);
+    println!("  {} --url http://127.0.0.1:11434  # Connect to Ollama (default)", program);
+    println!("  {} --model \"qwen2.5:14b\"          # Use specific model", program);
+    println!("  {} --system-prompt \"You are a helpful assistant\"  # Custom prompt", program);
+    println!("  {} --system-prompt ./prompt.txt  # Load prompt from file", program);
+    println!("  LLM_URL=http://127.0.0.1:15200 {}  # Use environment variable", program);
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    println!("          Welcome to Haico!");
+    println!("=====================================\n");
+
+    // Parse configuration from command-line arguments
+    let config = parse_config()?;
+    println!("Connecting to LLM server at: {}", config.llm_url);
+
+    // Determine which model to use
+    let selected_model = if let Some(model_name) = config.model {
+        // Model specified via command-line, use it directly
+        println!("Using specified model: {}\n", model_name);
+        model_name
+    } else {
+        // No model specified, fetch available models and let user select
+        println!("Fetching available models...");
+        let models = match fetch_available_models(&config.llm_url).await {
+            Ok(models) => models,
+            Err(e) => {
+                println!("Error connecting to LLM: {e}");
+                return Ok(());
+            }
+        };
+
+        if models.is_empty() {
+            return Err(anyhow::anyhow!("No models available from server"));
+        }
+
+        // Let user select a model interactively
+        select_model_interactive(models)?
+    };
 
     // Initialize LM Studio client with selected model
     let lm_client = LMStudioClient::new(
-        LLM_URL.to_string(),
+        config.llm_url,
         selected_model,
     );
 
@@ -1660,11 +1761,20 @@ async fn main() -> Result<()> {
     // }
     // println!();
 
+    // Determine system prompt to use
+    let system_prompt_content = if let Some(custom_prompt) = config.system_prompt {
+        // Use custom prompt if provided
+        custom_prompt
+    } else {
+        // Use default prompt with environment variables
+        build_system_prompt()
+    };
+
     // Conversation history
     let mut messages: Vec<Value> = vec![];
     messages.push(json!({
         "role": "system",
-        "content": build_system_prompt()
+        "content": system_prompt_content
     }));
 
     // Permission manager
@@ -1693,7 +1803,7 @@ async fn main() -> Result<()> {
             messages.clear();
             messages.push(json!({
                 "role": "system",
-                "content": build_system_prompt()
+                "content": &system_prompt_content
             }));
             continue;
         }

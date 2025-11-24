@@ -1,4 +1,4 @@
-# Coding MCP Server (working name)
+# Haico
 
 [![Build Status](https://img.shields.io/github/workflow/status/Revertron/CI)](https://github.com/Revertron/actions)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE.md)
@@ -7,15 +7,15 @@
 - [Overview](#overview)
 - [Features](#features)
 - [Installation](#installation)
+- [Configuration](#configuration)
 - [Usage](#usage)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
 
 ## Overview
 
-**Coding MCP Server** is a Rust‑based interactive CLI assistant that integrates an LLM client (via **LM Studio**) with a custom “MCP” tool router.  
+**Haico** is a Rust‑based interactive CLI assistant that integrates an LLM client (via **LM Studio** or **Ollama**) with a custom “MCP” tool router.  
 The system enables seamless interaction between a language model and programmable actions on the host environment.
 
 ### How it works
@@ -43,12 +43,12 @@ All tools are described via JSON schemas, making them easy to extend or integrat
 ## Installation
 ### Prerequisites
 - Rust ≥ 1.56 (installed via `rustup`).
-- **LM Studio** client (or any compatible LLM API).
+- **Ollama** or **LM Studio** (or any OpenAI-compatible LLM API server).
 
 ```bash
 # Clone the repository
-git clone https://github.com/Revertron/coding-mcp-server.git
-cd coding-mcp-server
+git clone https://github.com/Revertron/haico.git
+cd haico
 
 # Build the project
 cargo build --release
@@ -58,11 +58,98 @@ Optional: Install additional dependencies if required (e.g., `reqwest` for web f
 
 ---
 
+## Configuration
+
+Haico supports flexible configuration through command-line arguments and environment variables, making it compatible with both **Ollama** and **LM Studio**.
+
+### Command-Line Options
+
+```bash
+haico [OPTIONS]
+
+Options:
+  -u, --url <URL>              LLM server URL (default: http://127.0.0.1:11434)
+  -m, --model <MODEL>          Model name (skips interactive selection)
+  -s, --system-prompt <PROMPT> System prompt (string or path to text file)
+  -h, --help                   Print help message
+```
+
+### Environment Variables
+
+- **`LLM_URL`** - LLM server URL (overridden by `--url`)
+
+### Configuration Priority
+
+Parameters are resolved in the following order:
+1. Command-line arguments (highest priority)
+2. Environment variables
+3. Default values (lowest priority)
+
+### Examples
+
+#### Connect to Ollama (default)
+```bash
+# Uses default Ollama port (11434)
+./haico
+
+# Explicitly specify Ollama URL
+./haico --url http://127.0.0.1:11434
+```
+
+#### Connect to LM Studio
+```bash
+# LM Studio uses port 15200 by default
+./haico --url http://127.0.0.1:15200
+
+# Or use environment variable
+LLM_URL=http://127.0.0.1:15200 ./haico
+```
+
+#### Skip Model Selection
+```bash
+# Directly specify model name
+./haico --model "qwen2.5:14b"
+
+# Works with any server
+./haico --url http://127.0.0.1:15200 --model "llama-3.2-3b-instruct"
+```
+
+#### Custom System Prompt
+
+You can customize the system prompt either as a string or from a file:
+
+```bash
+# Use inline string
+./haico --system-prompt "You are a helpful coding assistant specializing in Rust"
+
+# Load from file
+./haico --system-prompt ./my_custom_prompt.txt
+```
+
+**Note:** The system prompt file can be a plain text file containing your custom instructions. If the path doesn't exist, it will be treated as a literal string.
+
+#### Complete Example
+```bash
+# Connect to LM Studio with specific model and custom prompt
+./haico \
+  --url http://127.0.0.1:15200 \
+  --model "llama-3.2-3b-instruct" \
+  --system-prompt "./prompts/coding_assistant.txt"
+```
+
+---
+
 ## Usage
 Run the CLI assistant:
 
+```
+./target/release/haico.exe
+```
+
+or:
+
 ```bash
-./target/release/coding_mcp_server
+./target/release/haico
 ```
 
 You’ll see a prompt where you can type natural language commands.  
@@ -72,18 +159,6 @@ Examples:
 - **Search web:** `Find articles about Rust concurrency.`
 
 The assistant will automatically parse tool calls, ask for permission (if needed), and execute them.
-
----
-
-## Contributing
-We welcome contributions! Please follow these steps:
-1️⃣ Fork the repository.
-2️⃣ Create a new branch (`git checkout -b feature-name`).
-3️⃣ Implement your changes.
-4️⃣ Run tests (`cargo test`) to ensure stability.
-5️⃣ Submit a pull request with a clear description of your changes.
-
-Feel free to open issues for bugs, feature requests, or documentation improvements.
 
 ---
 
