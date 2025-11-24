@@ -517,7 +517,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(format!("Result: {}", result))]))
     }
 
-    #[tool(description = "Reads a file from the local filesystem with optional offset and limit for pagination")]
+    #[tool(description = "Read files from filesystem. Requires absolute path. Reads up to 2000 lines (use offset/limit for large files). Lines >2000 chars truncated.")]
     async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -574,7 +574,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Writes content to a file, creating or overwriting it")]
+    #[tool(description = "Write file to filesystem. Overwrites existing files (Read first for existing files). Prefer editing over creating new files. Don't proactively create docs/READMEs. No emojis unless requested.")]
     async fn write_file(&self, params: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -595,7 +595,7 @@ impl MyMcpServer {
         ))]))
     }
 
-    #[tool(description = "Performs exact string replacement in a file")]
+    #[tool(description = "Exact string replacement in files. Must Read file first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
     async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -649,7 +649,7 @@ impl MyMcpServer {
         ))]))
     }
 
-    #[tool(description = "Fast file pattern matching using glob patterns like **/*.rs or src/**/*.json")]
+    #[tool(description = "Fast file pattern matching. Supports glob patterns (\"**/*.js\"). Returns paths sorted by modification time. For open-ended multi-round searches, use Agent. Batch multiple searches when useful.")]
     async fn glob_search(&self, params: Parameters<GlobParams>) -> Result<CallToolResult, McpError> {
         let base_path = params.0.path.as_deref().unwrap_or(".");
         let pattern = if params.0.path.is_some() {
@@ -688,7 +688,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Search for patterns in files using regex. Supports filtering by glob patterns and multiple output modes")]
+    #[tool(description = "Search for patterns in files using regex. Filter by glob (\"*.js\") or type (\"js\", \"py\"). Output modes: content (lines), files_with_matches (paths, default), count. Escape literal braces. Use multiline:true for cross-line patterns. Use Task for open-ended searches.")]
     async fn grep(&self, params: Parameters<GrepParams>) -> Result<CallToolResult, McpError> {
         let pattern = params.0.pattern.clone();
         let case_insensitive = params.0.case_insensitive.unwrap_or(false);
@@ -793,7 +793,7 @@ impl MyMcpServer {
 
         // Fetch the content
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; MCPBot/1.0)")
+            .user_agent("Mozilla/5.0 (compatible; Haico/0.1.0)")
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| {
@@ -957,7 +957,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Lists directory contents with file/folder information")]
+    #[tool(description = "Lists directory contents with file/folder information. Prefer Glob/Grep when target directories are known.")]
     async fn ls(&self, params: Parameters<LSParams>) -> Result<CallToolResult, McpError> {
         let path = PathBuf::from(&params.0.path);
 
@@ -1029,7 +1029,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Executes a bash command with optional timeout (default 120s, max 600s)")]
+    #[tool(description = "Execute bash commands in persistent shell. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max. Use run_in_background for long commands (monitor with BashOutput). AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with ;/&&, no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit with HEREDOC, check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with HEREDOC.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
     async fn bash(&self, params: Parameters<BashParams>) -> Result<CallToolResult, McpError> {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
