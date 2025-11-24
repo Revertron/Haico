@@ -98,11 +98,11 @@ Parameters are resolved in the following order:
 
 #### Connect to LM Studio
 ```bash
-# LM Studio uses port 15200 by default
-./haico --url http://127.0.0.1:15200
+# LM Studio uses port 1234 by default
+./haico --url http://127.0.0.1:1234
 
 # Or use environment variable
-LLM_URL=http://127.0.0.1:15200 ./haico
+LLM_URL=http://127.0.0.1:1234 ./haico
 ```
 
 #### Skip Model Selection
@@ -111,7 +111,7 @@ LLM_URL=http://127.0.0.1:15200 ./haico
 ./haico --model "qwen2.5:14b"
 
 # Works with any server
-./haico --url http://127.0.0.1:15200 --model "llama-3.2-3b-instruct"
+./haico --url http://127.0.0.1:1234 --model "llama-3.2-3b-instruct"
 ```
 
 #### Custom System Prompt
@@ -132,7 +132,7 @@ You can customize the system prompt either as a string or from a file:
 ```bash
 # Connect to LM Studio with specific model and custom prompt
 ./haico \
-  --url http://127.0.0.1:15200 \
+  --url http://127.0.0.1:1234 \
   --model "llama-3.2-3b-instruct" \
   --system-prompt "./prompts/coding_assistant.txt"
 ```
