@@ -364,6 +364,7 @@ fn ask_permission(tool_name: &str, description: &str, diff: Option<&str>) -> Res
 }
 
 // LM Studio client
+#[derive(Clone)]
 struct LMStudioClient {
     client: reqwest::Client,
     base_url: String,
@@ -399,6 +400,42 @@ impl LMStudioClient {
             .context("Failed to parse response")?;
 
         Ok(result)
+    }
+
+    async fn simple_completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": system_prompt
+            }),
+            json!({
+                "role": "user",
+                "content": user_prompt
+            })
+        ];
+
+        let response = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .json(&json!({
+                "model": self.model,
+                "messages": messages
+            }))
+            .send()
+            .await
+            .context("Failed to send request to LM Studio")?;
+
+        let result = response
+            .json::<Value>()
+            .await
+            .context("Failed to parse response")?;
+
+        let content = result["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        Ok(content)
     }
 }
 
@@ -512,13 +549,15 @@ struct BashParams {
 #[derive(Clone)]
 struct MyMcpServer {
     tool_router: ToolRouter<Self>,
+    llm_client: LMStudioClient,
 }
 
 #[tool_router]
 impl MyMcpServer {
-    fn new() -> Self {
+    fn new(llm_client: LMStudioClient) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            llm_client,
         }
     }
 
@@ -863,22 +902,33 @@ impl MyMcpServer {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Limit output size
+        // Limit input to LLM to avoid context overflow
         const MAX_LENGTH: usize = 50000;
-        let output = if cleaned_text.len() > MAX_LENGTH {
-            format!(
-                "{}\n\n[Content truncated - {} of {} characters shown]",
-                &cleaned_text[..MAX_LENGTH],
-                MAX_LENGTH,
-                cleaned_text.len()
-            )
+        let truncated_text = if cleaned_text.len() > MAX_LENGTH {
+            &cleaned_text[..MAX_LENGTH]
         } else {
-            cleaned_text
+            &cleaned_text
         };
 
+        // Use LLM to extract information based on the prompt
+        let system_prompt = "You are a helpful assistant that extracts specific information from web page content. \
+                            Be concise and focus only on answering the user's query based on the provided content.";
+
+        let user_prompt = format!(
+            "Web page URL: {}\n\nContent:\n{}\n\n---\n\nTask: {}",
+            final_url, truncated_text, prompt
+        );
+
+        let extracted_info = self.llm_client
+            .simple_completion(system_prompt, &user_prompt)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to extract information with LLM: {}", e), None)
+            })?;
+
         let result_text = format!(
-            "URL: {}\nPrompt: {}\n\n=== Content ===\n\n{}",
-            final_url, prompt, output
+            "URL: {}\n\n=== Extracted Information ===\n\n{}",
+            final_url, extracted_info
         );
 
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
@@ -1348,7 +1398,7 @@ fn render_markdown(text: &str) -> Result<()> {
 
         if in_code_block {
             // Render code with dark grey background
-            execute!(io::stdout(), SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?;
+            execute!(io::stdout(), SetBackgroundColor(Color::Grey), SetForegroundColor(Color::Black))?;
             print!("  {}", line);
             execute!(io::stdout(), ResetColor)?;
             println!();
@@ -1601,14 +1651,14 @@ async fn main() -> Result<()> {
     );
 
     // Initialize MCP server with tools
-    let server = MyMcpServer::new();
+    let server = MyMcpServer::new(lm_client.clone());
     let openai_tools = mcp_tools_to_openai_format(&server);
 
-    println!("Available tools:");
-    for tool in server.tool_router.list_all() {
-        println!("  - {}: {}", tool.name, tool.description.as_deref().unwrap_or(""));
-    }
-    println!();
+    // println!("Available tools:");
+    // for tool in server.tool_router.list_all() {
+    //     println!("  - {}: {}", tool.name, tool.description.as_deref().unwrap_or(""));
+    // }
+    // println!();
 
     // Conversation history
     let mut messages: Vec<Value> = vec![];
