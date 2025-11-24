@@ -405,78 +405,105 @@ impl LMStudioClient {
 // Tool parameter structs
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct CalculatorParams {
+    #[schemars(description = "The arithmetic operation to perform: 'add', 'subtract', 'multiply', or 'divide'")]
     operation: String,
+    #[schemars(description = "The first operand")]
     a: f64,
+    #[schemars(description = "The second operand")]
     b: f64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct ReadParams {
+    #[schemars(description = "Absolute path to the file to read")]
     file_path: String,
+    #[schemars(description = "Line number to start reading from (default: 0)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<usize>,
+    #[schemars(description = "Maximum number of lines to read (default: 2000)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct WriteParams {
+    #[schemars(description = "Absolute path where the file should be written")]
     file_path: String,
+    #[schemars(description = "The complete content to write to the file")]
     content: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct EditParams {
+    #[schemars(description = "Absolute path to the file to modify")]
     file_path: String,
+    #[schemars(description = "The exact text to search for and replace")]
     old_string: String,
+    #[schemars(description = "The text to replace it with (must be different from old_string)")]
     new_string: String,
+    #[schemars(description = "Replace all occurrences of old_string (default false)")]
     #[serde(default)]
     replace_all: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct GlobParams {
+    #[schemars(description = "Glob pattern to match files (e.g., '**/*.rs', '*.txt')")]
     pattern: String,
+    #[schemars(description = "Base directory to search in (default: current directory)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct GrepParams {
+    #[schemars(description = "Regular expression pattern to search for")]
     pattern: String,
+    #[schemars(description = "File or directory to search in (default: current directory)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[schemars(description = "Glob pattern to filter files (e.g., '*.rs', '*.{ts,tsx}')")]
     #[serde(skip_serializing_if = "Option::is_none")]
     glob: Option<String>,
+    #[schemars(description = "Output format: 'content' (matching lines), 'files_with_matches' (file paths, default), or 'count' (match counts)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     output_mode: Option<String>,
+    #[schemars(description = "Perform case-insensitive search (default: false)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
+    #[schemars(description = "Limit output to first N results")]
     #[serde(skip_serializing_if = "Option::is_none")]
     head_limit: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct WebFetchParams {
+    #[schemars(description = "The URL to fetch content from")]
     url: String,
+    #[schemars(description = "A prompt describing what information to extract from the fetched page")]
     prompt: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct WebSearchParams {
+    #[schemars(description = "The search query to submit to the search engine")]
     query: String,
+    #[schemars(description = "Maximum number of search results to return (default: 10)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     max_results: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct LSParams {
+    #[schemars(description = "Path to the directory to list")]
     path: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct BashParams {
+    #[schemars(description = "The bash/shell command to execute")]
     command: String,
+    #[schemars(description = "Timeout in seconds (default: 120, max: 600)")]
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u64>,
 }
