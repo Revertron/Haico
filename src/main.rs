@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use reqwest;
 use rmcp::model::{CallToolResult, Content};
-use rmcp::{tool, tool_router, ErrorData as McpError};
+use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt, ErrorData as McpError};
 use rmcp::handler::server::{tool::ToolRouter, wrapper::Parameters};
+use rmcp::transport::stdio;
 use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
@@ -522,6 +523,19 @@ struct WebFetchParams {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct WebGetParams {
+    #[schemars(description = "The URL to fetch content from")]
+    url: String,
+}
+
+// Outcome of fetching and cleaning a web page: either a cross-host redirect notice to
+// surface to the caller, or the cleaned, size-limited page text.
+enum FetchResult {
+    Redirect(String),
+    Text { final_url: String, text: String },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct WebSearchParams {
     #[schemars(description = "The search query to submit to the search engine")]
     query: String,
@@ -555,8 +569,14 @@ struct MyMcpServer {
 #[tool_router]
 impl MyMcpServer {
     fn new(llm_client: LMStudioClient) -> Self {
+        let mut tool_router = Self::tool_router();
+        // web_get (raw page text) is always available. web_fetch additionally summarizes
+        // via the LLM, so only expose it when a model is configured.
+        if llm_client.model.is_empty() {
+            tool_router.remove_route("web_fetch");
+        }
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             llm_client,
         }
     }
@@ -840,13 +860,11 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Fetches content from a URL and converts HTML to readable text. Takes a URL and a prompt describing what information to extract")]
-    async fn web_fetch(&self, params: Parameters<WebFetchParams>) -> Result<CallToolResult, McpError> {
-        let url = params.0.url.clone();
-        let prompt = params.0.prompt.clone();
-
+    // Shared helper: fetch a URL and return its cleaned, size-limited text. Used by both
+    // web_fetch (which then summarizes via the LLM) and web_get (which returns text directly).
+    async fn fetch_clean_text(&self, url: &str) -> Result<FetchResult, McpError> {
         // Validate URL
-        let parsed_url = url::Url::parse(&url).map_err(|e| {
+        let parsed_url = url::Url::parse(url).map_err(|e| {
             McpError::invalid_params(format!("Invalid URL: {}", e), None)
         })?;
 
@@ -854,7 +872,7 @@ impl MyMcpServer {
         let url_string = if parsed_url.scheme() == "http" {
             url.replace("http://", "https://")
         } else {
-            url.clone()
+            url.to_string()
         };
 
         // Fetch the content
@@ -877,10 +895,10 @@ impl MyMcpServer {
         // Check if we got redirected to a different host
         let final_url = response.url().to_string();
         if response.url().host_str() != parsed_url.host_str() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "URL redirected to different host: {}\nPlease call web_fetch again with this URL if you want to fetch it.",
+            return Ok(FetchResult::Redirect(format!(
+                "URL redirected to different host: {}\nPlease request this URL again if you want to fetch it.",
                 final_url
-            ))]));
+            )));
         }
 
         // Get the response body
@@ -892,7 +910,10 @@ impl MyMcpServer {
             })?;
 
         // Convert HTML to plain text
-        let text_content = html2text::from_read(html.as_bytes(), 100);
+        let text_content = html2text::from_read(html.as_bytes(), 100)
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to convert HTML to text: {}", e), None)
+            })?;
 
         // Trim and clean up the text
         let cleaned_text = text_content
@@ -902,12 +923,24 @@ impl MyMcpServer {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Limit input to LLM to avoid context overflow
-        const MAX_LENGTH: usize = 50000;
-        let truncated_text = if cleaned_text.len() > MAX_LENGTH {
-            &cleaned_text[..MAX_LENGTH]
+        // Limit size to avoid context overflow
+        const MAX_LENGTH: usize = 65536;
+        let text = if cleaned_text.len() > MAX_LENGTH {
+            cleaned_text[..MAX_LENGTH].to_string()
         } else {
-            &cleaned_text
+            cleaned_text
+        };
+
+        Ok(FetchResult::Text { final_url, text })
+    }
+
+    #[tool(description = "Fetches content from an URL and converts HTML to readable text. Takes an URL and a prompt describing what information to extract")]
+    async fn web_fetch(&self, params: Parameters<WebFetchParams>) -> Result<CallToolResult, McpError> {
+        let (final_url, truncated_text) = match self.fetch_clean_text(&params.0.url).await? {
+            FetchResult::Redirect(message) => {
+                return Ok(CallToolResult::success(vec![Content::text(message)]));
+            }
+            FetchResult::Text { final_url, text } => (final_url, text),
         };
 
         // Use LLM to extract information based on the prompt
@@ -916,7 +949,7 @@ impl MyMcpServer {
 
         let user_prompt = format!(
             "Web page URL: {}\n\nContent:\n{}\n\n---\n\nTask: {}",
-            final_url, truncated_text, prompt
+            final_url, truncated_text, params.0.prompt
         );
 
         let extracted_info = self.llm_client
@@ -929,6 +962,23 @@ impl MyMcpServer {
         let result_text = format!(
             "URL: {}\n\n=== Extracted Information ===\n\n{}",
             final_url, extracted_info
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(result_text)]))
+    }
+
+    #[tool(description = "Fetches content from an URL and converts HTML to readable text, returning the cleaned page text directly (no summarization). Use when you want the raw page content to read or process yourself.")]
+    async fn web_get(&self, params: Parameters<WebGetParams>) -> Result<CallToolResult, McpError> {
+        let (final_url, text) = match self.fetch_clean_text(&params.0.url).await? {
+            FetchResult::Redirect(message) => {
+                return Ok(CallToolResult::success(vec![Content::text(message)]));
+            }
+            FetchResult::Text { final_url, text } => (final_url, text),
+        };
+
+        let result_text = format!(
+            "URL: {}\n\n=== Page Content ===\n\n{}",
+            final_url, text
         );
 
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
@@ -1227,6 +1277,10 @@ impl MyMcpServer {
                 let params: WebFetchParams = serde_json::from_value(arguments)?;
                 self.web_fetch(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
+            "web_get" => {
+                let params: WebGetParams = serde_json::from_value(arguments)?;
+                self.web_get(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
             "web_search" => {
                 let params: WebSearchParams = serde_json::from_value(arguments)?;
                 self.web_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
@@ -1255,6 +1309,11 @@ impl MyMcpServer {
         Ok(text)
     }
 }
+
+// MCP server handler: wires the existing tool_router to handle list_tools/call_tool.
+// The macro auto-generates a tools-enabled get_info() (server identity comes from Cargo.toml).
+#[tool_handler(router = self.tool_router, name = "haico")]
+impl ServerHandler for MyMcpServer {}
 
 // Convert MCP tools to OpenAI tool format
 fn mcp_tools_to_openai_format(server: &MyMcpServer) -> Vec<Value> {
@@ -1633,6 +1692,8 @@ struct Config {
     llm_url: String,
     system_prompt: Option<String>,
     model: Option<String>,
+    server: bool,
+    url_supplied: bool,
 }
 
 // Parse configuration from command-line arguments and environment variables
@@ -1644,6 +1705,7 @@ fn parse_config() -> Result<Config> {
     opts.optopt("u", "url", "LLM server URL (default: http://127.0.0.1:11434 for Ollama)", "URL");
     opts.optopt("s", "system-prompt", "System prompt (string or path to text file)", "PROMPT");
     opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
+    opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("h", "help", "Print this help message");
 
     let matches = match opts.parse(&args[1..]) {
@@ -1671,6 +1733,10 @@ fn parse_config() -> Result<Config> {
         "http://127.0.0.1:11434".to_string()
     };
 
+    // Whether the URL was set explicitly (flag or env var) vs. falling back to the default.
+    // web_fetch's LLM summarization requires the URL to be supplied explicitly, not defaulted.
+    let url_supplied = matches.opt_present("u") || env::var("LLM_URL").is_ok();
+
     // Parse system prompt
     // Can be a string or a path to a text file
     let system_prompt = if let Some(prompt_arg) = matches.opt_str("s") {
@@ -1691,10 +1757,15 @@ fn parse_config() -> Result<Config> {
     // Parse model
     let model = matches.opt_str("m");
 
+    // Run as an stdio MCP server instead of the interactive REPL
+    let server = matches.opt_present("server");
+
     Ok(Config {
         llm_url,
         system_prompt,
         model,
+        server,
+        url_supplied,
     })
 }
 
@@ -1709,16 +1780,56 @@ fn print_usage(program: &str, opts: Options) {
     println!("  {} --model \"qwen2.5:14b\"          # Use specific model", program);
     println!("  {} --system-prompt \"You are a helpful assistant\"  # Custom prompt", program);
     println!("  {} --system-prompt ./prompt.txt  # Load prompt from file", program);
+    println!("  {} --server                       # Run as a stdio MCP server (for LM Studio)", program);
     println!("  LLM_URL=http://127.0.0.1:15200 {}  # Use environment variable", program);
+}
+
+// Run haico as an stdio MCP server. stdout/stdin carry the JSON-RPC protocol, so this
+// function must NOT print to stdout — all diagnostics go to stderr via eprintln!.
+async fn run_mcp_server(config: Config) -> Result<()> {
+    eprintln!("[haico] starting MCP server (stdio)...");
+
+    // web_fetch summarizes pages via the LLM and is only exposed when fully configured for
+    // it — i.e. when BOTH --url and --model are set explicitly. Otherwise, it is hidden and
+    // only web_get (raw cleaned page text, no LLM round-trip) is exposed. Every other tool
+    // works regardless.
+    let model = match (config.url_supplied, config.model) {
+        (true, Some(m)) => m,
+        _ => {
+            eprintln!("[haico] note: no model configured (needs BOTH --url and --model); \
+                       exposing web_get (raw page text) and hiding web_fetch (summarization).");
+            String::new()
+        }
+    };
+
+    let lm_client = LMStudioClient::new(config.llm_url, model);
+    let server = MyMcpServer::new(lm_client);
+
+    eprintln!("[haico] MCP server ready; serving over stdio.");
+    let running = server
+        .serve(stdio())
+        .await
+        .context("failed to start MCP stdio server")?;
+    running
+        .waiting()
+        .await
+        .context("MCP server terminated with error")?;
+    eprintln!("[haico] MCP server stopped.");
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse configuration first so we know the mode before any stdout output.
+    let config = parse_config()?;
+
+    // Server mode: hand off to the MCP stdio server and return (no banner, no REPL).
+    if config.server {
+        return run_mcp_server(config).await;
+    }
+
     println!("          Welcome to Haico!");
     println!("=====================================\n");
-
-    // Parse configuration from command-line arguments
-    let config = parse_config()?;
     println!("Connecting to LLM server at: {}", config.llm_url);
 
     // Determine which model to use
@@ -1889,7 +2000,7 @@ async fn main() -> Result<()> {
                     // Check if permission is needed for this tool
                     let needs_permission = matches!(
                         tool_name,
-                        "web_search" | "web_fetch" | "read" | "write_file" | "edit" | "bash" | "ls"
+                        "web_search" | "web_fetch" | "web_get" | "read" | "write_file" | "edit" | "bash" | "ls"
                     );
 
                     if needs_permission && !perm_manager.is_allowed(tool_name) {
@@ -1946,7 +2057,7 @@ async fn main() -> Result<()> {
                                 let query = arguments["query"].as_str().unwrap_or("unknown");
                                 format!("Search the web for: '{}'", query)
                             }
-                            "web_fetch" => {
+                            "web_fetch" | "web_get" => {
                                 let url = arguments["url"].as_str().unwrap_or("unknown");
                                 format!("Fetch content from URL: {}", url)
                             }

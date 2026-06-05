@@ -9,6 +9,7 @@
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [MCP Server Mode](#mcp-server-mode)
 - [License](#license)
 
 ---
@@ -32,9 +33,10 @@ The system enables seamless interaction between a language model and programmabl
 - **File Operations** – read, write, edit files (including exact string replacement).
 - **Glob Search** – fast pattern matching across directories (`**/*.rs`, etc.).
 - **Regex Grep** – search for patterns in files with optional case‑insensitivity.
-- **Web Fetch & Search** – retrieve and parse web content using DuckDuckGo.
+- **Web Tools** – `web_fetch` (fetch a page and summarize it via the LLM), `web_get` (fetch a page and return its cleaned text), and `web_search` (DuckDuckGo search).
 - **Directory Listing** – list contents of a folder.
 - **Bash Execution** – run shell commands with timeout controls.
+- **MCP Server Mode** – run as a stdio MCP server so other MCP hosts (e.g. LM Studio) can use Haico's tools.
 
 All tools are described via JSON schemas, making them easy to extend or integrate with other systems.
 
@@ -71,6 +73,7 @@ Options:
   -u, --url <URL>              LLM server URL (default: http://127.0.0.1:11434)
   -m, --model <MODEL>          Model name (skips interactive selection)
   -s, --system-prompt <PROMPT> System prompt (string or path to text file)
+      --server                 Run as a stdio MCP server (no REPL; for MCP hosts like LM Studio)
   -h, --help                   Print help message
 ```
 
@@ -159,6 +162,44 @@ Examples:
 - **Search web:** `Find articles about Rust concurrency.`
 
 The assistant will automatically parse tool calls, ask for permission (if needed), and execute them.
+
+---
+
+## MCP Server Mode
+
+In addition to the interactive REPL, Haico can run as a **stdio MCP server**, exposing its tools to any MCP host (such as **LM Studio**). Pass `--server` to start in this mode:
+
+```bash
+./haico --server
+```
+
+In server mode Haico speaks the Model Context Protocol over stdin/stdout, so it prints no banner or prompts (diagnostics go to stderr) and does **not** select a model interactively. The MCP host launches the binary and decides when to call each tool — including any confirmation, since Haico's interactive permission prompts do not apply in server mode.
+
+### Using with LM Studio
+
+Build a release binary (`cargo build --release`) and register Haico in LM Studio's `mcp.json` (Program ▸ Edit `mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "haico": {
+      "command": "C:\\path\\to\\haico\\target\\release\\haico.exe",
+      "args": ["--server", "--url", "http://127.0.0.1:1234", "--model", "qwen2.5:14b"]
+    }
+  }
+}
+```
+
+On non-Windows platforms use the plain path to the `haico` binary. Haico's tools then appear in LM Studio and can be called by the model.
+
+### Web tools in server mode
+
+The two page-fetching tools differ, and which are exposed depends on configuration:
+
+- **`web_get(url)`** – fetches a page and returns its cleaned text directly, with no LLM call. Always available.
+- **`web_fetch(url, prompt)`** – fetches a page and uses the LLM to summarize/extract per the prompt. Because this makes a second LLM round-trip (which can exceed the host's request timeout on large pages), it is only exposed when an LLM is explicitly configured — i.e. when **both** `--url` and `--model` are passed. Otherwise it is hidden and only `web_get` is offered.
+
+When a model is configured, both tools are exposed and the calling model picks whichever it needs. (In the interactive REPL a model is always selected, so both are always available there.)
 
 ---
 
