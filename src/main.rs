@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 use std::process::Command;
 use std::env;
+use std::sync::{Arc, Mutex};
+use std::num::NonZeroUsize;
+use lru::LruCache;
 use chrono;
 use tokio;
 use getopts::Options;
@@ -530,6 +533,7 @@ struct WebGetParams {
 
 // Outcome of fetching and cleaning a web page: either a cross-host redirect notice to
 // surface to the caller, or the cleaned, size-limited page text.
+#[derive(Clone)]
 enum FetchResult {
     Redirect(String),
     Text { final_url: String, text: String },
@@ -564,6 +568,9 @@ struct BashParams {
 struct MyMcpServer {
     tool_router: ToolRouter<Self>,
     llm_client: LMStudioClient,
+    // LRU cache of the last ~10 fetched pages, keyed by (upgraded) URL. Shared across
+    // clones via Arc so web_fetch and web_get (and the REPL) hit the same cache.
+    cache: Arc<Mutex<LruCache<String, FetchResult>>>,
 }
 
 #[tool_router]
@@ -578,6 +585,7 @@ impl MyMcpServer {
         Self {
             tool_router,
             llm_client,
+            cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
         }
     }
 
@@ -875,6 +883,15 @@ impl MyMcpServer {
             url.to_string()
         };
 
+        // Serve repeat fetches of the same page from the LRU cache. The lock is dropped
+        // before any .await below, so it is never held across an await point.
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(hit) = cache.get(&url_string) {
+                return Ok(hit.clone());
+            }
+        }
+
         // Fetch the content
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; Haico/0.1.0)")
@@ -895,10 +912,12 @@ impl MyMcpServer {
         // Check if we got redirected to a different host
         let final_url = response.url().to_string();
         if response.url().host_str() != parsed_url.host_str() {
-            return Ok(FetchResult::Redirect(format!(
+            let result = FetchResult::Redirect(format!(
                 "URL redirected to different host: {}\nPlease request this URL again if you want to fetch it.",
                 final_url
-            )));
+            ));
+            self.cache.lock().unwrap().put(url_string.clone(), result.clone());
+            return Ok(result);
         }
 
         // Get the response body
@@ -931,7 +950,9 @@ impl MyMcpServer {
             cleaned_text
         };
 
-        Ok(FetchResult::Text { final_url, text })
+        let result = FetchResult::Text { final_url, text };
+        self.cache.lock().unwrap().put(url_string.clone(), result.clone());
+        Ok(result)
     }
 
     #[tool(description = "Fetches content from an URL and converts HTML to readable text. Takes an URL and a prompt describing what information to extract")]
