@@ -555,8 +555,8 @@ struct LSParams {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct BashParams {
-    #[schemars(description = "The bash/shell command to execute")]
+struct RunCommandParams {
+    #[schemars(description = "The shell command to execute")]
     command: String,
     #[schemars(description = "Timeout in seconds (default: 120, max: 600)")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -589,7 +589,7 @@ impl MyMcpServer {
         }
     }
 
-    #[tool(description = "Perform basic arithmetic operations (add, subtract, multiply, divide)")]
+    #[tool(description = "Use for exact arithmetic instead of computing in your head — reach for this whenever a task involves numbers to add, subtract, multiply, or divide, especially with large values or decimals, or when a wrong result would be costly. Performs one basic arithmetic operation (add, subtract, multiply, divide) on two numbers.")]
     async fn calculator(&self, params: Parameters<CalculatorParams>) -> Result<CallToolResult, McpError> {
         let operation = params.0.operation.as_str();
         let a = params.0.a;
@@ -611,7 +611,19 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(format!("Result: {}", result))]))
     }
 
-    #[tool(description = "Read files from filesystem. Requires absolute path. Reads up to 2000 lines (use offset/limit for large files). Lines >2000 chars truncated.")]
+    #[tool(description = "Call this whenever anything depends on today's date — you have no reliable internal clock and your best guess is usually stale or wrong, so never assume the date. Use it before answering 'what is today', resolving relative dates ('yesterday', 'next Monday', 'in two weeks'), computing ages, durations or deadlines, or naming files and logs by date. Returns the current local date in YYYY-MM-DD format (e.g. 2026-06-22).")]
+    async fn get_date(&self) -> Result<CallToolResult, McpError> {
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        Ok(CallToolResult::success(vec![Content::text(date)]))
+    }
+
+    #[tool(description = "Call this whenever you need the current wall-clock time or timezone — you cannot know it on your own and must not guess. Use it for 'what time is it', scheduling, measuring how long something takes, timestamping, or converting between time zones. Returns the current local time in HH:MM:SS format with UTC offset (e.g. 14:30:05 +03:00).")]
+    async fn get_time(&self) -> Result<CallToolResult, McpError> {
+        let time = chrono::Local::now().format("%H:%M:%S %:z").to_string();
+        Ok(CallToolResult::success(vec![Content::text(time)]))
+    }
+
+    #[tool(description = "Use whenever you need to see what a file actually contains rather than assume — inspecting source before changing it, checking config or data, or quoting exact text. Always Read a file before you Edit or Write it. Reads files from the filesystem. Requires absolute path. Reads up to 2000 lines (use offset/limit for large files). Lines >2000 chars truncated.")]
     async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -668,7 +680,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Write file to filesystem. Overwrites existing files (Read first for existing files). Prefer editing over creating new files. Don't proactively create docs/READMEs. No emojis unless requested.")]
+    #[tool(description = "Use to create a brand-new file or completely replace an existing file's contents; to change only part of a file, prefer Edit instead. Writes a file to the filesystem, overwriting existing files (Read first for existing files). Prefer editing over creating new files. Don't proactively create docs/READMEs. No emojis unless requested.")]
     async fn write_file(&self, params: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -689,7 +701,7 @@ impl MyMcpServer {
         ))]))
     }
 
-    #[tool(description = "Exact string replacement in files. Must Read file first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
+    #[tool(description = "Use to change part of an existing file — fixing a line, renaming a symbol, or adjusting a value — without rewriting the whole file. Performs exact string replacement. Must Read file first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
     async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -743,7 +755,7 @@ impl MyMcpServer {
         ))]))
     }
 
-    #[tool(description = "Fast file pattern matching. Supports glob patterns (\"**/*.js\"). Returns paths sorted by modification time. For open-ended multi-round searches, use Agent. Batch multiple searches when useful.")]
+    #[tool(description = "Use when you know how a file is named or where it lives but not its exact path — locating files by name or extension across a tree. Fast file pattern matching that supports glob patterns (\"**/*.js\"). Returns paths sorted by modification time. Batch multiple searches when useful.")]
     async fn glob_search(&self, params: Parameters<GlobParams>) -> Result<CallToolResult, McpError> {
         let base_path = params.0.path.as_deref().unwrap_or(".");
         let pattern = if params.0.path.is_some() {
@@ -782,7 +794,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Search for patterns in files using regex. Filter by glob (\"*.js\") or type (\"js\", \"py\"). Output modes: content (lines), files_with_matches (paths, default), count. Escape literal braces. Use multiline:true for cross-line patterns. Use Task for open-ended searches.")]
+    #[tool(description = "Use when you need to find where something appears in the code — a function, variable, string literal, or any regex pattern — across many files at once. Searches file contents using regex. Filter by glob (\"*.js\") or type (\"js\", \"py\"). Output modes: content (lines), files_with_matches (paths, default), count. Escape literal braces. Use multiline:true for cross-line patterns.")]
     async fn grep(&self, params: Parameters<GrepParams>) -> Result<CallToolResult, McpError> {
         let pattern = params.0.pattern.clone();
         let case_insensitive = params.0.case_insensitive.unwrap_or(false);
@@ -955,7 +967,7 @@ impl MyMcpServer {
         Ok(result)
     }
 
-    #[tool(description = "Fetches content from an URL and converts HTML to readable text. Takes an URL and a prompt describing what information to extract")]
+    #[tool(description = "Use when you have a specific URL and want a focused answer pulled from it rather than the whole page — the page is fetched, converted to readable text, and an assistant extracts just what your prompt asks for. Takes a URL and a prompt describing what information to extract. Use web_get instead when you want the full raw text yourself.")]
     async fn web_fetch(&self, params: Parameters<WebFetchParams>) -> Result<CallToolResult, McpError> {
         let (final_url, truncated_text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
@@ -988,7 +1000,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 
-    #[tool(description = "Fetches content from an URL and converts HTML to readable text, returning the cleaned page text directly (no summarization). Use when you want the raw page content to read or process yourself.")]
+    #[tool(description = "Use when you have a URL and want to read or process the full page yourself, with no filtering — fetches the page and returns the cleaned text directly (no summarization). Choose web_fetch instead when you only need a specific fact and want it extracted for you.")]
     async fn web_get(&self, params: Parameters<WebGetParams>) -> Result<CallToolResult, McpError> {
         let (final_url, text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
@@ -1005,7 +1017,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 
-    #[tool(description = "Searches the web using DuckDuckGo and returns search results with titles, URLs, and snippets")]
+    #[tool(description = "Use when you need information you don't have or that may be newer than your knowledge, or when you don't yet have a URL to open — search the web by keywords to discover relevant pages. Searches using DuckDuckGo and returns results with titles, URLs, and snippets; follow up with web_fetch or web_get on a promising URL.")]
     async fn web_search(&self, params: Parameters<WebSearchParams>) -> Result<CallToolResult, McpError> {
         let query = params.0.query.clone();
         let max_results = params.0.max_results.unwrap_or(10);
@@ -1014,9 +1026,13 @@ impl MyMcpServer {
         let encoded_query = urlencoding::encode(&query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        // Fetch search results
+        // Fetch search results. Send a full set of browser-like headers so the request
+        // looks like a real browser rather than a bare scraper.
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| {
@@ -1025,11 +1041,23 @@ impl MyMcpServer {
 
         let response = client
             .get(&search_url)
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(reqwest::header::REFERER, "https://duckduckgo.com/")
             .send()
             .await
             .map_err(|e| {
                 McpError::internal_error(format!("Failed to fetch search results: {}", e), None)
             })?;
+
+        // DuckDuckGo answers requests it flags as automated with an HTTP 202 anti-bot
+        // challenge page (an "anomaly-modal" CAPTCHA) instead of results. Detect it and
+        // report clearly, otherwise the empty parse below falls through to a misleading
+        // "No search results found" message.
+        let status = response.status();
 
         let html = response
             .text()
@@ -1037,6 +1065,15 @@ impl MyMcpServer {
             .map_err(|e| {
                 McpError::internal_error(format!("Failed to read response body: {}", e), None)
             })?;
+
+        if status == reqwest::StatusCode::ACCEPTED || html.contains("anomaly-modal") {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "DuckDuckGo blocked this search with a bot-detection challenge (HTTP {}). \
+                 Web search is temporarily unavailable — please try again later or configure \
+                 an alternative search provider.",
+                status.as_u16()
+            ))]));
+        }
 
         // Parse HTML
         use scraper::{Html, Selector};
@@ -1105,7 +1142,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Lists directory contents with file/folder information. Prefer Glob/Grep when target directories are known.")]
+    #[tool(description = "Use when you need to see what a directory actually contains — discovering files and subfolders, confirming a path exists, or checking a parent directory before writing into it. Lists directory contents with file/folder information. Prefer Glob/Grep when you already know what you're looking for.")]
     async fn ls(&self, params: Parameters<LSParams>) -> Result<CallToolResult, McpError> {
         let path = PathBuf::from(&params.0.path);
 
@@ -1177,8 +1214,8 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Execute bash commands in persistent shell. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max. Use run_in_background for long commands (monitor with BashOutput). AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with ;/&&, no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit with HEREDOC, check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with HEREDOC.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
-    async fn bash(&self, params: Parameters<BashParams>) -> Result<CallToolResult, McpError> {
+    #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
+    async fn run_command(&self, params: Parameters<RunCommandParams>) -> Result<CallToolResult, McpError> {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
 
@@ -1274,6 +1311,12 @@ impl MyMcpServer {
                 let params: CalculatorParams = serde_json::from_value(arguments)?;
                 self.calculator(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
+            "get_date" => {
+                self.get_date().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "get_time" => {
+                self.get_time().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
             "read" => {
                 let params: ReadParams = serde_json::from_value(arguments)?;
                 self.read(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
@@ -1310,9 +1353,9 @@ impl MyMcpServer {
                 let params: LSParams = serde_json::from_value(arguments)?;
                 self.ls(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
-            "bash" => {
-                let params: BashParams = serde_json::from_value(arguments)?;
-                self.bash(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            "run_command" => {
+                let params: RunCommandParams = serde_json::from_value(arguments)?;
+                self.run_command(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             _ => return Err(anyhow::anyhow!("Unknown tool: {}", name)),
         };
@@ -2021,7 +2064,7 @@ async fn main() -> Result<()> {
                     // Check if permission is needed for this tool
                     let needs_permission = matches!(
                         tool_name,
-                        "web_search" | "web_fetch" | "web_get" | "read" | "write_file" | "edit" | "bash" | "ls"
+                        "web_search" | "web_fetch" | "web_get" | "read" | "write_file" | "edit" | "run_command" | "ls"
                     );
 
                     if needs_permission && !perm_manager.is_allowed(tool_name) {
@@ -2104,7 +2147,7 @@ async fn main() -> Result<()> {
                                     format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
                                 }
                             }
-                            "bash" => {
+                            "run_command" => {
                                 let command = arguments["command"].as_str().unwrap_or("unknown");
                                 let cmd_display = if command.len() > 50 {
                                     format!("{}...", &command[..50])

@@ -35,7 +35,7 @@ The system enables seamless interaction between a language model and programmabl
 - **Regex Grep** – search for patterns in files with optional case‑insensitivity.
 - **Web Tools** – `web_fetch` (fetch a page and summarize it via the LLM), `web_get` (fetch a page and return its cleaned text), and `web_search` (DuckDuckGo search).
 - **Directory Listing** – list contents of a folder.
-- **Bash Execution** – run shell commands with timeout controls.
+- **Command Execution** – `run_command` runs shell commands with timeout controls.
 - **MCP Server Mode** – run as a stdio MCP server so other MCP hosts (e.g. LM Studio) can use Haico's tools.
 
 All tools are described via JSON schemas, making them easy to extend or integrate with other systems.
