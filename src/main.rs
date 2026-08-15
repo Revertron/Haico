@@ -621,6 +621,62 @@ fn rust_api_client() -> Result<reqwest::Client, McpError> {
         .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
 }
 
+// The Firefox release we impersonate in the web tools. Bump this occasionally: a
+// user-agent that trails the real release train by too many versions is itself a
+// bot signal.
+const FIREFOX_VERSION: &str = "153";
+
+// Shared HTTP client for the web tools (web_search, web_get, web_fetch). Many sites
+// challenge or reject requests whose headers look like a bare HTTP library, so we send
+// the same header set a desktop Firefox sends for a top-level page load.
+//
+// This only disguises the headers. The TLS ClientHello and HTTP/2 settings are still
+// reqwest's, so services that fingerprint at that level (Cloudflare, DataDome) can
+// still tell us apart from a real browser.
+fn browser_client() -> Result<reqwest::Client, McpError> {
+    use reqwest::header::{
+        HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
+        UPGRADE_INSECURE_REQUESTS,
+    };
+
+    let mut headers = HeaderMap::new();
+    // Verbatim from DocumentAcceptHeader() in Firefox's nsHttpHandler.cpp.
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,\
+             image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        ),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.5"));
+    // Safe to advertise only because the matching reqwest features are enabled in
+    // Cargo.toml; reqwest keeps this header as written and still decodes the response.
+    headers.insert(
+        ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
+    headers.insert(UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
+    // Fetch metadata for a user-initiated, top-level navigation. web_search overrides
+    // Sec-Fetch-Site because it sends a Referer.
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
+    headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
+    headers.insert("Priority", HeaderValue::from_static("u=0, i"));
+
+    reqwest::Client::builder()
+        .user_agent(format!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{v}.0) Gecko/20100101 Firefox/{v}.0",
+            v = FIREFOX_VERSION
+        ))
+        .default_headers(headers)
+        // Anti-bot flows commonly set a cookie and redirect; without a jar we drop it.
+        .cookie_store(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
+}
+
 // MCP Server with tools
 #[derive(Clone)]
 struct MyMcpServer {
@@ -963,13 +1019,7 @@ impl MyMcpServer {
         }
 
         // Fetch the content
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; Haico/0.1.0)")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| {
-                McpError::internal_error(format!("Failed to build HTTP client: {}", e), None)
-            })?;
+        let client = browser_client()?;
 
         let response = client
             .get(&url_string)
@@ -1084,27 +1134,15 @@ impl MyMcpServer {
         let encoded_query = urlencoding::encode(&query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        // Fetch search results. Send a full set of browser-like headers so the request
-        // looks like a real browser rather than a bare scraper.
-        let client = reqwest::Client::builder()
-            .user_agent(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            )
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| {
-                McpError::internal_error(format!("Failed to build HTTP client: {}", e), None)
-            })?;
+        // Fetch search results. browser_client() already carries the Firefox header set;
+        // this request additionally looks like the search form on duckduckgo.com was
+        // submitted, so the Referer and Sec-Fetch-Site have to agree with each other.
+        let client = browser_client()?;
 
         let response = client
             .get(&search_url)
-            .header(
-                reqwest::header::ACCEPT,
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .header(reqwest::header::REFERER, "https://duckduckgo.com/")
+            .header("Sec-Fetch-Site", "same-site")
             .send()
             .await
             .map_err(|e| {

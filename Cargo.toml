@@ -6,7 +6,7 @@ description = "This Rust project implements an interactive CLI assistant that in
 
 [dependencies]
 rmcp = { version = "3.1.0", features = ["transport-io"] }
-reqwest = { version = "0.13.4", features = ["json"] }
+reqwest = { version = "0.13.4", features = ["json", "gzip", "deflate", "brotli", "zstd", "cookies"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 schemars = "1.0"
