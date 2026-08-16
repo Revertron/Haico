@@ -677,6 +677,78 @@ fn browser_client() -> Result<reqwest::Client, McpError> {
         .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
 }
 
+// Resolve a search result's URL into an absolute, scheme-carrying one.
+//
+// DuckDuckGo's HTML results print the URL without a scheme in the link text
+// ("rust-lang.org/tools/install") and wrap the real target in a protocol-relative
+// redirect ("//duckduckgo.com/l/?uddg=<percent-encoded target>&rut=..."). Models that
+// get the bare text back often fail to prepend a scheme and then can't fetch the page,
+// so prefer the target decoded out of the redirect and fall back to the display text
+// with https:// prepended.
+fn resolve_result_url(href: Option<&str>, display_text: &str) -> String {
+    if let Some(href) = href {
+        let absolute = if href.starts_with("//") {
+            format!("https:{}", href)
+        } else {
+            href.to_string()
+        };
+
+        if let Ok(parsed) = url::Url::parse(&absolute) {
+            // query_pairs() percent-decodes, so this is already the plain target URL.
+            if let Some((_, target)) = parsed.query_pairs().find(|(key, _)| key == "uddg") {
+                return target.into_owned();
+            }
+            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+                return absolute;
+            }
+        }
+    }
+
+    let text = display_text.trim();
+    if text.is_empty() || text.starts_with("http://") || text.starts_with("https://") {
+        text.to_string()
+    } else {
+        format!("https://{}", text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_result_url;
+
+    #[test]
+    fn decodes_duckduckgo_redirect() {
+        assert_eq!(
+            resolve_result_url(
+                Some("//duckduckgo.com/l/?uddg=https%3A%2F%2Frust%2Dlang.org%2Ftools%2Finstall%2F&rut=ae4a"),
+                "rust-lang.org/tools/install",
+            ),
+            "https://rust-lang.org/tools/install/"
+        );
+    }
+
+    #[test]
+    fn keeps_a_plain_absolute_href() {
+        assert_eq!(
+            resolve_result_url(Some("https://example.com/page"), "example.com/page"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_display_text_with_a_scheme() {
+        assert_eq!(
+            resolve_result_url(None, "example.com/page"),
+            "https://example.com/page"
+        );
+        assert_eq!(
+            resolve_result_url(None, "https://example.com/page"),
+            "https://example.com/page"
+        );
+        assert_eq!(resolve_result_url(None, ""), "");
+    }
+}
+
 // MCP Server with tools
 #[derive(Clone)]
 struct MyMcpServer {
@@ -1208,10 +1280,16 @@ impl MyMcpServer {
             let url = result
                 .select(&url_selector)
                 .next()
-                .map(|e| e.text().collect::<String>())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+                .map(|e| resolve_result_url(e.value().attr("href"), &e.text().collect::<String>()))
+                .filter(|u| !u.is_empty())
+                // Some layouts only carry the target on the title link.
+                .or_else(|| {
+                    result
+                        .select(&title_selector)
+                        .next()
+                        .map(|e| resolve_result_url(e.value().attr("href"), ""))
+                })
+                .unwrap_or_default();
 
             if !title.is_empty() {
                 results.push(format!(
