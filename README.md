@@ -72,14 +72,22 @@ haico [OPTIONS]
 Options:
   -u, --url <URL>              LLM server URL (default: http://127.0.0.1:11434)
   -m, --model <MODEL>          Model name (skips interactive selection)
+  -t, --token <TOKEN>          API token for servers with authentication enabled
   -s, --system-prompt <PROMPT> System prompt (string or path to text file)
       --server                 Run as a stdio MCP server (no REPL; for MCP hosts like LM Studio)
   -h, --help                   Print help message
 ```
 
+The URL is normalized before use: a trailing `/` or `/v1` is stripped, so
+`http://127.0.0.1:1234`, `http://127.0.0.1:1234/`, and `http://127.0.0.1:1234/v1` are
+equivalent. (LM Studio's UI and OpenAI SDKs present the base URL with `/v1` appended;
+without stripping, that would build `/v1/v1/chat/completions`, which LM Studio rejects
+while still answering HTTP 200.)
+
 ### Environment Variables
 
 - **`LLM_URL`** - LLM server URL (overridden by `--url`)
+- **`LM_API_TOKEN`** - API token for authenticated servers (overridden by `--token`)
 
 ### Configuration Priority
 
@@ -107,6 +115,21 @@ Parameters are resolved in the following order:
 # Or use environment variable
 LLM_URL=http://127.0.0.1:1234 ./haico
 ```
+
+#### Connect to a server with authentication enabled
+
+LM Studio can require an API token (Settings → Developer → enable authentication). Pass it
+with `--token`, or keep it out of your shell history via `LM_API_TOKEN`:
+
+```bash
+./haico --url http://127.0.0.1:1234 --token sk-lm-...
+
+# Preferred: token via environment, not on the command line
+LM_API_TOKEN=sk-lm-... ./haico --url http://127.0.0.1:1234
+```
+
+Without a token, an authenticated server answers every request with `401` and haico
+reports it directly rather than failing to parse the error body.
 
 #### Skip Model Selection
 ```bash
@@ -191,6 +214,22 @@ Build a release binary (`cargo build --release`) and register Haico in LM Studio
 ```
 
 On non-Windows platforms use the plain path to the `haico` binary. Haico's tools then appear in LM Studio and can be called by the model.
+
+If the LLM server Haico talks to requires an API token, pass it through here too — either
+as another entry in `args` (`"--token", "sk-lm-..."`) or, to keep the secret out of
+`mcp.json`, via the host's environment:
+
+```json
+{
+  "mcpServers": {
+    "haico": {
+      "command": "C:\\path\\to\\haico\\target\\release\\haico.exe",
+      "args": ["--server", "--url", "http://127.0.0.1:1234", "--model", "qwen2.5:14b"],
+      "env": { "LM_API_TOKEN": "sk-lm-..." }
+    }
+  }
+}
+```
 
 ### Web tools in server mode
 

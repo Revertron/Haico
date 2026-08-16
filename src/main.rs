@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt, ErrorData as McpError};
@@ -367,6 +367,31 @@ fn ask_permission(tool_name: &str, description: &str, diff: Option<&str>) -> Res
     Ok(response)
 }
 
+// Normalize an LLM server URL down to a bare origin, so the "/v1/..." paths below always
+// concatenate cleanly. LM Studio's UI hands out its base URL with "/v1" already appended
+// (and OpenAI SDKs expect it that way), which would otherwise build
+// "/v1/v1/chat/completions" — a path LM Studio rejects while still answering HTTP 200.
+fn normalize_base_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    url.strip_suffix("/v1")
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+// Explain a 401 in terms of what the user can actually change.
+fn unauthorized_message(had_token: bool) -> String {
+    if had_token {
+        "LLM server rejected the request (401 Unauthorized): the configured token was not \
+         accepted. Check --token / LM_API_TOKEN."
+            .to_string()
+    } else {
+        "LLM server rejected the request (401 Unauthorized): it requires an API token, but \
+         none was configured. Pass --token or set LM_API_TOKEN."
+            .to_string()
+    }
+}
+
 // LM Studio client
 #[derive(Clone)]
 struct LMStudioClient {
@@ -376,14 +401,26 @@ struct LMStudioClient {
     // then omitted from requests entirely, so the server answers with the model it already
     // has loaded.
     model: String,
+    // Bearer token for servers with authentication enabled (LM Studio's "API token").
+    // None means send no Authorization header, which is what a default local server wants.
+    token: Option<String>,
 }
 
 impl LMStudioClient {
-    fn new(base_url: String, model: String) -> Self {
+    fn new(base_url: String, model: String, token: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url,
+            base_url: normalize_base_url(&base_url),
             model,
+            token,
+        }
+    }
+
+    // Attach the bearer token, when one is configured.
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => req.bearer_auth(token),
+            None => req,
         }
     }
 
@@ -394,6 +431,29 @@ impl LMStudioClient {
         }
     }
 
+    // POST a chat-completions request. An auth failure is reported as such, instead of
+    // surfacing later as a confusing "failed to parse response" on the error JSON.
+    async fn post_chat(&self, body: &Value) -> Result<Value> {
+        let response = self
+            .authorize(
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base_url)),
+            )
+            .json(body)
+            .send()
+            .await
+            .context("Failed to send request to LM Studio")?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("{}", unauthorized_message(self.token.is_some()));
+        }
+
+        response
+            .json::<Value>()
+            .await
+            .context("Failed to parse response")
+    }
+
     async fn chat_completion(&self, messages: Vec<Value>, tools: Vec<Value>) -> Result<Value> {
         let mut body = json!({
             "messages": messages,
@@ -402,20 +462,7 @@ impl LMStudioClient {
         });
         self.set_model(&mut body);
 
-        let response = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send request to LM Studio")?;
-
-        let result = response
-            .json::<Value>()
-            .await
-            .context("Failed to parse response")?;
-
-        Ok(result)
+        self.post_chat(&body).await
     }
 
     async fn simple_completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
@@ -435,18 +482,7 @@ impl LMStudioClient {
         });
         self.set_model(&mut body);
 
-        let response = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send request to LM Studio")?;
-
-        let result = response
-            .json::<Value>()
-            .await
-            .context("Failed to parse response")?;
+        let result = self.post_chat(&body).await?;
 
         let content = result["choices"][0]["message"]["content"]
             .as_str()
@@ -714,7 +750,40 @@ fn resolve_result_url(href: Option<&str>, display_text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_result_url;
+    use super::{normalize_base_url, resolve_result_url};
+
+    #[test]
+    fn normalizes_base_urls() {
+        // The forms haico already documents are left alone.
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:1234"),
+            "http://127.0.0.1:1234"
+        );
+        // The forms LM Studio's UI and OpenAI SDKs hand out.
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:1234/v1"),
+            "http://127.0.0.1:1234"
+        );
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:1234/v1/"),
+            "http://127.0.0.1:1234"
+        );
+        assert_eq!(
+            normalize_base_url("  http://127.0.0.1:1234/  "),
+            "http://127.0.0.1:1234"
+        );
+        // Bracketed IPv6 hosts survive intact.
+        assert_eq!(
+            normalize_base_url("http://[225:ca89:40a8:611e:78b8:ab81:999a:d4d7]:1234/v1"),
+            "http://[225:ca89:40a8:611e:78b8:ab81:999a:d4d7]:1234"
+        );
+        // Known trade-off: stripping is unconditional, so a proxy whose base path really
+        // does end in "/v1" loses it. Documented rather than special-cased.
+        assert_eq!(
+            normalize_base_url("http://example.com/api/v1"),
+            "http://example.com/api"
+        );
+    }
 
     #[test]
     fn decodes_duckduckgo_redirect() {
@@ -1880,13 +1949,22 @@ fn mcp_tools_to_openai_format(server: &MyMcpServer) -> Vec<Value> {
 }
 
 // Fetch available models from LLM server
-async fn fetch_available_models(base_url: &str) -> Result<Vec<String>> {
+async fn fetch_available_models(base_url: &str, token: Option<&str>) -> Result<Vec<String>> {
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("{}/v1/models", base_url))
+    let request = client.get(format!("{}/v1/models", normalize_base_url(base_url)));
+    let request = match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+
+    let response = request
         .send()
         .await
         .context("Failed to fetch models from server")?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("{}", unauthorized_message(token.is_some()));
+    }
 
     let models_response: ModelsResponse = response
         .json()
@@ -2236,6 +2314,7 @@ fn select_model_interactive(models: Vec<String>) -> Result<String> {
 // Configuration structure
 struct Config {
     llm_url: String,
+    token: Option<String>,
     system_prompt: Option<String>,
     model: Option<String>,
     server: bool,
@@ -2251,6 +2330,7 @@ fn parse_config() -> Result<Config> {
     opts.optopt("u", "url", "LLM server URL (default: http://127.0.0.1:11434 for Ollama)", "URL");
     opts.optopt("s", "system-prompt", "System prompt (string or path to text file)", "PROMPT");
     opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
+    opts.optopt("t", "token", "API token for servers with authentication enabled", "TOKEN");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("h", "help", "Print this help message");
 
@@ -2283,6 +2363,13 @@ fn parse_config() -> Result<Config> {
     // web_fetch's LLM summarization requires the URL to be supplied explicitly, not defaulted.
     let url_supplied = matches.opt_present("u") || env::var("LLM_URL").is_ok();
 
+    // Parse API token, for servers that have authentication enabled.
+    // Priority: command-line arg > environment variable > none.
+    let token = matches
+        .opt_str("t")
+        .or_else(|| env::var("LM_API_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty());
+
     // Parse system prompt
     // Can be a string or a path to a text file
     let system_prompt = if let Some(prompt_arg) = matches.opt_str("s") {
@@ -2308,6 +2395,7 @@ fn parse_config() -> Result<Config> {
 
     Ok(Config {
         llm_url,
+        token,
         system_prompt,
         model,
         server,
@@ -2319,7 +2407,8 @@ fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
     print!("{}", opts.usage(&brief));
     println!("\nEnvironment variables:");
-    println!("  LLM_URL    LLM server URL (overridden by --url)");
+    println!("  LLM_URL       LLM server URL (overridden by --url)");
+    println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
     println!("\nExamples:");
     println!("  {} --url http://127.0.0.1:15200  # Connect to LM Studio", program);
     println!("  {} --url http://127.0.0.1:11434  # Connect to Ollama (default)", program);
@@ -2328,6 +2417,8 @@ fn print_usage(program: &str, opts: Options) {
     println!("  {} --system-prompt ./prompt.txt  # Load prompt from file", program);
     println!("  {} --server                       # Run as a stdio MCP server (for LM Studio)", program);
     println!("  LLM_URL=http://127.0.0.1:15200 {}  # Use environment variable", program);
+    println!("  {} --token sk-lm-...              # Server with authentication enabled", program);
+    println!("  LM_API_TOKEN=sk-lm-... {}         # Token via environment variable", program);
 }
 
 // Run haico as an stdio MCP server. stdout/stdin carry the JSON-RPC protocol, so this
@@ -2350,7 +2441,7 @@ async fn run_mcp_server(config: Config) -> Result<()> {
         eprintln!("[haico] no --model given; using the model already loaded on the LLM server.");
     }
 
-    let lm_client = LMStudioClient::new(config.llm_url, model);
+    let lm_client = LMStudioClient::new(config.llm_url, model, config.token);
     let server = MyMcpServer::new(lm_client, config.url_supplied);
 
     eprintln!("[haico] MCP server ready; serving over stdio.");
@@ -2388,7 +2479,7 @@ async fn main() -> Result<()> {
     } else {
         // No model specified, fetch available models and let user select
         println!("Fetching available models...");
-        let models = match fetch_available_models(&config.llm_url).await {
+        let models = match fetch_available_models(&config.llm_url, config.token.as_deref()).await {
             Ok(models) => models,
             Err(e) => {
                 println!("Error connecting to LLM: {e}");
@@ -2408,6 +2499,7 @@ async fn main() -> Result<()> {
     let lm_client = LMStudioClient::new(
         config.llm_url,
         selected_model,
+        config.token,
     );
 
     // Initialize MCP server with tools
