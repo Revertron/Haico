@@ -33,7 +33,7 @@ The system enables seamless interaction between a language model and programmabl
 - **File Operations** – read, write, edit files (including exact string replacement).
 - **Glob Search** – fast pattern matching across directories (`**/*.rs`, etc.).
 - **Regex Grep** – search for patterns in files with optional case‑insensitivity.
-- **Web Tools** – `web_fetch` (fetch a page and summarize it via the LLM), `web_get` (fetch a page and return its cleaned text), and `web_search` (DuckDuckGo search).
+- **Web Tools** – `web_fetch` (fetch a page and summarize it via the LLM), `web_get` (fetch a page and return its cleaned text), and `web_search` (DuckDuckGo, or a SearxNG instance via `--searxng`).
 - **Directory Listing** – list contents of a folder.
 - **Command Execution** – `run_command` runs shell commands with timeout controls.
 - **MCP Server Mode** – run as a stdio MCP server so other MCP hosts (e.g. LM Studio) can use Haico's tools.
@@ -74,6 +74,7 @@ Options:
   -m, --model <MODEL>          Model name (skips interactive selection)
   -t, --token <TOKEN>          API token for servers with authentication enabled
   -s, --system-prompt <PROMPT> System prompt (string or path to text file)
+      --searxng <URL>          SearxNG instance for web_search (default: DuckDuckGo)
       --server                 Run as a stdio MCP server (no REPL; for MCP hosts like LM Studio)
   -h, --help                   Print help message
 ```
@@ -88,6 +89,7 @@ while still answering HTTP 200.)
 
 - **`LLM_URL`** - LLM server URL (overridden by `--url`)
 - **`LM_API_TOKEN`** - API token for authenticated servers (overridden by `--token`)
+- **`SEARXNG_URL`** - SearxNG instance for `web_search` (overridden by `--searxng`)
 
 ### Configuration Priority
 
@@ -130,6 +132,37 @@ LM_API_TOKEN=sk-lm-... ./haico --url http://127.0.0.1:1234
 
 Without a token, an authenticated server answers every request with `401` and haico
 reports it directly rather than failing to parse the error body.
+
+#### Search through SearxNG instead of DuckDuckGo
+
+`web_search` uses DuckDuckGo by default, which throttles and eventually answers with a
+bot-detection challenge. Point `--searxng` at a [SearxNG](https://docs.searxng.org/)
+instance (your own, ideally) to search through it instead:
+
+```bash
+./haico --searxng http://127.0.0.1:8080
+
+# Or via environment variable
+SEARXNG_URL=http://127.0.0.1:8080 ./haico
+```
+
+Pass the instance's base URL; haico appends `/search` itself. When set, SearxNG replaces
+DuckDuckGo entirely — there is no fallback between providers, so a failing instance is
+reported rather than silently worked around.
+
+Haico first asks for JSON, which parses cleanly. SearxNG does **not** enable that by
+default, so add it to the instance's `settings.yml`:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Without it, haico falls back to scraping the HTML result page, which works but is tied to
+SearxNG's page markup. Note that most *public* instances run behind an anti-bot challenge
+that blocks both paths; a self-hosted instance is the reliable option.
 
 #### Skip Model Selection
 ```bash

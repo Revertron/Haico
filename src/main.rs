@@ -748,9 +748,215 @@ fn resolve_result_url(href: Option<&str>, display_text: &str) -> String {
     }
 }
 
+// One parsed search result. Both backends (DuckDuckGo and SearxNG) produce these, and
+// format_search_results renders them, so the tool's output looks the same either way.
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn format_search_results(query: &str, results: &[SearchResult]) -> String {
+    if results.is_empty() {
+        return format!("No search results found for query: '{}'", query);
+    }
+
+    let body = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            format!(
+                "{}. {}\n   URL: {}\n   {}\n",
+                index + 1,
+                result.title,
+                if result.url.is_empty() { "N/A" } else { &result.url },
+                result.snippet
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Search results for '{}' ({} results):\n\n{}",
+        query,
+        results.len(),
+        body
+    )
+}
+
+// A SearxNG instance's JSON answer. Only the fields we render are declared.
+#[derive(Deserialize)]
+struct SearxngResponse {
+    #[serde(default)]
+    results: Vec<SearxngResult>,
+}
+
+#[derive(Deserialize)]
+struct SearxngResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+// Search through a SearxNG instance instead of DuckDuckGo (--searxng / SEARXNG_URL).
+//
+// JSON is the format we want, but "json" is not in the default `search.formats` of
+// SearxNG's settings.yml, so an instance that hasn't enabled it answers a format=json
+// request with a 403 (or an HTML error page). Try JSON first and fall back to scraping
+// the normal HTML result page, which every instance serves.
+//
+// Unlike the DuckDuckGo path there is no silent fallback across providers: --searxng was
+// passed deliberately, so a broken instance is reported rather than worked around.
+async fn searxng_search(
+    base_url: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<CallToolResult, McpError> {
+    let client = browser_client()?;
+    let search_url = format!("{}/search?q={}", base_url, urlencoding::encode(query));
+
+    let response = client
+        .get(format!("{}&format=json", search_url))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| {
+            McpError::internal_error(
+                format!("Failed to reach the SearxNG instance at {}: {}", base_url, e),
+                None,
+            )
+        })?;
+
+    if response.status().is_success() {
+        let body = response.text().await.map_err(|e| {
+            McpError::internal_error(format!("Failed to read response body: {}", e), None)
+        })?;
+
+        if let Ok(parsed) = serde_json::from_str::<SearxngResponse>(&body) {
+            let results: Vec<SearchResult> = parsed
+                .results
+                .into_iter()
+                .take(max_results)
+                .map(|r| SearchResult {
+                    title: r.title,
+                    url: r.url,
+                    snippet: r.content,
+                })
+                .collect();
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_search_results(query, &results),
+            )]));
+        }
+    }
+
+    // JSON is not enabled on this instance; scrape the HTML result page instead.
+    let html = client
+        .get(&search_url)
+        .send()
+        .await
+        .map_err(|e| {
+            McpError::internal_error(
+                format!("Failed to reach the SearxNG instance at {}: {}", base_url, e),
+                None,
+            )
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            McpError::internal_error(
+                format!("SearxNG at {} rejected the search: {}", base_url, e),
+                None,
+            )
+        })?
+        .text()
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("Failed to read response body: {}", e), None)
+        })?;
+
+    let results = parse_searxng_html(&html, max_results);
+
+    // An anti-bot challenge (common on public instances) is served as a normal HTTP 200
+    // page, and a URL that isn't a SearxNG instance at all answers with something else
+    // entirely. Both scrape to zero results, so check for the result page's own markup
+    // before reporting a genuine "no results".
+    if results.is_empty() && !html.contains("id=\"urls\"") && !html.contains("id=\"results\"") {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "SearxNG at {} did not return a results page. The instance may be behind an \
+             anti-bot challenge, or the URL may not point at a SearxNG instance. Enabling \
+             'json' under search.formats in the instance's settings.yml avoids HTML parsing \
+             entirely.",
+            base_url
+        ))]));
+    }
+
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        format_search_results(query, &results),
+    )]))
+}
+
+// Scrape SearxNG's "simple" theme result page. Results are <article class="result">, with
+// the target on the <h3> link and repeated on the a.url_header wrapper above it (older
+// SearxNG put that class on a.url_wrapper instead, so accept either as a fallback).
+fn parse_searxng_html(html: &str, max_results: usize) -> Vec<SearchResult> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let result_selector = Selector::parse(".result").unwrap();
+    let title_selector = Selector::parse("h3 a").unwrap();
+    let url_selector = Selector::parse("a.url_header, a.url_wrapper").unwrap();
+    let snippet_selector = Selector::parse("p.content").unwrap();
+
+    let mut results = Vec::new();
+
+    for result in document.select(&result_selector) {
+        if results.len() >= max_results {
+            break;
+        }
+
+        let title_element = result.select(&title_selector).next();
+
+        let title = title_element
+            .map(|e| e.text().collect::<String>())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if title.is_empty() {
+            continue;
+        }
+
+        let url = title_element
+            .map(|e| resolve_result_url(e.value().attr("href"), ""))
+            .filter(|u| !u.is_empty())
+            .or_else(|| {
+                result
+                    .select(&url_selector)
+                    .next()
+                    .map(|e| resolve_result_url(e.value().attr("href"), ""))
+            })
+            .unwrap_or_default();
+
+        let snippet = result
+            .select(&snippet_selector)
+            .next()
+            .map(|e| e.text().collect::<String>())
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        results.push(SearchResult { title, url, snippet });
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_base_url, resolve_result_url};
+    use super::{normalize_base_url, parse_searxng_html, resolve_result_url};
 
     #[test]
     fn normalizes_base_urls() {
@@ -816,6 +1022,42 @@ mod tests {
         );
         assert_eq!(resolve_result_url(None, ""), "");
     }
+
+    #[test]
+    fn parses_searxng_html_results() {
+        // Shape of SearxNG's "simple" theme result page (searx/templates/simple/macros.html).
+        let html = r#"
+            <div id="urls">
+              <article class="result result-default category-general">
+                <a href="https://rust-lang.org/tools/install" class="url_header" rel="noreferrer">
+                  <div class="url_wrapper"><span class="url_o1"><span class="url_i1">rust-lang.org</span></span></div>
+                </a>
+                <h3><a href="https://rust-lang.org/tools/install" rel="noreferrer">Install Rust</a></h3>
+                <p class="content">Rustup is
+                   the recommended installer.</p>
+              </article>
+              <article class="result result-default category-general">
+                <a href="https://doc.rust-lang.org/book/" class="url_header" rel="noreferrer">
+                  <div class="url_wrapper"><span class="url_i1">doc.rust-lang.org</span></div>
+                </a>
+                <h3><a>The Rust Book</a></h3>
+                <p class="content empty_element">This site did not provide any description.</p>
+              </article>
+            </div>
+        "#;
+
+        let results = parse_searxng_html(html, 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Install Rust");
+        assert_eq!(results[0].url, "https://rust-lang.org/tools/install");
+        // Whitespace inside the snippet is collapsed onto one line.
+        assert_eq!(results[0].snippet, "Rustup is the recommended installer.");
+        // With no href on the <h3> link, the URL comes from the a.url_header wrapper.
+        assert_eq!(results[1].url, "https://doc.rust-lang.org/book/");
+
+        // max_results truncates.
+        assert_eq!(parse_searxng_html(html, 1).len(), 1);
+    }
 }
 
 // MCP Server with tools
@@ -826,11 +1068,14 @@ struct MyMcpServer {
     // LRU cache of the last ~10 fetched pages, keyed by (upgraded) URL. Shared across
     // clones via Arc so web_fetch and web_get (and the REPL) hit the same cache.
     cache: Arc<Mutex<LruCache<String, FetchResult>>>,
+    // Base URL of a SearxNG instance (--searxng / SEARXNG_URL). When set, web_search goes
+    // through it instead of DuckDuckGo.
+    searxng: Option<String>,
 }
 
 #[tool_router]
 impl MyMcpServer {
-    fn new(llm_client: LMStudioClient, expose_web_fetch: bool) -> Self {
+    fn new(llm_client: LMStudioClient, expose_web_fetch: bool, searxng: Option<String>) -> Self {
         let mut tool_router = Self::tool_router();
         // web_get (raw page text) is always available. web_fetch additionally summarizes
         // via the LLM, so only expose it when we know where the LLM lives.
@@ -841,6 +1086,7 @@ impl MyMcpServer {
             tool_router,
             llm_client,
             cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
+            searxng,
         }
     }
 
@@ -1266,10 +1512,15 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
     }
 
-    #[tool(description = "Use when you need information you don't have or that may be newer than your knowledge, or when you don't yet have a URL to open — search the web by keywords to discover relevant pages. Searches using DuckDuckGo and returns results with titles, URLs, and snippets; follow up with web_fetch or web_get on a promising URL.")]
+    #[tool(description = "Use when you need information you don't have or that may be newer than your knowledge, or when you don't yet have a URL to open — search the web by keywords to discover relevant pages. Searches using DuckDuckGo (or a configured SearxNG instance) and returns results with titles, URLs, and snippets; follow up with web_fetch or web_get on a promising URL.")]
     async fn web_search(&self, params: Parameters<WebSearchParams>) -> Result<CallToolResult, McpError> {
         let query = params.0.query.clone();
         let max_results = params.0.max_results.unwrap_or(10);
+
+        // A configured SearxNG instance replaces DuckDuckGo entirely.
+        if let Some(base_url) = &self.searxng {
+            return searxng_search(base_url, &query, max_results).await;
+        }
 
         // URL encode the query
         let encoded_query = urlencoding::encode(&query);
@@ -1361,28 +1612,13 @@ impl MyMcpServer {
                 .unwrap_or_default();
 
             if !title.is_empty() {
-                results.push(format!(
-                    "{}. {}\n   URL: {}\n   {}\n",
-                    index + 1,
-                    title,
-                    if url.is_empty() { "N/A" } else { &url },
-                    snippet
-                ));
+                results.push(SearchResult { title, url, snippet });
             }
         }
 
-        let output = if results.is_empty() {
-            format!("No search results found for query: '{}'", query)
-        } else {
-            format!(
-                "Search results for '{}' ({} results):\n\n{}",
-                query,
-                results.len(),
-                results.join("\n")
-            )
-        };
-
-        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            format_search_results(&query, &results),
+        )]))
     }
 
     #[tool(description = "Use when you need to see what a directory actually contains — discovering files and subfolders, confirming a path exists, or checking a parent directory before writing into it. Lists directory contents with file/folder information. Prefer Glob/Grep when you already know what you're looking for.")]
@@ -2319,6 +2555,7 @@ struct Config {
     model: Option<String>,
     server: bool,
     url_supplied: bool,
+    searxng: Option<String>,
 }
 
 // Parse configuration from command-line arguments and environment variables
@@ -2331,6 +2568,7 @@ fn parse_config() -> Result<Config> {
     opts.optopt("s", "system-prompt", "System prompt (string or path to text file)", "PROMPT");
     opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
     opts.optopt("t", "token", "API token for servers with authentication enabled", "TOKEN");
+    opts.optopt("", "searxng", "Base URL of a SearxNG instance to search through instead of DuckDuckGo", "URL");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("h", "help", "Print this help message");
 
@@ -2393,6 +2631,14 @@ fn parse_config() -> Result<Config> {
     // Run as an stdio MCP server instead of the interactive REPL
     let server = matches.opt_present("server");
 
+    // SearxNG instance for web_search, replacing DuckDuckGo when set.
+    // Priority: command-line arg > environment variable > none (DuckDuckGo).
+    let searxng = matches
+        .opt_str("searxng")
+        .or_else(|| env::var("SEARXNG_URL").ok())
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty());
+
     Ok(Config {
         llm_url,
         token,
@@ -2400,6 +2646,7 @@ fn parse_config() -> Result<Config> {
         model,
         server,
         url_supplied,
+        searxng,
     })
 }
 
@@ -2409,6 +2656,7 @@ fn print_usage(program: &str, opts: Options) {
     println!("\nEnvironment variables:");
     println!("  LLM_URL       LLM server URL (overridden by --url)");
     println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
+    println!("  SEARXNG_URL   SearxNG instance for web_search (overridden by --searxng)");
     println!("\nExamples:");
     println!("  {} --url http://127.0.0.1:15200  # Connect to LM Studio", program);
     println!("  {} --url http://127.0.0.1:11434  # Connect to Ollama (default)", program);
@@ -2419,6 +2667,7 @@ fn print_usage(program: &str, opts: Options) {
     println!("  LLM_URL=http://127.0.0.1:15200 {}  # Use environment variable", program);
     println!("  {} --token sk-lm-...              # Server with authentication enabled", program);
     println!("  LM_API_TOKEN=sk-lm-... {}         # Token via environment variable", program);
+    println!("  {} --searxng http://127.0.0.1:8080  # Search via SearxNG instead of DuckDuckGo", program);
 }
 
 // Run haico as an stdio MCP server. stdout/stdin carry the JSON-RPC protocol, so this
@@ -2441,8 +2690,12 @@ async fn run_mcp_server(config: Config) -> Result<()> {
         eprintln!("[haico] no --model given; using the model already loaded on the LLM server.");
     }
 
+    if let Some(searxng) = &config.searxng {
+        eprintln!("[haico] web_search will query SearxNG at {}.", searxng);
+    }
+
     let lm_client = LMStudioClient::new(config.llm_url, model, config.token);
-    let server = MyMcpServer::new(lm_client, config.url_supplied);
+    let server = MyMcpServer::new(lm_client, config.url_supplied, config.searxng);
 
     eprintln!("[haico] MCP server ready; serving over stdio.");
     let running = server
@@ -2470,6 +2723,9 @@ async fn main() -> Result<()> {
     println!("          Welcome to Haico!");
     println!("=====================================\n");
     println!("Connecting to LLM server at: {}", config.llm_url);
+    if let Some(searxng) = &config.searxng {
+        println!("Searching through SearxNG at: {}", searxng);
+    }
 
     // Determine which model to use
     let selected_model = if let Some(model_name) = config.model {
@@ -2503,7 +2759,7 @@ async fn main() -> Result<()> {
     );
 
     // Initialize MCP server with tools
-    let server = MyMcpServer::new(lm_client.clone(), true);
+    let server = MyMcpServer::new(lm_client.clone(), true, config.searxng);
     let openai_tools = mcp_tools_to_openai_format(&server);
 
     // println!("Available tools:");
