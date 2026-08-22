@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "This Rust project implements an interactive CLI assistant that integrates a LLM client (via LM Studio) with a custom “MCP” tool router. It defines numerous utility tools—calculator, file read/write/edit, glob/glob‑search, regex grep, web fetch/search, directory listing, and bash execution—each described via JSON schemas. A permission manager prompts the user for safe‑execution of potentially risky tools (e.g., web access or shell commands). The main loop reads user input, sends it to the LLM, parses tool calls from the model’s response, obtains permission, executes the selected tool, and feeds the result back into the conversation. This showcases a seamless blend of language model interactions with programmable system actions."
 
@@ -26,3 +26,5 @@ getopts = "0.2"
 lru = "0.18.0"
 flate2 = "1"
 public-api = "0.52"
+dom_smoothie = "0.18.0"
+ego-tree = "0.11.0"

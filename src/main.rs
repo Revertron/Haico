@@ -28,6 +28,8 @@ use crossterm::{
 };
 use similar::{ChangeTag, TextDiff};
 
+mod readable;
+
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
 fn run_git_command(args: &[&str]) -> Option<String> {
@@ -1435,24 +1437,20 @@ impl MyMcpServer {
                 McpError::internal_error(format!("Failed to read response body: {}", e), None)
             })?;
 
-        // Convert HTML to plain text
-        let text_content = html2text::from_read(html.as_bytes(), 100)
-            .map_err(|e| {
-                McpError::internal_error(format!("Failed to convert HTML to text: {}", e), None)
-            })?;
+        // Convert the page to readable text: the article subtree only, the way a browser's
+        // reader mode presents it.
+        let cleaned_text = readable::html_to_text(&html, &final_url);
 
-        // Trim and clean up the text
-        let cleaned_text = text_content
-            .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Limit size to avoid context overflow
+        // Limit size to avoid context overflow. The cut is made at a line boundary so the tail
+        // of the text is not a half-finished sentence, and never inside a multi-byte character.
         const MAX_LENGTH: usize = 65536;
         let text = if cleaned_text.len() > MAX_LENGTH {
-            cleaned_text[..MAX_LENGTH].to_string()
+            let mut end = MAX_LENGTH;
+            while !cleaned_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let end = cleaned_text[..end].rfind('\n').unwrap_or(end);
+            format!("{}\n\n[Page truncated]", &cleaned_text[..end])
         } else {
             cleaned_text
         };
@@ -1462,7 +1460,7 @@ impl MyMcpServer {
         Ok(result)
     }
 
-    #[tool(description = "Use when you have a specific URL and want a focused answer pulled from it rather than the whole page — the page is fetched, converted to readable text, and an assistant extracts just what your prompt asks for. Takes a URL and a prompt describing what information to extract. Use web_get instead when you want the full raw text yourself.")]
+    #[tool(description = "Use when you have a specific URL and suspect that it is very big, and want a focused answer pulled from it rather than the whole page — the page is fetched, converted to readable text, and an assistant extracts just what your prompt asks for. Takes a URL and a prompt describing what information to extract. This tool saves context, but takes more time to process. Use web_get instead when you want the full raw text yourself.")]
     async fn web_fetch(&self, params: Parameters<WebFetchParams>) -> Result<CallToolResult, McpError> {
         let (final_url, truncated_text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
@@ -1495,7 +1493,7 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
     }
 
-    #[tool(description = "Use when you have a URL and want to read or process the full page yourself, with no filtering — fetches the page and returns the cleaned text directly (no summarization). Choose web_fetch instead when you only need a specific fact and want it extracted for you.")]
+    #[tool(description = "Use when you have a URL and want to read or process the full page yourself, with no filtering — fetches the page and returns the cleaned text directly (no summarization). Choose web_fetch instead if you suspect that the page will be very big, but you only need a specific fact and want it extracted for you.")]
     async fn web_get(&self, params: Parameters<WebGetParams>) -> Result<CallToolResult, McpError> {
         let (final_url, text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
