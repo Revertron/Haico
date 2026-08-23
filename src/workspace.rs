@@ -308,6 +308,81 @@ mod tests {
         assert!(workspace.refusal("grep", &json!({"pattern": "fn"})).is_none());
     }
 
+    // Creating a symlink needs privilege or developer mode on Windows, so the test below
+    // reports rather than fails when it cannot make one.
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+    #[cfg(not(windows))]
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[test]
+    fn a_symlink_out_of_the_workspace_cannot_be_used_to_climb_back_in() {
+        let base = std::env::temp_dir().join(format!("haico-link-{}", std::process::id()));
+        let project = base.join("project");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.env"), "AWS_SECRET=hunter2\n").unwrap();
+
+        let link = project.join("link");
+        let _ = std::fs::remove_dir_all(&link);
+        if !link_dir(&outside, &link) {
+            eprintln!("skipping: this machine will not let the test create a symlink");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let workspace = Workspace::new(&project, &[]);
+
+        // Straight through the link, which is the vector that works everywhere: the file
+        // really is outside, and canonicalization resolves the link and refuses it.
+        assert!(!workspace.may_read(&link.join("secret.env")));
+        assert!(workspace
+            .refusal("read", &json!({"file_path": link.join("secret.env").display().to_string()}))
+            .is_some());
+
+        // ".." cancelling the symlink is where the two platforms genuinely disagree, so
+        // the invariant worth asserting is not a fixed verdict but that the gate matches
+        // whichever file the OS would actually open.
+        let cancelled = project.join("link").join("..").join("secret.env");
+
+        // POSIX resolves the symlink before the "..", so this lands outside `project`
+        // altogether. Collapsing ".." textually first — which is what the resolver used to
+        // do — made it read as "project/secret.env" and pass, while the tool opening the
+        // original string followed the link and left the workspace.
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !workspace.may_read(&cancelled),
+                "a symlink cancelled by '..' must not pass as an in-workspace path"
+            );
+            assert!(!workspace.may_write(&cancelled));
+        }
+
+        // Win32 normalizes ".." textually before the filesystem ever sees the path, so
+        // here it genuinely *is* project/secret.env — verified by opening both forms and
+        // getting the inside file. Allowing it is correct rather than a hole.
+        #[cfg(windows)]
+        {
+            std::fs::write(project.join("secret.env"), "inside\n").unwrap();
+            assert!(workspace.may_read(&cancelled));
+            assert_eq!(
+                std::fs::read_to_string(&cancelled).unwrap(),
+                std::fs::read_to_string(project.join("secret.env")).unwrap(),
+                "the gate allowed this path, so it must be the in-project file"
+            );
+        }
+
+        // Ordinary work inside the project is untouched by any of this.
+        assert!(workspace.may_write(&project.join("src").join("main.rs")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_relative_path_cannot_climb_out_of_the_workspace() {
         let (project, _, elsewhere) = scratch_dirs();

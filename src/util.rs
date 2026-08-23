@@ -77,26 +77,38 @@ pub(crate) fn absolute_path(path: &std::path::Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    let normalized = lexical_normalize(&absolute);
-
+    // Canonicalize first, and resolve ".." lexically only over the part that could not be.
+    //
+    // Doing it the other way round is a traversal: with `link` a symlink out of the
+    // workspace, "W/link/../secret" cancels textually to "W/secret" and passes the boundary
+    // check, while the tool then opens the original string and the OS — which resolves the
+    // symlink before the ".." — lands outside. The gate would approve one file and the tool
+    // open another. Letting canonicalize see the path first means symlinks and ".." in the
+    // existing prefix are resolved by the same rules the tool will use.
     let mut trailing: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = normalized.as_path();
+    let mut current = absolute.as_path();
     loop {
         if let Ok(canonical) = fs::canonicalize(current) {
             let mut resolved = canonical;
             for part in trailing.iter().rev() {
                 resolved.push(part);
             }
-            return resolved;
+            // Only the tail that does not exist yet can still hold "..", and it has no
+            // symlinks in it by definition, so collapsing it textually is safe here.
+            return lexical_normalize(&resolved);
         }
         // Walk up until something exists. A drive root or "/" always does, so this
         // terminates well before running out of components in practice.
-        match (current.parent(), current.file_name()) {
-            (Some(parent), Some(name)) => {
-                trailing.push(name.to_os_string());
+        //
+        // The last *component* rather than file_name(): file_name() is None for a "..",
+        // which would abandon the walk and fall back to the purely lexical answer this
+        // exists to avoid.
+        match (current.parent(), current.components().next_back()) {
+            (Some(parent), Some(component)) => {
+                trailing.push(component.as_os_str().to_os_string());
                 current = parent;
             }
-            _ => return normalized,
+            _ => return lexical_normalize(&absolute),
         }
     }
 }
