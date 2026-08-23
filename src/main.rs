@@ -721,14 +721,11 @@ Usage: /set <name> <value>, or /set <name> unset
         loop {
             round += 1;
             if round > MAX_TOOL_ROUNDS {
-                println!(
-                    "\n[stopped after {} tool-call rounds without a final answer]",
-                    MAX_TOOL_ROUNDS
-                );
+                println!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
                 break;
             }
 
-            println!("Fancying around...");
+            println!("\n○ {}", get_thinking_message());
 
             // Assistant text is printed the moment it arrives, so none of the branches
             // below re-print it.
@@ -749,7 +746,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     |text| {
                         if !streamed_any {
                             streamed_any = true;
-                            print!("\n● ");
+                            print!("● ");
                         }
                         print!("{}", text);
                         let _ = io::stdout().flush();
@@ -793,7 +790,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 .filter(|s| !s.is_empty())
             {
                 // Some models put their whole preamble in `reasoning` and send no content.
-                print!("\n● ");
+                print!("● ");
                 let _ = render_text(reasoning);
                 println!();
             }
@@ -996,7 +993,7 @@ Usage: /set <name> <value>, or /set <name> unset
                         // hang. Erased once it lands, because the outcome belongs on the
                         // call line below — left standing, every single call would cost two
                         // lines of log to say one thing.
-                        print!("  🤖 Reviewing this call...");
+                        print!("  🤖 Reviewing this call…");
                         let _ = io::stdout().flush();
                         let verdict = tokio::select! {
                             verdict = judge_tool_call(&lm_client, tool_name, &arguments) => Some(verdict),
@@ -1233,3 +1230,75 @@ Usage: /set <name> <value>, or /set <name> unset
 }
 
 // ROUNDTRIP
+
+fn get_thinking_message() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const MESSAGES: &[&str] = &[
+        // First step
+        "Fancying around…",
+        "Thinking deeply…",
+        "Connecting the dots…",
+        "Pondering possibilities…",
+        "Weighing options…",
+        "Untangling logic…",
+        "Simulating neurons…",
+        "Brewing ideas…",
+        "Scanning the horizon…",
+        "Assembling the puzzle…",
+
+        // Technical / Agent-y
+        "Parsing intent…",
+        "Traversing the graph…",
+        "Running inference…",
+        "Compiling thoughts…",
+        "Optimizing the plan…",
+        "Executing mental threads…",
+        "Querying the knowledge base…",
+        "Running a quick sanity check…",
+        "Bootstrapping context…",
+        "Refining the approach…",
+
+        // Whimsical / Personable
+        "Staring into the void (productively)…",
+        "Consulting the oracle…",
+        "Summoning the code spirits…",
+        "Bribing the compiler…",
+        "Rubber-ducking internally…",
+        "Channeling Ada Lovelace…",
+        "Polishing the crystal ball…",
+        "Negotiating with entropy…",
+        "Warming up the neurons…",
+        "Reticulating splines…",
+
+        // Concise / Dry
+        "Processing…",
+        "Analyzing…",
+        "Evaluating…",
+        "Computing…",
+        "Reasoning…",
+        "Synthesizing…",
+        "Deliberating…",
+        "Calculating…",
+        "Inspecting…",
+        "Contemplating…",
+
+        // Creative / Poetic
+        "Following the thread…",
+        "Tracing constellations…",
+        "Weaving the narrative…",
+        "Tuning the frequency…",
+        "Listening to the silence…",
+        "Reading between the lines…",
+        "Chasing the spark…",
+        "Stirring the cauldron…",
+        "Sharpening the quill…",
+        "Lighting the lantern…",
+    ];
+
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize % MESSAGES.len();
+
+    MESSAGES[idx]
+}
