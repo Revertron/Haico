@@ -4,8 +4,12 @@ use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use std::env;
-use std::io::{self, Write};
 use std::path::PathBuf;
+
+// Declared first, and with #[macro_use], so out!/outln! are in scope for every
+// module below it.
+#[macro_use]
+mod out;
 
 mod config;
 mod llm;
@@ -75,32 +79,32 @@ fn indented_command(command: &str) -> String {
 }
 
 fn print_repl_help() {
-    println!("Commands:");
-    println!("  /help              Show this list");
-    println!("  /plan              Research and propose only; nothing changes until approved");
-    println!("  /auto              Review each gated call; routine ones run without asking");
-    println!("  /normal            Back to answering every prompt yourself");
-    println!("  /add <path>        Let the file tools read and write another directory too");
-    println!("  /workspace         Show which paths the file tools may touch");
-    println!("  /mode              Show which of the three is in force");
-    println!("  /tools             List available tools and whether they prompt");
-    println!("  /model [name]      Switch model; with no name, pick from the server's list");
-    println!("  /config            Show the settings in force and where each came from");
-    println!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty or");
-    println!("                     max_tokens ('/set <name> unset' to undo). '/temp' is short");
-    println!("                     for '/set temperature'.");
-    println!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
-    println!("  /undo              Revert the last file change made by a tool");
-    println!("  /todo              Show the current plan, if the model made one");
-    println!("  /context           Show how much context the conversation is using");
-    println!("  /compact           Replace the history with a summary, freeing context");
-    println!("  /clear /new /reset Start over, keeping the system prompt");
-    println!("  /exit /quit        Leave (Ctrl+D also works)");
-    println!();
-    println!("At the prompt: up/down for history, Ctrl+C to abandon the current line.");
-    println!("While working:  Ctrl+C interrupts the run and returns to the prompt.");
-    println!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
-    println!();
+    outln!("Commands:");
+    outln!("  /help              Show this list");
+    outln!("  /plan              Research and propose only; nothing changes until approved");
+    outln!("  /auto              Review each gated call; routine ones run without asking");
+    outln!("  /normal            Back to answering every prompt yourself");
+    outln!("  /add <path>        Let the file tools read and write another directory too");
+    outln!("  /workspace         Show which paths the file tools may touch");
+    outln!("  /mode              Show which of the three is in force");
+    outln!("  /tools             List available tools and whether they prompt");
+    outln!("  /model [name]      Switch model; with no name, pick from the server's list");
+    outln!("  /config            Show the settings in force and where each came from");
+    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty or");
+    outln!("                     max_tokens ('/set <name> unset' to undo). '/temp' is short");
+    outln!("                     for '/set temperature'.");
+    outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
+    outln!("  /undo              Revert the last file change made by a tool");
+    outln!("  /todo              Show the current plan, if the model made one");
+    outln!("  /context           Show how much context the conversation is using");
+    outln!("  /compact           Replace the history with a summary, freeing context");
+    outln!("  /clear /new /reset Start over, keeping the system prompt");
+    outln!("  /exit /quit        Leave (Ctrl+D also works)");
+    outln!();
+    outln!("At the prompt: up/down for history, Ctrl+C to abandon the current line.");
+    outln!("While working:  Ctrl+C interrupts the run and returns to the prompt.");
+    outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
+    outln!();
 }
 
 // Rough size of the conversation, in tokens.
@@ -157,28 +161,28 @@ async fn main() -> Result<()> {
         return run_mcp_server(config).await;
     }
 
-    println!("          Welcome to Haico!");
-    println!("=====================================\n");
+    outln!("          Welcome to Haico!");
+    outln!("=====================================\n");
     if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
-        println!("Config: {}", path.display());
+        outln!("Config: {}", path.display());
     }
-    println!("Connecting to LLM server at: {}", config.llm_url);
+    outln!("Connecting to LLM server at: {}", config.llm_url);
     if let Some(searxng) = &config.searxng {
-        println!("Searching through SearxNG at: {}", searxng);
+        outln!("Searching through SearxNG at: {}", searxng);
     }
 
     // Determine which model to use
     let selected_model = if let Some(model_name) = config.model.clone() {
         // Model specified via command-line, use it directly
-        println!("Using specified model: {}\n", model_name);
+        outln!("Using specified model: {}\n", model_name);
         model_name
     } else {
         // No model specified, fetch available models and let user select
-        println!("Fetching available models...");
+        outln!("Fetching available models...");
         let models = match fetch_available_models(&config.llm_url, config.token.as_deref()).await {
             Ok(models) => models,
             Err(e) => {
-                println!("Error connecting to LLM: {e}");
+                outln!("Error connecting to LLM: {e}");
                 return Ok(());
             }
         };
@@ -208,11 +212,11 @@ async fn main() -> Result<()> {
     let mut server = MyMcpServer::new(lm_client.clone(), true, config.searxng.clone(), true);
     let openai_tools = mcp_tools_to_openai_format(&server);
 
-    // println!("Available tools:");
+    // outln!("Available tools:");
     // for tool in server.tool_router.list_all() {
-    //     println!("  - {}: {}", tool.name, tool.description.as_deref().unwrap_or(""));
+    //     outln!("  - {}: {}", tool.name, tool.description.as_deref().unwrap_or(""));
     // }
-    // println!();
+    // outln!();
 
     // Determine system prompt to use
     let mut system_prompt_content = if let Some(custom_prompt) = config.system_prompt.clone() {
@@ -226,7 +230,7 @@ async fn main() -> Result<()> {
     // A project's own instructions are appended to whichever prompt is in use, so they
     // apply to a custom --system-prompt too.
     if let Some((name, project_context)) = load_project_context() {
-        println!("Loaded project context from {}", name);
+        outln!("Loaded project context from {}", name);
         system_prompt_content.push_str(&format!(
             "\n\n# Project instructions ({})\n\n\
              The following comes from this project and takes precedence over the general \
@@ -251,16 +255,16 @@ async fn main() -> Result<()> {
                 let count = session.messages.len();
                 messages.extend(session.messages);
                 *server.todos.lock().unwrap() = session.todos;
-                println!(
+                outln!(
                     "Resumed {} message(s) from {} (model then: {}).",
                     count, session.saved_at, session.model
                 );
             }
-            Some(Err(e)) => println!("Could not resume: {:#}. Starting fresh.", e),
-            None => println!("Could not resume: no home directory. Starting fresh."),
+            Some(Err(e)) => outln!("Could not resume: {:#}. Starting fresh.", e),
+            None => outln!("Could not resume: no home directory. Starting fresh."),
         }
     } else if session_path.as_deref().is_some_and(|p| p.exists()) {
-        println!("A previous conversation exists here — start with --resume to continue it.");
+        outln!("A previous conversation exists here — start with --resume to continue it.");
     }
 
     // Permission manager. Deliberately not persisted: approvals last for one session, so
@@ -277,7 +281,7 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut workspace = Workspace::new(&cwd, &config.file.read_paths);
     if !workspace.readable_roots().is_empty() {
-        println!(
+        outln!(
             "Readable outside the project: {}",
             workspace
                 .readable_roots()
@@ -302,7 +306,7 @@ async fn main() -> Result<()> {
         let _ = editor.load_history(path);
     }
 
-    println!("Type /help for commands.\n");
+    outln!("Type /help for commands.\n");
 
     // Main loop
     loop {
@@ -313,11 +317,11 @@ async fn main() -> Result<()> {
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             // Ctrl+D, or stdin closing when input is piped in.
             Err(rustyline::error::ReadlineError::Eof) => {
-                println!("Goodbye!");
+                outln!("Goodbye!");
                 break;
             }
             Err(e) => {
-                eprintln!("[error] could not read input: {}", e);
+                outln!("[error] could not read input: {}", e);
                 break;
             }
         };
@@ -328,7 +332,7 @@ async fn main() -> Result<()> {
         }
 
         if input == "/exit" || input == "/quit" {
-            println!("Goodbye!");
+            outln!("Goodbye!");
             break;
         }
 
@@ -340,30 +344,30 @@ async fn main() -> Result<()> {
         if input == "/add" || input.starts_with("/add ") {
             let requested = input.strip_prefix("/add").unwrap_or("").trim();
             if requested.is_empty() {
-                println!("Usage: /add <path>   (a directory to read and write for this session)\n");
+                outln!("Usage: /add <path>   (a directory to read and write for this session)\n");
                 continue;
             }
             match workspace.add(std::path::Path::new(requested)) {
-                Ok(added) => println!("Added to the workspace: {}\n", display_path(&added)),
-                Err(reason) => println!("{}\n", reason),
+                Ok(added) => outln!("Added to the workspace: {}\n", display_path(&added)),
+                Err(reason) => outln!("{}\n", reason),
             }
             continue;
         }
 
         if input == "/workspace" {
-            println!("Readable and writable:");
+            outln!("Readable and writable:");
             for root in workspace.writable_roots() {
-                println!("  {}", display_path(root));
+                outln!("  {}", display_path(root));
             }
             if workspace.readable_roots().is_empty() {
-                println!("Readable only: none configured (see 'read_paths' in the config file).");
+                outln!("Readable only: none configured (see 'read_paths' in the config file).");
             } else {
-                println!("Readable only:");
+                outln!("Readable only:");
                 for root in workspace.readable_roots() {
-                    println!("  {}", display_path(root));
+                    outln!("  {}", display_path(root));
                 }
             }
-            println!("\nAnything else is refused outright, for reads as well as writes.\n");
+            outln!("\nAnything else is refused outright, for reads as well as writes.\n");
             continue;
         }
 
@@ -377,17 +381,17 @@ async fn main() -> Result<()> {
             if let Some(requested) = requested {
                 mode = requested;
             }
-            println!("Mode: {}\n", mode.describe());
+            outln!("Mode: {}\n", mode.describe());
             if mode == Mode::Auto {
                 // Spelled out, because this is the mode that acts without asking and the
                 // user should know exactly how far that goes before leaving it on.
-                println!(
+                outln!(
                     "{} reviews each call that would have asked you, with no conversation \
                      history. Calls it judges routine run on their own, tagged with the \
                      reason. Anything it refuses — or cannot judge — still comes to you.",
                     lm_client.model
                 );
-                println!(
+                outln!(
                     "It is the same model, so treat it as a check against drift and \
                      mistakes, not as a security boundary.\n"
                 );
@@ -401,21 +405,21 @@ async fn main() -> Result<()> {
                 "role": "system",
                 "content": &system_prompt_content
             }));
-            println!("Conversation cleared.\n");
+            outln!("Conversation cleared.\n");
             continue;
         }
 
         if input == "/tools" {
-            println!("{} tools available:", server.tool_router.list_all().len());
+            outln!("{} tools available:", server.tool_router.list_all().len());
             for tool in server.tool_router.list_all() {
                 let gate = if AUTO_ALLOWED_TOOLS.contains(&tool.name.as_ref()) {
                     "auto"
                 } else {
                     "asks"
                 };
-                println!("  {:<14} [{}]", tool.name, gate);
+                outln!("  {:<14} [{}]", tool.name, gate);
             }
-            println!();
+            outln!();
             continue;
         }
 
@@ -430,16 +434,16 @@ async fn main() -> Result<()> {
                     Ok(models) if !models.is_empty() => match select_model_interactive(models) {
                         Ok(model) => Some(model),
                         Err(e) => {
-                            println!("Model selection cancelled: {}\n", e);
+                            outln!("Model selection cancelled: {}\n", e);
                             None
                         }
                     },
                     Ok(_) => {
-                        println!("The server reports no available models.\n");
+                        outln!("The server reports no available models.\n");
                         None
                     }
                     Err(e) => {
-                        println!("Could not list models: {:#}\n", e);
+                        outln!("Could not list models: {:#}\n", e);
                         None
                     }
                 }
@@ -461,8 +465,8 @@ async fn main() -> Result<()> {
                 server.llm_client.model = model.clone();
                 server.llm_client.apply_settings(&settings);
 
-                println!("Now using model: {}", model);
-                println!(
+                outln!("Now using model: {}", model);
+                outln!(
                     "  context {} ({}){}\n",
                     context_tokens,
                     settings.context_source,
@@ -477,31 +481,31 @@ async fn main() -> Result<()> {
 
         if input == "/config" {
             match config.config_path.as_deref() {
-                Some(path) if path.exists() => println!("Config file: {}", path.display()),
-                Some(path) => println!("Config file: {} (not created yet)", path.display()),
-                None => println!("Config file: unavailable (no home directory)"),
+                Some(path) if path.exists() => outln!("Config file: {}", path.display()),
+                Some(path) => outln!("Config file: {} (not created yet)", path.display()),
+                None => outln!("Config file: unavailable (no home directory)"),
             }
-            println!("
+            outln!("
 In force for '{}':", lm_client.model);
-            println!("  url             {}", lm_client.base_url);
-            println!(
+            outln!("  url             {}", lm_client.base_url);
+            outln!(
                 "  token           {}",
                 if lm_client.token.is_some() { "set" } else { "not set" }
             );
-            println!(
+            outln!(
                 "  context         {}  [{}]",
                 context_tokens, settings.context_source
             );
-            println!("  temperature     {}", settings.temperature.describe());
-            println!("  top_p           {}", settings.top_p.describe());
-            println!("  top_k           {}", settings.top_k.describe());
-            println!("  repeat_penalty  {}", settings.repeat_penalty.describe());
-            println!("  max_tokens      {}", settings.max_tokens.describe());
-            println!(
+            outln!("  temperature     {}", settings.temperature.describe());
+            outln!("  top_p           {}", settings.top_p.describe());
+            outln!("  top_k           {}", settings.top_k.describe());
+            outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
+            outln!("  max_tokens      {}", settings.max_tokens.describe());
+            outln!(
                 "\nA '-' means the field is left out of the request, so the server's own \
                  setting for that model applies."
             );
-            println!("Change one for this session with /set <name> <value>.\n");
+            outln!("Change one for this session with /set <name> <value>.\n");
             continue;
         }
 
@@ -518,12 +522,12 @@ In force for '{}':", lm_client.model);
             let value = parts.next().unwrap_or("").to_string();
 
             if name.is_empty() {
-                println!("  temperature     {}", settings.temperature.describe());
-                println!("  top_p           {}", settings.top_p.describe());
-                println!("  top_k           {}", settings.top_k.describe());
-                println!("  repeat_penalty  {}", settings.repeat_penalty.describe());
-                println!("  max_tokens      {}", settings.max_tokens.describe());
-                println!("
+                outln!("  temperature     {}", settings.temperature.describe());
+                outln!("  top_p           {}", settings.top_p.describe());
+                outln!("  top_k           {}", settings.top_k.describe());
+                outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
+                outln!("  max_tokens      {}", settings.max_tokens.describe());
+                outln!("
 Usage: /set <name> <value>, or /set <name> unset
 ");
                 continue;
@@ -537,7 +541,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 "repeat_penalty" | "repeat-penalty" | "repeat" | "penalty" => "repeat_penalty",
                 "max_tokens" | "max-tokens" | "max" => "max_tokens",
                 other => {
-                    println!(
+                    outln!(
                         "Unknown setting '{}'. Try: temperature, top_p, top_k,                          repeat_penalty, max_tokens.
 ",
                         other
@@ -554,7 +558,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     "repeat_penalty" => settings.repeat_penalty.describe(),
                     _ => settings.max_tokens.describe(),
                 };
-                println!("  {}  {}
+                outln!("  {}  {}
 ", canonical, shown);
                 continue;
             }
@@ -586,7 +590,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             true
                         }
                         Err(_) => {
-                            println!("{} needs a whole number, got '{}'.
+                            outln!("{} needs a whole number, got '{}'.
 ", canonical, value);
                             false
                         }
@@ -602,7 +606,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             true
                         }
                         Err(_) => {
-                            println!("{} needs a number, got '{}'.
+                            outln!("{} needs a number, got '{}'.
 ", canonical, value);
                             false
                         }
@@ -615,10 +619,10 @@ Usage: /set <name> <value>, or /set <name> unset
                 lm_client.apply_settings(&settings);
                 server.llm_client.apply_settings(&settings);
                 if clearing {
-                    println!("{} unset — the server decides again.
+                    outln!("{} unset — the server decides again.
 ", canonical);
                 } else {
-                    println!("{} = {} for this session.
+                    outln!("{} = {} for this session.
 ", canonical, value);
                 }
             }
@@ -638,19 +642,19 @@ Usage: /set <name> <value>, or /set <name> unset
                         .collect()
                 };
                 if listing.is_empty() {
-                    println!("No background jobs.\n");
+                    outln!("No background jobs.\n");
                 } else {
-                    println!("Background jobs:\n{}\n", listing.join("\n"));
+                    outln!("Background jobs:\n{}\n", listing.join("\n"));
                 }
             } else if argument == "stop" {
                 let stopped = server.stop_all_background().await;
-                println!("Stopped {} job(s).\n", stopped);
+                outln!("Stopped {} job(s).\n", stopped);
             } else if let Some(id) = argument.strip_prefix("stop ").and_then(|n| n.trim().parse::<u32>().ok()) {
                 let result = server
                     .background_stop(Parameters(BackgroundStopParams { id: Some(id) }))
                     .await;
                 match result {
-                    Ok(result) => println!(
+                    Ok(result) => outln!(
                         "{}\n",
                         result
                             .content
@@ -659,18 +663,18 @@ Usage: /set <name> <value>, or /set <name> unset
                             .collect::<Vec<_>>()
                             .join("\n")
                     ),
-                    Err(e) => println!("Could not stop job {}: {:?}\n", id, e),
+                    Err(e) => outln!("Could not stop job {}: {:?}\n", id, e),
                 }
             } else {
-                println!("Usage: /bg, /bg stop <id>, /bg stop\n");
+                outln!("Usage: /bg, /bg stop <id>, /bg stop\n");
             }
             continue;
         }
 
         if input == "/undo" {
             match server.undo_last() {
-                Ok(what) => println!("Reverted: {}\n", what),
-                Err(why) => println!("{}\n", why),
+                Ok(what) => outln!("Reverted: {}\n", what),
+                Err(why) => outln!("{}\n", why),
             }
             continue;
         }
@@ -678,18 +682,18 @@ Usage: /set <name> <value>, or /set <name> unset
         if input == "/todo" {
             let todos = server.todos.lock().unwrap().clone();
             if todos.is_empty() {
-                println!("No plan yet.\n");
+                outln!("No plan yet.\n");
             } else {
-                println!("Plan:");
+                outln!("Plan:");
                 for item in &todos {
                     let mark = match item.status.as_str() {
                         "done" => "x",
                         "in_progress" => "»",
                         _ => " ",
                     };
-                    println!("  [{}] {}", mark, item.task);
+                    outln!("  [{}] {}", mark, item.task);
                 }
-                println!();
+                outln!();
             }
             continue;
         }
@@ -701,8 +705,8 @@ Usage: /set <name> <value>, or /set <name> unset
 
         if input == "/compact" {
             match compact_history(&lm_client, &mut messages).await {
-                Ok(summary) => println!("{}\n", summary),
-                Err(e) => eprintln!("[error] could not compact: {:#}\n", e),
+                Ok(summary) => outln!("{}\n", summary),
+                Err(e) => outln!("[error] could not compact: {:#}\n", e),
             }
             continue;
         }
@@ -721,11 +725,11 @@ Usage: /set <name> <value>, or /set <name> unset
         loop {
             round += 1;
             if round > MAX_TOOL_ROUNDS {
-                println!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
+                outln!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
                 break;
             }
 
-            println!("\n○ {}", get_thinking_message());
+            outln!("\n○ {}", get_thinking_message());
 
             // Assistant text is printed the moment it arrives, so none of the branches
             // below re-print it.
@@ -746,10 +750,10 @@ Usage: /set <name> <value>, or /set <name> unset
                     |text| {
                         if !streamed_any {
                             streamed_any = true;
-                            print!("● ");
+                            out!("● ");
                         }
-                        print!("{}", text);
-                        let _ = io::stdout().flush();
+                        out!("{}", text);
+                        crate::out::flush();
                     },
                 ) => Some(result),
                 _ = tokio::signal::ctrl_c() => None,
@@ -760,9 +764,9 @@ Usage: /set <name> <value>, or /set <name> unset
                 // history is worse than no reply at all. Everything before this turn stays
                 // consistent, so the conversation is still usable.
                 if streamed_any {
-                    println!();
+                    outln!();
                 }
-                println!("\n[interrupted]\n");
+                outln!("\n[interrupted]\n");
                 break;
             };
 
@@ -773,16 +777,16 @@ Usage: /set <name> <value>, or /set <name> unset
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
                     if streamed_any {
-                        println!();
+                        outln!();
                     }
-                    eprintln!("\n[error] {:#}", e);
-                    println!("Conversation kept. Type a message to retry.");
+                    outln!("\n[error] {:#}", e);
+                    outln!("Conversation kept. Type a message to retry.");
                     break;
                 }
             };
 
             if streamed_any {
-                println!();
+                outln!();
             } else if let Some(reasoning) = message
                 .get("reasoning")
                 .and_then(|r| r.as_str())
@@ -790,9 +794,9 @@ Usage: /set <name> <value>, or /set <name> unset
                 .filter(|s| !s.is_empty())
             {
                 // Some models put their whole preamble in `reasoning` and send no content.
-                print!("● ");
-                let _ = render_text(reasoning);
-                println!();
+                out!("● ");
+                out!("{}", render_text(reasoning));
+                outln!();
             }
 
             // Check if model wants to call a tool
@@ -800,7 +804,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 let tool_calls_array = match tool_calls.as_array() {
                     Some(arr) => arr,
                     None => {
-                        eprintln!("[ERROR] tool_calls is not an array: {:?}", tool_calls);
+                        outln!("[ERROR] tool_calls is not an array: {:?}", tool_calls);
                         break;
                     }
                 };
@@ -820,7 +824,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 let mut interrupted = false;
 
                 for tool_call in tool_calls_array {
-                    //println!("[DEBUG] Processing tool call: {}", serde_json::to_string_pretty(&tool_call).unwrap_or_default());
+                    //outln!("[DEBUG] Processing tool call: {}", serde_json::to_string_pretty(&tool_call).unwrap_or_default());
 
                     // Captured up front: every path out of this iteration owes the model a
                     // `role:"tool"` message under this id. Leaving one unanswered makes the
@@ -836,7 +840,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                 "Malformed tool call: no function name in {}",
                                 truncate_at_boundary(&function.to_string(), 500)
                             );
-                            eprintln!("[ERROR] {}", detail);
+                            outln!("[ERROR] {}", detail);
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
@@ -849,7 +853,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     let arguments = match parse_tool_arguments(function) {
                         Ok(arguments) => arguments,
                         Err(detail) => {
-                            eprintln!("[ERROR] {}: {}", tool_name, detail);
+                            outln!("[ERROR] {}: {}", tool_name, detail);
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
@@ -871,7 +875,7 @@ Usage: /set <name> <value>, or /set <name> unset
                              call present_plan."
                         } else {
                             mode = Mode::Plan;
-                            println!("\n📋 Plan mode — investigating before changing anything.\n");
+                            outln!("\n📋 Plan mode — investigating before changing anything.\n");
                             "Plan mode is active. The tools that change this machine are no \
                              longer available to you. Investigate the real code with read, \
                              grep, ls and glob_search, then call present_plan with what you \
@@ -904,7 +908,7 @@ Usage: /set <name> <value>, or /set <name> unset
                         let content = match review_plan(&plan) {
                             Ok(PlanDecision::Approve) => {
                                 mode = Mode::Normal;
-                                println!("\n✓ Plan approved — starting work.\n");
+                                outln!("\n✓ Plan approved — starting work.\n");
                                 "The user approved the plan. Plan mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
@@ -912,10 +916,10 @@ Usage: /set <name> <value>, or /set <name> unset
                             }
                             Ok(PlanDecision::ApproveWithAuto) => {
                                 mode = Mode::Auto;
-                                println!("\n✓ Plan approved — starting work in auto mode.");
+                                outln!("\n✓ Plan approved — starting work in auto mode.");
                                 // Said plainly, because "auto" sounds like it will stop
                                 // asking and right now it does not.
-                                println!(
+                                outln!(
                                     "  Each gated call is reviewed first; you still answer \
                                      the prompt.\n"
                                 );
@@ -928,7 +932,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                     .to_string()
                             }
                             Ok(PlanDecision::Revise(feedback)) => {
-                                println!("\n✗ Plan sent back for revision.\n");
+                                outln!("\n✗ Plan sent back for revision.\n");
                                 format!(
                                     "The user did not approve the plan. Their corrections: {}\n\n\
                                      You are still in plan mode and must not change anything. \
@@ -938,7 +942,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                 )
                             }
                             Err(e) => {
-                                eprintln!("\n[error] could not ask about the plan: {}", e);
+                                outln!("\n[error] could not ask about the plan: {}", e);
                                 "The plan could not be shown for approval (no interactive \
                                  terminal), so it is not approved. Do not start work."
                                     .to_string()
@@ -960,7 +964,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     let gate = gate_for_mode(mode, &workspace, tool_name, &arguments);
 
                     if let Gate::Deny(reason) = &gate {
-                        println!("\n⛔ {}\n", reason);
+                        outln!("\n⛔ {}\n", reason);
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
@@ -993,17 +997,12 @@ Usage: /set <name> <value>, or /set <name> unset
                         // hang. Erased once it lands, because the outcome belongs on the
                         // call line below — left standing, every single call would cost two
                         // lines of log to say one thing.
-                        print!("  🤖 Reviewing this call…");
-                        let _ = io::stdout().flush();
+                        crate::out::transient("  🤖 Reviewing this call…");
                         let verdict = tokio::select! {
                             verdict = judge_tool_call(&lm_client, tool_name, &arguments) => Some(verdict),
                             _ = tokio::signal::ctrl_c() => None,
                         };
-                        print!("\r");
-                        let _ = crossterm::execute!(
-                            io::stdout(),
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
-                        );
+                        crate::out::clear_transient();
 
                         match verdict {
                             Some(Ok(Verdict { allow: true, reason })) => {
@@ -1092,7 +1091,7 @@ Usage: /set <name> <value>, or /set <name> unset
                         ) {
                             Ok(response) => response,
                             Err(e) => {
-                                eprintln!("\n[error] could not ask for permission: {}", e);
+                                outln!("\n[error] could not ask for permission: {}", e);
                                 messages.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
@@ -1109,17 +1108,17 @@ Usage: /set <name> <value>, or /set <name> unset
                         match response {
                             PermissionResponse::Allow => {
                                 // Allow once, proceed with execution
-                                println!("✓ Permission granted for this request\n");
+                                outln!("✓ Permission granted for this request\n");
                             }
                             PermissionResponse::AllowAll => {
                                 // Remembered under the narrow keys this call resolved to,
                                 // not under the tool name.
                                 perm_manager.allow(&gate_keys);
-                                println!("✓ {}\n", allow_all_label);
+                                outln!("✓ {}\n", allow_all_label);
                             }
                             PermissionResponse::Reject(alternative) => {
                                 // User rejected, send alternative to LLM
-                                println!("✗ Permission denied. User suggestion: {}\n", alternative);
+                                outln!("✗ Permission denied. User suggestion: {}\n", alternative);
 
                                 messages.push(json!({
                                     "role": "tool",
@@ -1135,7 +1134,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // A slow tool (a big fetch, a long build) is interruptible too. The
                     // tool_call_id is still answered before breaking out — an unanswered one
                     // is what the next request gets rejected for.
-                    log_tool_call(tool_name, &arguments, auto_note.as_deref());
+                    outln!("{}", tool_call_line(tool_name, &arguments, auto_note.as_deref()));
 
                     // The diff belongs under the call line, not before it, and it has to
                     // appear on every path that skipped the prompt — a pre-approved write
@@ -1145,7 +1144,9 @@ Usage: /set <name> <value>, or /set <name> unset
                     // itself already showed the same diff a moment ago.
                     if !prompted {
                         if let Some(diff) = file_change_diff(tool_name, &arguments) {
-                            print_change_preview(&diff);
+                            if let Some(preview) = change_preview(&diff) {
+                                out!("{}", preview);
+                            }
                         }
                     }
 
@@ -1155,7 +1156,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     };
 
                     let Some(result) = executed else {
-                        println!("\n[interrupted]\n");
+                        outln!("\n[interrupted]\n");
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
@@ -1166,11 +1167,13 @@ Usage: /set <name> <value>, or /set <name> unset
                     };
 
                     let tool_result = result.unwrap_or_else(|e| {
-                        eprintln!("[ERROR] Tool execution failed: {:?}", e);
+                        outln!("[ERROR] Tool execution failed: {:?}", e);
                         format!("Error: {}", e)
                     });
 
-                    log_tool_result(&tool_result);
+                    if let Some(line) = tool_result_line(&tool_result) {
+                        outln!("{}", line);
+                    }
 
                     // Add tool result
                     messages.push(json!({
@@ -1199,7 +1202,7 @@ Usage: /set <name> <value>, or /set <name> unset
         // indication why. Compaction stays manual — dropping detail is the user's call.
         let used = estimate_tokens(&messages);
         if used > compact_hint_threshold(context_tokens) {
-            println!(
+            outln!(
                 "\n[context: ~{} of {} tokens. Run /compact to summarize and free space.]",
                 used, context_tokens
             );
@@ -1223,7 +1226,7 @@ Usage: /set <name> <value>, or /set <name> unset
     // outlive it holding a port. Silent when there is nothing to do.
     let stopped = server.stop_all_background().await;
     if stopped > 0 {
-        println!("Stopped {} background job(s).", stopped);
+        outln!("Stopped {} background job(s).", stopped);
     }
 
     Ok(())

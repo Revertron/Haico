@@ -10,6 +10,7 @@ use crossterm::{
 };
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -234,7 +235,9 @@ pub(crate) fn is_markdown(text: &str) -> bool {
 
 // Render Markdown text with colors and formatting for terminal output
 
-pub(crate) fn render_markdown(text: &str) -> Result<()> {
+
+pub(crate) fn render_markdown(text: &str) -> String {
+    let mut rendered = String::new();
     let mut in_code_block = false;
     let mut code_lang = String::new();
 
@@ -257,55 +260,76 @@ pub(crate) fn render_markdown(text: &str) -> Result<()> {
 
         if in_code_block {
             // Render code with dark grey background
-            execute!(io::stdout(), SetBackgroundColor(Color::Grey), SetForegroundColor(Color::Black))?;
-            print!("  {}", line);
-            execute!(io::stdout(), ResetColor)?;
-            println!();
+            let _ = write!(
+                rendered,
+                "{}{}  {}{}\n",
+                SetBackgroundColor(Color::Grey),
+                SetForegroundColor(Color::Black),
+                line,
+                ResetColor
+            );
             continue;
         }
 
         // Handle headers
         if trimmed.starts_with("# ") {
-            execute!(io::stdout(), SetForegroundColor(Color::Cyan))?;
-            println!("\n{}", trimmed.trim_start_matches("# "));
-            execute!(io::stdout(), ResetColor)?;
+            let _ = write!(
+                rendered,
+                "{}\n{}\n{}",
+                SetForegroundColor(Color::Cyan),
+                trimmed.trim_start_matches("# "),
+                ResetColor
+            );
             continue;
         } else if trimmed.starts_with("## ") {
-            execute!(io::stdout(), SetForegroundColor(Color::Cyan))?;
-            println!("\n{}", trimmed.trim_start_matches("## "));
-            execute!(io::stdout(), ResetColor)?;
+            let _ = write!(
+                rendered,
+                "{}\n{}\n{}",
+                SetForegroundColor(Color::Cyan),
+                trimmed.trim_start_matches("## "),
+                ResetColor
+            );
             continue;
         } else if trimmed.starts_with("### ") {
-            execute!(io::stdout(), SetForegroundColor(Color::Blue))?;
-            println!("\n{}", trimmed.trim_start_matches("### "));
-            execute!(io::stdout(), ResetColor)?;
+            let _ = write!(
+                rendered,
+                "{}\n{}\n{}",
+                SetForegroundColor(Color::Blue),
+                trimmed.trim_start_matches("### "),
+                ResetColor
+            );
             continue;
         }
 
         // Process inline formatting
-        render_inline_markdown(line)?;
+        rendered.push_str(&render_inline_markdown(line));
     }
 
-    Ok(())
+    rendered
 }
 
 // Render a line with inline Markdown formatting (bold, italic, code, links)
 
-pub(crate) fn render_inline_markdown(line: &str) -> Result<()> {
+
+pub(crate) fn render_inline_markdown(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
+    let mut rendered = String::new();
     let mut i = 0;
 
     while i < chars.len() {
         // Check for inline code (`code`)
         if chars[i] == '`' {
             if let Some(end) = find_closing('`', &chars, i + 1) {
-                execute!(io::stdout(), SetBackgroundColor(Color::Grey), SetForegroundColor(Color::Black))?;
-                print!(" ");
+                let _ = write!(
+                    rendered,
+                    "{}{} ",
+                    SetBackgroundColor(Color::Grey),
+                    SetForegroundColor(Color::Black)
+                );
                 for j in (i + 1)..end {
-                    print!("{}", chars[j]);
+                    rendered.push(chars[j]);
                 }
-                print!(" ");
-                execute!(io::stdout(), ResetColor)?;
+                let _ = write!(rendered, " {}", ResetColor);
                 i = end + 1;
                 continue;
             }
@@ -314,11 +338,11 @@ pub(crate) fn render_inline_markdown(line: &str) -> Result<()> {
         // Check for bold (**text**)
         if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_double_closing("**", &chars, i + 2) {
-                execute!(io::stdout(), SetAttribute(Attribute::Bold))?;
+                let _ = write!(rendered, "{}", SetAttribute(Attribute::Bold));
                 for j in (i + 2)..end {
-                    print!("{}", chars[j]);
+                    rendered.push(chars[j]);
                 }
-                execute!(io::stdout(), SetAttribute(Attribute::Reset))?;
+                let _ = write!(rendered, "{}", SetAttribute(Attribute::Reset));
                 i = end + 2;
                 continue;
             }
@@ -330,15 +354,15 @@ pub(crate) fn render_inline_markdown(line: &str) -> Result<()> {
             if let Some(end) = find_closing(marker, &chars, i + 1) {
                 // Make sure it's not part of **
                 if marker == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    print!("{}", chars[i]);
+                    rendered.push(chars[i]);
                     i += 1;
                     continue;
                 }
-                execute!(io::stdout(), SetForegroundColor(Color::Green))?;
+                let _ = write!(rendered, "{}", SetForegroundColor(Color::Green));
                 for j in (i + 1)..end {
-                    print!("{}", chars[j]);
+                    rendered.push(chars[j]);
                 }
-                execute!(io::stdout(), ResetColor)?;
+                let _ = write!(rendered, "{}", ResetColor);
                 i = end + 1;
                 continue;
             }
@@ -350,20 +374,18 @@ pub(crate) fn render_inline_markdown(line: &str) -> Result<()> {
                 if close_bracket + 1 < chars.len() && chars[close_bracket + 1] == '(' {
                     if let Some(close_paren) = find_closing(')', &chars, close_bracket + 2) {
                         // Render link text in blue
-                        execute!(io::stdout(), SetForegroundColor(Color::Blue))?;
+                        let _ = write!(rendered, "{}", SetForegroundColor(Color::Blue));
                         for j in (i + 1)..close_bracket {
-                            print!("{}", chars[j]);
+                            rendered.push(chars[j]);
                         }
-                        execute!(io::stdout(), ResetColor)?;
+                        let _ = write!(rendered, "{}", ResetColor);
 
                         // Render URL in dark grey
-                        execute!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
-                        print!(" (");
+                        let _ = write!(rendered, "{} (", SetForegroundColor(Color::DarkGrey));
                         for j in (close_bracket + 2)..close_paren {
-                            print!("{}", chars[j]);
+                            rendered.push(chars[j]);
                         }
-                        print!(")");
-                        execute!(io::stdout(), ResetColor)?;
+                        let _ = write!(rendered, "){}", ResetColor);
 
                         i = close_paren + 1;
                         continue;
@@ -373,12 +395,12 @@ pub(crate) fn render_inline_markdown(line: &str) -> Result<()> {
         }
 
         // Regular character
-        print!("{}", chars[i]);
+        rendered.push(chars[i]);
         i += 1;
     }
 
-    println!();
-    Ok(())
+    rendered.push('\n');
+    rendered
 }
 
 // Find closing character from a starting position
@@ -539,16 +561,17 @@ fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
 // It rides on the call line rather than a line of its own, so a run that was never
 // interrupted still reads as one line per call — and so the reason is impossible to miss
 // while scrolling back through what was allowed on the user's behalf.
-pub(crate) fn log_tool_call(tool_name: &str, arguments: &Value, note: Option<&str>) {
-    let summary = tool_call_summary(tool_name, arguments);
-    let mut out = io::stdout();
 
-    let _ = execute!(out, SetForegroundColor(Color::DarkGrey));
-    print!("  → {}", tool_name);
+pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&str>) -> String {
+    let summary = tool_call_summary(tool_name, arguments);
+    let mut line = String::new();
+
+    let _ = write!(line, "{}  → {}", SetForegroundColor(Color::DarkGrey), tool_name);
     if !summary.is_empty() {
         let summary: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
         let clipped = crate::util::truncate_at_boundary(&summary, 110);
-        print!(
+        let _ = write!(
+            line,
             "  {}{}",
             clipped,
             if clipped.len() < summary.len() { "…" } else { "" }
@@ -559,15 +582,15 @@ pub(crate) fn log_tool_call(tool_name: &str, arguments: &Value, note: Option<&st
         // an unbounded one would push the call itself off the line it belongs on.
         let note: String = note.split_whitespace().collect::<Vec<_>>().join(" ");
         let clipped = crate::util::truncate_at_boundary(&note, 90);
-        print!(
+        let _ = write!(
+            line,
             "  (allowed by auto analyzer: {}{})",
             clipped,
             if clipped.len() < note.len() { "…" } else { "" }
         );
     }
-    let _ = execute!(out, ResetColor);
-    println!();
-    let _ = out.flush();
+    let _ = write!(line, "{}", ResetColor);
+    line
 }
 
 // What a write is about to do, rendered as a diff.
@@ -654,54 +677,56 @@ pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<Str
 // Capped, because a newly written file renders as one "+" line per line of content and a
 // large one would bury everything around it. The head is what tells you whether the file is
 // what you expected; the tail rarely changes that.
-pub(crate) fn print_change_preview(diff: &str) {
+
+pub(crate) fn change_preview(diff: &str) -> Option<String> {
     const MAX_LINES: usize = 24;
 
     // The first line is "File: <path>", already shown by the call line above.
     let body: Vec<&str> = diff.lines().skip(1).collect();
     if body.is_empty() {
-        return;
+        return None;
     }
 
+    let mut preview = String::new();
     for line in body.iter().take(MAX_LINES) {
-        println!("    {}", line);
+        let _ = write!(preview, "    {}\n", line);
     }
 
     if body.len() > MAX_LINES {
-        let mut out = io::stdout();
-        let _ = execute!(out, SetForegroundColor(Color::DarkGrey));
-        print!("    … {} more line(s)", body.len() - MAX_LINES);
-        let _ = execute!(out, ResetColor);
-        println!();
+        let _ = write!(
+            preview,
+            "{}    … {} more line(s){}\n",
+            SetForegroundColor(Color::DarkGrey),
+            body.len() - MAX_LINES,
+            ResetColor
+        );
     }
-    let _ = io::stdout().flush();
+    Some(preview)
 }
 
 // One line of what a tool gave back. The repeated identical result is usually the clearest
 // evidence that a model is stuck, so it belongs in the log next to the call.
-pub(crate) fn log_tool_result(text: &str) {
+
+pub(crate) fn tool_result_line(text: &str) -> Option<String> {
     let first = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
     if first.is_empty() {
-        return;
+        return None;
     }
 
     let first = strip_project_prefix(first);
     let first = first.as_str();
     let clipped = crate::util::truncate_at_boundary(first, 110);
-    let mut out = io::stdout();
-    let _ = execute!(out, SetForegroundColor(Color::DarkGrey));
-    print!(
-        "    {}{}",
+    Some(format!(
+        "{}    {}{}{}",
+        SetForegroundColor(Color::DarkGrey),
         clipped,
-        if clipped.len() < first.len() { "…" } else { "" }
-    );
-    let _ = execute!(out, ResetColor);
-    println!();
-    let _ = out.flush();
+        if clipped.len() < first.len() { "…" } else { "" },
+        ResetColor
+    ))
 }
 
 #[cfg(test)]
@@ -846,12 +871,12 @@ mod log_tests {
     }
 }
 
-pub(crate) fn render_text(text: &str) -> Result<()> {
+
+pub(crate) fn render_text(text: &str) -> String {
     if is_markdown(text) {
         render_markdown(text)
     } else {
-        println!("{}", text);
-        Ok(())
+        format!("{}\n", text)
     }
 }
 
@@ -864,7 +889,7 @@ pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
 
     let mut selected_index = 0;
 
-    println!("Select a model (use Up/Down arrows, Enter to confirm):\n");
+    outln!("Select a model (use Up/Down arrows, Enter to confirm):\n");
 
     // Enable raw mode for key events
     enable_raw_mode()?;
@@ -873,18 +898,18 @@ pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
         // Clear screen and move cursor to top
         execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
 
-        println!("Select a model (use Up/Down arrows, Enter to confirm):\n");
+        outln!("Select a model (use Up/Down arrows, Enter to confirm):\n");
 
         // Display models
         for (index, model) in models.iter().enumerate() {
             if index == selected_index {
-                println!("> {} <", model);
+                outln!("> {} <", model);
             } else {
-                println!("  {}  ", model);
+                outln!("  {}  ", model);
             }
         }
 
-        io::stdout().flush()?;
+        crate::out::flush();
 
         // Read key event
         if let Event::Key(key_event) = event::read()? {
@@ -923,9 +948,10 @@ pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
 
     // Clear screen one final time and show selection
     execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    println!("Selected model: {}\n", models[selected_index]);
+    outln!("Selected model: {}\n", models[selected_index]);
 
     Ok(models[selected_index].clone())
 }
 
 // Configuration structure
+

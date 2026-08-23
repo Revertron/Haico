@@ -133,7 +133,7 @@ pub(crate) fn report_context(messages: &[Value], context_tokens: usize) {
     let used = estimate_tokens(messages);
     let percent = (used as f64 / context_tokens as f64) * 100.0;
 
-    println!(
+    outln!(
         "{} messages, {} user turn(s), ~{} of {} tokens ({:.1}%, estimated).",
         messages.len(),
         turns,
@@ -143,9 +143,9 @@ pub(crate) fn report_context(messages: &[Value], context_tokens: usize) {
     );
 
     if used > compact_hint_threshold(context_tokens) {
-        println!("Run /compact to replace the history with a summary.");
+        outln!("Run /compact to replace the history with a summary.");
     }
-    println!();
+    outln!();
 }
 
 // Flatten the conversation for a summarizer, dropping the system prompt (it is re-attached

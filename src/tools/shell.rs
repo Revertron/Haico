@@ -94,7 +94,7 @@ where
             while let Some(offset) = data[echoed_to..].iter().position(|&b| b == b'\n') {
                 let end = echoed_to + offset;
                 let line = String::from_utf8_lossy(&data[echoed_to..end]);
-                eprintln!("  │ {}", line.trim_end_matches('\r'));
+                outln!("  │ {}", line.trim_end_matches('\r'));
                 echoed_to = end + 1;
             }
         }
@@ -106,7 +106,7 @@ where
         let data = collected.bytes();
         if echoed_to < data.len() {
             let line = String::from_utf8_lossy(&data[echoed_to..]);
-            eprintln!("  │ {}", line.trim_end_matches('\r'));
+            outln!("  │ {}", line.trim_end_matches('\r'));
         }
     }
 }

@@ -16,7 +16,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use serde_json::{json, Value};
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 
 // Which set of rules is in force. One enum rather than independent flags: plan mode
@@ -172,19 +172,17 @@ pub(crate) enum PlanDecision {
 // Show a plan and ask what to do with it.
 
 pub(crate) fn review_plan(plan: &str) -> Result<PlanDecision> {
-    println!("\n📋 Proposed plan\n");
+    outln!("\n📋 Proposed plan\n");
     // Rendered rather than printed raw: plans come back as markdown, and an unrendered
     // one is a wall of asterisks exactly when it most needs reading.
-    if crate::render::render_markdown(plan).is_err() {
-        println!("{}", plan);
-    }
-    println!();
+    out!("{}", crate::render::render_markdown(plan));
+    outln!();
     // Same shape as the permission prompt: the approvals first, the refusal last, so the
     // key that means "no" is in the same place in both.
-    println!("1. Approve and start work");
-    println!("2. Approve and enable auto mode (routine calls run without asking)");
-    println!("3. Send back corrections");
-    io::stdout().flush()?;
+    outln!("1. Approve and start work");
+    outln!("2. Approve and enable auto mode (routine calls run without asking)");
+    outln!("3. Send back corrections");
+    crate::out::flush();
 
     enable_raw_mode()?;
     let decision = loop {
@@ -197,9 +195,9 @@ pub(crate) fn review_plan(plan: &str) -> Result<PlanDecision> {
                 KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
                 KeyCode::Char('3') => {
                     disable_raw_mode()?;
-                    println!("3\n");
-                    print!("What should change? > ");
-                    io::stdout().flush()?;
+                    outln!("3\n");
+                    out!("What should change? > ");
+                    crate::out::flush();
                     let mut feedback = String::new();
                     io::stdin().read_line(&mut feedback)?;
                     break PlanDecision::Revise(feedback.trim().to_string());

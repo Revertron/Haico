@@ -122,16 +122,16 @@ impl MyMcpServer {
         // Shown to the user as it changes, so the plan is visible rather than buried in
         // tool output only the model sees.
         if self.interactive {
-            println!("\n  Plan:");
+            outln!("\n  Plan:");
             for item in &params.0.todos {
                 let mark = match item.status.as_str() {
                     "done" => "x",
                     "in_progress" => "»",
                     _ => " ",
                 };
-                println!("   [{}] {}", mark, item.task);
+                outln!("   [{}] {}", mark, item.task);
             }
-            println!();
+            outln!();
         }
 
         let done = params

@@ -9,7 +9,7 @@ use crossterm::{
 };
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 
 pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
@@ -350,17 +350,17 @@ pub(crate) fn gate_for(workspace: &Workspace, tool_name: &str, arguments: &Value
 // Generate a colored diff with line numbers, showing only context around changes
 
 pub(crate) fn ask_permission(allow_all_label: &str, description: &str, diff: Option<&str>) -> Result<PermissionResponse> {
-    println!("🔒 Allow this tool usage?");
-    println!("{}\n", description);
+    outln!("🔒 Allow this tool usage?");
+    outln!("{}\n", description);
 
     if let Some(diff_content) = diff {
-        println!("{}", diff_content);
+        outln!("{}", diff_content);
     }
 
-    println!("1. Allow once");
-    println!("2. {}", allow_all_label);
-    println!("3. Reject and provide alternative");
-    io::stdout().flush()?;
+    outln!("1. Allow once");
+    outln!("2. {}", allow_all_label);
+    outln!("3. Reject and provide alternative");
+    crate::out::flush();
 
     // Enable raw mode
     enable_raw_mode()?;
@@ -382,10 +382,10 @@ pub(crate) fn ask_permission(allow_all_label: &str, description: &str, diff: Opt
                 KeyCode::Char('3') => {
                     // Disable raw mode to get text input
                     disable_raw_mode()?;
-                    println!("3\n");
+                    outln!("3\n");
 
-                    print!("> ");
-                    io::stdout().flush()?;
+                    out!("> ");
+                    crate::out::flush();
 
                     let mut alternative = String::new();
                     io::stdin().read_line(&mut alternative)?;
