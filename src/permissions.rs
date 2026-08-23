@@ -1,6 +1,7 @@
 //! What a tool call needs before it runs, and how the user is asked.
 
-use crate::util::{is_inside_cwd, absolute_path, truncate_at_boundary};
+use crate::util::truncate_at_boundary;
+use crate::workspace::Workspace;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -240,7 +241,14 @@ pub(crate) fn destructive_command(segment: &str) -> Option<&'static str> {
 
 // Resolve a path to an absolute one without requiring it to exist yet.
 
-pub(crate) fn gate_for(tool_name: &str, arguments: &Value) -> Gate {
+pub(crate) fn gate_for(workspace: &Workspace, tool_name: &str, arguments: &Value) -> Gate {
+    // Before anything else, including the auto-allow list below. The read-only tools are on
+    // that list, so checking the boundary afterwards would let every read skip it — and
+    // reading is how a secret leaves a machine.
+    if let Some(refusal) = workspace.refusal(tool_name, arguments) {
+        return Gate::Deny(refusal);
+    }
+
     if AUTO_ALLOWED_TOOLS.contains(&tool_name) {
         return Gate::Auto;
     }
@@ -314,21 +322,20 @@ pub(crate) fn gate_for(tool_name: &str, arguments: &Value) -> Gate {
         }
 
         "write_file" | "edit" | "multi_edit" => {
+            // Anything outside the workspace was refused above, so this lands in one of the
+            // writable roots. Keyed to that root rather than to the workspace as a whole:
+            // approving writes in the backend must not silently cover a client directory
+            // added an hour later.
             let path = PathBuf::from(arguments["file_path"].as_str().unwrap_or_default());
+            let root = workspace.writable_root_for(&path);
+            // The key keeps the full canonical form, so two roots can never collide; the
+            // label drops the \\?\ prefix, which is noise to everyone reading the prompt.
+            let key = root.map(|r| r.display().to_string()).unwrap_or_default();
+            let shown = root.map(crate::util::display_path).unwrap_or_default();
 
-            if is_inside_cwd(&path) {
-                Gate::Ask {
-                    keys: vec![format!("{}:in-project", tool_name)],
-                    label: format!("Allow all '{}' calls inside this project", tool_name),
-                }
-            } else {
-                // Outside the project is a different kind of act, so approval does not
-                // generalize past the single file.
-                let absolute = absolute_path(&path);
-                Gate::Ask {
-                    keys: vec![format!("{}:path:{}", tool_name, absolute.display())],
-                    label: format!("Allow all '{}' calls on {} (OUTSIDE this project)", tool_name, absolute.display())
-                }
+            Gate::Ask {
+                keys: vec![format!("{}:root:{}", tool_name, key)],
+                label: format!("Allow all '{}' calls under {}", tool_name, shown),
             }
         }
 
@@ -423,6 +430,11 @@ mod tests {
     use crate::util::*;
     use serde_json::json;
 
+    // The default posture: the working directory and nothing else.
+    fn ws() -> crate::workspace::Workspace {
+        crate::workspace::Workspace::new(&std::env::current_dir().unwrap(), &[])
+    }
+
     #[test]
     fn splits_chained_shell_commands() {
         use crate::command_segments;
@@ -484,7 +496,7 @@ mod tests {
         assert!(!runs_arbitrary_code("cargo build"));
         assert!(!runs_arbitrary_code("git status"));
 
-        let keys_for = |command: &str| match gate_for("run_command", &json!({"command": command})) {
+        let keys_for = |command: &str| match gate_for(&ws(), "run_command", &json!({"command": command})) {
             Gate::Ask { keys, label } => (keys, label),
             other => panic!(
                 "expected a prompt, got {}",
@@ -517,7 +529,7 @@ mod tests {
     fn a_long_chain_does_not_produce_an_unreadable_label() {
         use crate::permissions::{gate_for, Gate};
 
-        let Gate::Ask { keys, label } = gate_for(
+        let Gate::Ask { keys, label } = gate_for(&ws(), 
             "run_command",
             &json!({"command": "a && b && c && d && e && f && g"}),
         ) else {
@@ -551,7 +563,7 @@ mod tests {
     fn allow_all_does_not_leak_across_commands() {
         use crate::{gate_for, Gate, PermissionManager};
 
-        let gate_keys = |command: &str| match gate_for("run_command", &json!({"command": command})) {
+        let gate_keys = |command: &str| match gate_for(&ws(), "run_command", &json!({"command": command})) {
             Gate::Ask { keys, .. } => keys,
             Gate::Auto => panic!("run_command must never be auto-allowed"),
             Gate::Deny(reason) => panic!("unexpected deny: {}", reason),
@@ -584,7 +596,7 @@ mod tests {
 
         for tool in ["read", "ls", "grep", "glob_search", "crate_info", "calculator"] {
             assert!(
-                matches!(gate_for(tool, &json!({})), Gate::Auto),
+                matches!(gate_for(&ws(), tool, &json!({})), Gate::Auto),
                 "{} should not interrupt the user",
                 tool
             );
@@ -592,7 +604,7 @@ mod tests {
 
         for tool in ["write_file", "edit", "run_command", "web_search", "web_fetch"] {
             assert!(
-                !matches!(gate_for(tool, &json!({"command": "ls", "file_path": "a.rs"})), Gate::Auto),
+                !matches!(gate_for(&ws(), tool, &json!({"command": "ls", "file_path": "a.rs"})), Gate::Auto),
                 "{} must never be auto-allowed",
                 tool
             );
@@ -601,29 +613,44 @@ mod tests {
 
 
     #[test]
-    fn writes_outside_the_project_are_approved_per_file() {
+    fn work_outside_the_workspace_is_refused_rather_than_offered() {
         use crate::{gate_for, Gate};
 
-        let keys_and_label = |path: &str| match gate_for("edit", &json!({"file_path": path})) {
-            Gate::Ask { keys, label } => (keys, label),
-            _ => panic!("edit must ask"),
+        // Inside the working directory: one shared approval for the whole root.
+        let keys_for = |path: &str| match gate_for(&ws(), "edit", &json!({"file_path": path})) {
+            Gate::Ask { keys, .. } => keys,
+            other => panic!(
+                "expected a prompt, got {}",
+                match other {
+                    Gate::Auto => "auto".to_string(),
+                    Gate::Deny(reason) => reason,
+                    _ => unreachable!(),
+                }
+            ),
         };
+        assert_eq!(keys_for("src/main.rs"), keys_for("Cargo.toml"));
 
-        // Inside the working directory: one shared approval for the project.
-        let (inside, _) = keys_and_label("src/main.rs");
-        let (inside_other, _) = keys_and_label("Cargo.toml");
-        assert_eq!(inside, inside_other);
-
-        // Outside it: keyed per file, and the label says so, so approving one does not
-        // hand over the rest of the filesystem.
+        // Outside it there is no prompt to answer. This used to offer a per-file approval;
+        // it is now refused outright, because a prompt is something a model can talk its
+        // way through and the point of the boundary is that it cannot.
         let outside = std::env::temp_dir().join("haico-elsewhere.rs");
-        let (out_keys, out_label) = keys_and_label(&outside.display().to_string());
-        assert_ne!(out_keys, inside);
-        assert!(out_label.contains("OUTSIDE"), "got: {}", out_label);
+        let denied = gate_for(&ws(), "edit", &json!({"file_path": outside.display().to_string()}));
+        assert!(matches!(denied, Gate::Deny(_)), "a write outside must be denied");
 
-        let other_outside = std::env::temp_dir().join("haico-elsewhere-2.rs");
-        let (out_keys_2, _) = keys_and_label(&other_outside.display().to_string());
-        assert_ne!(out_keys, out_keys_2);
+        // And the same for reads, which is the new part: they were auto-allowed with no
+        // path check at all, so anything on the machine was one tool call away.
+        let secret = std::env::temp_dir().join("haico-secrets.env");
+        assert!(
+            matches!(gate_for(&ws(), "read", &json!({"file_path": secret.display().to_string()})), Gate::Deny(_)),
+            "a read outside the workspace must be denied"
+        );
+        assert!(
+            matches!(gate_for(&ws(), "ls", &json!({"path": std::env::temp_dir().display().to_string()})), Gate::Deny(_)),
+            "listing outside the workspace must be denied"
+        );
+
+        // Reads inside it are still free — the boundary must not cost a prompt per file.
+        assert!(matches!(gate_for(&ws(), "read", &json!({"file_path": "Cargo.toml"})), Gate::Auto));
     }
 
 
@@ -633,7 +660,7 @@ mod tests {
 
         let denied = |command: &str| {
             matches!(
-                gate_for("run_command", &json!({"command": command})),
+                gate_for(&ws(), "run_command", &json!({"command": command})),
                 Gate::Deny(_)
             )
         };

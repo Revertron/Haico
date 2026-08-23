@@ -9,6 +9,7 @@
 use crate::llm::LMStudioClient;
 use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
 use crate::render::file_change_diff;
+use crate::workspace::Workspace;
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -90,7 +91,12 @@ approved it — you will be told when they do.";
 
 // The permission decision for one call, once the mode has had its say.
 
-pub(crate) fn gate_for_mode(mode: Mode, tool_name: &str, arguments: &Value) -> Gate {
+pub(crate) fn gate_for_mode(
+    mode: Mode,
+    workspace: &Workspace,
+    tool_name: &str,
+    arguments: &Value,
+) -> Gate {
     match mode {
         // Changing mode touches nothing, and entering plan mode only ever takes capability
         // away — asking permission to become more restricted would be noise.
@@ -104,7 +110,7 @@ pub(crate) fn gate_for_mode(mode: Mode, tool_name: &str, arguments: &Value) -> G
         // Plan mode leaves the allowed tools on whatever gate they normally carry, so a
         // web fetch still asks. Auto mode changes who answers the prompt, not what counts
         // as needing one.
-        _ => gate_for(tool_name, arguments),
+        _ => gate_for(workspace, tool_name, arguments),
     }
 }
 
@@ -133,17 +139,21 @@ pub(crate) fn tools_for_mode(mode: Mode, tools: &[Value]) -> Vec<Value> {
 // Appended to the system message rather than pushed as a trailing one: a system message in
 // last position is handled inconsistently across local servers, and the note has to be
 // reliable to be worth having.
-pub(crate) fn with_mode_note(mode: Mode, messages: &[Value]) -> Vec<Value> {
+pub(crate) fn with_mode_note(mode: Mode, workspace: &Workspace, messages: &[Value]) -> Vec<Value> {
     let mut request = messages.to_vec();
+
+    let mut note = workspace.note();
     if mode == Mode::Plan {
-        if let Some(system) = request
-            .first_mut()
-            .filter(|m| m["role"] == "system")
-            .and_then(|m| m.get_mut("content"))
-            .and_then(|c| c.as_str().map(str::to_string))
-        {
-            request[0]["content"] = json!(format!("{}{}", system, PLAN_MODE_NOTE));
-        }
+        note.push_str(PLAN_MODE_NOTE);
+    }
+
+    if let Some(system) = request
+        .first_mut()
+        .filter(|m| m["role"] == "system")
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_str().map(str::to_string))
+    {
+        request[0]["content"] = json!(format!("{}{}", system, note));
     }
     request
 }
@@ -369,12 +379,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn ws() -> crate::workspace::Workspace {
+        crate::workspace::Workspace::new(&std::env::current_dir().unwrap(), &[])
+    }
+
     #[test]
     fn plan_mode_refuses_to_change_anything() {
         // Reading is how planning happens, so it must not prompt.
         for tool in ["read", "grep", "ls", "glob_search"] {
             assert!(
-                matches!(gate_for_mode(Mode::Plan, tool, &json!({})), Gate::Auto),
+                matches!(gate_for_mode(Mode::Plan, &ws(), tool, &json!({})), Gate::Auto),
                 "{} should stay available while planning",
                 tool
             );
@@ -383,20 +397,20 @@ mod tests {
         // Everything that touches the machine is refused outright, not merely asked about:
         // a plan the user has not seen yet cannot be consented to one call at a time.
         for tool in ["write_file", "edit", "multi_edit", "run_command", "run_background"] {
-            let gate = gate_for_mode(Mode::Plan, tool, &json!({"command": "ls", "file_path": "a.rs"}));
+            let gate = gate_for_mode(Mode::Plan, &ws(), tool, &json!({"command": "ls", "file_path": "a.rs"}));
             assert!(matches!(gate, Gate::Deny(_)), "{} must be denied in plan mode", tool);
         }
 
         // Research still reaches the network, and still asks first.
         assert!(matches!(
-            gate_for_mode(Mode::Plan, "web_search", &json!({"query": "x"})),
+            gate_for_mode(Mode::Plan, &ws(), "web_search", &json!({"query": "x"})),
             Gate::Ask { .. }
         ));
 
         // Normal and auto mode are unchanged by any of this.
         for mode in [Mode::Normal, Mode::Auto] {
             assert!(matches!(
-                gate_for_mode(mode, "write_file", &json!({"file_path": "a.rs"})),
+                gate_for_mode(mode, &ws(), "write_file", &json!({"file_path": "a.rs"})),
                 Gate::Ask { .. }
             ));
         }
@@ -444,7 +458,7 @@ mod tests {
         for mode in [Mode::Normal, Mode::Plan, Mode::Auto] {
             for tool in [START_PLAN, PRESENT_PLAN] {
                 assert!(
-                    matches!(gate_for_mode(mode, tool, &json!({"plan": "do the thing"})), Gate::Auto),
+                    matches!(gate_for_mode(mode, &ws(), tool, &json!({"plan": "do the thing"})), Gate::Auto),
                     "{} should not prompt in {:?} mode",
                     tool,
                     mode
@@ -460,7 +474,7 @@ mod tests {
             json!({"role": "user", "content": "do a thing"}),
         ];
 
-        let planning = with_mode_note(Mode::Plan, &messages);
+        let planning = with_mode_note(Mode::Plan, &ws(), &messages);
         let system = planning[0]["content"].as_str().unwrap();
         assert!(system.starts_with("base prompt"));
         assert!(system.contains("Plan mode is active"));
@@ -470,8 +484,16 @@ mod tests {
         // the mode that set it.
         assert_eq!(messages[0]["content"], "base prompt");
 
+        // The workspace note rides in every mode — the boundary applies whether or not a
+        // plan is being written, and discovering it through refusals costs a round each
+        // time. Only the plan note is conditional.
         for mode in [Mode::Normal, Mode::Auto] {
-            assert_eq!(with_mode_note(mode, &messages), messages);
+            let request = with_mode_note(mode, &ws(), &messages);
+            let system = request[0]["content"].as_str().unwrap();
+            assert!(system.starts_with("base prompt"));
+            assert!(system.contains("# Workspace"), "got: {}", system);
+            assert!(!system.contains("Plan mode is active"));
+            assert_eq!(request[1], messages[1]);
         }
     }
 

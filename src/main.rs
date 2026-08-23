@@ -3,7 +3,9 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
+use std::env;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 mod config;
 mod llm;
@@ -17,6 +19,7 @@ mod session;
 mod testutil;
 mod tools;
 mod util;
+mod workspace;
 
 use config::*;
 use llm::*;
@@ -27,6 +30,7 @@ use render::*;
 use session::*;
 use tools::*;
 use util::*;
+use workspace::*;
 
 
 // MCP Server with tools
@@ -76,6 +80,8 @@ fn print_repl_help() {
     println!("  /plan              Research and propose only; nothing changes until approved");
     println!("  /auto              Review each gated call; routine ones run without asking");
     println!("  /normal            Back to answering every prompt yourself");
+    println!("  /add <path>        Let the file tools read and write another directory too");
+    println!("  /workspace         Show which paths the file tools may touch");
     println!("  /mode              Show which of the three is in force");
     println!("  /tools             List available tools and whether they prompt");
     println!("  /model [name]      Switch model; with no name, pick from the server's list");
@@ -265,6 +271,23 @@ async fn main() -> Result<()> {
     // end in auto mode should not quietly resume deciding things on the user's behalf.
     let mut mode = Mode::Normal;
 
+    // Which paths the file tools may touch. The working directory to start with; `/add`
+    // widens it for this session only, and `read_paths` in the config file names
+    // directories that may be read but never written.
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut workspace = Workspace::new(&cwd, &config.file.read_paths);
+    if !workspace.readable_roots().is_empty() {
+        println!(
+            "Readable outside the project: {}",
+            workspace
+                .readable_roots()
+                .iter()
+                .map(|r| display_path(r))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Line editing, history and bracketed paste. Plain read_line gave no arrow-key
     // history, no editing beyond backspace, and turned a pasted multi-line snippet into one
     // user turn per line.
@@ -311,6 +334,36 @@ async fn main() -> Result<()> {
 
         if input == "/help" {
             print_repl_help();
+            continue;
+        }
+
+        if input == "/add" || input.starts_with("/add ") {
+            let requested = input.strip_prefix("/add").unwrap_or("").trim();
+            if requested.is_empty() {
+                println!("Usage: /add <path>   (a directory to read and write for this session)\n");
+                continue;
+            }
+            match workspace.add(std::path::Path::new(requested)) {
+                Ok(added) => println!("Added to the workspace: {}\n", display_path(&added)),
+                Err(reason) => println!("{}\n", reason),
+            }
+            continue;
+        }
+
+        if input == "/workspace" {
+            println!("Readable and writable:");
+            for root in workspace.writable_roots() {
+                println!("  {}", display_path(root));
+            }
+            if workspace.readable_roots().is_empty() {
+                println!("Readable only: none configured (see 'read_paths' in the config file).");
+            } else {
+                println!("Readable only:");
+                for root in workspace.readable_roots() {
+                    println!("  {}", display_path(root));
+                }
+            }
+            println!("\nAnything else is refused outright, for reads as well as writes.\n");
             continue;
         }
 
@@ -686,7 +739,7 @@ Usage: /set <name> <value>, or /set <name> unset
             // which is exactly when a model heading down the wrong path needs stopping.
             // Rebuilt every round rather than once per turn: approving a plan switches the
             // mode mid-turn, and the very next request has to carry the full tool list.
-            let request_messages = with_mode_note(mode, &messages);
+            let request_messages = with_mode_note(mode, &workspace, &messages);
             let request_tools = tools_for_mode(mode, &openai_tools);
 
             let result = tokio::select! {
@@ -907,7 +960,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // consent under a narrowly scoped key, or an outright refusal. The mode
                     // has the first word — plan mode refuses anything that changes the
                     // machine, whatever the call would normally be entitled to.
-                    let gate = gate_for_mode(mode, tool_name, &arguments);
+                    let gate = gate_for_mode(mode, &workspace, tool_name, &arguments);
 
                     if let Gate::Deny(reason) = &gate {
                         println!("\n⛔ {}\n", reason);

@@ -218,6 +218,12 @@ pub(crate) struct FileConfig {
     pub(crate) searxng: Option<String>,
     pub(crate) system_prompt: Option<String>,
 
+    // Directories the file tools may read but never write, on top of the working
+    // directory. Empty by default and deliberately so: the value of the boundary is that
+    // nothing outside it is reachable unless it was named on purpose.
+    #[serde(default)]
+    pub(crate) read_paths: Vec<String>,
+
     // Top-level fallbacks, used when the selected model has no entry of its own.
     pub(crate) context: Option<usize>,
     pub(crate) temperature: Option<f64>,

@@ -101,12 +101,18 @@ pub(crate) fn absolute_path(path: &std::path::Path) -> PathBuf {
     }
 }
 
-pub(crate) fn is_inside_cwd(path: &std::path::Path) -> bool {
-    let Ok(cwd) = env::current_dir() else {
-        return false;
-    };
-    // Both sides through the same resolver, so neither can end up in a different form.
-    absolute_path(path).starts_with(absolute_path(&cwd))
+// A path as a person should see it.
+//
+// Canonicalizing on Windows yields the verbatim form (\\?\E:\proj), which is the right
+// thing to compare against — that prefix is why a not-yet-created path once read as being
+// outside its own project — and the wrong thing to put in front of a user. Stripped for
+// display only; every comparison still runs on the full form.
+pub(crate) fn display_path(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    shown
+        .strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(shown)
 }
 
 // Decide what a tool call needs before it runs.
@@ -129,6 +135,16 @@ pub(crate) fn modified_time(path: &std::path::Path) -> Option<std::time::SystemT
 #[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
+
+    // Superseded in production by Workspace::may_write, which does the same comparison
+    // against several roots. Kept here because these cases are the regression coverage for
+    // the Windows verbatim-path bug, and what they are really exercising is absolute_path.
+    fn is_inside_cwd(path: &std::path::Path) -> bool {
+        let Ok(cwd) = std::env::current_dir() else {
+            return false;
+        };
+        absolute_path(path).starts_with(absolute_path(&cwd))
+    }
     use crate::config::*;
     use crate::llm::*;
     use crate::permissions::*;
