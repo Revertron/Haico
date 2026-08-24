@@ -6,17 +6,14 @@
 //! anything else falls through to the user with the reason attached. The reviewer can
 //! spend the user's consent, never withhold it.
 
+use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::llm::LMStudioClient;
 use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
 use crate::render::file_change_diff;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, Result};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::{json, Value};
-use std::io;
 use std::path::PathBuf;
 
 // Which set of rules is in force. One enum rather than independent flags: plan mode
@@ -32,13 +29,23 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
-    // The prompt prefix, so the current mode is visible on the line being typed rather
-    // than only in the message that switched to it.
-    pub(crate) fn prompt(&self) -> &'static str {
+    // Shift+Tab walks the modes in the order they take capability away and give it
+    // back: ask about everything, ask about nothing but change nothing, ask about
+    // little. Cycling rather than a menu, because it is a key pressed mid-thought.
+    pub(crate) fn next(&self) -> Mode {
         match self {
-            Mode::Normal => "> ",
-            Mode::Plan => "plan> ",
-            Mode::Auto => "auto> ",
+            Mode::Normal => Mode::Plan,
+            Mode::Plan => Mode::Auto,
+            Mode::Auto => Mode::Normal,
+        }
+    }
+
+    // The one word for the status bar, where there is no room for the sentence.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Mode::Normal => "normal",
+            Mode::Plan => "plan",
+            Mode::Auto => "auto",
         }
     }
 
@@ -147,13 +154,17 @@ pub(crate) fn with_mode_note(mode: Mode, workspace: &Workspace, messages: &[Valu
         note.push_str(PLAN_MODE_NOTE);
     }
 
-    if let Some(system) = request
-        .first_mut()
-        .filter(|m| m["role"] == "system")
-        .and_then(|m| m.get_mut("content"))
-        .and_then(|c| c.as_str().map(str::to_string))
-    {
-        request[0]["content"] = json!(format!("{}{}", system, note));
+    // With no system message to append to — a model configured with `use_system_prompt =
+    // false`, in a project with no instructions of its own — the note becomes the system
+    // message. Plan mode depends on it: without the note the model is never told it is
+    // planning, and the workspace boundary would only be discovered through refusals.
+    match request.first().map(|m| m["role"] == "system") {
+        Some(true) => {
+            if let Some(system) = request[0]["content"].as_str().map(str::to_string) {
+                request[0]["content"] = json!(format!("{}{}", system, note));
+            }
+        }
+        _ => request.insert(0, json!({"role": "system", "content": note.trim_start()})),
     }
     request
 }
@@ -171,7 +182,7 @@ pub(crate) enum PlanDecision {
 
 // Show a plan and ask what to do with it.
 
-pub(crate) fn review_plan(plan: &str) -> Result<PlanDecision> {
+pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecision> {
     outln!("\n📋 Proposed plan\n");
     // Rendered rather than printed raw: plans come back as markdown, and an unrendered
     // one is a wall of asterisks exactly when it most needs reading.
@@ -184,34 +195,34 @@ pub(crate) fn review_plan(plan: &str) -> Result<PlanDecision> {
     outln!("3. Send back corrections");
     crate::out::flush();
 
-    enable_raw_mode()?;
     let decision = loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        let Some(Event::Key(key)) = keys.next().await else {
+            return Err(anyhow!("no interactive terminal to review the plan"));
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('1') => break PlanDecision::Approve,
+            KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
+            KeyCode::Char('3') => {
+                outln!("3\n");
+                const PROMPT: &str = "What should change? > ";
+                let mut editor = Editor::new(Vec::new());
+                let feedback = match read_text(keys, &mut editor, PROMPT).await {
+                    Input::Text(text) => text,
+                    // Backing out is not corrections; the plan stands unapproved and the
+                    // model is told only that.
+                    _ => String::new(),
+                };
+                outln!("{}", echo(PROMPT, &feedback));
+                break PlanDecision::Revise(feedback.trim().to_string());
             }
-            match key.code {
-                KeyCode::Char('1') => break PlanDecision::Approve,
-                KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
-                KeyCode::Char('3') => {
-                    disable_raw_mode()?;
-                    outln!("3\n");
-                    out!("What should change? > ");
-                    crate::out::flush();
-                    let mut feedback = String::new();
-                    io::stdin().read_line(&mut feedback)?;
-                    break PlanDecision::Revise(feedback.trim().to_string());
-                }
-                _ => continue,
-            }
+            _ => continue,
         }
     };
-    let _ = disable_raw_mode();
 
-    use std::time::Duration;
-    while event::poll(Duration::from_millis(0))? {
-        let _ = event::read()?;
-    }
+    keys.drain();
 
     Ok(decision)
 }
@@ -493,6 +504,17 @@ mod tests {
             assert!(!system.contains("Plan mode is active"));
             assert_eq!(request[1], messages[1]);
         }
+
+        // A model configured without haico's prompt still has to be told the boundary and
+        // the mode, so the note becomes the system message rather than being dropped.
+        let bare = vec![json!({"role": "user", "content": "do a thing"})];
+        let planning = with_mode_note(Mode::Plan, &ws(), &bare);
+        assert_eq!(planning[0]["role"], "system");
+        let system = planning[0]["content"].as_str().unwrap();
+        assert!(system.starts_with("# Workspace"), "got: {}", system);
+        assert!(system.contains("Plan mode is active"));
+        assert_eq!(planning[1], bare[0]);
+        assert_eq!(bare.len(), 1);
     }
 
     #[test]

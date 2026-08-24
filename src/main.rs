@@ -12,6 +12,7 @@ use std::path::PathBuf;
 mod out;
 
 mod config;
+mod input;
 mod llm;
 mod modes;
 mod permissions;
@@ -26,6 +27,7 @@ mod util;
 mod workspace;
 
 use config::*;
+use input::*;
 use llm::*;
 use modes::*;
 use permissions::*;
@@ -101,10 +103,133 @@ fn print_repl_help() {
     outln!("  /clear /new /reset Start over, keeping the system prompt");
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
     outln!();
-    outln!("At the prompt: up/down for history, Ctrl+C to abandon the current line.");
-    outln!("While working:  Ctrl+C interrupts the run and returns to the prompt.");
+    outln!("At the prompt: up/down for history, Shift+Enter for another line,");
+    outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
+    outln!("While working: keep typing — Enter queues the message for when the turn");
+    outln!("               ends. Esc interrupts and returns to the prompt.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
     outln!();
+}
+
+// Raw mode has to come off however the program leaves, including the error paths that
+// return early. A terminal left in raw mode stops echoing what is typed into it, which
+// looks exactly like a hung shell.
+struct TerminalGuard(bool);
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            out::clear_region();
+            let _ = crossterm::terminal::disable_raw_mode();
+            out::set_raw(false);
+        }
+    }
+}
+
+// The three questions that need a keyboard. Each one refuses when there is none rather
+// than picking an answer: a terminal that cannot be read from is not consent, and that
+// rule is the same whether what is being asked about is a tool call, a plan, or which
+// model to load.
+
+async fn pick_model(keys: Option<&mut Keys>, models: Vec<String>) -> Result<String> {
+    match keys {
+        Some(keys) => select_model_interactive(keys, models).await,
+        None => Err(anyhow::anyhow!(
+            "choosing a model needs an interactive terminal; pass --model"
+        )),
+    }
+}
+
+async fn ask_about_plan(keys: Option<&mut Keys>, plan: &str) -> Result<PlanDecision> {
+    match keys {
+        Some(keys) => review_plan(keys, plan).await,
+        None => Err(anyhow::anyhow!("no interactive terminal")),
+    }
+}
+
+async fn ask_about_call(
+    keys: Option<&mut Keys>,
+    allow_all_label: &str,
+    description: &str,
+    diff: Option<&str>,
+) -> Result<PermissionResponse> {
+    match keys {
+        Some(keys) => ask_permission(keys, allow_all_label, description, diff).await,
+        None => Err(anyhow::anyhow!("no interactive terminal")),
+    }
+}
+
+// The right-hand end of the status bar.
+fn status_line(model: &str, messages: &[Value], context_tokens: usize) -> String {
+    let used = estimate_tokens(messages);
+    let percent = (used as f64 / context_tokens.max(1) as f64) * 100.0;
+    format!("{}  ctx {:.0}%", model, percent)
+}
+
+// Run something with the input box still live underneath it.
+//
+// This is what the whole rework is for: while the model is thinking, or a tool is
+// running, the user can still type. What they submit is queued for the end of the
+// round rather than interrupting it — a message injected between an assistant turn
+// that called tools and the results of those calls is a message order the server
+// rejects. Esc, on the other hand, does interrupt: None comes back and the turn ends.
+async fn work_with_input<T>(
+    keys: &mut Option<Keys>,
+    editor: &mut Editor,
+    mode: &mut Mode,
+    queued: &mut Vec<String>,
+    status: &str,
+    busy: &str,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(keys) = keys.as_mut() else {
+        // Piped input has nothing to type with, so the only way to stop is the signal
+        // that raw mode would otherwise have swallowed.
+        outln!("
+○ {}", busy);
+        return tokio::select! {
+            output = work => Some(output),
+            _ = tokio::signal::ctrl_c() => None,
+        };
+    };
+
+    tokio::pin!(work);
+    loop {
+        crate::input::draw(
+            editor,
+            &crate::input::Chrome {
+                mode: *mode,
+                busy: Some(busy),
+                status,
+            },
+        );
+
+        tokio::select! {
+            output = &mut work => {
+                out::clear_region();
+                return Some(output);
+            }
+            event = keys.next() => {
+                let Some(event) = event else {
+                    // The keyboard is gone. Finishing the work is still better than
+                    // dropping it on the floor.
+                    out::clear_region();
+                    return Some(work.await);
+                };
+                match crate::input::while_working(editor, mode, event) {
+                    crate::input::WhileWorking::Interrupt => {
+                        out::clear_region();
+                        return None;
+                    }
+                    crate::input::WhileWorking::Queued(text) => {
+                        outln!("{}", crate::input::echo(PROMPT, &text));
+                        queued.push(text);
+                    }
+                    crate::input::WhileWorking::Nothing => {}
+                }
+            }
+        }
+    }
 }
 
 // Rough size of the conversation, in tokens.
@@ -161,6 +286,20 @@ async fn main() -> Result<()> {
         return run_mcp_server(config).await;
     }
 
+    // From here on the keyboard is read a key at a time rather than a line at a time,
+    // which is what lets the input box exist while the model is working. Piped input
+    // has no keyboard to read, so it keeps the plain line-at-a-time path; scripting
+    // haico still works.
+    let interactive = crate::input::stdin_is_a_terminal();
+    let _terminal = TerminalGuard(interactive);
+    let mut keys = if interactive {
+        crossterm::terminal::enable_raw_mode()?;
+        out::set_raw(true);
+        Some(Keys::start())
+    } else {
+        None
+    };
+
     outln!("          Welcome to Haico!");
     outln!("=====================================\n");
     if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
@@ -192,7 +331,14 @@ async fn main() -> Result<()> {
         }
 
         // Let user select a model interactively
-        select_model_interactive(models)?
+        match keys.as_mut() {
+            Some(keys) => select_model_interactive(keys, models).await?,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "choosing a model needs an interactive terminal; pass --model"
+                ))
+            }
+        }
     };
 
     // Initialize LM Studio client with selected model
@@ -218,33 +364,30 @@ async fn main() -> Result<()> {
     // }
     // outln!();
 
-    // Determine system prompt to use
-    let mut system_prompt_content = if let Some(custom_prompt) = config.system_prompt.clone() {
-        // Use custom prompt if provided
-        custom_prompt
-    } else {
-        // Use default prompt with environment variables
-        build_system_prompt(&lm_client.model)
-    };
-
-    // A project's own instructions are appended to whichever prompt is in use, so they
-    // apply to a custom --system-prompt too.
-    if let Some((name, project_context)) = load_project_context() {
+    // Read once and kept: /model rebuilds the system message, and re-reading the file on
+    // every switch would announce it again each time.
+    let project_context = load_project_context();
+    if let Some((name, _)) = &project_context {
         outln!("Loaded project context from {}", name);
-        system_prompt_content.push_str(&format!(
-            "\n\n# Project instructions ({})\n\n\
-             The following comes from this project and takes precedence over the general \
-             guidance above wherever the two disagree.\n\n{}",
-            name, project_context
-        ));
     }
+
+    // None when this model is configured without our prompt and the project has no
+    // instructions of its own — then the conversation carries no system message at all.
+    let mut system_prompt_content = compose_system_prompt(
+        config.system_prompt.as_deref(),
+        &lm_client.model,
+        settings.use_system_prompt,
+        project_context.as_ref(),
+    );
 
     // Conversation history
     let mut messages: Vec<Value> = vec![];
-    messages.push(json!({
-        "role": "system",
-        "content": system_prompt_content
-    }));
+    if let Some(content) = &system_prompt_content {
+        messages.push(json!({
+            "role": "system",
+            "content": content
+        }));
+    }
 
     // Restoring only the messages, never the stored system prompt: the date, branch and git
     // status in it would otherwise be whatever they were when the session was saved.
@@ -292,37 +435,57 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Line editing, history and bracketed paste. Plain read_line gave no arrow-key
-    // history, no editing beyond backspace, and turned a pasted multi-line snippet into one
-    // user turn per line.
-    let rl_config = rustyline::Config::builder()
-        .auto_add_history(true)
-        .bracketed_paste(true)
-        .build();
-    let mut editor: rustyline::Editor<(), rustyline::history::DefaultHistory> =
-        rustyline::Editor::with_config(rl_config)?;
+    // Line editing and history. The editor holds what is being typed; the writer keeps
+    // it pinned to the bottom of the screen and prints everything else above it.
     let history_path = history_file_path();
-    if let Some(path) = &history_path {
-        let _ = editor.load_history(path);
-    }
+    let history = history_path
+        .as_deref()
+        .map(crate::input::load_history)
+        .unwrap_or_default();
+    let mut editor = Editor::new(history);
+
+    // Typed while the model was working. Drained at the next round boundary, or at the
+    // next prompt if the turn finished first.
+    let mut queued: Vec<String> = Vec::new();
 
     outln!("Type /help for commands.\n");
 
     // Main loop
     loop {
-        // Read user input
-        let input = match editor.readline(mode.prompt()) {
-            Ok(line) => line,
-            // Ctrl+C at the prompt abandons the half-typed line, it does not quit.
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
-            // Ctrl+D, or stdin closing when input is piped in.
-            Err(rustyline::error::ReadlineError::Eof) => {
-                outln!("Goodbye!");
-                break;
-            }
-            Err(e) => {
-                outln!("[error] could not read input: {}", e);
-                break;
+        // Read user input — unless there is already something waiting that was typed
+        // while the last turn was running.
+        let input = if !queued.is_empty() {
+            queued.remove(0)
+        } else {
+            match keys.as_mut() {
+                Some(keys) => {
+                    let status = status_line(&lm_client.model, &messages, context_tokens);
+                    match read_command(keys, &mut editor, &mut mode, &status).await {
+                        // The finished entry becomes a plain line of the transcript, so
+                        // the conversation reads as one when scrolled back.
+                        Input::Text(text) => {
+                            outln!("{}", echo(PROMPT, &text));
+                            text
+                        }
+                        // Ctrl+C at the prompt abandons the half-typed line, not the
+                        // session.
+                        Input::Interrupted => continue,
+                        // Ctrl+D, or the keyboard going away.
+                        Input::Eof => {
+                            outln!("Goodbye!");
+                            break;
+                        }
+                        // read_command handles this one itself.
+                        Input::CycleMode => continue,
+                    }
+                }
+                None => match crate::input::read_piped_line() {
+                    Some(line) => line,
+                    None => {
+                        outln!("Goodbye!");
+                        break;
+                    }
+                },
             }
         };
         let input = input.trim();
@@ -401,10 +564,12 @@ async fn main() -> Result<()> {
 
         if input == "/clear" || input == "/new" || input == "/reset" {
             messages.clear();
-            messages.push(json!({
-                "role": "system",
-                "content": &system_prompt_content
-            }));
+            if let Some(content) = &system_prompt_content {
+                messages.push(json!({
+                    "role": "system",
+                    "content": content
+                }));
+            }
             outln!("Conversation cleared.\n");
             continue;
         }
@@ -431,7 +596,7 @@ async fn main() -> Result<()> {
 
             let chosen = if requested.is_empty() {
                 match fetch_available_models(&llm_url, token.as_deref()).await {
-                    Ok(models) if !models.is_empty() => match select_model_interactive(models) {
+                    Ok(models) if !models.is_empty() => match pick_model(keys.as_mut(), models).await {
                         Ok(model) => Some(model),
                         Err(e) => {
                             outln!("Model selection cancelled: {}\n", e);
@@ -464,6 +629,20 @@ async fn main() -> Result<()> {
                 lm_client.apply_settings(&settings);
                 server.llm_client.model = model.clone();
                 server.llm_client.apply_settings(&settings);
+
+                // The system message belongs to the new model too: it names the model, and
+                // the model's own config section decides whether ours is sent at all.
+                // Replaced in place, so the conversation itself carries on unchanged.
+                let rebuilt = compose_system_prompt(
+                    config.system_prompt.as_deref(),
+                    &model,
+                    settings.use_system_prompt,
+                    project_context.as_ref(),
+                );
+                if rebuilt != system_prompt_content {
+                    system_prompt_content = rebuilt;
+                    set_system_message(&mut messages, system_prompt_content.as_deref());
+                }
 
                 outln!("Now using model: {}", model);
                 outln!(
@@ -501,6 +680,14 @@ In force for '{}':", lm_client.model);
             outln!("  top_k           {}", settings.top_k.describe());
             outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
             outln!("  max_tokens      {}", settings.max_tokens.describe());
+            outln!(
+                "  system prompt   {}",
+                match (settings.use_system_prompt, &system_prompt_content) {
+                    (true, _) => "haico's own",
+                    (false, Some(_)) => "off — project instructions only  [config [models]]",
+                    (false, None) => "off — nothing sent  [config [models]]",
+                }
+            );
             outln!(
                 "\nA '-' means the field is left out of the request, so the server's own \
                  setting for that model applies."
@@ -718,33 +905,65 @@ Usage: /set <name> <value>, or /set <name> unset
         }));
 
         // Get LLM response and handle tool call chains. The cap stops a model that keeps
-        // calling tools forever from spinning until the user kills the process.
+        // calling tools forever from spinning until the user kills the process. It does
+        // not apply in auto mode: a fixed number of rounds is a poor stand-in for "this is
+        // going nowhere", and a long job that hits it unattended has nobody to say
+        // "continue". Repetition is the better signal, and it is what guards auto mode.
         const MAX_TOOL_ROUNDS: usize = 50;
+        // A stuck model gives itself away by calling the same tool with the same arguments
+        // over and over with nothing in between, which can happen on the tenth round or
+        // the fiftieth. The first threshold says so in the conversation; the second gives
+        // up on the turn.
+        const LOOP_NUDGE: usize = 3;
+        const LOOP_BREAK: usize = 5;
         let mut round = 0usize;
+
+        // The (tool, arguments) pair called last, and how long the unbroken run of it is.
+        // Consecutive rather than counted across the turn: a model working through a list
+        // of compiler errors legitimately runs the same build command a dozen times in one
+        // turn, and every one of those is progress because there were edits in between. A
+        // loop is the same call with nothing else happening between the tries. Any
+        // different call resets the run, `nudged_at` with it, so a later loop still gets
+        // its warning.
+        let mut last_call: Option<(String, String)> = None;
+        let mut run = (0usize, String::new());
+        let mut nudged_at = 0usize;
 
         loop {
             round += 1;
-            if round > MAX_TOOL_ROUNDS {
+            // Re-read every round rather than captured once: approving a plan can switch
+            // into auto mode mid-turn, and the cap should stop applying from that point.
+            if mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
                 outln!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
                 break;
             }
 
-            outln!("\n○ {}", get_thinking_message());
+            let thinking = get_thinking_message().to_string();
 
             // Assistant text is printed the moment it arrives, so none of the branches
             // below re-print it.
             let mut streamed_any = false;
-            // Ctrl+C abandons the turn instead of killing the process. rustyline puts the
-            // terminal in raw mode at the prompt, so Ctrl+C there is read as a keypress and
-            // never reaches this handler — it only fires while a request is in flight,
-            // which is exactly when a model heading down the wrong path needs stopping.
+            // Rendered as it arrives rather than at the end, so the answer still
+            // appears a piece at a time and still comes out as markdown.
+            let mut markdown = MarkdownStream::new();
             // Rebuilt every round rather than once per turn: approving a plan switches the
             // mode mid-turn, and the very next request has to carry the full tool list.
             let request_messages = with_mode_note(mode, &workspace, &messages);
             let request_tools = tools_for_mode(mode, &openai_tools);
+            let status = status_line(&lm_client.model, &messages, context_tokens);
 
-            let result = tokio::select! {
-                result = lm_client.chat_completion_streaming(
+            // Esc abandons the turn instead of killing the process. It arrives here as a
+            // keystroke rather than as a signal because raw mode is on for the whole
+            // session — which is also what lets the next message be typed while this one
+            // is still running.
+            let result = work_with_input(
+                &mut keys,
+                &mut editor,
+                &mut mode,
+                &mut queued,
+                &status,
+                &thinking,
+                lm_client.chat_completion_streaming(
                     request_messages,
                     request_tools,
                     |text| {
@@ -752,18 +971,19 @@ Usage: /set <name> <value>, or /set <name> unset
                             streamed_any = true;
                             out!("● ");
                         }
-                        out!("{}", text);
+                        out!("{}", markdown.push(text));
                         crate::out::flush();
                     },
-                ) => Some(result),
-                _ = tokio::signal::ctrl_c() => None,
-            };
+                ),
+            )
+            .await;
 
             let Some(result) = result else {
                 // The partial reply is dropped rather than stored: half a tool call in the
                 // history is worse than no reply at all. Everything before this turn stays
                 // consistent, so the conversation is still usable.
                 if streamed_any {
+                    out!("{}", markdown.finish(false));
                     outln!();
                 }
                 outln!("\n[interrupted]\n");
@@ -786,14 +1006,19 @@ Usage: /set <name> <value>, or /set <name> unset
             };
 
             if streamed_any {
+                out!("{}", markdown.finish(false));
                 outln!();
             } else if let Some(reasoning) = message
-                .get("reasoning")
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
                 .and_then(|r| r.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                // Some models put their whole preamble in `reasoning` and send no content.
+                // Some models put their whole preamble in the reasoning field and send no
+                // content. Either key can appear here: the assembler normalizes streamed
+                // chunks to `reasoning_content`, while the non-streaming fallback returns
+                // the server's message untouched.
                 out!("● ");
                 out!("{}", render_text(reasoning));
                 outln!();
@@ -866,6 +1091,22 @@ Usage: /set <name> <value>, or /set <name> unset
                         }
                     };
 
+                    // Counted here, before any of the branches below, so a call that is
+                    // refused or denied counts too — retrying a call the workspace or the
+                    // user has already turned down, unchanged and immediately, is a loop
+                    // like any other. What it returned is deliberately not part of the key:
+                    // a build that fails three times in a row with nothing done between the
+                    // tries is stuck whatever the errors say. serde_json sorts object keys,
+                    // so the same call always renders to the same string.
+                    let call = (tool_name.to_string(), arguments.to_string());
+                    if last_call.as_ref() == Some(&call) {
+                        run.0 += 1;
+                    } else {
+                        last_call = Some(call);
+                        run = (1, tool_name.to_string());
+                        nudged_at = 0;
+                    }
+
                     // The model can put itself into plan mode, for when the user asked for
                     // a plan rather than for the work. Nothing to approve: this only ever
                     // takes capability away, and present_plan is where consent is needed.
@@ -905,7 +1146,7 @@ Usage: /set <name> <value>, or /set <name> unset
 
                         // A terminal that cannot be read from must not be taken as
                         // approval — the same rule the permission prompt follows.
-                        let content = match review_plan(&plan) {
+                        let content = match ask_about_plan(keys.as_mut(), &plan).await {
                             Ok(PlanDecision::Approve) => {
                                 mode = Mode::Normal;
                                 outln!("\n✓ Plan approved — starting work.\n");
@@ -997,12 +1238,17 @@ Usage: /set <name> <value>, or /set <name> unset
                         // hang. Erased once it lands, because the outcome belongs on the
                         // call line below — left standing, every single call would cost two
                         // lines of log to say one thing.
-                        crate::out::transient("  🤖 Reviewing this call…");
-                        let verdict = tokio::select! {
-                            verdict = judge_tool_call(&lm_client, tool_name, &arguments) => Some(verdict),
-                            _ = tokio::signal::ctrl_c() => None,
-                        };
-                        crate::out::clear_transient();
+                        let status = status_line(&lm_client.model, &messages, context_tokens);
+                        let verdict = work_with_input(
+                            &mut keys,
+                            &mut editor,
+                            &mut mode,
+                            &mut queued,
+                            &status,
+                            "🤖 Reviewing this call…",
+                            judge_tool_call(&lm_client, tool_name, &arguments),
+                        )
+                        .await;
 
                         match verdict {
                             Some(Ok(Verdict { allow: true, reason })) => {
@@ -1084,11 +1330,14 @@ Usage: /set <name> <value>, or /set <name> unset
                         // Ask for permission with diff if available. A terminal we cannot
                         // read from (piped stdin, no TTY) must not end the session, and must
                         // never be taken as consent: refuse the call and tell the model.
-                        let response = match ask_permission(
+                        let response = match ask_about_call(
+                            keys.as_mut(),
                             &allow_all_label,
                             &description,
                             diff_content.as_deref(),
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(response) => response,
                             Err(e) => {
                                 outln!("\n[error] could not ask for permission: {}", e);
@@ -1150,10 +1399,18 @@ Usage: /set <name> <value>, or /set <name> unset
                         }
                     }
 
-                    let executed = tokio::select! {
-                        result = server.execute_tool(tool_name, arguments) => Some(result),
-                        _ = tokio::signal::ctrl_c() => None,
-                    };
+                    let status = status_line(&lm_client.model, &messages, context_tokens);
+                    let busy = format!("{}…", tool_name);
+                    let executed = work_with_input(
+                        &mut keys,
+                        &mut editor,
+                        &mut mode,
+                        &mut queued,
+                        &status,
+                        &busy,
+                        server.execute_tool(tool_name, arguments),
+                    )
+                    .await;
 
                     let Some(result) = executed else {
                         outln!("\n[interrupted]\n");
@@ -1188,6 +1445,52 @@ Usage: /set <name> <value>, or /set <name> unset
                     break;
                 }
 
+                // The tool log makes a loop obvious to whoever is watching it scroll past,
+                // but the model reads none of that — every round looks to it like a fresh
+                // decision, which is why it can repeat one call fifty times. Saying the
+                // repetition out loud in the conversation is what breaks it, and it breaks
+                // it far earlier than the round cap. That matters most in auto mode, where
+                // the cap is the only backstop and nobody is watching it climb.
+                if run.0 >= LOOP_BREAK {
+                    outln!(
+                        "\n[stopped: '{}' was called {} times in a row with the same arguments]\n",
+                        run.1, run.0
+                    );
+                    // Whatever was typed while this ran is deliberately left queued: it
+                    // becomes the next prompt, which is where the user takes over.
+                    break;
+                }
+                if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
+                    nudged_at = run.0;
+                    outln!(
+                        "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
+                        run.1, run.0
+                    );
+                    // A user message rather than a system one: mid-conversation system
+                    // messages are ignored by some local models and rejected outright by
+                    // some servers, and this one has to land. The order is legal here for
+                    // the same reason the queued text below is — every tool call in this
+                    // round already has its result.
+                    messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "You have called '{}' with the same arguments {} times in a \
+                             row. Get out of the loop — calling it again will not tell you \
+                             anything you have not already been told. Take a different \
+                             approach, or stop and say what you are stuck on.",
+                            run.1, run.0
+                        )
+                    }));
+                }
+
+                // Anything typed while this round ran joins the conversation here, where
+                // every tool call already has its result. Any sooner would put a user
+                // message between an assistant turn and the tool results it is waiting
+                // for, which is a message order servers reject outright.
+                for text in queued.drain(..) {
+                    messages.push(json!({"role": "user", "content": text}));
+                }
+
                 // Continue the loop to get next response (might be more tool calls or final answer)
                 continue;
             } else {
@@ -1210,7 +1513,7 @@ Usage: /set <name> <value>, or /set <name> unset
 
         // Persisted every turn, so a crash does not cost the session's history.
         if let Some(path) = &history_path {
-            let _ = editor.save_history(path);
+            crate::input::save_history(path, editor.history());
         }
         if let Some(path) = &session_path {
             let todos = server.todos.lock().unwrap().clone();
@@ -1219,7 +1522,7 @@ Usage: /set <name> <value>, or /set <name> unset
     }
 
     if let Some(path) = &history_path {
-        let _ = editor.save_history(path);
+        crate::input::save_history(path, editor.history());
     }
 
     // Every way out of the loop lands here, so a dev server started mid-session does not

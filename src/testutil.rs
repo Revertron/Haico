@@ -214,6 +214,7 @@ pub(crate) fn settings_of(
         top_p: at(top_p),
         top_k: at(top_k),
         repeat_penalty: at(repeat_penalty),
+        use_system_prompt: true,
     }
     }
 

@@ -88,6 +88,52 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
         .replace("$last_5_commits", &last_5_commits)
 }
 
+// Assemble the system message: haico's own prompt — the built-in one, or whatever
+// --system-prompt supplied — with the project's instructions appended.
+//
+// `use_system_prompt` comes from the model's own config section. A model fine-tuned with
+// its own baked-in instructions can be made worse by a second set layered on top, so ours
+// is dropped for it while the project's own instructions still go through.
+//
+// None when that leaves nothing to say at all: such a model, in a directory with no
+// instruction file, gets no system message rather than an empty one.
+
+pub(crate) fn compose_system_prompt(
+    custom: Option<&str>,
+    model: &str,
+    use_system_prompt: bool,
+    project_context: Option<&(String, String)>,
+) -> Option<String> {
+    let mut content = if !use_system_prompt {
+        String::new()
+    } else if let Some(custom) = custom {
+        custom.to_string()
+    } else {
+        build_system_prompt(model)
+    };
+
+    // Appended to whichever prompt is in use, so a custom --system-prompt gets the
+    // project's instructions too, and a model configured without ours still gets these.
+    if let Some((name, project)) = project_context {
+        if content.is_empty() {
+            content = format!("# Project instructions ({})\n\n{}", name, project);
+        } else {
+            content.push_str(&format!(
+                "\n\n# Project instructions ({})\n\n\
+                 The following comes from this project and takes precedence over the general \
+                 guidance above wherever the two disagree.\n\n{}",
+                name, project
+            ));
+        }
+    }
+
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
 // Model response structures
 
 pub(crate) const PROJECT_CONTEXT_FILES: &[&str] = &["HAICO.md", "AGENTS.md", "CLAUDE.md"];

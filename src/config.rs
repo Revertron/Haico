@@ -197,6 +197,11 @@ pub(crate) fn parse_config() -> Result<Config> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelSettingsFile {
     pub(crate) context: Option<usize>,
+    // Whether haico's own system prompt is sent for this model. Per-model only and true
+    // unless said otherwise: a model fine-tuned with its own baked-in instructions can be
+    // made worse by a second set layered on top, and that is a property of the model, not
+    // of the machine or the project.
+    pub(crate) use_system_prompt: Option<bool>,
     pub(crate) temperature: Option<f64>,
     pub(crate) max_tokens: Option<u64>,
     pub(crate) top_p: Option<f64>,
@@ -322,6 +327,9 @@ pub(crate) struct ResolvedSettings {
     pub(crate) top_p: Setting<f64>,
     pub(crate) top_k: Setting<u64>,
     pub(crate) repeat_penalty: Setting<f64>,
+    // Not layered like the rest: it only exists per model, so there is nothing to fall
+    // through to. Absent means true.
+    pub(crate) use_system_prompt: bool,
 }
 
 // Apply the layers for a specific model: command line / environment first, then that
@@ -360,6 +368,7 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
             per_model.repeat_penalty,
             config.file.repeat_penalty,
         ),
+        use_system_prompt: per_model.use_system_prompt.unwrap_or(true),
     }
 }
 
@@ -398,6 +407,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  top_p          = 0.95");
     println!("  top_k          = 40");
     println!("  repeat_penalty = 1.1");
+    println!("  use_system_prompt = false  # send only the project's own instructions");
     println!("\nAnything left out is omitted from the request, so the server's own setting");
     println!("for that model still applies. top_k and repeat_penalty are extensions that");
     println!("llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
@@ -517,6 +527,50 @@ mod tests {
         assert_eq!(bare.top_p.value, None);
         assert_eq!(bare.top_k.value, None);
         assert_eq!(bare.repeat_penalty.value, None);
+    }
+
+
+    #[test]
+    fn a_model_can_be_configured_without_haico_s_own_prompt() {
+        use crate::{compose_system_prompt, resolve_settings};
+
+        let config = config_with(
+            r#"
+            [models."raw-model"]
+            use_system_prompt = false
+
+            [models."guided-model"]
+            temperature = 0.2
+        "#,
+        );
+
+        // Only the model that asked for it loses the prompt; absent means true, so no
+        // existing config changes behavior.
+        assert!(!resolve_settings(&config, "raw-model").use_system_prompt);
+        assert!(resolve_settings(&config, "guided-model").use_system_prompt);
+        assert!(resolve_settings(&config, "never-heard-of-it").use_system_prompt);
+
+        let project = ("CLAUDE.md".to_string(), "PROJECT RULES".to_string());
+
+        // Off: the project's own instructions still go through, ours does not — including
+        // a custom one supplied with --system-prompt.
+        let bare = compose_system_prompt(Some("CUSTOM"), "raw-model", false, Some(&project))
+            .expect("project instructions still make a system message");
+        assert!(bare.contains("PROJECT RULES"));
+        assert!(!bare.contains("CUSTOM"));
+        assert!(!bare.contains("# Tone and style"), "got: {}", bare);
+
+        // ...and with nothing to say at all there is no system message to send.
+        assert!(compose_system_prompt(Some("CUSTOM"), "raw-model", false, None).is_none());
+
+        // On: unchanged from before — custom prompt if given, ours otherwise, project
+        // instructions appended either way.
+        let custom = compose_system_prompt(Some("CUSTOM"), "guided-model", true, Some(&project))
+            .expect("a prompt is in force");
+        assert!(custom.starts_with("CUSTOM"));
+        assert!(custom.contains("PROJECT RULES"));
+        let ours = compose_system_prompt(None, "guided-model", true, None).expect("built-in");
+        assert!(ours.contains("guided-model"));
     }
 
 

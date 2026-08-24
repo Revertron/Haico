@@ -193,11 +193,15 @@ impl LMStudioClient {
             return Ok(content.to_string());
         }
 
-        // Some models put everything in `reasoning` and send empty content. Falling back to
-        // it beats reporting an empty reply as a server failure.
-        let reasoning = message["reasoning"].as_str().unwrap_or("").trim();
-        if !reasoning.is_empty() {
-            return Ok(reasoning.to_string());
+        // Some models put everything in the reasoning field and send empty content. Falling
+        // back to it beats reporting an empty reply as a server failure. Both spellings are
+        // in the wild, and a reviewer verdict lost to the wrong key would gate a call that
+        // the model actually approved.
+        for key in ["reasoning_content", "reasoning"] {
+            let reasoning = message[key].as_str().unwrap_or("").trim();
+            if !reasoning.is_empty() {
+                return Ok(reasoning.to_string());
+            }
         }
 
         bail!("the model returned an empty reply")
@@ -450,8 +454,12 @@ impl StreamAssembler {
             "content": self.content,
         });
 
+        // Echoed back under the key the thinking-model chat templates read (Qwen3,
+        // DeepSeek-R1 and friends), whichever of the two keys it arrived under, so the
+        // model is shown its own chain of thought on the next round instead of having it
+        // silently dropped by the template.
         if !self.reasoning.is_empty() {
-            message["reasoning"] = json!(self.reasoning);
+            message["reasoning_content"] = json!(self.reasoning);
         }
 
         // A fragment that never carried a name is a hole in the stream, not a call.
@@ -597,7 +605,7 @@ mod tests {
         assembler.push(&json!({"choices": [{"delta": {"reasoning": "hmm"}}]}));
         let message = assembler.into_message();
         assert_eq!(message["content"], "");
-        assert_eq!(message["reasoning"], "hmm");
+        assert_eq!(message["reasoning_content"], "hmm");
         assert!(message.get("tool_calls").is_none());
 
         // A server that omits the id still yields something we can echo back as

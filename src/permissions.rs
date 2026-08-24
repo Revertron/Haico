@@ -1,15 +1,12 @@
 //! What a tool call needs before it runs, and how the user is asked.
 
+use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::util::truncate_at_boundary;
 use crate::workspace::Workspace;
-use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
+use anyhow::{anyhow, Result};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io;
 use std::path::PathBuf;
 
 pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
@@ -349,7 +346,12 @@ pub(crate) fn gate_for(workspace: &Workspace, tool_name: &str, arguments: &Value
 
 // Generate a colored diff with line numbers, showing only context around changes
 
-pub(crate) fn ask_permission(allow_all_label: &str, description: &str, diff: Option<&str>) -> Result<PermissionResponse> {
+pub(crate) async fn ask_permission(
+    keys: &mut Keys,
+    allow_all_label: &str,
+    description: &str,
+    diff: Option<&str>,
+) -> Result<PermissionResponse> {
     outln!("🔒 Allow this tool usage?");
     outln!("{}\n", description);
 
@@ -362,52 +364,48 @@ pub(crate) fn ask_permission(allow_all_label: &str, description: &str, diff: Opt
     outln!("3. Reject and provide alternative");
     crate::out::flush();
 
-    // Enable raw mode
-    enable_raw_mode()?;
-
     let response = loop {
-        if let Event::Key(key_event) = event::read()? {
-            // Only process key press events, ignore key release
-            if key_event.kind != KeyEventKind::Press {
-                continue;
+        let Some(Event::Key(key_event)) = keys.next().await else {
+            // The keyboard reader is gone, which is not consent.
+            return Err(anyhow!("no interactive terminal to ask for permission"));
+        };
+
+        // Only process key press events, ignore key release
+        if key_event.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key_event.code {
+            KeyCode::Char('1') => {
+                break PermissionResponse::Allow;
             }
+            KeyCode::Char('2') => {
+                break PermissionResponse::AllowAll;
+            }
+            KeyCode::Char('3') => {
+                outln!("3\n");
 
-            match key_event.code {
-                KeyCode::Char('1') => {
-                    break PermissionResponse::Allow;
-                }
-                KeyCode::Char('2') => {
-                    break PermissionResponse::AllowAll;
-                }
-                KeyCode::Char('3') => {
-                    // Disable raw mode to get text input
-                    disable_raw_mode()?;
-                    outln!("3\n");
+                let mut editor = Editor::new(Vec::new());
+                let alternative = match read_text(keys, &mut editor, "> ").await {
+                    Input::Text(text) => text,
+                    // Backing out of the question is not an answer to it, so it is the
+                    // same as rejecting with nothing to say.
+                    _ => String::new(),
+                };
+                outln!("{}", echo("> ", &alternative));
 
-                    out!("> ");
-                    crate::out::flush();
-
-                    let mut alternative = String::new();
-                    io::stdin().read_line(&mut alternative)?;
-
-                    break PermissionResponse::Reject(alternative.trim().to_string());
-                }
-                _ => {
-                    // Invalid key, continue waiting
-                    continue;
-                }
+                break PermissionResponse::Reject(alternative.trim().to_string());
+            }
+            _ => {
+                // Invalid key, continue waiting
+                continue;
             }
         }
     };
 
-    // Disable raw mode if not already disabled
-    let _ = disable_raw_mode();
-
-    // Drain any remaining events from the input buffer to prevent key queue issues
-    use std::time::Duration;
-    while event::poll(Duration::from_millis(0))? {
-        let _ = event::read()?;
-    }
+    // Anything typed while the question was on screen was not meant for whatever comes
+    // after it.
+    keys.drain();
 
     Ok(response)
 }

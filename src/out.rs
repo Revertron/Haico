@@ -7,10 +7,12 @@
 //! translation, so "\n" has to become "\r\n" in one place rather than at two
 //! hundred call sites.
 //!
-//! Nothing turns raw mode on yet. `set_raw` is here for the input rework and stays
-//! off until then, so what reaches the terminal today is byte for byte what the
-//! `println!` calls this replaced produced.
+//! The bottom of the screen is a *region*: a few rows holding the input box, owned
+//! by this module and redrawn around anything else that gets printed. Finished
+//! output still scrolls into the terminal's own scrollback above it, so selecting
+//! and copying it works the way it does in any other program.
 
+use crossterm::cursor::{Hide, MoveRight, MoveToColumn, MoveUp, Show};
 use crossterm::terminal::{Clear, ClearType};
 use std::fmt;
 use std::io::{self, Write};
@@ -18,21 +20,47 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 struct Out {
     raw: bool,
-    // Whether a transient status line is sitting on the current row waiting to be
-    // erased. Anything else printed has to erase it first, or the two overlap.
-    transient: bool,
+    // Whether the cursor is sitting at the start of a row. The region has to begin on
+    // one of its own, so a half-finished line gets a newline before it is drawn.
+    at_line_start: bool,
+    // The rows of the input region, already wrapped to the terminal width, and where
+    // the cursor belongs inside them. Empty when there is no region on screen.
+    region: Vec<String>,
+    caret: (usize, usize),
+    region_drawn: bool,
+    // How far below the top of the drawn block the cursor was left, so erasing it
+    // walks back exactly as far as drawing walked forward.
+    drawn_caret_row: usize,
+    // A line of output that has not ended yet. The model streams a few characters at
+    // a time, and a half-finished line cannot go into the scrollback above the input
+    // box — the next fragment would have nowhere to continue from. It waits here and
+    // is drawn just above the box until its newline arrives.
+    pending: String,
     // Set by the tests so they can assert on what would have been written.
     capture: Option<String>,
 }
 
 impl Out {
-    // Show something, erasing a transient status line first if one is up.
+    // Show something, stepping around whatever is currently pinned to the bottom.
     fn emit(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.drop_transient();
-        self.put(text);
+        self.erase_region();
+
+        if self.region.is_empty() {
+            // Nothing is pinned, so there is nothing to hold a half-finished line back
+            // for: write it straight out, the way every other program does.
+            self.put(text);
+            return;
+        }
+
+        self.pending.push_str(text);
+        if let Some(end) = self.pending.rfind('\n') {
+            let completed: String = self.pending.drain(..=end).collect();
+            self.put(&completed);
+        }
+        self.draw_region();
     }
 
     fn put(&mut self, text: &str) {
@@ -54,6 +82,10 @@ impl Out {
         } else {
             self.write_out(text);
         }
+
+        if let Some(last) = text.chars().last() {
+            self.at_line_start = last == '\n';
+        }
     }
 
     fn write_out(&mut self, text: &str) {
@@ -64,13 +96,122 @@ impl Out {
         }
     }
 
-    fn drop_transient(&mut self) {
-        if !self.transient {
+    // Take the region off the screen, leaving the cursor where the region started.
+    // Everything below that point is the region's own, so clearing to the end of the
+    // screen cannot eat anything else.
+    fn erase_region(&mut self) {
+        if !self.region_drawn {
             return;
         }
-        self.transient = false;
-        self.put(&format!("\r{}", Clear(ClearType::CurrentLine)));
+        self.region_drawn = false;
+
+        let mut escapes = format!("{}{}", Hide, MoveToColumn(0));
+        if self.drawn_caret_row > 0 {
+            escapes.push_str(&MoveUp(self.drawn_caret_row as u16).to_string());
+        }
+        escapes.push_str(&Clear(ClearType::FromCursorDown).to_string());
+        escapes.push_str(&Show.to_string());
+        self.write_out(&escapes);
+        self.at_line_start = true;
     }
+
+    // How many screen rows a line of text takes up, given that the terminal wraps it
+    // itself. Escape sequences move the cursor nowhere, so they do not count.
+    fn rows_used(text: &str) -> usize {
+        let width = terminal_width();
+        let visible = visible_width(text);
+        if visible == 0 {
+            1
+        } else {
+            (visible - 1) / width + 1
+        }
+    }
+
+    fn draw_region(&mut self) {
+        if self.region.is_empty() || self.region_drawn {
+            return;
+        }
+        if !self.at_line_start {
+            self.put("\n");
+        }
+
+        self.write_out(&Hide.to_string());
+
+        // The unfinished line goes above the box, and its own wrapping is left to the
+        // terminal: it carries colors, and re-wrapping it here would mean cutting
+        // escape sequences in half.
+        let pending_rows = if self.pending.is_empty() {
+            0
+        } else {
+            let pending = self.pending.clone();
+            self.put(&pending);
+            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
+            self.put("\n");
+            Self::rows_used(&pending)
+        };
+
+        for (index, row) in self.region.clone().iter().enumerate() {
+            if index > 0 {
+                self.put("\n");
+            }
+            self.put(row);
+            // The row that was here before may have been longer.
+            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
+        }
+
+        // The cursor ends up after the last row; walk it back to where the caret is.
+        let last = pending_rows + self.region.len() - 1;
+        let caret_row = pending_rows + self.caret.0;
+        let mut escapes = String::new();
+        if last > caret_row {
+            escapes.push_str(&MoveUp((last - caret_row) as u16).to_string());
+        }
+        escapes.push_str(&MoveToColumn(0).to_string());
+        if self.caret.1 > 0 {
+            escapes.push_str(&MoveRight(self.caret.1 as u16).to_string());
+        }
+        escapes.push_str(&Show.to_string());
+        self.write_out(&escapes);
+
+        self.drawn_caret_row = caret_row;
+        self.region_drawn = true;
+        if self.capture.is_none() {
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
+fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(80)
+        .max(1)
+}
+
+// How wide a string prints. Escape sequences take no space, and counting them would
+// make every colored line look several times longer than it is.
+pub(crate) fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            width += 1;
+            continue;
+        }
+        // CSI sequences run until a byte in @..~; anything else is a two-character
+        // escape. Either way none of it lands on the screen.
+        match chars.next() {
+            Some('[') => {
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    width
 }
 
 // A panic while the lock is held would otherwise poison it and take the whole
@@ -80,7 +221,12 @@ fn lock() -> MutexGuard<'static, Out> {
     OUT.get_or_init(|| {
         Mutex::new(Out {
             raw: false,
-            transient: false,
+            at_line_start: true,
+            region: Vec::new(),
+            caret: (0, 0),
+            region_drawn: false,
+            drawn_caret_row: 0,
+            pending: String::new(),
             capture: None,
         })
     })
@@ -104,35 +250,55 @@ pub(crate) fn flush() {
     }
 }
 
-// Whether line feeds need a carriage return in front of them. Off until the input
-// rework takes raw mode for the whole session, which is the only caller it is
-// waiting for.
-#[allow(dead_code)]
+// Whether line feeds need a carriage return in front of them. On for as long as the
+// input loop holds raw mode.
 pub(crate) fn set_raw(raw: bool) {
     lock().raw = raw;
 }
 
-// A line that is going to be erased again: a spinner, a "working on it" note. It
-// stays on its row until something else is printed or `clear_transient` runs.
-pub(crate) fn transient(text: &str) {
+// Put the input box on the bottom of the screen, or move it. The rows are physical
+// ones: whatever draws them is responsible for wrapping them to the terminal width,
+// because it is also the only thing that knows where the cursor belongs afterwards.
+pub(crate) fn set_region(rows: Vec<String>, caret_row: usize, caret_col: usize) {
     let mut state = lock();
-    state.drop_transient();
-    state.put(text);
-    state.transient = true;
-    if state.capture.is_none() {
-        let _ = io::stdout().flush();
+    state.erase_region();
+    state.region = rows;
+    state.caret = (caret_row, caret_col);
+    state.draw_region();
+}
+
+// Take the input box off the screen and leave it off. Whatever line was waiting for
+// its newline is written out as it stands: with nothing pinned below it, the next
+// thing printed can simply continue it.
+pub(crate) fn clear_region() {
+    let mut state = lock();
+    state.erase_region();
+    state.region.clear();
+    state.caret = (0, 0);
+    if !state.pending.is_empty() {
+        let pending = std::mem::take(&mut state.pending);
+        state.put(&pending);
     }
 }
 
-pub(crate) fn clear_transient() {
-    lock().drop_transient();
+// The writer is a global, so two tests capturing at once would read each other's
+// output. Everything that captures takes this first.
+#[cfg(test)]
+pub(crate) fn capture_guard() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 pub(crate) fn start_capture() {
     let mut state = lock();
     state.raw = false;
-    state.transient = false;
+    state.at_line_start = true;
+    state.region.clear();
+    state.caret = (0, 0);
+    state.region_drawn = false;
+    state.drawn_caret_row = 0;
+    state.pending.clear();
     state.capture = Some(String::new());
 }
 
@@ -154,14 +320,9 @@ macro_rules! outln {
 
 #[cfg(test)]
 mod tests {
-    // One test at a time: the writer is a global, so two tests capturing at once
-    // would read each other's output.
-    use std::sync::Mutex;
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     #[test]
     fn raw_mode_returns_the_carriage_on_every_line_feed() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::capture_guard();
 
         super::start_capture();
         outln!("one");
@@ -178,22 +339,56 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_line_is_erased_by_whatever_comes_next() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fn output_steps_over_the_region_and_puts_it_back() {
+        let _guard = super::capture_guard();
+
+        // A line printed while the region is up: the region comes off first, the line
+        // lands in the scrollback, and the region goes back on below it.
+        super::start_capture();
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        outln!("a result");
+        let written = super::take_capture();
+        let erase = written.find("[J").expect("the region should be cleared first");
+        let line = written.find("a result").expect("the line should be written");
+        let redraw = written.rfind("> hello").expect("the region should be redrawn");
+        assert!(erase < line && line < redraw, "wrong order in {:?}", written);
+
+        // And once it is cleared it stays off.
+        super::start_capture();
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        super::clear_region();
+        let written = super::take_capture();
+        let gone = written.rfind("[J").expect("the region should be cleared");
+        assert!(
+            written[gone..].find("> hello").is_none(),
+            "the region came back in {:?}",
+            written
+        );
+    }
+
+    #[test]
+    fn a_half_finished_line_waits_above_the_region_until_its_newline() {
+        let _guard = super::capture_guard();
 
         super::start_capture();
-        super::transient("working…");
-        outln!("done");
-        let written = super::take_capture();
-        assert!(written.starts_with("working…\r"), "got {:?}", written);
-        assert!(written.ends_with("done\n"), "got {:?}", written);
+        super::set_region(vec!["> ".to_string()], 0, 2);
 
-        // And erasing it twice does not emit the escape twice.
-        super::start_capture();
-        super::transient("working…");
-        super::clear_transient();
-        super::clear_transient();
+        // Streamed in pieces, none of which ends the line. Each redraw carries the whole
+        // line so far, so the fragments never land on top of each other — and the
+        // newline is what finally commits it to the scrollback, exactly once.
+        out!("one ");
+        out!("two");
+        out!(" three\n");
         let written = super::take_capture();
-        assert_eq!(written.matches('\r').count(), 1, "got {:?}", written);
+        assert!(written.contains("one two three\n"), "got {:?}", written);
+        assert_eq!(written.matches("one two three").count(), 1, "got {:?}", written);
+
+        // Taking the region away flushes whatever is still waiting for its newline.
+        super::start_capture();
+        super::set_region(vec!["> ".to_string()], 0, 2);
+        out!("tail");
+        super::clear_region();
+        let written = super::take_capture();
+        assert!(written.ends_with("tail"), "got {:?}", written);
     }
 }

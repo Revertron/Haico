@@ -66,11 +66,36 @@ pub(crate) fn session_file_path_for(cwd: &std::path::Path) -> Option<PathBuf> {
     )
 }
 
+// Where the conversation proper starts. The system message is optional — a model can be
+// configured without haico's prompt, and in a project with no instruction file that leaves
+// none at all — so index 0 cannot be assumed to be it.
+
+pub(crate) fn history_start(messages: &[Value]) -> usize {
+    usize::from(messages.first().is_some_and(|m| m["role"] == "system"))
+}
+
+// Put the system message in place, replacing or removing whatever is there now. Used when
+// /model switches to a model whose config asks for a different prompt.
+
+pub(crate) fn set_system_message(messages: &mut Vec<Value>, content: Option<&str>) {
+    let present = history_start(messages) == 1;
+    match (present, content) {
+        (true, Some(content)) => messages[0] = json!({"role": "system", "content": content}),
+        (true, None) => {
+            messages.remove(0);
+        }
+        (false, Some(content)) => {
+            messages.insert(0, json!({"role": "system", "content": content}))
+        }
+        (false, None) => {}
+    }
+}
+
 // Persist the conversation so closing the terminal does not lose it.
 
 pub(crate) fn save_session(path: &std::path::Path, messages: &[Value], model: &str, todos: &[TodoItem]) {
     // Skip the system prompt: it is rebuilt on load.
-    let Some(rest) = messages.get(1..) else { return };
+    let Some(rest) = messages.get(history_start(messages)..) else { return };
 
     let session = SavedSession {
         version: SESSION_FORMAT_VERSION,
@@ -155,7 +180,7 @@ pub(crate) fn report_context(messages: &[Value], context_tokens: usize) {
 pub(crate) fn render_transcript(messages: &[Value]) -> String {
     let mut out = String::new();
 
-    for message in messages.iter().skip(1) {
+    for message in messages.iter().skip(history_start(messages)) {
         let role = message["role"].as_str().unwrap_or("?");
 
         if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
@@ -189,7 +214,8 @@ pub(crate) fn render_transcript(messages: &[Value]) -> String {
 // server checks cannot be broken by this.
 
 pub(crate) async fn compact_history(client: &LMStudioClient, messages: &mut Vec<Value>) -> Result<String> {
-    if messages.len() <= 2 {
+    let start = history_start(messages);
+    if messages.len() <= start + 1 {
         bail!("nothing to compact yet");
     }
 
@@ -211,9 +237,11 @@ pub(crate) async fn compact_history(client: &LMStudioClient, messages: &mut Vec<
         bail!("the model returned an empty summary; history left untouched");
     }
 
-    let system = messages[0].clone();
+    let system = messages.first().filter(|_| start == 1).cloned();
     messages.clear();
-    messages.push(system);
+    if let Some(system) = system {
+        messages.push(system);
+    }
     messages.push(json!({
         "role": "user",
         "content": format!("Notes from the conversation so far:\n\n{}", summary)

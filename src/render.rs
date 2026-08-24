@@ -1,18 +1,19 @@
 //! Terminal rendering: markdown, diffs, and the model picker.
 
+use crate::input::Keys;
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{Event, KeyCode, KeyEventKind},
     execute,
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    terminal::{Clear, ClearType},
 };
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &str) -> Result<String> {
@@ -236,75 +237,99 @@ pub(crate) fn is_markdown(text: &str) -> bool {
 // Render Markdown text with colors and formatting for terminal output
 
 
-pub(crate) fn render_markdown(text: &str) -> String {
-    let mut rendered = String::new();
-    let mut in_code_block = false;
-    let mut code_lang = String::new();
 
-    for line in text.lines() {
+// Markdown as it arrives.
+//
+// A stream cannot be rendered a fragment at a time: "**bold**" turns up as several
+// pieces and means nothing until its closing pair lands. A whole line can be, and a
+// line is the unit markdown is written in — so text waits here until its newline and
+// is rendered then, with the code-fence state carried from one line to the next.
+pub(crate) struct MarkdownStream {
+    buffer: String,
+    in_code_block: bool,
+}
+
+impl MarkdownStream {
+    pub(crate) fn new() -> Self {
+        MarkdownStream {
+            buffer: String::new(),
+            in_code_block: false,
+        }
+    }
+
+    // Whatever is now complete, rendered. Anything after the last newline stays behind
+    // until the rest of it arrives.
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        self.buffer.push_str(text);
+        let mut rendered = String::new();
+        while let Some(end) = self.buffer.find('\n') {
+            let line: String = self.buffer.drain(..=end).collect();
+            rendered.push_str(&self.line(line.trim_end_matches('\n'), true));
+        }
+        rendered
+    }
+
+    // The last line, which the model usually ends without a newline of its own.
+    pub(crate) fn finish(&mut self, newline: bool) -> String {
+        if self.buffer.is_empty() {
+            return String::new();
+        }
+        let line = std::mem::take(&mut self.buffer);
+        self.line(&line, newline)
+    }
+
+    fn line(&mut self, line: &str, newline: bool) -> String {
+        let ending = if newline { "\n" } else { "" };
         let trimmed = line.trim();
 
         // Handle code blocks
         if trimmed.starts_with("```") {
-            if in_code_block {
-                // End of code block
-                in_code_block = false;
-                code_lang.clear();
-            } else {
-                // Start of code block
-                in_code_block = true;
-                code_lang = trimmed.trim_start_matches("```").to_string();
-            }
-            continue;
+            self.in_code_block = !self.in_code_block;
+            return String::new();
         }
 
-        if in_code_block {
+        if self.in_code_block {
             // Render code with dark grey background
-            let _ = write!(
-                rendered,
-                "{}{}  {}{}\n",
+            return format!(
+                "{}{}  {}{}{}",
                 SetBackgroundColor(Color::Grey),
                 SetForegroundColor(Color::Black),
                 line,
-                ResetColor
+                ResetColor,
+                ending
             );
-            continue;
         }
 
         // Handle headers
-        if trimmed.starts_with("# ") {
-            let _ = write!(
-                rendered,
-                "{}\n{}\n{}",
-                SetForegroundColor(Color::Cyan),
-                trimmed.trim_start_matches("# "),
-                ResetColor
-            );
-            continue;
-        } else if trimmed.starts_with("## ") {
-            let _ = write!(
-                rendered,
-                "{}\n{}\n{}",
-                SetForegroundColor(Color::Cyan),
-                trimmed.trim_start_matches("## "),
-                ResetColor
-            );
-            continue;
-        } else if trimmed.starts_with("### ") {
-            let _ = write!(
-                rendered,
-                "{}\n{}\n{}",
-                SetForegroundColor(Color::Blue),
-                trimmed.trim_start_matches("### "),
-                ResetColor
-            );
-            continue;
+        for (marker, color) in [
+            ("# ", Color::Cyan),
+            ("## ", Color::Cyan),
+            ("### ", Color::Blue),
+        ] {
+            if trimmed.starts_with(marker) {
+                return format!(
+                    "{}\n{}{}{}",
+                    SetForegroundColor(color),
+                    trimmed.trim_start_matches(marker),
+                    ending,
+                    ResetColor
+                );
+            }
         }
 
         // Process inline formatting
-        rendered.push_str(&render_inline_markdown(line));
+        let mut rendered = render_inline_markdown(line);
+        if !newline {
+            rendered.truncate(rendered.trim_end_matches('\n').len());
+        }
+        rendered
     }
+}
 
+pub(crate) fn render_markdown(text: &str) -> String {
+    let mut stream = MarkdownStream::new();
+    let mut rendered = stream.push(text);
+    rendered.push_str(&stream.finish(true));
     rendered
 }
 
@@ -351,20 +376,18 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
         // Check for italic (*text* or _text_)
         if chars[i] == '*' || chars[i] == '_' {
             let marker = chars[i];
-            if let Some(end) = find_closing(marker, &chars, i + 1) {
-                // Make sure it's not part of **
-                if marker == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    rendered.push(chars[i]);
-                    i += 1;
+            // Make sure it's not part of **
+            let part_of_bold = marker == '*' && i + 1 < chars.len() && chars[i + 1] == '*';
+            if !part_of_bold && opens_emphasis(marker, &chars, i) {
+                if let Some(end) = closing_emphasis(marker, &chars, i + 1) {
+                    let _ = write!(rendered, "{}", SetForegroundColor(Color::Green));
+                    for j in (i + 1)..end {
+                        rendered.push(chars[j]);
+                    }
+                    let _ = write!(rendered, "{}", ResetColor);
+                    i = end + 1;
                     continue;
                 }
-                let _ = write!(rendered, "{}", SetForegroundColor(Color::Green));
-                for j in (i + 1)..end {
-                    rendered.push(chars[j]);
-                }
-                let _ = write!(rendered, "{}", ResetColor);
-                i = end + 1;
-                continue;
             }
         }
 
@@ -404,6 +427,45 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
 }
 
 // Find closing character from a starting position
+
+// Whether a '*' or '_' at this position is opening emphasis rather than just sitting
+// in the middle of something.
+//
+// Without this, rendering every line as markdown mangles the text this tool spends
+// most of its time on: `load_project_context and build_system_prompt` has four
+// underscores in it, and the naive rule turns the middle of two identifiers green.
+// The test is the one CommonMark uses, cut down: an opener is followed by something
+// other than a space, and an underscore additionally may not sit inside a word.
+fn opens_emphasis(marker: char, chars: &[char], at: usize) -> bool {
+    let next = chars.get(at + 1);
+    if !next.is_some_and(|ch| !ch.is_whitespace()) {
+        return false;
+    }
+    if marker == '_' {
+        if at > 0 && chars[at - 1].is_alphanumeric() {
+            return false;
+        }
+    }
+    true
+}
+
+// The matching close: not preceded by a space, and for an underscore not glued to the
+// front of a word either.
+fn closing_emphasis(marker: char, chars: &[char], start: usize) -> Option<usize> {
+    for i in start..chars.len() {
+        if chars[i] != marker {
+            continue;
+        }
+        if i == start || chars[i - 1].is_whitespace() {
+            continue;
+        }
+        if marker == '_' && chars.get(i + 1).is_some_and(|ch| ch.is_alphanumeric()) {
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
 
 pub(crate) fn find_closing(marker: char, chars: &[char], start: usize) -> Option<usize> {
     for i in start..chars.len() {
@@ -882,21 +944,16 @@ pub(crate) fn render_text(text: &str) -> String {
 
 // Interactive model selection using arrow keys
 
-pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
+pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String>) -> Result<String> {
     if models.is_empty() {
         return Err(anyhow::anyhow!("No models available"));
     }
 
     let mut selected_index = 0;
 
-    outln!("Select a model (use Up/Down arrows, Enter to confirm):\n");
-
-    // Enable raw mode for key events
-    enable_raw_mode()?;
-
     loop {
         // Clear screen and move cursor to top
-        execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        out!("{}{}", cursor::MoveTo(0, 0), Clear(ClearType::All));
 
         outln!("Select a model (use Up/Down arrows, Enter to confirm):\n");
 
@@ -912,42 +969,41 @@ pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
         crate::out::flush();
 
         // Read key event
-        if let Event::Key(key_event) = event::read()? {
-            // Only process key press events, ignore key release
-            if key_event.kind != KeyEventKind::Press {
-                continue;
-            }
+        let Some(Event::Key(key_event)) = keys.next().await else {
+            return Err(anyhow::anyhow!("no interactive terminal to pick a model"));
+        };
 
-            match key_event.code {
-                KeyCode::Up => {
-                    if selected_index > 0 {
-                        selected_index -= 1;
-                    }
+        // Only process key press events, ignore key release
+        if key_event.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key_event.code {
+            KeyCode::Up => {
+                if selected_index > 0 {
+                    selected_index -= 1;
                 }
-                KeyCode::Down => {
-                    if selected_index < models.len() - 1 {
-                        selected_index += 1;
-                    }
+            }
+            KeyCode::Down => {
+                if selected_index < models.len() - 1 {
+                    selected_index += 1;
                 }
-                KeyCode::Enter => {
-                    // Selection confirmed
-                    break;
-                }
-                KeyCode::Esc => {
-                    disable_raw_mode()?;
-                    return Err(anyhow::anyhow!("Model selection cancelled"));
-                }
-                _ => {
-                    // Ignore other keys
-                }
+            }
+            KeyCode::Enter => {
+                // Selection confirmed
+                break;
+            }
+            KeyCode::Esc => {
+                return Err(anyhow::anyhow!("Model selection cancelled"));
+            }
+            _ => {
+                // Ignore other keys
             }
         }
     }
 
-    disable_raw_mode()?;
-
     // Clear screen one final time and show selection
-    execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    out!("{}{}", cursor::MoveTo(0, 0), Clear(ClearType::All));
     outln!("Selected model: {}\n", models[selected_index]);
 
     Ok(models[selected_index].clone())
@@ -955,3 +1011,66 @@ pub(crate) fn select_model_interactive(models: Vec<String>) -> Result<String> {
 
 // Configuration structure
 
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_renders_the_same_as_the_whole_text_at_once() {
+        const TEXT: &str = "# Title\nSome **bold** and `code`.\n\nplain line\ndone\n";
+        let whole = render_markdown(TEXT);
+
+        // Fed three characters at a time, the way a model sends it — the line breaks
+        // fall in the middle of chunks, which is the whole point.
+        let mut stream = MarkdownStream::new();
+        let mut piecemeal = String::new();
+        let chars: Vec<char> = TEXT.chars().collect();
+        for chunk in chars.chunks(3) {
+            piecemeal.push_str(&stream.push(&chunk.iter().collect::<String>()));
+        }
+        piecemeal.push_str(&stream.finish(true));
+
+        assert_eq!(piecemeal, whole);
+    }
+
+    #[test]
+    fn a_fence_opened_in_one_chunk_still_closes_in_another() {
+        let mut stream = MarkdownStream::new();
+        let mut rendered = stream.push("```rust\nlet x = 1;\n");
+        rendered.push_str(&stream.push("```\nafter\n"));
+
+        // The fenced line got the code background; the line after it did not.
+        assert!(rendered.contains("let x = 1;"));
+        let code = rendered.find("let x = 1;").unwrap();
+        let after = rendered.find("after").unwrap();
+        assert!(rendered[..code].contains("48;5;7"), "no code background: {:?}", rendered);
+        assert!(!rendered[code..after].ends_with("48;5;7"));
+    }
+
+    #[test]
+    fn identifiers_are_not_mistaken_for_emphasis() {
+        // The text this tool spends its life on: underscores inside words, and a lone
+        // asterisk between numbers. Both used to come out half green.
+        for plain in [
+            "call load_project_context and build_system_prompt",
+            "2 * 3 * 4",
+            "a_b_c_d",
+        ] {
+            assert_eq!(
+                render_inline_markdown(plain),
+                format!("{}\n", plain),
+                "{}",
+                plain
+            );
+        }
+    }
+
+    #[test]
+    fn emphasis_still_renders_where_it_is_meant() {
+        let rendered = render_inline_markdown("an *italic* and _another_ one");
+        assert!(!rendered.contains("*italic*"), "got {:?}", rendered);
+        assert!(!rendered.contains("_another_"), "got {:?}", rendered);
+        assert!(rendered.contains("italic") && rendered.contains("another"));
+    }
+}
