@@ -200,6 +200,8 @@ async fn work_with_input<T>(
             &crate::input::Chrome {
                 mode: *mode,
                 busy: Some(busy),
+                // Something is running, so the bar has better than history to show.
+                last: None,
                 status,
             },
         );
@@ -449,6 +451,10 @@ async fn main() -> Result<()> {
     // next prompt if the turn finished first.
     let mut queued: Vec<String> = Vec::new();
 
+    // What the bar above the box says once a run is over: the last thing that actually
+    // happened, rather than an empty row. None until the first tool has run.
+    let mut last_activity: Option<String> = None;
+
     outln!("Type /help for commands.\n");
 
     // Main loop
@@ -461,7 +467,7 @@ async fn main() -> Result<()> {
             match keys.as_mut() {
                 Some(keys) => {
                     let status = status_line(&lm_client.model, &messages, context_tokens);
-                    match read_command(keys, &mut editor, &mut mode, &status).await {
+                    match read_command(keys, &mut editor, &mut mode, &status, last_activity.as_deref()).await {
                         // The finished entry becomes a plain line of the transcript, so
                         // the conversation reads as one when scrolled back.
                         Input::Text(text) => {
@@ -999,7 +1005,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 // consistent, so the conversation is still usable.
                 if streamed_any {
                     out!("{}", markdown.finish(false));
-                    outln!();
+                    crate::out::ensure_line_start();
                 }
                 outln!("\n[interrupted]\n");
                 break;
@@ -1022,7 +1028,7 @@ Usage: /set <name> <value>, or /set <name> unset
 
             if streamed_any {
                 out!("{}", markdown.finish(false));
-                outln!();
+                crate::out::ensure_line_start();
             } else if let Some(reasoning) = message
                 .get("reasoning_content")
                 .or_else(|| message.get("reasoning"))
@@ -1036,7 +1042,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 // the server's message untouched.
                 out!("● ");
                 out!("{}", render_text(reasoning));
-                outln!();
+                crate::out::ensure_line_start();
             }
 
             // Check if model wants to call a tool
@@ -1422,6 +1428,17 @@ Usage: /set <name> <value>, or /set <name> unset
 
                     let status = status_line(&lm_client.model, &messages, context_tokens);
                     let busy = format!("{}…", tool_name);
+
+                    // Captured before the arguments move into the call. For a shell tool
+                    // the command is the thing that ran, so naming the tool as well would
+                    // only say "run_command" twice.
+                    let did = match crate::render::tool_call_summary(tool_name, &arguments) {
+                        summary if summary.is_empty() => format!("ran {}", tool_name),
+                        summary if matches!(tool_name, "run_command" | "run_background") => {
+                            format!("ran {}", summary)
+                        }
+                        summary => format!("ran {} {}", tool_name, summary),
+                    };
                     let executed = work_with_input(
                         &mut keys,
                         &mut editor,
@@ -1443,6 +1460,10 @@ Usage: /set <name> <value>, or /set <name> unset
                         interrupted = true;
                         break;
                     };
+
+                    // It ran, whatever it returned: a failed build is still the last
+                    // thing that happened, and the bar saying so is the point.
+                    last_activity = Some(did);
 
                     let tool_result = result.unwrap_or_else(|e| {
                         outln!("[ERROR] Tool execution failed: {:?}", e);

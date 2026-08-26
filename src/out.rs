@@ -244,6 +244,20 @@ pub(crate) fn write_line(args: fmt::Arguments) {
     lock().emit(&text);
 }
 
+// Start a fresh row, unless the last thing written already ended one.
+//
+// The caller that follows a stream cannot know whether it stopped mid-line: a model that
+// ended its message on a newline needs nothing, and one that did not needs exactly one.
+// Emitting a newline either way is what put a blank row after every reply. `pending`
+// counts as unfinished even though nothing reached the screen — it is a line waiting for
+// its ending, and the next thing written would otherwise land on the same row.
+pub(crate) fn ensure_line_start() {
+    let mut out = lock();
+    if !out.at_line_start || !out.pending.is_empty() {
+        out.emit("\n");
+    }
+}
+
 pub(crate) fn flush() {
     if lock().capture.is_none() {
         let _ = io::stdout().flush();

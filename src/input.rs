@@ -9,7 +9,7 @@
 use crate::modes::Mode;
 use crate::out;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::tty::IsTty;
 use std::fs;
 use std::io;
@@ -451,8 +451,69 @@ fn terminal_width() -> usize {
 pub(crate) struct Chrome<'a> {
     pub(crate) mode: Mode,
     pub(crate) busy: Option<&'a str>,
+    // What the top bar says when nothing is running. Ignored while `busy` is set, since
+    // what is happening now always beats what happened last.
+    pub(crate) last: Option<&'a str>,
     // The right-hand end of the status bar: which model, and how full its context is.
     pub(crate) status: &'a str,
+}
+
+// The chrome's colors. The bars are the only thing on screen that is painted rather than
+// merely tinted, which is what makes them read as furniture instead of as output.
+//
+// A 256-color light blue rather than an RGB one: it lands the same on any terminal from
+// the last twenty years, and the exact shade is not worth a truecolor requirement.
+const BAR_BACKGROUND: Color = Color::AnsiValue(153);
+const BAR_TEXT: Color = Color::Black;
+
+// Paint one row of chrome the whole way across.
+//
+// Two things this owes the writer. The row stops a column short of the width, because a
+// row the terminal wrapped on its own is a row `out` cannot count and the region's height
+// is wrong from then on — with a background that last cell simply stays unpainted. And
+// line breaks and tabs become spaces, because a summary of a multi-line shell command
+// would otherwise put line feeds inside a row that is supposed to be exactly one.
+//
+// Runs of spaces are left alone, and that is not an oversight: the gap that right-aligns
+// the status bar is a run of spaces, and collapsing it flattens the bar to the left.
+fn bar(content: &str, width: usize) -> String {
+    let room = width.saturating_sub(1);
+    if room == 0 {
+        return String::new();
+    }
+
+    let content: String = content
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+        .collect();
+
+    // Cut by characters: what reaches here is plain text, painted here rather than
+    // carrying escapes of its own, so there is no sequence to cut in half.
+    let length = content.chars().count();
+    let content: String = if length > room {
+        content.chars().take(room - 1).chain(['…']).collect()
+    } else {
+        content
+    };
+
+    let pad = room.saturating_sub(content.chars().count());
+    format!(
+        "{}{}{}{}{}",
+        SetBackgroundColor(BAR_BACKGROUND),
+        SetForegroundColor(BAR_TEXT),
+        content,
+        " ".repeat(pad),
+        ResetColor
+    )
+}
+
+// The bar above the box: what is running, or what ran last.
+//
+// It used to exist only while something was running, which meant the input box jumped a
+// row every time work started or stopped. Always drawn, so it does not.
+fn activity_bar(chrome: &Chrome, width: usize) -> String {
+    let text = chrome.busy.or(chrome.last).unwrap_or("ready");
+    bar(&format!("○ {}", text), width)
 }
 
 // One row: the mode on the left, the model and context on the right. Kept a column
@@ -475,33 +536,19 @@ fn status_bar(mode: Mode, status: &str, width: usize) -> String {
 
     let used = left.chars().count() + status.chars().count();
     let gap = room.saturating_sub(used).max(1);
-    format!(
-        "{}{}{}{}{}",
-        SetForegroundColor(Color::DarkGrey),
-        left,
-        " ".repeat(gap),
-        status,
-        ResetColor
-    )
+    bar(&format!("{}{}{}", left, " ".repeat(gap), status), width)
 }
 
 pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     let width = terminal_width();
     let (mut rows, caret_row, caret_column) = editor.rows(PROMPT, width);
 
-    let offset = match chrome.busy {
-        Some(busy) => {
-            rows.insert(
-                0,
-                format!("{}○ {}{}", SetForegroundColor(Color::DarkGrey), busy, ResetColor),
-            );
-            1
-        }
-        None => 0,
-    };
+    rows.insert(0, activity_bar(chrome, width));
     rows.push(status_bar(chrome.mode, chrome.status, width));
 
-    out::set_region(rows, caret_row + offset, caret_column);
+    // Always one row above the box now, where it used to depend on whether anything was
+    // running.
+    out::set_region(rows, caret_row + 1, caret_column);
 }
 
 // What a submitted entry looks like once it is part of the scrollback rather than
@@ -551,6 +598,7 @@ pub(crate) async fn read_command(
     editor: &mut Editor,
     mode: &mut Mode,
     status: &str,
+    last: Option<&str>,
 ) -> Input {
     loop {
         draw(
@@ -558,6 +606,7 @@ pub(crate) async fn read_command(
             &Chrome {
                 mode: *mode,
                 busy: None,
+                last,
                 status,
             },
         );
@@ -761,22 +810,77 @@ mod tests {
         let mut editor = Editor::new(Vec::new());
         type_text(&mut editor, "hello");
 
-        let _guard = crate::out::capture_guard();
-        crate::out::start_capture();
-        draw(
-            &editor,
-            &Chrome {
-                mode: Mode::Plan,
-                busy: Some("thinking"),
-                status: "a-model  ctx 3%",
-            },
-        );
-        let written = crate::out::take_capture();
+        let drawn = |chrome: &Chrome| {
+            let _guard = crate::out::capture_guard();
+            crate::out::start_capture();
+            draw(&editor, chrome);
+            crate::out::take_capture()
+        };
+
+        let written = drawn(&Chrome {
+            mode: Mode::Plan,
+            busy: Some("thinking"),
+            last: Some("ran cargo build"),
+            status: "a-model  ctx 3%",
+        });
 
         let busy = written.find("○ thinking").expect("the busy line");
         let box_row = written.find("> hello").expect("the input box");
+        // The two spaces before "ctx" are the separator status_line puts there. Only line
+        // breaks are flattened, so a run of spaces has to survive the bar intact — the gap
+        // that right-aligns this one is made of them.
         let bar = written.rfind("a-model  ctx 3%").expect("the status bar");
         assert!(busy < box_row && box_row < bar, "wrong order in {:?}", written);
+
+        // Both bars are painted, and black on light blue is what says "chrome" rather
+        // than "something the model said".
+        let painted = format!("{}{}", SetBackgroundColor(BAR_BACKGROUND), SetForegroundColor(BAR_TEXT));
+        assert_eq!(written.matches(&painted).count(), 2, "both bars paint: {:?}", written);
+
+        // Nothing running: the top bar stays on screen showing what last happened, so the
+        // box never jumps a row between turns.
+        let idle = drawn(&Chrome {
+            mode: Mode::Plan,
+            busy: None,
+            last: Some("ran cargo build"),
+            status: "a-model  ctx 3%",
+        });
+        assert!(idle.contains("○ ran cargo build"), "got {:?}", idle);
+
+        // ...and before anything has happened at all, it still says something.
+        let fresh = drawn(&Chrome {
+            mode: Mode::Plan,
+            busy: None,
+            last: None,
+            status: "a-model  ctx 3%",
+        });
+        assert!(fresh.contains("○ ready"), "got {:?}", fresh);
+    }
+
+    #[test]
+    fn a_bar_stays_one_row_whatever_it_is_handed() {
+        // A multi-line shell command is a plausible summary, and a line feed inside a row
+        // the writer counts as one is how the region's height goes wrong.
+        for width in [20usize, 40, 80] {
+            for content in [
+                "",
+                "○ ran cargo build",
+                "○ ran for f in *.rs\ndo\n  echo $f\ndone",
+                &"○ ran ".to_string().repeat(40),
+            ] {
+                let row = bar(content, width);
+                assert!(!row.contains('\n'), "line feed in {:?}", row);
+                // Painted the whole way across, and never wider than the writer allows.
+                assert_eq!(
+                    crate::out::visible_width(&row),
+                    width - 1,
+                    "width {} with {:?}: {:?}",
+                    width,
+                    content,
+                    row
+                );
+            }
+        }
     }
 
     #[test]

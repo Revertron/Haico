@@ -247,6 +247,13 @@ pub(crate) fn is_markdown(text: &str) -> bool {
 pub(crate) struct MarkdownStream {
     buffer: String,
     in_code_block: bool,
+    // Blank lines seen but not yet printed.
+    //
+    // A blank line only earns its row once something follows it. At the end of a reply
+    // nothing does: models routinely end a message on one or two newlines, and those used
+    // to print as a gap before whatever came next — the tool call line, the next prompt.
+    // Held here instead, flushed when a real line arrives, and dropped by `finish`.
+    held_blanks: usize,
 }
 
 impl MarkdownStream {
@@ -254,6 +261,7 @@ impl MarkdownStream {
         MarkdownStream {
             buffer: String::new(),
             in_code_block: false,
+            held_blanks: 0,
         }
     }
 
@@ -264,13 +272,27 @@ impl MarkdownStream {
         let mut rendered = String::new();
         while let Some(end) = self.buffer.find('\n') {
             let line: String = self.buffer.drain(..=end).collect();
-            rendered.push_str(&self.line(line.trim_end_matches('\n'), true));
+            let line = line.trim_end_matches('\n');
+
+            // Inside a fence a blank line is content, painted like every other line of
+            // the block, so only prose blanks are held back.
+            if !self.in_code_block && line.trim().is_empty() {
+                self.held_blanks += 1;
+                continue;
+            }
+
+            // Something followed after all, so they were separators rather than trailing
+            // whitespace: pay them out before the line that earned them.
+            rendered.push_str(&"\n".repeat(std::mem::take(&mut self.held_blanks)));
+            rendered.push_str(&self.line(line, true));
         }
         rendered
     }
 
-    // The last line, which the model usually ends without a newline of its own.
+    // The last line, which the model usually ends without a newline of its own. Blank
+    // lines still held at this point were trailing after all, and are dropped.
     pub(crate) fn finish(&mut self, newline: bool) -> String {
+        self.held_blanks = 0;
         if self.buffer.is_empty() {
             return String::new();
         }
@@ -565,7 +587,7 @@ fn short_path(path: &str) -> String {
 }
 
 // The interesting argument of a tool call, in a few words.
-fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
+pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
     let text = |key: &str| arguments[key].as_str().unwrap_or("").to_string();
 
     match tool_name {
@@ -1032,6 +1054,40 @@ mod markdown_tests {
         piecemeal.push_str(&stream.finish(true));
 
         assert_eq!(piecemeal, whole);
+    }
+
+    #[test]
+    fn trailing_blank_lines_never_reach_the_screen() {
+        // What a local model actually sends when it is about to call a tool: a sentence
+        // and then one or two newlines to end its turn. Those used to print as a gap
+        // between the reply and the tool call line below it.
+        let mut stream = MarkdownStream::new();
+        let mut rendered = stream.push("Let me look at the diff.\n\n");
+        rendered.push_str(&stream.finish(false));
+        assert_eq!(rendered.matches('\n').count(), 1, "got {:?}", rendered);
+        assert!(rendered.ends_with('\n'));
+
+        // A blank line between two paragraphs is a separator, not trailing whitespace,
+        // and still gets its row.
+        let mut stream = MarkdownStream::new();
+        let mut rendered = stream.push("first\n\nsecond\n\n\n");
+        rendered.push_str(&stream.finish(false));
+        assert_eq!(rendered.matches('\n').count(), 3, "got {:?}", rendered);
+
+        // Held across chunk boundaries too, since a newline and what follows it rarely
+        // arrive in the same piece — and a blank held in one chunk and paid out in the
+        // next must come to exactly what it would have unsplit.
+        let mut stream = MarkdownStream::new();
+        let mut split = stream.push("first\n");
+        split.push_str(&stream.push("\n"));
+        split.push_str(&stream.push("second\n"));
+        split.push_str(&stream.finish(false));
+        assert_eq!(split, rendered.trim_end_matches('\n').to_string() + "\n");
+
+        // Inside a fence a blank line is content: dropping it would rewrite the code.
+        let mut stream = MarkdownStream::new();
+        let rendered = stream.push("```\nlet x = 1;\n\nlet y = 2;\n```\n");
+        assert_eq!(rendered.matches('\n').count(), 3, "got {:?}", rendered);
     }
 
     #[test]
