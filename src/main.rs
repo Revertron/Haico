@@ -413,6 +413,7 @@ async fn main() -> Result<()> {
     // Permission manager. Deliberately not persisted: approvals last for one session, so
     // resuming never silently carries over permission to run something.
     let mut perm_manager = PermissionManager::new();
+    let mut review_cache = ReviewCache::new();
 
     // Not persisted either, and for the same reason: resuming a session that happened to
     // end in auto mode should not quietly resume deciding things on the user's behalf.
@@ -570,6 +571,12 @@ async fn main() -> Result<()> {
                     "content": content
                 }));
             }
+            // To hand the memory back, not to withdraw anything: an entry is keyed by the
+            // whole evidence string, so it holds a whole script or a whole diff, and a long
+            // session accumulates them. No verdict is invalidated by this — the reviewer
+            // never saw the conversation, so dropping the conversation tells it nothing.
+            // Approvals in `perm_manager` deliberately survive, same as they always have.
+            review_cache.clear();
             outln!("Conversation cleared.\n");
             continue;
         }
@@ -629,6 +636,9 @@ async fn main() -> Result<()> {
                 lm_client.apply_settings(&settings);
                 server.llm_client.model = model.clone();
                 server.llm_client.apply_settings(&settings);
+
+                // The reviewer is this model too, so its verdicts leave with it.
+                review_cache.clear();
 
                 // The system message belongs to the new model too: it names the model, and
                 // the model's own config section decides whether ours is sent at all.
@@ -892,7 +902,12 @@ Usage: /set <name> <value>, or /set <name> unset
 
         if input == "/compact" {
             match compact_history(&lm_client, &mut messages).await {
-                Ok(summary) => outln!("{}\n", summary),
+                // The same reclaim as /clear, on the one path that actually shrank the
+                // session. A compaction that failed freed nothing to go with it.
+                Ok(summary) => {
+                    review_cache.clear();
+                    outln!("{}\n", summary)
+                }
                 Err(e) => outln!("[error] could not compact: {:#}\n", e),
             }
             continue;
@@ -1246,16 +1261,22 @@ Usage: /set <name> <value>, or /set <name> unset
                             &mut queued,
                             &status,
                             "🤖 Reviewing this call…",
-                            judge_tool_call(&lm_client, tool_name, &arguments),
+                            judge_tool_call(&lm_client, &mut review_cache, tool_name, &arguments),
                         )
                         .await;
 
                         match verdict {
-                            Some(Ok(Verdict { allow: true, reason })) => {
-                                auto_note = Some(reason);
+                            Some(Ok(Verdict { allow: true, reason, cached })) => {
+                                // Marked, so reading back through a run still tells apart
+                                // a call the reviewer weighed from one it merely
+                                // recognized.
+                                auto_note = Some(match cached {
+                                    true => format!("cached — {}", reason),
+                                    false => reason,
+                                });
                                 ask = None;
                             }
-                            Some(Ok(Verdict { allow: false, reason })) => {
+                            Some(Ok(Verdict { allow: false, reason, .. })) => {
                                 review_line = Some(format!("🤖 Review: DENY — {}", reason));
                             }
                             Some(Err(e)) => {
