@@ -89,6 +89,7 @@ fn print_repl_help() {
     outln!("  /add <path>        Let the file tools read and write another directory too");
     outln!("  /workspace         Show which paths the file tools may touch");
     outln!("  /mode              Show which of the three is in force");
+    outln!("  /init              Study the project and write its instruction file");
     outln!("  /tools             List available tools and whether they prompt");
     outln!("  /model [name]      Switch model; with no name, pick from the server's list");
     outln!("  /config            Show the settings in force and where each came from");
@@ -368,7 +369,7 @@ async fn main() -> Result<()> {
 
     // Read once and kept: /model rebuilds the system message, and re-reading the file on
     // every switch would announce it again each time.
-    let project_context = load_project_context();
+    let mut project_context = load_project_context();
     if let Some((name, _)) = &project_context {
         outln!("Loaded project context from {}", name);
     }
@@ -570,6 +571,26 @@ async fn main() -> Result<()> {
         }
 
         if input == "/clear" || input == "/new" || input == "/reset" {
+            // The boundary where a stale copy of the project's instructions actually costs
+            // something: whatever the model knew about the file from having read it is about
+            // to be thrown out with the rest of the history, leaving the system message as
+            // the only copy. One file read at a pause the user asked for, and it picks up an
+            // edit made in an editor just as well as one a tool made.
+            let reloaded = load_project_context();
+            if reloaded != project_context {
+                project_context = reloaded;
+                system_prompt_content = compose_system_prompt(
+                    config.system_prompt.as_deref(),
+                    &lm_client.model,
+                    settings.use_system_prompt,
+                    project_context.as_ref(),
+                );
+                match &project_context {
+                    Some((name, _)) => outln!("Reloaded project context from {}", name),
+                    None => outln!("Project context file is gone; carrying on without it"),
+                }
+            }
+
             messages.clear();
             if let Some(content) = &system_prompt_content {
                 messages.push(json!({
@@ -918,6 +939,32 @@ Usage: /set <name> <value>, or /set <name> unset
             }
             continue;
         }
+
+        // The one "command" that is not one: /init does not do anything itself, it expands
+        // into a long instruction and runs as an ordinary turn. Written that way so it gets
+        // the tools, the permission prompts and /undo for free — there is nothing about
+        // writing an instruction file that needs its own machinery.
+        let init_instruction;
+        let mut initializing = false;
+        let input = if input == "/init" {
+            let target = init_target_file(&cwd);
+            // It ends in write_file, which plan mode strips from the request. Better to say
+            // so now than to have the model research the whole project and then find it
+            // cannot save the result.
+            if mode == Mode::Plan {
+                outln!(
+                    "/init writes {}, which plan mode does not allow. Switch with /normal first.\n",
+                    target
+                );
+                continue;
+            }
+            outln!("Analyzing the project to write {}...\n", target);
+            initializing = true;
+            init_instruction = build_init_prompt(&cwd);
+            init_instruction.as_str()
+        } else {
+            input
+        };
 
         // Add user message
         messages.push(json!({
@@ -1539,6 +1586,28 @@ Usage: /set <name> <value>, or /set <name> unset
                 // No tool call, this is the final response — already streamed above.
                 messages.push(message.clone());
                 break;
+            }
+        }
+
+        // The file /init just wrote is the one that belongs in the system message, and what
+        // was loaded at startup — usually nothing, since /init is what you run when the
+        // project has no instructions yet — is now out of date. Re-read it here rather than
+        // leaving it to the next startup, so the new rules are in force for the rest of this
+        // session and survive /clear, which re-pushes this same content.
+        if initializing {
+            let reloaded = load_project_context();
+            if reloaded != project_context {
+                project_context = reloaded;
+                if let Some((name, _)) = &project_context {
+                    outln!("\nLoaded project context from {}", name);
+                }
+                system_prompt_content = compose_system_prompt(
+                    config.system_prompt.as_deref(),
+                    &lm_client.model,
+                    settings.use_system_prompt,
+                    project_context.as_ref(),
+                );
+                set_system_message(&mut messages, system_prompt_content.as_deref());
             }
         }
 

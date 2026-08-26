@@ -1,0 +1,21 @@
+Analyze this project and write `$target_file` — the file haico reads at the start of every future session in this directory, before it has seen any code.
+
+Write it for a competent developer who has never opened this repository. Keep it short: 40 to 80 lines. What earns a place in it:
+
+- What the project is, in two or three sentences. What it does, and what shape it has: one binary, a library, a service, a monorepo of several packages.
+- The commands that really work here — build, test, run a single test, lint, format. Take them from the manifest, the CI workflow, the Makefile or the README. Do not invent a command you have not seen written down somewhere in the project.
+- How the code is laid out, and the part of that layout the file names do not give away: which module owns what, where execution starts, how the pieces reach each other.
+- The rules and invariants a newcomer would break. A change that has to be made in two places at once, a convention followed everywhere, a check one module performs that everything else depends on. These are the most valuable lines in the file and the hardest to find — look for them in comments that explain *why*, in the tests, and in code written to guard against something.
+- Whatever the project already says about working on it: CONTRIBUTING.md, an existing rules file, editor or agent configuration.
+
+Leave out a file-by-file listing, advice that would be true of any project, anything you did not actually verify, and the obvious.
+
+How to go about it:
+
+1. Start from the facts below. Read the manifest and the README properly with `read` if they matter.
+2. Open the entry point and the few largest source files. Use `grep` and `glob_search` to answer specific questions instead of reading everything.
+3. Find out how the tests are run and where they live.
+4. Write `$target_file` with `write_file`, as markdown.
+5. Then say in one or two lines what went into it. Do not print the file back.
+
+Change no other file. Do not run builds or test suites to find out whether a command works — read what the project says about it.

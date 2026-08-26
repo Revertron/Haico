@@ -3,7 +3,7 @@
 use crate::util::{run_git_command, truncate_at_boundary};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
@@ -167,6 +167,209 @@ pub(crate) fn load_project_context() -> Option<(String, String)> {
     None
 }
 
+pub(crate) const INIT_PROMPT: &str = include_str!("init_prompt.txt");
+
+// The first instruction file the project actually has, with its contents.
+fn existing_context_file(root: &Path) -> Option<(&'static str, String)> {
+    for name in PROJECT_CONTEXT_FILES {
+        let Ok(contents) = fs::read_to_string(root.join(name)) else {
+            continue;
+        };
+        if contents.trim().is_empty() {
+            continue;
+        }
+        return Some((name, contents));
+    }
+    None
+}
+
+// Which file `/init` writes.
+//
+// Not always HAICO.md: load_project_context reads the *first* of PROJECT_CONTEXT_FILES
+// that exists, so writing HAICO.md into a project that already has its own CLAUDE.md would
+// shadow it from then on, leaving two files that disagree and no sign of which one is in
+// force. Whatever is already being loaded is what gets improved.
+
+pub(crate) fn init_target_file(root: &Path) -> &'static str {
+    existing_context_file(root)
+        .map(|(name, _)| name)
+        .unwrap_or("HAICO.md")
+}
+
+// The instruction `/init` sends, with everything haico can cheaply find out about the
+// project already attached to it.
+//
+// The facts are gathered here rather than left to the model to discover because the models
+// haico talks to are small local ones: asked to "analyze the project" from nothing, they
+// tend to call `ls` once, guess the rest, and write a confident file full of build commands
+// that do not exist. Handing them the listing, the manifests, the README and the recent
+// commits costs nothing and changes what comes back.
+
+pub(crate) fn build_init_prompt(root: &Path) -> String {
+    // Enough of a README to tell what the project is and to show which commands it
+    // documents; enough of an existing instruction file to improve it rather than guess.
+    const README_LINES: usize = 40;
+    const README_BYTES: usize = 4_096;
+    const EXISTING_BYTES: usize = 20_480;
+
+    let mut prompt = INIT_PROMPT.replace("$target_file", init_target_file(root));
+
+    prompt.push_str("\n# What haico already found\n\n");
+    prompt.push_str(&format!("Working directory: {}\n", root.display()));
+
+    let root_arg = root.to_string_lossy().to_string();
+    if let Some(branch) = run_git_command(&["-C", &root_arg, "rev-parse", "--abbrev-ref", "HEAD"]) {
+        prompt.push_str(&format!("Git branch: {}\n", branch));
+    }
+
+    let (entries, hidden) = top_level_entries(root);
+    if !entries.is_empty() {
+        prompt.push_str("\nTop-level entries:\n");
+        for entry in &entries {
+            prompt.push_str(&format!("  {}\n", entry));
+        }
+        if hidden > 0 {
+            prompt.push_str(&format!("  ... and {} more\n", hidden));
+        }
+    }
+
+    let manifests = manifest_files(root);
+    if !manifests.is_empty() {
+        prompt.push_str("\nBuild and manifest files (this is where the commands are):\n");
+        for manifest in &manifests {
+            prompt.push_str(&format!("  {}\n", manifest));
+        }
+    }
+
+    if let Some((name, text)) = readme(root) {
+        let head = text.lines().take(README_LINES).collect::<Vec<_>>().join("\n");
+        let head = truncate_at_boundary(&head, README_BYTES);
+        prompt.push_str(&format!(
+            "\n{} (first {} lines):\n\n{}\n",
+            name, README_LINES, head
+        ));
+    }
+
+    if let Some(log) = run_git_command(&["-C", &root_arg, "log", "--oneline", "-15"]) {
+        if !log.is_empty() {
+            prompt.push_str(&format!("\nRecent commits:\n\n{}\n", log));
+        }
+    }
+
+    // Last, and with its own instruction, because "here is the file you are replacing" is
+    // the one fact the model most often acts on wrongly — throwing away hand-written rules
+    // it could not verify in one session.
+    if let Some((name, contents)) = existing_context_file(root) {
+        let trimmed = truncate_at_boundary(&contents, EXISTING_BYTES);
+        prompt.push_str(&format!(
+            "\n# {} already exists\n\nImprove it instead of starting over: keep what is still \
+             true, correct what is wrong, add what is missing. Do not drop a section because \
+             you have not checked it — check it.\n\n{}\n",
+            name, trimmed
+        ));
+        if trimmed.len() < contents.len() {
+            prompt.push_str(
+                "\n[cut short here — `read` the file in full and use `edit` rather than \
+                 rewriting it whole]\n",
+            );
+        }
+    }
+
+    prompt
+}
+
+// Sorted, directories marked, and the noise every project has left out. The count of what
+// was dropped goes with it so the model knows the listing is partial.
+fn top_level_entries(root: &Path) -> (Vec<String>, usize) {
+    const MAX_ENTRIES: usize = 60;
+    const SKIP: &[&str] = &[".git", "target", "node_modules", ".venv", "venv", "dist", "build"];
+
+    let Ok(dir) = fs::read_dir(root) else {
+        return (Vec::new(), 0);
+    };
+
+    let mut names: Vec<String> = dir
+        .flatten()
+        .filter(|entry| !SKIP.contains(&entry.file_name().to_string_lossy().as_ref()))
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                format!("{}/", name)
+            } else {
+                name
+            }
+        })
+        .collect();
+    names.sort();
+
+    let hidden = names.len().saturating_sub(MAX_ENTRIES);
+    names.truncate(MAX_ENTRIES);
+    (names, hidden)
+}
+
+// Manifests one level down as well as at the top, because in a workspace or a monorepo the
+// top-level listing says nothing at all about how anything is built.
+fn manifest_files(root: &Path) -> Vec<String> {
+    const NAMES: &[&str] = &[
+        "Cargo.toml", "package.json", "pyproject.toml", "setup.py", "requirements.txt",
+        "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "CMakeLists.txt",
+        "Makefile", "makefile", "justfile", "Justfile", "composer.json", "Gemfile",
+        "deno.json", "tsconfig.json", "Dockerfile", "docker-compose.yml",
+    ];
+    const SKIP: &[&str] = &[".git", "target", "node_modules", ".venv", "venv", "dist", "build"];
+    const MAX: usize = 25;
+
+    let mut found = Vec::new();
+
+    for name in NAMES {
+        if root.join(name).is_file() {
+            found.push(name.to_string());
+        }
+    }
+
+    if let Ok(dir) = fs::read_dir(root) {
+        let mut subdirs: Vec<PathBuf> = dir
+            .flatten()
+            .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .map(|n| SKIP.contains(&n.to_string_lossy().as_ref()))
+                    .unwrap_or(true)
+            })
+            .collect();
+        subdirs.sort();
+
+        for subdir in subdirs {
+            for name in NAMES {
+                if found.len() >= MAX {
+                    return found;
+                }
+                if subdir.join(name).is_file() {
+                    let parent = subdir.file_name().unwrap_or_default().to_string_lossy();
+                    found.push(format!("{}/{}", parent, name));
+                }
+            }
+        }
+    }
+
+    found
+}
+
+fn readme(root: &Path) -> Option<(&'static str, String)> {
+    const NAMES: &[&str] = &["README.md", "readme.md", "README.rst", "README.txt", "README"];
+
+    for name in NAMES {
+        if let Ok(contents) = fs::read_to_string(root.join(name)) {
+            if !contents.trim().is_empty() {
+                return Some((name, contents));
+            }
+        }
+    }
+    None
+}
+
 // Settings that vary by model rather than by server. Context window is a genuine property
 // of the model; sampling is usually chosen per model too.
 //
@@ -179,3 +382,67 @@ pub(crate) fn load_project_context() -> Option<(String, String)> {
 // top_k and repeat_penalty are not part of the OpenAI API — they are extensions that
 // llama.cpp, Ollama, LM Studio and vLLM all understand. A strictly-OpenAI endpoint will
 // ignore or reject them, which is why nothing is sent unless it was asked for.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Its own directory rather than testutil::scratch, because build_init_prompt lists the
+    // whole directory and scratch is shared by every test on the thread.
+    fn init_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "haico-init-{}-{}-{:?}",
+            std::process::id(),
+            name,
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn init_prompt_carries_the_project_facts() {
+        let dir = init_dir("facts");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(dir.join("README.md"), "# Demo\n\nRun with `cargo run`.\n").unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("target")).unwrap();
+
+        let prompt = build_init_prompt(&dir);
+
+        assert!(prompt.contains("HAICO.md"), "no target file named:\n{}", prompt);
+        assert!(prompt.contains("Cargo.toml"));
+        assert!(prompt.contains("src/"));
+        assert!(prompt.contains("Run with `cargo run`."));
+        // The build directory is noise in every project that has one.
+        assert!(!prompt.contains("target/"), "listed target/:\n{}", prompt);
+    }
+
+    // Writing HAICO.md next to an existing CLAUDE.md would shadow it, so /init has to
+    // improve whichever file load_project_context is already reading.
+    #[test]
+    fn init_improves_the_instruction_file_the_project_already_has() {
+        let dir = init_dir("existing");
+        fs::write(dir.join("CLAUDE.md"), "# Rules\n\nNever touch generated code.\n").unwrap();
+
+        assert_eq!(init_target_file(&dir), "CLAUDE.md");
+
+        let prompt = build_init_prompt(&dir);
+        assert!(prompt.contains("`CLAUDE.md`"), "wrong target:\n{}", prompt);
+        assert!(!prompt.contains("`HAICO.md`"));
+        assert!(prompt.contains("Never touch generated code."));
+        assert!(prompt.contains("Improve it instead of starting over"));
+    }
+
+    // An empty file is not instructions; load_project_context skips it, so this must too,
+    // or /init would "improve" a file nothing reads.
+    #[test]
+    fn init_ignores_an_empty_instruction_file() {
+        let dir = init_dir("empty");
+        fs::write(dir.join("AGENTS.md"), "\n  \n").unwrap();
+
+        assert_eq!(init_target_file(&dir), "HAICO.md");
+    }
+}
+
