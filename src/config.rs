@@ -408,6 +408,10 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  top_k          = 40");
     println!("  repeat_penalty = 1.1");
     println!("  use_system_prompt = false  # send only the project's own instructions");
+    println!("\nInstructions: ~/.haico/HAICO.md holds preferences that apply everywhere; a");
+    println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
+    println!("own, and takes precedence over both. Both are sent even to a model configured");
+    println!("with use_system_prompt = false.");
     println!("\nAnything left out is omitted from the request, so the server's own setting");
     println!("for that model still applies. top_k and repeat_penalty are extensions that");
     println!("llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
@@ -552,24 +556,33 @@ mod tests {
 
         let project = ("CLAUDE.md".to_string(), "PROJECT RULES".to_string());
 
-        // Off: the project's own instructions still go through, ours does not — including
-        // a custom one supplied with --system-prompt.
-        let bare = compose_system_prompt(Some("CUSTOM"), "raw-model", false, Some(&project))
-            .expect("project instructions still make a system message");
+        // Off: the user's and the project's own instructions still go through, ours does
+        // not — including a custom one supplied with --system-prompt.
+        let bare = compose_system_prompt(
+            Some("CUSTOM"),
+            "raw-model",
+            false,
+            Some("USER RULES"),
+            Some(&project),
+        )
+        .expect("project instructions still make a system message");
+        assert!(bare.contains("USER RULES"));
         assert!(bare.contains("PROJECT RULES"));
         assert!(!bare.contains("CUSTOM"));
         assert!(!bare.contains("# Tone and style"), "got: {}", bare);
 
         // ...and with nothing to say at all there is no system message to send.
-        assert!(compose_system_prompt(Some("CUSTOM"), "raw-model", false, None).is_none());
+        assert!(compose_system_prompt(Some("CUSTOM"), "raw-model", false, None, None).is_none());
 
         // On: unchanged from before — custom prompt if given, ours otherwise, project
         // instructions appended either way.
-        let custom = compose_system_prompt(Some("CUSTOM"), "guided-model", true, Some(&project))
-            .expect("a prompt is in force");
+        let custom =
+            compose_system_prompt(Some("CUSTOM"), "guided-model", true, None, Some(&project))
+                .expect("a prompt is in force");
         assert!(custom.starts_with("CUSTOM"));
         assert!(custom.contains("PROJECT RULES"));
-        let ours = compose_system_prompt(None, "guided-model", true, None).expect("built-in");
+        let ours =
+            compose_system_prompt(None, "guided-model", true, None, None).expect("built-in");
         assert!(ours.contains("guided-model"));
     }
 

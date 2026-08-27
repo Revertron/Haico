@@ -416,12 +416,20 @@ async fn main() -> Result<()> {
         outln!("Loaded project context from {}", name);
     }
 
-    // None when this model is configured without our prompt and the project has no
-    // instructions of its own — then the conversation carries no system message at all.
+    // Read once for the whole session and never reloaded — it lives outside the project and
+    // nothing here writes to it, so the reload points the project's file needs do not apply.
+    let user_context = load_user_context();
+    if user_context.is_some() {
+        outln!("Loaded user context from {}", USER_CONTEXT_FILE);
+    }
+
+    // None when this model is configured without our prompt and neither file exists — then
+    // the conversation carries no system message at all.
     let mut system_prompt_content = compose_system_prompt(
         config.system_prompt.as_deref(),
         &lm_client.model,
         settings.use_system_prompt,
+        user_context.as_deref(),
         project_context.as_ref(),
     );
 
@@ -625,6 +633,7 @@ async fn main() -> Result<()> {
                     config.system_prompt.as_deref(),
                     &lm_client.model,
                     settings.use_system_prompt,
+                    user_context.as_deref(),
                     project_context.as_ref(),
                 );
                 match &project_context {
@@ -716,6 +725,7 @@ async fn main() -> Result<()> {
                     config.system_prompt.as_deref(),
                     &model,
                     settings.use_system_prompt,
+                    user_context.as_deref(),
                     project_context.as_ref(),
                 );
                 if rebuilt != system_prompt_content {
@@ -1735,6 +1745,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     config.system_prompt.as_deref(),
                     &lm_client.model,
                     settings.use_system_prompt,
+                    user_context.as_deref(),
                     project_context.as_ref(),
                 );
                 set_system_message(&mut messages, system_prompt_content.as_deref());

@@ -89,19 +89,26 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
 }
 
 // Assemble the system message: haico's own prompt — the built-in one, or whatever
-// --system-prompt supplied — with the project's instructions appended.
+// --system-prompt supplied — with the user's global instructions and then the project's
+// appended.
+//
+// The order is the precedence order, least specific first: ours, the user's, the project's.
+// Each section says it overrides what is above it, so the most specific file wins simply by
+// being last.
 //
 // `use_system_prompt` comes from the model's own config section. A model fine-tuned with
 // its own baked-in instructions can be made worse by a second set layered on top, so ours
-// is dropped for it while the project's own instructions still go through.
+// is dropped for it while the user's and the project's still go through — those are the
+// user's own words, not haico's, and dropping them would silently ignore what they wrote.
 //
-// None when that leaves nothing to say at all: such a model, in a directory with no
-// instruction file, gets no system message rather than an empty one.
+// None when that leaves nothing to say at all: such a model, with neither file present,
+// gets no system message rather than an empty one.
 
 pub(crate) fn compose_system_prompt(
     custom: Option<&str>,
     model: &str,
     use_system_prompt: bool,
+    user_context: Option<&str>,
     project_context: Option<&(String, String)>,
 ) -> Option<String> {
     let mut content = if !use_system_prompt {
@@ -112,25 +119,43 @@ pub(crate) fn compose_system_prompt(
         build_system_prompt(model)
     };
 
-    // Appended to whichever prompt is in use, so a custom --system-prompt gets the
-    // project's instructions too, and a model configured without ours still gets these.
+    // Appended to whichever prompt is in use, so a custom --system-prompt gets these too,
+    // and a model configured without ours still gets them.
+    if let Some(user) = user_context {
+        append_section(
+            &mut content,
+            &format!("# User instructions ({})", USER_CONTEXT_FILE),
+            "The following comes from this user and takes precedence over the general \
+             guidance above wherever the two disagree.",
+            user,
+        );
+    }
+
     if let Some((name, project)) = project_context {
-        if content.is_empty() {
-            content = format!("# Project instructions ({})\n\n{}", name, project);
-        } else {
-            content.push_str(&format!(
-                "\n\n# Project instructions ({})\n\n\
-                 The following comes from this project and takes precedence over the general \
-                 guidance above wherever the two disagree.\n\n{}",
-                name, project
-            ));
-        }
+        append_section(
+            &mut content,
+            &format!("# Project instructions ({})", name),
+            "The following comes from this project and takes precedence over the general \
+             guidance above wherever the two disagree.",
+            project,
+        );
     }
 
     if content.trim().is_empty() {
         None
     } else {
         Some(content)
+    }
+}
+
+// The precedence sentence is dropped when this section is the whole message — with nothing
+// above it there is nothing for it to take precedence over, and the model would be reading
+// a reference to guidance that was never sent.
+fn append_section(content: &mut String, heading: &str, precedence: &str, body: &str) {
+    if content.is_empty() {
+        *content = format!("{}\n\n{}", heading, body);
+    } else {
+        content.push_str(&format!("\n\n{}\n\n{}\n\n{}", heading, precedence, body));
     }
 }
 
@@ -165,6 +190,40 @@ pub(crate) fn load_project_context() -> Option<(String, String)> {
     }
 
     None
+}
+
+// The user's own instructions, in force in every directory.
+//
+// Displayed name only — the path is resolved below — because "~/.haico/HAICO.md" is what
+// the user has to type to find it, on Windows as much as anywhere else.
+pub(crate) const USER_CONTEXT_FILE: &str = "~/.haico/HAICO.md";
+
+// Next to config.toml rather than in the home directory itself: preferences that hold
+// everywhere ("always American English", "never commit unless asked") belong in one place
+// instead of being copied into every project's instruction file.
+pub(crate) fn user_context_path() -> Option<PathBuf> {
+    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".haico").join("HAICO.md"))
+}
+
+// Read once at startup and kept for the session. Unlike the project's file this one is not
+// re-read on /clear or after /init: it lives outside the project, nothing haico does writes
+// to it, and editing it mid-session is not a thing that happens.
+
+pub(crate) fn load_user_context() -> Option<String> {
+    const MAX_BYTES: usize = 32_768;
+
+    let contents = fs::read_to_string(user_context_path()?).ok()?;
+    if contents.trim().is_empty() {
+        return None;
+    }
+
+    let trimmed = truncate_at_boundary(&contents, MAX_BYTES);
+    let mut text = trimmed.to_string();
+    if trimmed.len() < contents.len() {
+        text.push_str("\n\n[user context truncated]");
+    }
+    Some(text)
 }
 
 pub(crate) const INIT_PROMPT: &str = include_str!("init_prompt.txt");
@@ -399,6 +458,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // The order is the whole point: the project's file has to come after the user's, or
+    // "takes precedence over the guidance above" in each section says the wrong thing and
+    // the more specific file is the one that loses.
+    #[test]
+    fn user_instructions_sit_between_ours_and_the_project_s() {
+        let project = ("HAICO.md".to_string(), "PROJECT RULES".to_string());
+
+        let both = compose_system_prompt(
+            Some("OUR PROMPT"),
+            "some-model",
+            true,
+            Some("USER RULES"),
+            Some(&project),
+        )
+        .expect("everything is present");
+
+        let ours = both.find("OUR PROMPT").unwrap();
+        let user = both.find("USER RULES").unwrap();
+        let proj = both.find("PROJECT RULES").unwrap();
+        assert!(ours < user && user < proj, "wrong order:\n{}", both);
+        assert!(both.contains("# User instructions (~/.haico/HAICO.md)"));
+
+        // Alone it is still a system message, and without anything above it the sentence
+        // about taking precedence is left out.
+        let alone = compose_system_prompt(None, "some-model", false, Some("USER RULES"), None)
+            .expect("the user's own file is enough on its own");
+        assert!(alone.starts_with("# User instructions"), "got: {}", alone);
+        assert!(!alone.contains("takes precedence"), "got: {}", alone);
     }
 
     #[test]
