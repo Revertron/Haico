@@ -36,6 +36,11 @@ struct Out {
     // box — the next fragment would have nowhere to continue from. It waits here and
     // is drawn just above the box until its newline arrives.
     pending: String,
+    // Where the last thing committed to the scrollback left the cursor, and what the
+    // wrapped rows of the line being written line up under. Only committed output moves
+    // it: `pending` is re-wrapped from a copy on every redraw, because a word arriving a
+    // fragment at a time has to stay free to move to the next row until its line ends.
+    wrap: Wrap,
     // Set by the tests so they can assert on what would have been written.
     capture: Option<String>,
 }
@@ -48,17 +53,23 @@ impl Out {
         }
         self.erase_region();
 
+        // Read again rather than cached: a terminal can be resized between two lines of
+        // the same reply.
+        self.wrap.width = wrap_width();
+
         if self.region.is_empty() {
             // Nothing is pinned, so there is nothing to hold a half-finished line back
             // for: write it straight out, the way every other program does.
-            self.put(text);
+            let wrapped = self.wrap.feed(text);
+            self.put(&wrapped);
             return;
         }
 
         self.pending.push_str(text);
         if let Some(end) = self.pending.rfind('\n') {
             let completed: String = self.pending.drain(..=end).collect();
-            self.put(&completed);
+            let wrapped = self.wrap.feed(&completed);
+            self.put(&wrapped);
         }
         self.draw_region();
     }
@@ -115,39 +126,35 @@ impl Out {
         self.at_line_start = true;
     }
 
-    // How many screen rows a line of text takes up, given that the terminal wraps it
-    // itself. Escape sequences move the cursor nowhere, so they do not count.
-    fn rows_used(text: &str) -> usize {
-        let width = terminal_width();
-        let visible = visible_width(text);
-        if visible == 0 {
-            1
-        } else {
-            (visible - 1) / width + 1
-        }
-    }
-
     fn draw_region(&mut self) {
         if self.region.is_empty() || self.region_drawn {
             return;
         }
         if !self.at_line_start {
             self.put("\n");
+            // The box starts on a row of its own, which ends the line that was being
+            // written just as surely as a newline of its own would have.
+            self.wrap.reset_line();
         }
 
         self.write_out(&Hide.to_string());
 
-        // The unfinished line goes above the box, and its own wrapping is left to the
-        // terminal: it carries colors, and re-wrapping it here would mean cutting
-        // escape sequences in half.
+        // The unfinished line goes above the box, wrapped from a *copy* of the state so
+        // that nothing about it is settled yet: the word at the end of it may still turn
+        // out to belong on the next row once the rest of it arrives.
         let pending_rows = if self.pending.is_empty() {
             0
         } else {
-            let pending = self.pending.clone();
+            let mut wrap = self.wrap.clone();
+            wrap.width = wrap_width();
+            let pending = wrap.feed(&self.pending);
+            // Each row it was broken into is exactly one screen row, which is the whole
+            // point of breaking it here instead of letting the terminal do it.
+            let rows = pending.matches('\n').count() + 1;
             self.put(&pending);
             self.write_out(&Clear(ClearType::UntilNewLine).to_string());
             self.put("\n");
-            Self::rows_used(&pending)
+            rows
         };
 
         for (index, row) in self.region.clone().iter().enumerate() {
@@ -214,6 +221,274 @@ pub(crate) fn visible_width(text: &str) -> usize {
     width
 }
 
+// The width text is broken at. A row exactly as wide as the terminal wraps in some
+// terminals and not others, so everything stops a column short — the same margin the
+// input box keeps, for the same reason.
+fn wrap_width() -> usize {
+    terminal_width().saturating_sub(1).max(1)
+}
+
+// Consume one escape sequence, the ESC itself already taken, and give it back whole. A
+// sequence cut in half paints everything after it, so nothing here may ever split one.
+fn take_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut escape = String::from('\u{1b}');
+    match chars.next() {
+        Some('[') => {
+            escape.push('[');
+            for ch in chars.by_ref() {
+                escape.push(ch);
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        }
+        Some(ch) => escape.push(ch),
+        None => {}
+    }
+    escape
+}
+
+// Where the wrapped rows of a line start, so they line up under the text they continue
+// rather than under whatever introduced it: past the line's own indentation, and past a
+// bullet or a numbered item if it has one. Without this a wrapped list item runs back to
+// column zero and reads as the start of a new paragraph.
+fn hanging_indent(line: &str, width: usize) -> usize {
+    let mut chars = line.chars().peekable();
+    let mut indent = 0usize;
+    loop {
+        match chars.peek() {
+            Some('\u{1b}') => {
+                chars.next();
+                take_escape(&mut chars);
+            }
+            Some(' ') => {
+                chars.next();
+                indent += 1;
+            }
+            _ => break,
+        }
+    }
+
+    // A marker can have colors around it — the reply's own "● " arrives that way — so it
+    // is matched against what actually prints rather than against the raw characters.
+    let mut visible = String::new();
+    let mut rest = chars.clone();
+    while visible.chars().count() < 6 {
+        match rest.next() {
+            Some('\u{1b}') => {
+                take_escape(&mut rest);
+            }
+            Some(ch) => visible.push(ch),
+            None => break,
+        }
+    }
+
+    let marker = ["- ", "* ", "+ ", "• ", "● ", "○ ", "→ "]
+        .into_iter()
+        .find(|marker| visible.starts_with(marker))
+        .map(|marker| marker.chars().count())
+        .or_else(|| numbered_marker(&visible))
+        .unwrap_or(0);
+
+    // Half the row is as far as a hanging indent can usefully go; a deeply indented code
+    // line past that would leave a column too narrow to read.
+    (indent + marker).min(width / 2)
+}
+
+// "1. " or "12) ": the width of the number together with the punctuation after it.
+fn numbered_marker(visible: &str) -> Option<usize> {
+    let digits = visible.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let mut after = visible.chars().skip(digits);
+    match (after.next(), after.next()) {
+        (Some('.') | Some(')'), Some(' ')) => Some(digits + 2),
+        _ => None,
+    }
+}
+
+// Breaking output into rows at spaces rather than wherever the right edge happens to fall.
+//
+// Left to itself the terminal cuts words in half, which is what a streamed reply of any
+// length used to look like. Doing it here costs two things the terminal never has to
+// think about. Escape sequences carry the colors and move the cursor nowhere: they take
+// no width and must survive whole. And a run with no space in it that is wider than a
+// whole row — a URL, a hash, a base64 blob — has to be broken anyway, because refusing
+// would push it off the edge, which is worse than the break that was going to happen
+// regardless.
+//
+// The state is carried across calls because a line does not arrive in one piece: the
+// reply's "● " and the words after it are separate writes, and only the first of them
+// says where the wrapped rows should line up.
+#[derive(Clone)]
+struct Wrap {
+    width: usize,
+    // Columns already used on the current screen row.
+    column: usize,
+    // What a wrapped row of the current line is indented by, worked out once from the
+    // start of the line and kept for the rest of it.
+    indent: String,
+    // Nothing has been written on this line yet, so its indent is still to be found.
+    fresh: bool,
+    // Nothing but the indent on the current row, so breaking again would only leave an
+    // empty row behind.
+    row_empty: bool,
+}
+
+impl Wrap {
+    fn new(width: usize) -> Self {
+        Wrap {
+            width: width.max(1),
+            column: 0,
+            indent: String::new(),
+            fresh: true,
+            row_empty: true,
+        }
+    }
+
+    // A line ended for real, by a newline of its own or by the input box taking the row.
+    fn reset_line(&mut self) {
+        self.column = 0;
+        self.indent.clear();
+        self.fresh = true;
+        self.row_empty = true;
+    }
+
+    // The same text with the breaks put in. Newlines that were already there keep their
+    // meaning: they end a line, and the next one works out its own indent.
+    fn feed(&mut self, text: &str) -> String {
+        let mut wrapped = String::with_capacity(text.len() + 16);
+        for (index, line) in text.split('\n').enumerate() {
+            if index > 0 {
+                wrapped.push('\n');
+                self.reset_line();
+            }
+            self.line(line, &mut wrapped);
+        }
+        wrapped
+    }
+
+    fn line(&mut self, line: &str, out: &mut String) {
+        if line.is_empty() {
+            return;
+        }
+        if self.fresh {
+            self.indent = " ".repeat(hanging_indent(line, self.width));
+            self.fresh = false;
+        }
+
+        // Almost everything printed is short. Passing it through untouched keeps the
+        // common case byte-for-byte what it was before any of this existed.
+        let visible = visible_width(line);
+        if self.column + visible <= self.width {
+            out.push_str(line);
+            self.column += visible;
+            self.row_empty &= visible == 0;
+            return;
+        }
+
+        // A word is a run of non-blanks together with any escape sequence touching it:
+        // the color has to travel to whichever row the word lands on.
+        let mut word = String::new();
+        let mut word_width = 0usize;
+        let mut gap = String::new();
+        let mut gap_width = 0usize;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\u{1b}' => word.push_str(&take_escape(&mut chars)),
+                // A stray carriage return prints nothing and belongs where it was written.
+                '\r' => word.push('\r'),
+                ' ' | '\t' => {
+                    if !word.is_empty() {
+                        self.place(out, &word, word_width, &gap, gap_width);
+                        word.clear();
+                        word_width = 0;
+                        gap.clear();
+                        gap_width = 0;
+                    }
+                    gap.push(ch);
+                    gap_width += 1;
+                }
+                _ => {
+                    word.push(ch);
+                    word_width += 1;
+                }
+            }
+        }
+        self.place(out, &word, word_width, &gap, gap_width);
+    }
+
+    // One word, with the blanks that stood in front of it. They are held back until here
+    // so that a break can drop them instead of leaving them dangling past the edge.
+    fn place(
+        &mut self,
+        out: &mut String,
+        word: &str,
+        word_width: usize,
+        gap: &str,
+        gap_width: usize,
+    ) {
+        if word.is_empty() {
+            return;
+        }
+        // Escape sequences on their own — the reset closing a colored run — take no width
+        // and belong exactly where they were written.
+        if word_width == 0 {
+            out.push_str(gap);
+            self.column += gap_width;
+            out.push_str(word);
+            return;
+        }
+        if self.column + gap_width + word_width <= self.width {
+            out.push_str(gap);
+            self.column += gap_width;
+        } else {
+            if !self.row_empty {
+                self.break_row(out);
+            }
+            if self.column + word_width > self.width {
+                return self.hard(out, word);
+            }
+        }
+        out.push_str(word);
+        self.column += word_width;
+        self.row_empty = false;
+    }
+
+    fn break_row(&mut self, out: &mut String) {
+        out.push('\n');
+        out.push_str(&self.indent);
+        self.column = self.indent.chars().count();
+        self.row_empty = true;
+    }
+
+    // A word too long for a row of its own, broken wherever the edge falls. There is no
+    // better place for it, and letting it run would only move the same break one column
+    // to the right.
+    fn hard(&mut self, out: &mut String, word: &str) {
+        let mut chars = word.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                let escape = take_escape(&mut chars);
+                out.push_str(&escape);
+                continue;
+            }
+            if ch == '\r' {
+                out.push('\r');
+                continue;
+            }
+            if self.column >= self.width && !self.row_empty {
+                self.break_row(out);
+            }
+            out.push(ch);
+            self.column += 1;
+            self.row_empty = false;
+        }
+    }
+}
+
 // A panic while the lock is held would otherwise poison it and take the whole
 // interface down with it, which is a bad trade for a line of output.
 fn lock() -> MutexGuard<'static, Out> {
@@ -227,6 +502,7 @@ fn lock() -> MutexGuard<'static, Out> {
             region_drawn: false,
             drawn_caret_row: 0,
             pending: String::new(),
+            wrap: Wrap::new(80),
             capture: None,
         })
     })
@@ -298,7 +574,9 @@ pub(crate) fn clear_region() {
     state.caret = (0, 0);
     if !state.pending.is_empty() {
         let pending = std::mem::take(&mut state.pending);
-        state.put(&pending);
+        state.wrap.width = wrap_width();
+        let wrapped = state.wrap.feed(&pending);
+        state.put(&wrapped);
     }
 }
 
@@ -320,6 +598,7 @@ pub(crate) fn start_capture() {
     state.region_drawn = false;
     state.drawn_caret_row = 0;
     state.pending.clear();
+    state.wrap = Wrap::new(80);
     state.capture = Some(String::new());
 }
 
@@ -411,5 +690,100 @@ mod tests {
         super::clear_region();
         let written = super::take_capture();
         assert!(written.ends_with("tail"), "got {:?}", written);
+    }
+
+    // Wrapping is tested at a width given here rather than the terminal's, which under a
+    // test runner is whatever happens to be attached.
+    fn wrapped(text: &str, width: usize) -> String {
+        super::Wrap::new(width).feed(text)
+    }
+
+    fn no_row_overflows(wrapped: &str, width: usize) {
+        for row in wrapped.split('\n') {
+            assert!(
+                super::visible_width(row) <= width,
+                "row wider than {}: {:?}",
+                width,
+                row
+            );
+        }
+    }
+
+    #[test]
+    fn text_breaks_between_words_rather_than_through_them() {
+        const TEXT: &str = "the quick brown fox jumps over the lazy dog and keeps going";
+
+        let rows = wrapped(TEXT, 20);
+        assert!(rows.contains('\n'), "nothing was wrapped: {:?}", rows);
+        no_row_overflows(&rows, 20);
+
+        // Every break landed on a space, so putting the rows back together with one space
+        // each returns exactly what went in.
+        let joined = rows.split('\n').collect::<Vec<_>>().join(" ");
+        assert_eq!(joined, TEXT);
+    }
+
+    #[test]
+    fn a_word_wider_than_a_row_is_broken_anyway() {
+        const TEXT: &str = "see https://example.com/a/very/long/path/that/never/breaks now";
+
+        let rows = wrapped(TEXT, 20);
+        no_row_overflows(&rows, 20);
+
+        // Broken, but nothing lost or repeated on the way.
+        let printed: String = rows.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let want: String = TEXT.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(printed, want);
+    }
+
+    #[test]
+    fn wrapped_rows_line_up_under_the_text_they_continue() {
+        let rows = wrapped("  - a list item long enough to need a second row", 24);
+        let rows: Vec<&str> = rows.split('\n').collect();
+        assert!(rows.len() > 1, "nothing was wrapped: {:?}", rows);
+        for row in &rows[1..] {
+            assert!(
+                row.starts_with("    ") && !row.starts_with("     "),
+                "not under the item's text: {:?}",
+                row
+            );
+        }
+
+        // And the reply's own bullet counts, even though it is written separately from
+        // the words that follow it.
+        let mut wrap = super::Wrap::new(24);
+        let mut rows = wrap.feed("● ");
+        rows.push_str(&wrap.feed("an answer long enough to wrap"));
+        let rows: Vec<&str> = rows.split('\n').collect();
+        assert!(rows.len() > 1, "nothing was wrapped: {:?}", rows);
+        for row in &rows[1..] {
+            assert!(
+                row.starts_with("  ") && !row.starts_with("   "),
+                "not under the answer: {:?}",
+                row
+            );
+        }
+    }
+
+    #[test]
+    fn colors_survive_the_break_and_never_count_toward_the_width() {
+        const TEXT: &str =
+            "plain \u{1b}[1mbold words in here\u{1b}[0m and more plain text after that";
+
+        let rows = wrapped(TEXT, 20);
+        no_row_overflows(&rows, 20);
+        // Cut in half, either sequence would paint everything after it.
+        assert_eq!(rows.matches("\u{1b}[1m").count(), 1, "got {:?}", rows);
+        assert_eq!(rows.matches("\u{1b}[0m").count(), 1, "got {:?}", rows);
+        assert_eq!(rows.split('\n').collect::<Vec<_>>().join(" "), TEXT);
+    }
+
+
+    #[test]
+    fn a_line_that_fits_is_left_exactly_as_it_was() {
+        assert_eq!(wrapped("short enough\n", 40), "short enough\n");
+        assert_eq!(wrapped("", 40), "");
+        // Blank lines keep their rows.
+        assert_eq!(wrapped("one\n\ntwo\n", 40), "one\n\ntwo\n");
     }
 }
