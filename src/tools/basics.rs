@@ -38,6 +38,19 @@ pub(crate) struct TodoWriteParams {
 
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+pub(crate) struct AskUserParams {
+    #[schemars(
+        description = "The question, as one plain sentence. Say what you are deciding and why it matters, not just 'which one?'."
+    )]
+    pub(crate) question: String,
+    #[schemars(
+        description = "The answers to offer, two to eight of them, in the order you would recommend. Write each one as long as it needs to be — a whole sentence naming the trade-off is far more use than a bare word. Do not add an 'other' or 'you decide' option: one is always added for you."
+    )]
+    pub(crate) options: Vec<String>,
+}
+
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct PresentPlanParams {
     #[schemars(
         description = "The plan itself, as markdown. Name the specific files and functions you will change and what each change does, in the order you will do them. Call out anything you are unsure about so the user can correct it. Keep it short enough to be checked in one read."
@@ -161,6 +174,24 @@ impl MyMcpServer {
         };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
+    }
+
+    #[tool(
+        description = "Ask the user a question and let them pick the answer. Reach for this the moment you are genuinely unsure and the answer would change what you build: two designs that both look reasonable, which library or dependency to use, a requirement that could mean either of two things, a name or format to settle on, whether to replace something or keep it. Ask at the point the decision comes up, not after you have already built one of the branches. One question now is cheaper than the wrong thing built well — and far cheaper than deciding, doubting the decision, and deciding again. If you notice yourself turning the same choice over for a second time, that is the signal: stop and ask. Offer the alternatives you are actually weighing, spelled out; the user can always type an answer of their own. Do not ask about anything you could settle yourself by reading the code, and do not ask the user to re-confirm work they already asked for."
+    )]
+    pub(crate) async fn ask_user(&self, params: Parameters<AskUserParams>) -> Result<CallToolResult, McpError> {
+        // In the REPL this never runs: the turn loop intercepts the call and puts the
+        // question on the screen itself, because the keyboard lives out there. Reaching
+        // this body means there is nobody on the other end to ask — an MCP client calling
+        // the tool directly — so the question is still checked over, and then the model is
+        // told plainly that it is on its own.
+        match crate::ask::normalize(&params.0.question, &params.0.options) {
+            Err(reason) => Ok(CallToolResult::error(vec![ContentBlock::text(reason)])),
+            Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "There is nobody to ask in this context. Decide it yourself, say in one \
+                 line which way you went and why, and carry on.",
+            )])),
+        }
     }
 
     #[tool(description = "Switch yourself into plan mode, where you can read and investigate but cannot change anything until the user approves a plan. Call this first, before doing anything else, whenever the user asks for a plan, a proposal, an approach, or how you would go about something — rather than asking you to just do it. Also reach for it when a request is large or ambiguous enough that building the wrong thing would waste real work. Do not use it for small, clear changes the user plainly wants carried out now. Once in plan mode, investigate the code and then call present_plan.")]

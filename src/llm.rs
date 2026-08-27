@@ -218,7 +218,7 @@ impl LMStudioClient {
         &self,
         messages: Vec<Value>,
         tools: Vec<Value>,
-        mut on_text: impl FnMut(&str),
+        mut on_chunk: impl FnMut(Chunk),
     ) -> Result<Value> {
         let mut body = json!({
             "messages": messages,
@@ -304,8 +304,8 @@ impl LMStudioClient {
                     );
                 }
 
-                if let Some(text) = assembler.push(&parsed) {
-                    on_text(&text);
+                for piece in assembler.push(&parsed) {
+                    on_chunk(piece);
                 }
             }
 
@@ -335,8 +335,25 @@ impl LMStudioClient {
                 .cloned()
                 .context("LLM server returned no message")?;
 
-            if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
-                on_text(text);
+            // Handed to the caller in the same two flavors the streaming path uses, so the
+            // REPL has one way of showing a reply rather than one per transport. The whole
+            // thing arrives at once here, which is the nature of a server that ignored
+            // "stream": true — there was nothing to show earlier.
+            for key in ["reasoning", "reasoning_content"] {
+                if let Some(text) = message
+                    .get(key)
+                    .and_then(|r| r.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    on_chunk(Chunk::Reasoning(text.to_string()));
+                }
+            }
+            if let Some(text) = message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                on_chunk(Chunk::Content(text.to_string()));
             }
             return Ok(message);
         }
@@ -399,18 +416,41 @@ pub(crate) struct StreamAssembler {
     pub(crate) tool_calls: Vec<StreamToolCall>,
 }
 
+// A piece of the reply as it lands, tagged with which of the two streams it came from.
+//
+// They are kept apart rather than concatenated because they are shown differently: the
+// answer is rendered as markdown, the chain of thought is dimmed. Reasoning used to be
+// swallowed here and printed only once the response was complete, which meant a model
+// that thinks for fifteen minutes before its first content token left the screen blank
+// for fifteen minutes and then emptied its whole preamble onto it at once.
+pub(crate) enum Chunk {
+    Content(String),
+    Reasoning(String),
+}
 
 impl StreamAssembler {
-    // Feed one parsed `data:` payload. Returns newly arrived visible text, if any, so the
-    // caller can print it the moment it lands.
-    pub(crate) fn push(&mut self, chunk: &Value) -> Option<String> {
-        let delta = chunk.get("choices")?.get(0)?.get("delta")?;
+    // Feed one parsed `data:` payload. Returns whatever newly arrived text it carried, in
+    // arrival order, so the caller can print it the moment it lands. Usually nothing or a
+    // single piece; a delta carrying both kinds yields both, thinking first.
+    pub(crate) fn push(&mut self, chunk: &Value) -> Vec<Chunk> {
+        let mut pieces = Vec::new();
+        let Some(delta) = chunk
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("delta"))
+        else {
+            return pieces;
+        };
 
-        // Some models stream their chain of thought separately. Keep it, but out of the
-        // printed stream: the non-streaming path only shows it when there is no content.
+        // Some models stream their chain of thought separately, under either key.
         for key in ["reasoning", "reasoning_content"] {
-            if let Some(text) = delta.get(key).and_then(|r| r.as_str()) {
+            if let Some(text) = delta
+                .get(key)
+                .and_then(|r| r.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 self.reasoning.push_str(text);
+                pieces.push(Chunk::Reasoning(text.to_string()));
             }
         }
 
@@ -440,12 +480,16 @@ impl StreamAssembler {
             }
         }
 
-        let text = delta
+        if let Some(text) = delta
             .get("content")
             .and_then(|c| c.as_str())
-            .filter(|s| !s.is_empty())?;
-        self.content.push_str(text);
-        Some(text.to_string())
+            .filter(|s| !s.is_empty())
+        {
+            self.content.push_str(text);
+            pieces.push(Chunk::Content(text.to_string()));
+        }
+
+        pieces
     }
 
     pub(crate) fn into_message(self) -> Value {
@@ -544,10 +588,12 @@ mod tests {
 
         // Text arrives token by token; each token is handed back for immediate printing.
         for token in ["Let", " me", " look"] {
-            let out = assembler
-                .push(&json!({"choices": [{"delta": {"content": token}}]}))
-                .unwrap();
-            printed.push_str(&out);
+            for piece in assembler.push(&json!({"choices": [{"delta": {"content": token}}]})) {
+                match piece {
+                    crate::Chunk::Content(text) => printed.push_str(&text),
+                    crate::Chunk::Reasoning(text) => panic!("not thinking: {}", text),
+                }
+            }
         }
         assert_eq!(printed, "Let me look");
 
@@ -559,7 +605,7 @@ mod tests {
                 "id": "call_abc",
                 "function": {"name": "read", "arguments": "{\"file"}
             }]}}]}))
-            .is_none());
+            .is_empty());
         assembler.push(&json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
             "id": "call_abc",
@@ -574,7 +620,7 @@ mod tests {
         }]}}]}));
 
         // A chunk with no delta at all (keepalive / usage-only) is harmless.
-        assert!(assembler.push(&json!({"choices": [{"finish_reason": "tool_calls"}]})).is_none());
+        assert!(assembler.push(&json!({"choices": [{"finish_reason": "tool_calls"}]})).is_empty());
 
         let message = assembler.into_message();
         assert_eq!(message["role"], "assistant");
@@ -688,7 +734,11 @@ mod tests {
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut streamed = String::new();
         let message = client
-            .chat_completion_streaming(vec![], vec![], |text| streamed.push_str(text))
+            .chat_completion_streaming(vec![], vec![], |chunk| {
+                if let crate::Chunk::Content(text) = chunk {
+                    streamed.push_str(&text);
+                }
+            })
             .await
             .unwrap();
 
@@ -696,6 +746,38 @@ mod tests {
         assert_eq!(streamed, "Hi there");
         assert_eq!(message["content"], "Hi there");
         assert_eq!(message["tool_calls"][0]["function"]["name"], "get_date");
+    }
+
+
+    #[tokio::test]
+    async fn thinking_reaches_the_caller_while_it_is_still_thinking() {
+        // A reasoning model: a long preamble under `reasoning_content`, then the answer.
+        // The preamble has to arrive piece by piece and stay tagged as thinking — held
+        // back until the end, it used to leave the screen blank for as long as the model
+        // took and then land in one block that read like the answer.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Yes, \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"wait…\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"42\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let url = serve_once(body, "text/event-stream").await;
+
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        // Recorded in arrival order, so the test also pins that thinking precedes content.
+        let mut order = Vec::new();
+        let message = client
+            .chat_completion_streaming(vec![], vec![], |chunk| match chunk {
+                crate::Chunk::Reasoning(text) => order.push(format!("think:{}", text)),
+                crate::Chunk::Content(text) => order.push(format!("say:{}", text)),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(order, ["think:Yes, ", "think:wait…", "say:42"]);
+        // And it is still echoed back to the model, which is what the chat templates read.
+        assert_eq!(message["reasoning_content"], "Yes, wait…");
+        assert_eq!(message["content"], "42");
     }
 
 
@@ -711,7 +793,11 @@ mod tests {
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut streamed = String::new();
         let message = client
-            .chat_completion_streaming(vec![], vec![], |text| streamed.push_str(text))
+            .chat_completion_streaming(vec![], vec![], |chunk| {
+                if let crate::Chunk::Content(text) = chunk {
+                    streamed.push_str(&text);
+                }
+            })
             .await
             .unwrap();
 

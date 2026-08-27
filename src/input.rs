@@ -14,6 +14,7 @@ use crossterm::tty::IsTty;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
 
 // The one thing that reads the keyboard.
@@ -507,6 +508,26 @@ fn bar(content: &str, width: usize) -> String {
     )
 }
 
+// What the activity bar says while something is running: the label, plus how much reply
+// has arrived so far once that is anything at all.
+//
+// Four characters to the token, the same rule of thumb `estimate_tokens` uses, so the two
+// figures on screen cannot disagree about what a token is. Nothing is bracketed until the
+// first token lands — through the silence before it, "(↓ 0)" says less than no bracket at
+// all, and the silence before it is exactly what this exists for.
+pub(crate) fn busy_label(busy: &str, streamed: Option<&AtomicUsize>) -> String {
+    let characters = match streamed {
+        Some(counter) => counter.load(Ordering::Relaxed),
+        None => 0,
+    };
+
+    match characters / 4 {
+        0 => busy.to_string(),
+        tokens if tokens < 1000 => format!("{} (↓ {})", busy, tokens),
+        tokens => format!("{} (↓ {:.1}k)", busy, tokens as f64 / 1000.0),
+    }
+}
+
 // The bar above the box: what is running, or what ran last.
 //
 // It used to exist only while something was running, which meant the input box jumped a
@@ -803,6 +824,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_activity_bar_counts_up_only_once_there_is_something_to_count() {
+        let streamed = AtomicUsize::new(0);
+
+        // Work that produces no stream of its own says only what it is doing.
+        assert_eq!(busy_label("Thinking…", None), "Thinking…");
+
+        // And so does a stream that has not delivered a token yet: the whole point is the
+        // silence before the first one, and "(↓ 0)" would fill it with nothing.
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking…");
+        streamed.store(3, Ordering::Relaxed);
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking…");
+
+        // Four characters to the token, the same rule `estimate_tokens` uses.
+        streamed.store(4, Ordering::Relaxed);
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 1)");
+        streamed.store(2596, Ordering::Relaxed);
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 649)");
+
+        // Thousands become the short form rather than a five-digit number nobody reads.
+        streamed.store(4000, Ordering::Relaxed);
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 1.0k)");
+        streamed.store(94_000, Ordering::Relaxed);
+        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 23.5k)");
     }
 
     #[test]

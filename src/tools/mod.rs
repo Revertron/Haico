@@ -302,6 +302,10 @@ impl MyMcpServer {
                 let params: TodoWriteParams = serde_json::from_value(arguments)?;
                 self.todo_write(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
+            "ask_user" => {
+                let params: AskUserParams = serde_json::from_value(arguments)?;
+                self.ask_user(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
             "start_plan" => {
                 self.start_plan().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }

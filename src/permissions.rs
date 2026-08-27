@@ -23,6 +23,11 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     "todo_write",
     "background_output",
     "background_stop",
+    // Not read-only so much as inert: it changes nothing on this machine, and it is the
+    // user answering it. Prompting for permission to ask a question would be a question
+    // about a question. Listed here rather than special-cased because plan mode reads the
+    // same list, and planning is where the model is least sure of anything.
+    "ask_user",
 ];
 
 // Programs where the bare name says almost nothing about what is about to happen, so the

@@ -158,81 +158,6 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
 
 // Ask user for permission to execute a tool
 
-pub(crate) fn is_markdown(text: &str) -> bool {
-    let mut markdown_score = 0;
-    let lines: Vec<&str> = text.lines().collect();
-
-    if lines.is_empty() {
-        return false;
-    }
-
-    for line in &lines {
-        let trimmed = line.trim();
-
-        // Check for headers (lines starting with #)
-        if trimmed.starts_with('#') && trimmed.len() > 1 {
-            markdown_score += 2;
-        }
-
-        // Check for unordered list items (lines starting with -)
-        if trimmed.starts_with('-') && trimmed.len() > 1 {
-            markdown_score += 1;
-        }
-
-        // Check for unordered list items (lines starting with *)
-        if trimmed.starts_with('*') && trimmed.len() > 1 && !trimmed.starts_with("**") {
-            markdown_score += 1;
-        }
-
-        // Check for bold text markers (**text**)
-        if line.contains("**") {
-            // Count pairs of **
-            let count = line.matches("**").count();
-            if count >= 2 {
-                markdown_score += 1;
-            }
-        }
-
-        // Check for italic markers (*text* or _text_) - only if they appear in pairs and not part of snake_case
-        // Count underscores only if surrounded by non-word chars to avoid snake_case false positives
-        let underscore_count = line.matches('_').count();
-        if underscore_count >= 2 {
-            // Check if they look like markdown (not snake_case)
-            // Simple heuristic: if there's whitespace around them, they're likely markdown
-            if line.contains(" _") || line.contains("_ ") {
-                markdown_score += 1;
-            }
-        }
-
-        // Check for code blocks (```)
-        if trimmed.starts_with("```") {
-            markdown_score += 3;
-        }
-
-        // Check for inline code (`text`)
-        if line.contains('`') && !trimmed.starts_with("```") {
-            markdown_score += 1;
-        }
-
-        // Check for links ([text](url))
-        if line.contains("[") && line.contains("](") {
-            markdown_score += 2;
-        }
-
-        // Check for ordered list (1. text)
-        if trimmed.len() > 2 {
-            let chars: Vec<char> = trimmed.chars().collect();
-            if chars[0].is_numeric() && chars.len() > 1 && chars[1] == '.' {
-                markdown_score += 1;
-            }
-        }
-    }
-
-    // Determine threshold: if we have enough Markdown indicators relative to text length
-    // Consider it Markdown if score is at least 3, or if score/lines ratio is > 0.2
-    let ratio = markdown_score as f64 / lines.len() as f64;
-    markdown_score >= 3 || ratio > 0.2
-}
 
 // Render Markdown text with colors and formatting for terminal output
 
@@ -955,14 +880,6 @@ mod log_tests {
     }
 }
 
-
-pub(crate) fn render_text(text: &str) -> String {
-    if is_markdown(text) {
-        render_markdown(text)
-    } else {
-        format!("{}\n", text)
-    }
-}
 
 // Interactive model selection using arrow keys
 

@@ -94,6 +94,10 @@ with your plan.\n\n\
 A good plan names the specific files and functions it will touch, says what will change in \
 each, and calls out anything you are unsure about. It is for a human to read and correct, \
 so keep it concrete and short enough to check.\n\n\
+If a choice would change the shape of the plan — which of two designs, which dependency, \
+which of two readings of the request is meant — call `ask_user` and settle it now. A plan \
+built on a guess is a plan the user has to correct, and this is the cheapest moment to \
+find out you guessed wrong.\n\n\
 The user will approve the plan or send back corrections. Do not begin work until they have \
 approved it — you will be told when they do.";
 
@@ -536,6 +540,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_question_for_the_user_runs_unprompted_in_every_mode() {
+        use crate::ask::ASK_USER;
+
+        let call = json!({"question": "Which one?", "options": ["a", "b"]});
+
+        // Prompting for permission to ask a question would be a question about a
+        // question, and the answer is the user's either way.
+        for mode in [Mode::Normal, Mode::Plan, Mode::Auto] {
+            assert!(
+                matches!(gate_for_mode(mode, &ws(), ASK_USER, &call), Gate::Auto),
+                "{} should not prompt in {:?} mode",
+                ASK_USER,
+                mode
+            );
+        }
+
+        // Plan mode most of all: a plan is written at exactly the moment the model knows
+        // least, and the tool list is what it goes by — one it cannot see is one it does
+        // not reach for.
+        assert!(plan_mode_allows(ASK_USER));
+        let tools = vec![json!({"function": {"name": ASK_USER}})];
+        assert_eq!(tools_for_mode(Mode::Plan, &tools).len(), 1);
+        assert_eq!(tools_for_mode(Mode::Normal, &tools).len(), 1);
     }
 
     #[test]

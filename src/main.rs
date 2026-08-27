@@ -1,16 +1,19 @@
 use anyhow::{Context, Result};
+use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Declared first, and with #[macro_use], so out!/outln! are in scope for every
 // module below it.
 #[macro_use]
 mod out;
 
+mod ask;
 mod config;
 mod input;
 mod llm;
@@ -26,6 +29,7 @@ mod tools;
 mod util;
 mod workspace;
 
+use ask::*;
 use config::*;
 use input::*;
 use llm::*;
@@ -127,10 +131,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-// The three questions that need a keyboard. Each one refuses when there is none rather
+// The four questions that need a keyboard. Each one refuses when there is none rather
 // than picking an answer: a terminal that cannot be read from is not consent, and that
-// rule is the same whether what is being asked about is a tool call, a plan, or which
-// model to load.
+// rule is the same whether what is being asked about is a tool call, a plan, which model
+// to load, or a fork the model wants the user to settle.
 
 async fn pick_model(keys: Option<&mut Keys>, models: Vec<String>) -> Result<String> {
     match keys {
@@ -144,6 +148,17 @@ async fn pick_model(keys: Option<&mut Keys>, models: Vec<String>) -> Result<Stri
 async fn ask_about_plan(keys: Option<&mut Keys>, plan: &str) -> Result<PlanDecision> {
     match keys {
         Some(keys) => review_plan(keys, plan).await,
+        None => Err(anyhow::anyhow!("no interactive terminal")),
+    }
+}
+
+async fn ask_the_user(
+    keys: Option<&mut Keys>,
+    question: &str,
+    options: &[String],
+) -> Result<Answer> {
+    match keys {
+        Some(keys) => ask_question(keys, question, options).await,
         None => Err(anyhow::anyhow!("no interactive terminal")),
     }
 }
@@ -181,6 +196,9 @@ async fn work_with_input<T>(
     queued: &mut Vec<String>,
     status: &str,
     busy: &str,
+    // Characters of reply seen so far, for the work that produces one. Shared rather than
+    // returned because it has to be readable while the future filling it is still running.
+    streamed: Option<&AtomicUsize>,
     work: impl std::future::Future<Output = T>,
 ) -> Option<T> {
     let Some(keys) = keys.as_mut() else {
@@ -195,24 +213,48 @@ async fn work_with_input<T>(
     };
 
     tokio::pin!(work);
+
+    // The bar is redrawn on a timer as well as on keystrokes. Without a tick it only
+    // changes when a key is pressed, which would leave the counter frozen through exactly
+    // the long silence it exists to fill.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+
+    // What the bar last said, and whether anything else needs redrawing. A tick that would
+    // draw the same label again is skipped: work with no counter to move — a tool running,
+    // a call being judged — never changes it, and repainting the region four times a second
+    // for the length of a long build is traffic and flicker bought for nothing.
+    let mut shown: Option<String> = None;
+    let mut dirty = true;
+
     loop {
-        crate::input::draw(
-            editor,
-            &crate::input::Chrome {
-                mode: *mode,
-                busy: Some(busy),
-                // Something is running, so the bar has better than history to show.
-                last: None,
-                status,
-            },
-        );
+        let label = crate::input::busy_label(busy, streamed);
+        if dirty || shown.as_deref() != Some(label.as_str()) {
+            crate::input::draw(
+                editor,
+                &crate::input::Chrome {
+                    mode: *mode,
+                    busy: Some(&label),
+                    // Something is running, so the bar has better than history to show.
+                    last: None,
+                    status,
+                },
+            );
+            shown = Some(label);
+            dirty = false;
+        }
 
         tokio::select! {
+            // Nothing to do with the tick itself: the loop redraws at the top if the
+            // counter has moved since it last did.
+            _ = tick.tick() => {}
             output = &mut work => {
                 out::clear_region();
                 return Some(output);
             }
             event = keys.next() => {
+                // Whatever it was — a character typed, a mode cycled, a resize — the box
+                // below the bar has to be drawn again even when the label has not moved.
+                dirty = true;
                 let Some(event) = event else {
                     // The keyboard is gone. Finishing the work is still better than
                     // dropping it on the floor.
@@ -1011,6 +1053,16 @@ Usage: /set <name> <value>, or /set <name> unset
             // Assistant text is printed the moment it arrives, so none of the branches
             // below re-print it.
             let mut streamed_any = false;
+            // The same for the chain of thought, which is shown dimmed as it lands. Tracked
+            // separately because it is not markdown and does not go through the stream
+            // above, and because the branches below have to know that something was already
+            // put on screen even when no content ever followed.
+            let mut streamed_thinking = false;
+            // Characters of reply seen so far, thinking included, for the activity bar. A
+            // big model can reason for many minutes before its first content token, and a
+            // bar that only says "Thinking…" for all of it is indistinguishable from one
+            // that has hung. An atomic rather than a Cell so the future stays Send.
+            let streamed_chars = AtomicUsize::new(0);
             // Rendered as it arrives rather than at the end, so the answer still
             // appears a piece at a time and still comes out as markdown.
             let mut markdown = MarkdownStream::new();
@@ -1031,15 +1083,48 @@ Usage: /set <name> <value>, or /set <name> unset
                 &mut queued,
                 &status,
                 &thinking,
+                Some(&streamed_chars),
                 lm_client.chat_completion_streaming(
                     request_messages,
                     request_tools,
-                    |text| {
-                        if !streamed_any {
-                            streamed_any = true;
-                            out!("● ");
+                    |chunk| {
+                        match chunk {
+                            // Dimmed, and painted per piece rather than left switched on
+                            // across the stream: an unfinished line is redrawn above the
+                            // input box every time the box moves, and a color left open at
+                            // the end of it would bleed into the box itself.
+                            Chunk::Reasoning(text) => {
+                                streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
+                                if !streamed_thinking {
+                                    streamed_thinking = true;
+                                    out!(
+                                        "{}○ {}",
+                                        SetForegroundColor(Color::DarkGrey),
+                                        ResetColor
+                                    );
+                                }
+                                out!(
+                                    "{}{}{}",
+                                    SetForegroundColor(Color::DarkGrey),
+                                    text,
+                                    ResetColor
+                                );
+                            }
+                            Chunk::Content(text) => {
+                                streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
+                                if !streamed_any {
+                                    streamed_any = true;
+                                    // The answer starts on a row of its own, so it is not
+                                    // mistaken for the tail of the thinking above it.
+                                    if streamed_thinking {
+                                        crate::out::ensure_line_start();
+                                        outln!();
+                                    }
+                                    out!("● ");
+                                }
+                                out!("{}", markdown.push(&text));
+                            }
                         }
-                        out!("{}", markdown.push(text));
                         crate::out::flush();
                     },
                 ),
@@ -1052,6 +1137,8 @@ Usage: /set <name> <value>, or /set <name> unset
                 // consistent, so the conversation is still usable.
                 if streamed_any {
                     out!("{}", markdown.finish(false));
+                }
+                if streamed_any || streamed_thinking {
                     crate::out::ensure_line_start();
                 }
                 outln!("\n[interrupted]\n");
@@ -1064,7 +1151,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // A dropped connection, a server-side error, or an unparseable body
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
-                    if streamed_any {
+                    if streamed_any || streamed_thinking {
                         outln!();
                     }
                     outln!("\n[error] {:#}", e);
@@ -1073,22 +1160,14 @@ Usage: /set <name> <value>, or /set <name> unset
                 }
             };
 
+            // Both kinds of text were printed as they arrived — including the case of a
+            // model whose entire reply is chain of thought with no content at all, which
+            // is why nothing is re-printed from `message` here. All that is left is to
+            // close whichever of the two was last on screen.
             if streamed_any {
                 out!("{}", markdown.finish(false));
-                crate::out::ensure_line_start();
-            } else if let Some(reasoning) = message
-                .get("reasoning_content")
-                .or_else(|| message.get("reasoning"))
-                .and_then(|r| r.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                // Some models put their whole preamble in the reasoning field and send no
-                // content. Either key can appear here: the assembler normalizes streamed
-                // chunks to `reasoning_content`, while the non-streaming fallback returns
-                // the server's message untouched.
-                out!("● ");
-                out!("{}", render_text(reasoning));
+            }
+            if streamed_any || streamed_thinking {
                 crate::out::ensure_line_start();
             }
 
@@ -1266,6 +1345,51 @@ Usage: /set <name> <value>, or /set <name> unset
                         continue;
                     }
 
+                    // A question for the user is answered out here for the same reason a
+                    // plan is: the keyboard belongs to the REPL, and the tool body runs in
+                    // the MCP server too, where there is nobody to ask.
+                    if tool_name == ASK_USER {
+                        let question = arguments["question"].as_str().unwrap_or_default();
+                        // Anything that is not a string is dropped rather than rendered as
+                        // JSON: a model that sent objects here is better told the list was
+                        // too short than shown its own braces back on screen.
+                        let options: Vec<String> = arguments["options"]
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|item| item.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let content = match ask::normalize(question, &options) {
+                            Err(reason) => reason,
+                            Ok((question, options)) => {
+                                match ask_the_user(keys.as_mut(), &question, &options).await {
+                                    Ok(answer) => ask::reply_for(&answer, &options),
+                                    // Nobody to ask is not the same as an answer, and it
+                                    // must not stall the turn either: the model is told to
+                                    // carry the decision itself.
+                                    Err(e) => {
+                                        outln!("\n[error] could not ask the user: {}", e);
+                                        "The question could not be put to the user (no \
+                                         interactive terminal). Decide it yourself, say in \
+                                         one line which way you went and why, and carry on."
+                                            .to_string()
+                                    }
+                                }
+                            }
+                        };
+
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": content
+                        }));
+                        continue;
+                    }
+
                     // Decide what this specific call needs: nothing (read-only), the user's
                     // consent under a narrowly scoped key, or an outright refusal. The mode
                     // has the first word — plan mode refuses anything that changes the
@@ -1314,6 +1438,9 @@ Usage: /set <name> <value>, or /set <name> unset
                             &mut queued,
                             &status,
                             "🤖 Reviewing this call…",
+                            // The reviewer's own reply is not streamed, so there is
+                            // nothing to count.
+                            None,
                             judge_tool_call(&lm_client, &mut review_cache, tool_name, &arguments),
                         )
                         .await;
@@ -1493,6 +1620,9 @@ Usage: /set <name> <value>, or /set <name> unset
                         &mut queued,
                         &status,
                         &busy,
+                        // A tool produces its output all at once, so there is no partial
+                        // size to report while it runs.
+                        None,
                         server.execute_tool(tool_name, arguments),
                     )
                     .await;
