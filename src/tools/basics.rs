@@ -17,7 +17,7 @@ pub(crate) struct CalculatorParams {
 }
 
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq)]
 pub(crate) struct TodoItem {
     #[schemars(description = "What needs doing, phrased as an action (e.g. 'Add the --context flag')")]
     pub(crate) task: String,
@@ -132,9 +132,11 @@ impl MyMcpServer {
 
         *self.todos.lock().unwrap() = params.0.todos.clone();
 
-        // Shown to the user as it changes, so the plan is visible rather than buried in
-        // tool output only the model sees.
-        if self.interactive {
+        // Nothing to print in the REPL: the list is pinned above the input box, and the
+        // next draw picks the new one up from here. A piped session has no bottom region
+        // to pin anything to, so there it still goes into the transcript — buried under
+        // the next few tool calls, but shown, which beats not shown at all.
+        if self.interactive && !crate::out::has_region() {
             outln!("\n  Plan:");
             for item in &params.0.todos {
                 let mark = match item.status.as_str() {

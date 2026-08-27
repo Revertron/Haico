@@ -8,6 +8,7 @@
 
 use crate::modes::Mode;
 use crate::out;
+use crate::tools::TodoItem;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::tty::IsTty;
@@ -86,6 +87,36 @@ pub(crate) enum Input {
     // Shift+Tab. The editor does not own the mode, so it says so and lets the caller
     // decide whether cycling means anything where it is being used.
     CycleMode,
+    // Ctrl+T, and the same arrangement: the editor does not own the plan panel either,
+    // and the prompts that draw no panel simply ignore this.
+    TogglePlan,
+}
+
+// How much of the plan the panel shows, cycled with Ctrl+T.
+//
+// The windowed default is a compromise, and both ends of it are sometimes what is wanted:
+// the whole list while checking what the model set out to do, one line while reading the
+// transcript underneath it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum PlanView {
+    // One row: how far along the plan is, and what is being worked on.
+    Collapsed,
+    #[default]
+    Windowed,
+    // As much of it as the screen can spare, which is still not unbounded.
+    Full,
+}
+
+impl PlanView {
+    // Smallest, middle, largest, and round again. Starting from the middle, the first
+    // press opens the panel up and the second folds it away.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            PlanView::Collapsed => PlanView::Windowed,
+            PlanView::Windowed => PlanView::Full,
+            PlanView::Full => PlanView::Collapsed,
+        }
+    }
 }
 
 pub(crate) struct Editor {
@@ -364,6 +395,7 @@ impl Editor {
                 return Some(Input::Text(text));
             }
             KeyCode::BackTab => return Some(Input::CycleMode),
+            KeyCode::Char('t') if control => return Some(Input::TogglePlan),
             KeyCode::Char('c') if control => {
                 self.reset();
                 return Some(Input::Interrupted);
@@ -447,6 +479,13 @@ fn terminal_width() -> usize {
         .max(20)
 }
 
+fn terminal_height() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, rows)| rows as usize)
+        .unwrap_or(24)
+        .max(1)
+}
+
 // Everything the bottom of the screen shows besides what is being typed: what the
 // model is busy with above the box, and what the session is set to below it.
 pub(crate) struct Chrome<'a> {
@@ -457,6 +496,11 @@ pub(crate) struct Chrome<'a> {
     pub(crate) last: Option<&'a str>,
     // The right-hand end of the status bar: which model, and how full its context is.
     pub(crate) status: &'a str,
+    // The plan as todo_write last left it, drawn above everything else. Empty until the
+    // model writes one, and then the panel takes no rows at all.
+    pub(crate) todos: &'a [TodoItem],
+    // How much of it to show. Owned by the caller, since it outlives any one draw.
+    pub(crate) plan: PlanView,
 }
 
 // The chrome's colors. The bars are the only thing on screen that is painted rather than
@@ -490,12 +534,7 @@ fn bar(content: &str, width: usize) -> String {
 
     // Cut by characters: what reaches here is plain text, painted here rather than
     // carrying escapes of its own, so there is no sequence to cut in half.
-    let length = content.chars().count();
-    let content: String = if length > room {
-        content.chars().take(room - 1).chain(['…']).collect()
-    } else {
-        content
-    };
+    let content = fit(&content, room);
 
     let pad = room.saturating_sub(content.chars().count());
     format!(
@@ -560,6 +599,118 @@ fn status_bar(mode: Mode, status: &str, width: usize) -> String {
     bar(&format!("{}{}{}", left, " ".repeat(gap), status), width)
 }
 
+// The plan, pinned above the activity bar.
+//
+// todo_write used to print the list as ordinary output, which meant it scrolled away
+// behind the next few tool calls — exactly when it is most use. Pinned, it is on screen
+// for as long as the plan exists, and that is what the windowing pays for: a long plan
+// would otherwise take the transcript's rows away for the rest of the turn.
+//
+// The ceiling on the windowed view, whatever the height of the terminal, heading and "…"
+// lines included.
+const PLAN_MAX_ROWS: usize = 10;
+
+// Cut a plain-text row down to the room it has, for the same reason `bar` does it: a row
+// the terminal wraps on its own is a row the writer cannot count, and the region's height
+// is wrong from then on.
+fn fit(text: &str, columns: usize) -> String {
+    let length = text.chars().count();
+    if length <= columns || columns == 0 {
+        return text.to_string();
+    }
+    text.chars().take(columns - 1).chain(['…']).collect()
+}
+
+fn dim(text: String) -> String {
+    format!("{}{}{}", SetForegroundColor(Color::DarkGrey), text, ResetColor)
+}
+
+// `room` is how many rows the panel may take at most — what the box and the bars leave.
+// Even the full view is bounded by it: the writer erases the region by counting rows back
+// from the caret, so a region taller than the screen would have it walking back over rows
+// that scrolled away.
+pub(crate) fn plan_rows(
+    todos: &[TodoItem],
+    width: usize,
+    room: usize,
+    view: PlanView,
+) -> Vec<String> {
+    if todos.is_empty() || room == 0 {
+        return Vec::new();
+    }
+
+    let budget = match view {
+        PlanView::Collapsed => 1,
+        // A third of what is free, because the transcript above is what the panel borrows
+        // from, and never more than the ceiling however tall the terminal is.
+        PlanView::Windowed => (room / 3).clamp(4, PLAN_MAX_ROWS),
+        PlanView::Full => room,
+    }
+    .min(room);
+
+    let columns = width.saturating_sub(1);
+    let done = todos.iter().filter(|item| item.status == "done").count();
+    let mark = |item: &TodoItem| match item.status.as_str() {
+        "done" => "x",
+        "in_progress" => "»",
+        _ => " ",
+    };
+
+    // What the window is kept around: whatever is being worked on, or failing that the
+    // first thing still to do. A finished list shows its end, which is the part that says
+    // it is finished.
+    let focus = todos
+        .iter()
+        .position(|item| item.status == "in_progress")
+        .or_else(|| todos.iter().position(|item| item.status != "done"))
+        .unwrap_or(todos.len() - 1);
+
+    let heading = format!("  Plan  {}/{}", done, todos.len());
+
+    // The one-row form: asked for, or all there is room for. Below four rows a windowed
+    // list is mostly ellipses, and this says the same thing in less space.
+    if budget < 4 && todos.len() + 1 > budget {
+        let item = &todos[focus];
+        let line = format!("{}  [{}] {}", heading, mark(item), item.task);
+        return vec![dim(fit(&line, columns))];
+    }
+
+    // One row of the budget goes to the heading, and one to each "…" that turns out to be
+    // needed. Both are assumed and a row handed back when the window sits against an end,
+    // which is shorter than solving it exactly and lands on the same answer.
+    let body = budget - 1;
+    let (mut start, mut end) = (0, todos.len());
+    if todos.len() > body {
+        let shown = body.saturating_sub(2).max(1);
+        start = focus.saturating_sub(shown / 2).min(todos.len() - shown);
+        end = start + shown;
+        if start == 0 {
+            end = (end + 1).min(todos.len());
+        }
+        if end == todos.len() {
+            start = start.saturating_sub(1);
+        }
+    }
+
+    let mut rows = vec![dim(fit(&heading, columns))];
+    if start > 0 {
+        rows.push(dim(fit(&format!("   … {} above", start), columns)));
+    }
+    for item in &todos[start..end] {
+        let line = fit(&format!("   [{}] {}", mark(item), item.task), columns);
+        // Only what is left to do is worth full brightness: the finished items are there
+        // to say the plan is being followed, not to be read again.
+        rows.push(if item.status == "done" { dim(line) } else { line });
+    }
+    if end < todos.len() {
+        rows.push(dim(fit(
+            &format!("   … +{} more", todos.len() - end),
+            columns,
+        )));
+    }
+    rows
+}
+
 pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     let width = terminal_width();
     let (mut rows, caret_row, caret_column) = editor.rows(PROMPT, width);
@@ -567,9 +718,19 @@ pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     rows.insert(0, activity_bar(chrome, width));
     rows.push(status_bar(chrome.mode, chrome.status, width));
 
-    // Always one row above the box now, where it used to depend on whether anything was
-    // running.
-    out::set_region(rows, caret_row + 1, caret_column);
+    // What is left for the plan once the box and the bars have had their rows, less two:
+    // one so the transcript never disappears entirely, and one for a streamed line that
+    // has not ended yet, which is drawn above the region and counts against the screen
+    // just the same.
+    let room = terminal_height().saturating_sub(rows.len() + 2);
+    let plan = plan_rows(chrome.todos, width, room, chrome.plan);
+
+    // The plan sits above the activity bar, so everything below it — the box included —
+    // is that many rows further down than it used to be.
+    let above = plan.len() + 1;
+    rows.splice(0..0, plan);
+
+    out::set_region(rows, caret_row + above, caret_column);
 }
 
 // What a submitted entry looks like once it is part of the scrollback rather than
@@ -598,12 +759,15 @@ pub(crate) async fn read_text(keys: &mut Keys, editor: &mut Editor, prompt: &str
         out::set_region(rows, caret_row, caret_column);
         match keys.next().await {
             None => return Input::Eof,
-            Some(Event::Key(key)) => {
-                if let Some(input) = editor.key(key) {
+            Some(Event::Key(key)) => match editor.key(key) {
+                // This prompt draws no plan panel, so there is nothing to fold.
+                Some(Input::TogglePlan) => {}
+                Some(input) => {
                     out::clear_region();
                     return input;
                 }
-            }
+                None => {}
+            },
             Some(Event::Paste(text)) => editor.paste(&text),
             // Redrawn at the top of the loop with the new width.
             Some(Event::Resize(..)) => {}
@@ -620,6 +784,8 @@ pub(crate) async fn read_command(
     mode: &mut Mode,
     status: &str,
     last: Option<&str>,
+    todos: &[TodoItem],
+    plan: &mut PlanView,
 ) -> Input {
     loop {
         draw(
@@ -629,12 +795,15 @@ pub(crate) async fn read_command(
                 busy: None,
                 last,
                 status,
+                todos,
+                plan: *plan,
             },
         );
         match keys.next().await {
             None => return Input::Eof,
             Some(Event::Key(key)) => match editor.key(key) {
                 Some(Input::CycleMode) => *mode = mode.next(),
+                Some(Input::TogglePlan) => *plan = plan.next(),
                 Some(input) => {
                     out::clear_region();
                     return input;
@@ -660,7 +829,12 @@ pub(crate) enum WhileWorking {
 
 // One keystroke's worth of the live input box, for use in a select! arm alongside
 // whatever the model is doing.
-pub(crate) fn while_working(editor: &mut Editor, mode: &mut Mode, event: Event) -> WhileWorking {
+pub(crate) fn while_working(
+    editor: &mut Editor,
+    mode: &mut Mode,
+    plan: &mut PlanView,
+    event: Event,
+) -> WhileWorking {
     match event {
         Event::Key(key) => {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
@@ -672,6 +846,11 @@ pub(crate) fn while_working(editor: &mut Editor, mode: &mut Mode, event: Event) 
                 Some(Input::Interrupted) => WhileWorking::Interrupt,
                 Some(Input::CycleMode) => {
                     *mode = mode.next();
+                    WhileWorking::Nothing
+                }
+                // Nothing to report: the caller redraws after every key it is handed.
+                Some(Input::TogglePlan) => {
+                    *plan = plan.next();
                     WhileWorking::Nothing
                 }
                 // Ctrl+D is for leaving, and leaving mid-turn is what Esc is for.
@@ -869,6 +1048,8 @@ mod tests {
             busy: Some("thinking"),
             last: Some("ran cargo build"),
             status: "a-model  ctx 3%",
+            todos: &[],
+            plan: PlanView::Windowed,
         });
 
         let busy = written.find("○ thinking").expect("the busy line");
@@ -891,6 +1072,8 @@ mod tests {
             busy: None,
             last: Some("ran cargo build"),
             status: "a-model  ctx 3%",
+            todos: &[],
+            plan: PlanView::Windowed,
         });
         assert!(idle.contains("○ ran cargo build"), "got {:?}", idle);
 
@@ -900,8 +1083,153 @@ mod tests {
             busy: None,
             last: None,
             status: "a-model  ctx 3%",
+            todos: &[],
+            plan: PlanView::Windowed,
         });
         assert!(fresh.contains("○ ready"), "got {:?}", fresh);
+    }
+
+    fn todo(task: &str, status: &str) -> TodoItem {
+        TodoItem {
+            task: task.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    // A plan long enough that no view can show all of it, with the work part way down.
+    fn long_plan() -> Vec<TodoItem> {
+        let mut plan: Vec<TodoItem> = (0..20)
+            .map(|index| todo(&format!("step {}", index), "done"))
+            .collect();
+        plan[12].status = "in_progress".to_string();
+        for item in plan.iter_mut().skip(13) {
+            item.status = "pending".to_string();
+        }
+        plan
+    }
+
+    #[test]
+    fn the_plan_panel_stays_short_and_keeps_the_current_item_in_view() {
+        // Nothing pinned until there is a plan: the panel costs no rows at all.
+        assert!(plan_rows(&[], 80, 20, PlanView::Windowed).is_empty());
+
+        let short = vec![
+            todo("write the config", "done"),
+            todo("write the server", "in_progress"),
+            todo("write main", "pending"),
+        ];
+        let rows = plan_rows(&short, 80, 20, PlanView::Windowed);
+        assert_eq!(rows.len(), 4, "a heading and one row each: {:?}", rows);
+        assert!(rows[0].contains("Plan  1/3"), "got {:?}", rows[0]);
+        assert!(rows[2].contains("[»] write the server"), "got {:?}", rows[2]);
+
+        // Longer than the panel: windowed around whatever is in progress, with both ends
+        // saying how much is out of sight rather than silently dropping it.
+        let long = long_plan();
+        for room in [6usize, 20, 60] {
+            let rows = plan_rows(&long, 80, room, PlanView::Windowed);
+            let budget = (room / 3).clamp(4, PLAN_MAX_ROWS).min(room);
+            assert!(rows.len() <= budget, "{} rows for room {}: {:?}", rows.len(), room, rows);
+            assert!(
+                rows.iter().any(|row| row.contains("step 12")),
+                "the item being worked on has to be in the window: {:?}",
+                rows
+            );
+            assert!(rows.iter().any(|row| row.contains("above")), "{:?}", rows);
+            assert!(rows.iter().any(|row| row.contains("more")), "{:?}", rows);
+        }
+
+        // And a row that wrapped would be a row the writer cannot count.
+        let wide = vec![todo(&"a very long task ".repeat(20), "pending")];
+        for row in plan_rows(&wide, 40, 20, PlanView::Windowed) {
+            assert!(crate::out::visible_width(&row) < 40, "too wide: {:?}", row);
+        }
+    }
+
+    #[test]
+    fn ctrl_t_cycles_the_panel_between_its_three_sizes() {
+        let mut editor = Editor::new(Vec::new());
+        let mut view = PlanView::default();
+        let mut cycle = || {
+            match editor.key(press(KeyCode::Char('t'), KeyModifiers::CONTROL)) {
+                Some(Input::TogglePlan) => view = view.next(),
+                other => panic!("Ctrl+T should ask for the panel, got {:?}", other.is_some()),
+            }
+            view
+        };
+        // The default is the middle size; the first press opens it up, the second folds
+        // it away, and the third is back where it started.
+        assert_eq!(PlanView::default(), PlanView::Windowed);
+        assert_eq!(cycle(), PlanView::Full);
+        assert_eq!(cycle(), PlanView::Collapsed);
+        assert_eq!(cycle(), PlanView::Windowed);
+
+        let long = long_plan();
+
+        // Folded away: one row, whatever the plan and whatever the room, and it still
+        // names what is being worked on.
+        let rows = plan_rows(&long, 80, 40, PlanView::Collapsed);
+        assert_eq!(rows.len(), 1, "got {:?}", rows);
+        assert!(rows[0].contains("Plan  12/20"), "got {:?}", rows[0]);
+        assert!(rows[0].contains("[»] step 12"), "got {:?}", rows[0]);
+
+        // Opened up: all twenty and the heading, since there is room for them.
+        let rows = plan_rows(&long, 80, 40, PlanView::Full);
+        assert_eq!(rows.len(), 21, "got {:?}", rows);
+        assert!(rows[1].contains("[x] step 0"), "got {:?}", rows[1]);
+        assert!(rows[20].contains("[ ] step 19"), "got {:?}", rows[20]);
+
+        // ...but never past what the screen can spare. The full view is bounded by the
+        // room it is given, because a region taller than the terminal scrolls its own top
+        // away and the writer then erases rows that are no longer there.
+        for room in [1usize, 2, 3, 7, 12] {
+            for view in [PlanView::Collapsed, PlanView::Windowed, PlanView::Full] {
+                let rows = plan_rows(&long, 80, room, view);
+                assert!(
+                    rows.len() <= room,
+                    "{:?} took {} rows out of {}: {:?}",
+                    view,
+                    rows.len(),
+                    room,
+                    rows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_sits_above_the_activity_bar_and_the_caret_moves_down_with_it() {
+        let mut editor = Editor::new(Vec::new());
+        type_text(&mut editor, "hello");
+        let todos = vec![todo("write the server", "in_progress")];
+
+        let _guard = crate::out::capture_guard();
+        crate::out::start_capture();
+        draw(
+            &editor,
+            &Chrome {
+                mode: Mode::Normal,
+                busy: Some("thinking"),
+                last: None,
+                status: "a-model  ctx 3%",
+                todos: &todos,
+                plan: PlanView::Windowed,
+            },
+        );
+        let written = crate::out::take_capture();
+
+        let plan = written.find("Plan  0/1").expect("the plan");
+        let busy = written.find("○ thinking").expect("the busy line");
+        let box_row = written.find("> hello").expect("the input box");
+        assert!(plan < busy && busy < box_row, "wrong order in {:?}", written);
+
+        // Two plan rows, the bar, the box, the status bar: the caret belongs on the fourth
+        // row of five, so the writer walks back exactly one from the last and along to
+        // column 7. An offset that forgot the plan is invisible in the text above and
+        // obvious on screen.
+        use crossterm::cursor::{MoveRight, MoveToColumn, MoveUp};
+        let landing = format!("{}{}{}", MoveUp(1), MoveToColumn(0), MoveRight(7));
+        assert!(written.contains(&landing), "the caret lands in the wrong place: {:?}", written);
     }
 
     #[test]

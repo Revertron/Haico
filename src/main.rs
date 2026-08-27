@@ -112,6 +112,7 @@ fn print_repl_help() {
     outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
     outln!("While working: keep typing — Enter queues the message for when the turn");
     outln!("               ends. Esc interrupts and returns to the prompt.");
+    outln!("Either way:    Ctrl+T cycles the plan panel — windowed, all of it, one line.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
     outln!();
 }
@@ -195,6 +196,11 @@ async fn work_with_input<T>(
     mode: &mut Mode,
     queued: &mut Vec<String>,
     status: &str,
+    // The plan, read fresh on every redraw rather than snapshotted once: todo_write runs
+    // inside the very work this is waiting on, and a panel that only caught up at the end
+    // of the turn would be worth nothing.
+    todos: &std::sync::Mutex<Vec<TodoItem>>,
+    plan_view: &mut PlanView,
     busy: &str,
     // Characters of reply seen so far, for the work that produces one. Shared rather than
     // returned because it has to be readable while the future filling it is still running.
@@ -224,11 +230,15 @@ async fn work_with_input<T>(
     // a call being judged — never changes it, and repainting the region four times a second
     // for the length of a long build is traffic and flicker bought for nothing.
     let mut shown: Option<String> = None;
+    let mut shown_plan: Vec<TodoItem> = Vec::new();
     let mut dirty = true;
 
     loop {
         let label = crate::input::busy_label(busy, streamed);
-        if dirty || shown.as_deref() != Some(label.as_str()) {
+        let plan = todos.lock().unwrap().clone();
+        if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
+            // Ctrl+T comes through `while_working` below, which sets `dirty` like any
+            // other key, so the view does not need watching separately here.
             crate::input::draw(
                 editor,
                 &crate::input::Chrome {
@@ -237,9 +247,12 @@ async fn work_with_input<T>(
                     // Something is running, so the bar has better than history to show.
                     last: None,
                     status,
+                    todos: &plan,
+                    plan: *plan_view,
                 },
             );
             shown = Some(label);
+            shown_plan = plan;
             dirty = false;
         }
 
@@ -261,7 +274,7 @@ async fn work_with_input<T>(
                     out::clear_region();
                     return Some(work.await);
                 };
-                match crate::input::while_working(editor, mode, event) {
+                match crate::input::while_working(editor, mode, plan_view, event) {
                     crate::input::WhileWorking::Interrupt => {
                         out::clear_region();
                         return None;
@@ -506,6 +519,10 @@ async fn main() -> Result<()> {
     // happened, rather than an empty row. None until the first tool has run.
     let mut last_activity: Option<String> = None;
 
+    // How much of the plan the panel shows. Lives out here rather than in the panel
+    // because Ctrl+T is pressed in one turn and has to still hold in the next.
+    let mut plan_view = PlanView::default();
+
     outln!("Type /help for commands.\n");
 
     // Main loop
@@ -518,7 +535,18 @@ async fn main() -> Result<()> {
             match keys.as_mut() {
                 Some(keys) => {
                     let status = status_line(&lm_client.model, &messages, context_tokens);
-                    match read_command(keys, &mut editor, &mut mode, &status, last_activity.as_deref()).await {
+                    let plan = server.todos.lock().unwrap().clone();
+                    match read_command(
+                        keys,
+                        &mut editor,
+                        &mut mode,
+                        &status,
+                        last_activity.as_deref(),
+                        &plan,
+                        &mut plan_view,
+                    )
+                    .await
+                    {
                         // The finished entry becomes a plain line of the transcript, so
                         // the conversation reads as one when scrolled back.
                         Input::Text(text) => {
@@ -533,8 +561,8 @@ async fn main() -> Result<()> {
                             outln!("Goodbye!");
                             break;
                         }
-                        // read_command handles this one itself.
-                        Input::CycleMode => continue,
+                        // read_command handles these two itself; neither ends an entry.
+                        Input::CycleMode | Input::TogglePlan => continue,
                     }
                 }
                 None => match crate::input::read_piped_line() {
@@ -655,6 +683,10 @@ async fn main() -> Result<()> {
             // never saw the conversation, so dropping the conversation tells it nothing.
             // Approvals in `perm_manager` deliberately survive, same as they always have.
             review_cache.clear();
+            // The plan went with the conversation. It used to be harmless to leave — only
+            // /todo ever looked at it — but pinned above the box, a plan for work that was
+            // just thrown away would sit there for the rest of the session.
+            server.todos.lock().unwrap().clear();
             outln!("Conversation cleared.\n");
             continue;
         }
@@ -1092,6 +1124,8 @@ Usage: /set <name> <value>, or /set <name> unset
                 &mut mode,
                 &mut queued,
                 &status,
+                &server.todos,
+                &mut plan_view,
                 &thinking,
                 Some(&streamed_chars),
                 lm_client.chat_completion_streaming(
@@ -1447,6 +1481,8 @@ Usage: /set <name> <value>, or /set <name> unset
                             &mut mode,
                             &mut queued,
                             &status,
+                            &server.todos,
+                            &mut plan_view,
                             "🤖 Reviewing this call…",
                             // The reviewer's own reply is not streamed, so there is
                             // nothing to count.
@@ -1629,6 +1665,8 @@ Usage: /set <name> <value>, or /set <name> unset
                         &mut mode,
                         &mut queued,
                         &status,
+                        &server.todos,
+                        &mut plan_view,
                         &busy,
                         // A tool produces its output all at once, so there is no partial
                         // size to report while it runs.

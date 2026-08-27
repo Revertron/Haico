@@ -281,6 +281,13 @@ pub(crate) fn set_region(rows: Vec<String>, caret_row: usize, caret_col: usize) 
     state.draw_region();
 }
 
+// Whether anything is pinned to the bottom of the screen at all. What has a permanent
+// place down there does not also need to be written into the transcript — and a piped
+// session, which has no region, still needs it written.
+pub(crate) fn has_region() -> bool {
+    !lock().region.is_empty()
+}
+
 // Take the input box off the screen and leave it off. Whatever line was waiting for
 // its newline is written out as it stands: with nothing pinned below it, the next
 // thing printed can simply continue it.
