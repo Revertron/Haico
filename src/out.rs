@@ -12,7 +12,7 @@
 //! output still scrolls into the terminal's own scrollback above it, so selecting
 //! and copying it works the way it does in any other program.
 
-use crossterm::cursor::{Hide, MoveRight, MoveToColumn, MoveUp, Show};
+use crossterm::cursor::{Hide, MoveDown, MoveRight, MoveToColumn, MoveUp, Show};
 use crossterm::terminal::{Clear, ClearType};
 use std::fmt;
 use std::io::{self, Write};
@@ -28,9 +28,18 @@ struct Out {
     region: Vec<String>,
     caret: (usize, usize),
     region_drawn: bool,
-    // How far below the top of the drawn block the cursor was left, so erasing it
-    // walks back exactly as far as drawing walked forward.
-    drawn_caret_row: usize,
+    // The rows of the block exactly as they are on the screen, in the order they were
+    // written: the unfinished line first, then the region. The next frame is compared
+    // against this, so only the rows that actually say something different are painted
+    // again — the whole reason a token counter ticking away in the bar no longer makes
+    // the plan panel and the input box blink along with it.
+    drawn: Vec<String>,
+    // Where in that block the cursor was left, so moving about inside it — and erasing
+    // it — walks back exactly as far as drawing walked forward.
+    drawn_caret: (usize, usize),
+    // How wide the screen was when it was drawn. Every row was laid out for that width,
+    // so a different one means none of them can be patched.
+    drawn_width: usize,
     // A line of output that has not ended yet. The model streams a few characters at
     // a time, and a half-finished line cannot go into the scrollback above the input
     // box — the next fragment would have nowhere to continue from. It waits here and
@@ -51,7 +60,6 @@ impl Out {
         if text.is_empty() {
             return;
         }
-        self.erase_region();
 
         // Read again rather than cached: a terminal can be resized between two lines of
         // the same reply.
@@ -67,11 +75,144 @@ impl Out {
 
         self.pending.push_str(text);
         if let Some(end) = self.pending.rfind('\n') {
+            // The line is finished, so it goes to the scrollback — and that scrolls the
+            // screen, which the block cannot be on while it happens. Nothing else moves
+            // the block: text that only makes the unfinished line longer is painted into
+            // the rows that line already has.
+            self.erase_region();
             let completed: String = self.pending.drain(..=end).collect();
             let wrapped = self.wrap.feed(&completed);
             self.put(&wrapped);
         }
-        self.draw_region();
+        self.paint();
+    }
+
+    // The rows the block should be showing: the unfinished line, wrapped, and then the
+    // region itself.
+    //
+    // The line is wrapped from a *copy* of the state so that nothing about it is settled
+    // yet — the word at the end of it may still turn out to belong on the next row once
+    // the rest of it arrives. Each row it is broken into is exactly one screen row, which
+    // is the whole point of breaking it here instead of letting the terminal do it.
+    fn frame(&self, width: usize) -> (Vec<String>, usize) {
+        let mut rows = Vec::with_capacity(self.region.len() + 2);
+        if !self.pending.is_empty() {
+            let mut wrap = self.wrap.clone();
+            wrap.width = width;
+            let pending = wrap.feed(&self.pending);
+            rows.extend(pending.split('\n').map(str::to_string));
+        }
+        let pending_rows = rows.len();
+        rows.extend(self.region.iter().cloned());
+        (rows, pending_rows)
+    }
+
+    // Bring the screen up to date with what the block should say.
+    fn paint(&mut self) {
+        if self.region.is_empty() {
+            // Nothing to pin any more: whatever was there comes off the screen.
+            self.erase_region();
+            return;
+        }
+
+        let width = wrap_width();
+        let (rows, pending_rows) = self.frame(width);
+        let caret = (pending_rows + self.caret.0, self.caret.1);
+
+        // A block of a different height, or one laid out for a different screen, cannot be
+        // patched row by row: everything below the first difference has moved.
+        if self.region_drawn && width == self.drawn_width && rows.len() == self.drawn.len() {
+            self.patch(&rows, caret);
+        } else {
+            self.erase_region();
+            self.draw(&rows, caret);
+        }
+
+        self.drawn = rows;
+        self.drawn_caret = caret;
+        self.drawn_width = width;
+        self.region_drawn = true;
+        if self.capture.is_none() {
+            let _ = io::stdout().flush();
+        }
+    }
+
+    // Rewrite the rows that differ and nothing else, stepping over the ones that already
+    // say the right thing rather than clearing them: a row that is never touched cannot
+    // blink. While a reply streams this is one row — the activity bar, whose token counter
+    // moves several times a second — out of a block a dozen rows tall.
+    //
+    // Not one line feed is written, which is also what keeps the update to a single write:
+    // stdout flushes on newlines, and a frame split across flushes is exactly what a
+    // half-drawn block looks like.
+    fn patch(&mut self, rows: &[String], caret: (usize, usize)) {
+        let changed: Vec<usize> = (0..rows.len())
+            .filter(|&index| rows[index] != self.drawn[index])
+            .collect();
+        if changed.is_empty() && caret == self.drawn_caret {
+            return;
+        }
+
+        self.write_out(&Hide.to_string());
+        let mut at = self.drawn_caret.0;
+        for index in changed {
+            self.move_to_row(at, index);
+            self.put(&rows[index]);
+            // The row that was here before may have been longer.
+            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
+            at = index;
+        }
+        self.move_to_row(at, caret.0);
+        self.place_caret(caret.1);
+    }
+
+    // Draw the whole block from the top down. Only ever reached with the screen already
+    // clear from here on: either nothing has been drawn yet, or the block just came off.
+    fn draw(&mut self, rows: &[String], caret: (usize, usize)) {
+        if !self.at_line_start {
+            self.put("\n");
+            // The box starts on a row of its own, which ends the line that was being
+            // written just as surely as a newline of its own would have.
+            self.wrap.reset_line();
+        }
+
+        self.write_out(&Hide.to_string());
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                self.put("\n");
+            }
+            self.put(row);
+            // The row that was here before may have been longer.
+            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
+        }
+
+        // The cursor ends up after the last row; walk it back to where the caret is.
+        self.move_to_row(rows.len() - 1, caret.0);
+        self.place_caret(caret.1);
+    }
+
+    // Put the cursor at the start of another row of the block. Both moves are guarded
+    // rather than let through as zero: `MoveUp(0)` is CSI 0 A, which a terminal reads as
+    // one row, not none.
+    fn move_to_row(&mut self, from: usize, to: usize) {
+        let mut escapes = String::new();
+        if to > from {
+            escapes.push_str(&MoveDown((to - from) as u16).to_string());
+        } else if from > to {
+            escapes.push_str(&MoveUp((from - to) as u16).to_string());
+        }
+        escapes.push_str(&MoveToColumn(0).to_string());
+        self.write_out(&escapes);
+    }
+
+    // Along the row the cursor is already on, and visible again.
+    fn place_caret(&mut self, column: usize) {
+        let mut escapes = String::new();
+        if column > 0 {
+            escapes.push_str(&MoveRight(column as u16).to_string());
+        }
+        escapes.push_str(&Show.to_string());
+        self.write_out(&escapes);
     }
 
     fn put(&mut self, text: &str) {
@@ -115,76 +256,16 @@ impl Out {
             return;
         }
         self.region_drawn = false;
+        self.drawn.clear();
 
         let mut escapes = format!("{}{}", Hide, MoveToColumn(0));
-        if self.drawn_caret_row > 0 {
-            escapes.push_str(&MoveUp(self.drawn_caret_row as u16).to_string());
+        if self.drawn_caret.0 > 0 {
+            escapes.push_str(&MoveUp(self.drawn_caret.0 as u16).to_string());
         }
         escapes.push_str(&Clear(ClearType::FromCursorDown).to_string());
         escapes.push_str(&Show.to_string());
         self.write_out(&escapes);
         self.at_line_start = true;
-    }
-
-    fn draw_region(&mut self) {
-        if self.region.is_empty() || self.region_drawn {
-            return;
-        }
-        if !self.at_line_start {
-            self.put("\n");
-            // The box starts on a row of its own, which ends the line that was being
-            // written just as surely as a newline of its own would have.
-            self.wrap.reset_line();
-        }
-
-        self.write_out(&Hide.to_string());
-
-        // The unfinished line goes above the box, wrapped from a *copy* of the state so
-        // that nothing about it is settled yet: the word at the end of it may still turn
-        // out to belong on the next row once the rest of it arrives.
-        let pending_rows = if self.pending.is_empty() {
-            0
-        } else {
-            let mut wrap = self.wrap.clone();
-            wrap.width = wrap_width();
-            let pending = wrap.feed(&self.pending);
-            // Each row it was broken into is exactly one screen row, which is the whole
-            // point of breaking it here instead of letting the terminal do it.
-            let rows = pending.matches('\n').count() + 1;
-            self.put(&pending);
-            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
-            self.put("\n");
-            rows
-        };
-
-        for (index, row) in self.region.clone().iter().enumerate() {
-            if index > 0 {
-                self.put("\n");
-            }
-            self.put(row);
-            // The row that was here before may have been longer.
-            self.write_out(&Clear(ClearType::UntilNewLine).to_string());
-        }
-
-        // The cursor ends up after the last row; walk it back to where the caret is.
-        let last = pending_rows + self.region.len() - 1;
-        let caret_row = pending_rows + self.caret.0;
-        let mut escapes = String::new();
-        if last > caret_row {
-            escapes.push_str(&MoveUp((last - caret_row) as u16).to_string());
-        }
-        escapes.push_str(&MoveToColumn(0).to_string());
-        if self.caret.1 > 0 {
-            escapes.push_str(&MoveRight(self.caret.1 as u16).to_string());
-        }
-        escapes.push_str(&Show.to_string());
-        self.write_out(&escapes);
-
-        self.drawn_caret_row = caret_row;
-        self.region_drawn = true;
-        if self.capture.is_none() {
-            let _ = io::stdout().flush();
-        }
     }
 }
 
@@ -500,7 +581,9 @@ fn lock() -> MutexGuard<'static, Out> {
             region: Vec::new(),
             caret: (0, 0),
             region_drawn: false,
-            drawn_caret_row: 0,
+            drawn: Vec::new(),
+            drawn_caret: (0, 0),
+            drawn_width: 0,
             pending: String::new(),
             wrap: Wrap::new(80),
             capture: None,
@@ -551,10 +634,13 @@ pub(crate) fn set_raw(raw: bool) {
 // because it is also the only thing that knows where the cursor belongs afterwards.
 pub(crate) fn set_region(rows: Vec<String>, caret_row: usize, caret_col: usize) {
     let mut state = lock();
-    state.erase_region();
     state.region = rows;
     state.caret = (caret_row, caret_col);
-    state.draw_region();
+    // Nothing is erased first. The block is redrawn on a timer as well as on every
+    // keystroke, and most of those redraws ask for what is already on the screen, or for
+    // one row of it changed: `paint` writes the difference, and writes nothing at all when
+    // there is none.
+    state.paint();
 }
 
 // Whether anything is pinned to the bottom of the screen at all. What has a permanent
@@ -596,7 +682,9 @@ pub(crate) fn start_capture() {
     state.region.clear();
     state.caret = (0, 0);
     state.region_drawn = false;
-    state.drawn_caret_row = 0;
+    state.drawn.clear();
+    state.drawn_caret = (0, 0);
+    state.drawn_width = 0;
     state.pending.clear();
     state.wrap = Wrap::new(80);
     state.capture = Some(String::new());
@@ -690,6 +778,90 @@ mod tests {
         super::clear_region();
         let written = super::take_capture();
         assert!(written.ends_with("tail"), "got {:?}", written);
+    }
+
+    #[test]
+    fn a_fragment_that_does_not_end_its_line_leaves_the_box_where_it_is() {
+        let _guard = super::capture_guard();
+
+        super::start_capture();
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        // The first fragment puts a line above the box, which the box has to move for.
+        out!("some ");
+        // The second only makes that line longer: it is written where the line already is,
+        // and nothing pinned below it is touched.
+        out!("words");
+        let written = super::take_capture();
+
+        assert_eq!(
+            written.matches("> hello").count(),
+            2,
+            "the box was repainted for a fragment: {:?}",
+            written
+        );
+        let box_row = written.rfind("> hello").expect("the box");
+        let line = written.rfind("some words").expect("the line above it");
+        assert!(box_row < line, "wrong order in {:?}", written);
+    }
+
+    #[test]
+    fn a_counter_ticking_in_the_bar_repaints_its_own_row_and_nothing_else() {
+        let _guard = super::capture_guard();
+
+        // A block shaped like the real one: a blank row, the activity bar, the input box.
+        let block = |bar: &str| {
+            vec![
+                String::new(),
+                format!("* {}", bar),
+                "> hello".to_string(),
+            ]
+        };
+
+        super::start_capture();
+        super::set_region(block("Thinking (1)"), 2, 7);
+        super::set_region(block("Thinking (2)"), 2, 7);
+        let written = super::take_capture();
+
+        // The bar was written once for each thing it said; everything around it was
+        // written when the block went up and never touched again.
+        assert_eq!(written.matches("* Thinking").count(), 2, "got {:?}", written);
+        assert_eq!(
+            written.matches("> hello").count(),
+            1,
+            "the box was repainted for a tick: {:?}",
+            written
+        );
+
+        // And the tick is the row on its own: nothing cleared below it, and no line feed,
+        // which is also what keeps it to a single write to the terminal.
+        let tick = &written[written.rfind("* Thinking").expect("the second tick")..];
+        assert!(!tick.contains('\n'), "a line feed in {:?}", tick);
+        assert!(!tick.contains("[J"), "the block was cleared in {:?}", tick);
+    }
+
+    #[test]
+    fn drawing_the_same_box_again_writes_nothing() {
+        let _guard = super::capture_guard();
+
+        super::start_capture();
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        let written = super::take_capture();
+        assert_eq!(
+            written.matches("> hello").count(),
+            1,
+            "repainted what was already there: {:?}",
+            written
+        );
+
+        // Anything that actually differs is drawn, of course — here one more character
+        // and the caret that moved with it.
+        super::start_capture();
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        super::set_region(vec!["> hello!".to_string()], 0, 8);
+        let written = super::take_capture();
+        assert_eq!(written.matches("> hello").count(), 2, "got {:?}", written);
     }
 
     // Wrapping is tested at a width given here rather than the terminal's, which under a
