@@ -210,6 +210,16 @@ pub(crate) struct MarkdownStream {
     // to print as a gap before whatever came next — the tool call line, the next prompt.
     // Held here instead, flushed when a real line arrives, and dropped by `finish`.
     held_blanks: usize,
+    // How many bytes of the line still in `buffer` are already on the screen.
+    //
+    // A reply used to appear a whole line at a time, because a line cannot be painted
+    // until it is known what it is: a leading "# " colors all of it, "```" turns the next
+    // rows into a code block, and `**bold**` is only bold once its closing pair arrives.
+    // But that is a statement about the *undecided* part of a line, and most of a line of
+    // prose is decided long before it ends. So as much of it as is settled is written as
+    // it arrives, and this is how much of it has gone — the rest of the line, when it
+    // finally ends, is all that is left to write.
+    streamed: usize,
 }
 
 impl MarkdownStream {
@@ -218,11 +228,12 @@ impl MarkdownStream {
             buffer: String::new(),
             in_code_block: false,
             held_blanks: 0,
+            streamed: 0,
         }
     }
 
-    // Whatever is now complete, rendered. Anything after the last newline stays behind
-    // until the rest of it arrives.
+    // Whatever is now settled, rendered: every line that has ended, and as much of the
+    // one still arriving as cannot be changed by what follows it.
     pub(crate) fn push(&mut self, text: &str) -> String {
         self.buffer.push_str(text);
         let mut rendered = String::new();
@@ -231,7 +242,8 @@ impl MarkdownStream {
             let line = line.trim_end_matches('\n');
 
             // Inside a fence a blank line is content, painted like every other line of
-            // the block, so only prose blanks are held back.
+            // the block, so only prose blanks are held back. A line that has already had
+            // part of itself written cannot be blank, so this never fires under one.
             if !self.in_code_block && line.trim().is_empty() {
                 self.held_blanks += 1;
                 continue;
@@ -240,7 +252,51 @@ impl MarkdownStream {
             // Something followed after all, so they were separators rather than trailing
             // whitespace: pay them out before the line that earned them.
             rendered.push_str(&"\n".repeat(std::mem::take(&mut self.held_blanks)));
-            rendered.push_str(&self.line(line, true));
+            rendered.push_str(&self.rest_of_line(line, true));
+        }
+        rendered.push_str(&self.stream_settled());
+        rendered
+    }
+
+    // As much of the unfinished line as can be shown now.
+    //
+    // Only prose: a fence, a heading or a line inside a code block is painted as a whole
+    // and would have to be unpainted to correct it. And only up to the last word boundary
+    // that no inline markup crosses — an opener with no closer yet is exactly the case
+    // where the next few characters decide what the ones already here mean.
+    fn stream_settled(&mut self) -> String {
+        if self.buffer.is_empty() || looks_like_prose(self.in_code_block, &self.buffer) != Some(true) {
+            return String::new();
+        }
+        let cut = settled_prefix(&self.buffer);
+        if cut <= self.streamed {
+            return String::new();
+        }
+
+        let mut rendered = render_inline_markdown(&self.buffer[self.streamed..cut]);
+        // Each piece is rendered on its own and they are simply written one after another,
+        // so none of them may carry the newline that ends the line.
+        rendered.truncate(rendered.trim_end_matches('\n').len());
+        // The blank rows this line earned are paid before the first of it reaches the
+        // screen, which is where they would have gone had the line arrived all at once.
+        if self.streamed == 0 {
+            rendered.insert_str(0, &"\n".repeat(std::mem::take(&mut self.held_blanks)));
+        }
+        self.streamed = cut;
+        rendered
+    }
+
+    // What is left of a line to write. A line nothing has been shown of is rendered whole,
+    // exactly as it always was; one that has been streamed renders only its tail, which
+    // comes to the same bytes because the cut never falls inside anything markup spans.
+    fn rest_of_line(&mut self, line: &str, newline: bool) -> String {
+        let streamed = std::mem::take(&mut self.streamed);
+        if streamed == 0 {
+            return self.line(line, newline);
+        }
+        let mut rendered = render_inline_markdown(&line[streamed..]);
+        if !newline {
+            rendered.truncate(rendered.trim_end_matches('\n').len());
         }
         rendered
     }
@@ -250,10 +306,11 @@ impl MarkdownStream {
     pub(crate) fn finish(&mut self, newline: bool) -> String {
         self.held_blanks = 0;
         if self.buffer.is_empty() {
+            self.streamed = 0;
             return String::new();
         }
         let line = std::mem::take(&mut self.buffer);
-        self.line(&line, newline)
+        self.rest_of_line(&line, newline)
     }
 
     fn line(&mut self, line: &str, newline: bool) -> String {
@@ -302,6 +359,119 @@ impl MarkdownStream {
         }
         rendered
     }
+}
+
+// Whether the line so far is ordinary prose, which can be written a word at a time, or
+// something whose look depends on the whole line and so cannot be written until it ends.
+// `None` while too little of it has arrived to tell the two apart.
+fn looks_like_prose(in_code_block: bool, line: &str) -> Option<bool> {
+    // Every row of a code block carries the block's background, and the fence itself is
+    // never printed at all.
+    if in_code_block {
+        return Some(false);
+    }
+    let trimmed = line.trim_start();
+    // Still nothing but indentation: this may yet turn out to be a blank line, which is
+    // held back rather than printed.
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("```") {
+        return Some(false);
+    }
+    // One backtick, or two, could still become the third.
+    if trimmed.chars().all(|ch| ch == '`') {
+        return None;
+    }
+    if ["# ", "## ", "### "].iter().any(|marker| trimmed.starts_with(marker)) {
+        return Some(false);
+    }
+    // The same for the hashes: "##" is a heading if a space comes next and prose if a
+    // fourth hash does.
+    if trimmed.len() <= 3 && trimmed.chars().all(|ch| ch == '#') {
+        return None;
+    }
+    Some(true)
+}
+
+// Inline markup starting at a position, as far as the text that has arrived can say.
+enum Inline {
+    // Not the start of any: an ordinary character.
+    No,
+    // One that has found its closing marker; it ends just before this index.
+    Whole(usize),
+    // One that has opened and could still be closed by text that has not arrived. Nothing
+    // from its opener onwards can be written yet: `**bold` is two literal stars until the
+    // closing pair turns the whole of it bold.
+    Open,
+}
+
+fn inline_at(chars: &[char], at: usize) -> Inline {
+    match chars[at] {
+        '`' => match find_closing('`', chars, at + 1) {
+            Some(end) => Inline::Whole(end + 1),
+            None => Inline::Open,
+        },
+        '*' if chars.get(at + 1) == Some(&'*') => match find_double_closing("**", chars, at + 2) {
+            Some(end) => Inline::Whole(end + 2),
+            None => Inline::Open,
+        },
+        // A lone marker is only an opener under the same test the renderer applies, so the
+        // underscores in an identifier are ordinary characters here too.
+        marker @ ('*' | '_') if opens_emphasis(marker, chars, at) => {
+            match closing_emphasis(marker, chars, at + 1) {
+                Some(end) => Inline::Whole(end + 1),
+                None => Inline::Open,
+            }
+        }
+        '[' => {
+            let Some(close) = find_closing(']', chars, at + 1) else {
+                return Inline::Open;
+            };
+            match chars.get(close + 1) {
+                // Whether this is a link at all is the next character's to say.
+                None => Inline::Open,
+                Some('(') => match find_closing(')', chars, close + 2) {
+                    Some(end) => Inline::Whole(end + 1),
+                    None => Inline::Open,
+                },
+                Some(_) => Inline::No,
+            }
+        }
+        _ => Inline::No,
+    }
+}
+
+// How much of an unfinished line is settled: the longest prefix that ends on a word
+// boundary and that no character still to arrive can change the meaning of.
+//
+// Rendering a line in pieces has to come to the same bytes as rendering it whole, which
+// it does as long as no piece ends inside something markup spans — every construct is
+// rendered from its own characters alone, and the one place a piece boundary is visible
+// from the outside is the "not inside a word" test on an underscore, which reads a space
+// before the cut and the start of the piece as the same thing.
+fn settled_prefix(line: &str) -> usize {
+    let indices: Vec<(usize, char)> = line.char_indices().collect();
+    let chars: Vec<char> = indices.iter().map(|(_, ch)| *ch).collect();
+
+    let mut settled = 0;
+    let mut at = 0;
+    while at < chars.len() {
+        match inline_at(&chars, at) {
+            Inline::Open => return settled,
+            Inline::Whole(end) => at = end,
+            Inline::No => {
+                // Words are never cut in half: partly because half a word on the screen
+                // reads as a typo, and partly because the writer wraps on spaces and a
+                // word split here would be free to wrap in the middle of itself.
+                if chars[at].is_whitespace() {
+                    settled = indices[at].0 + chars[at].len_utf8();
+                }
+                at += 1;
+            }
+        }
+    }
+    settled
 }
 
 pub(crate) fn render_markdown(text: &str) -> String {
@@ -1032,6 +1202,56 @@ mod markdown_tests {
         piecemeal.push_str(&stream.finish(true));
 
         assert_eq!(piecemeal, whole);
+    }
+
+    #[test]
+    fn prose_reaches_the_screen_a_word_at_a_time() {
+        let mut stream = MarkdownStream::new();
+
+        // The words that have ended do not wait for the end of the line; the one still
+        // being spelled does.
+        assert_eq!(stream.push("The quick bro"), "The quick ");
+        assert_eq!(stream.push("wn fox "), "brown fox ");
+
+        // Markup that has opened and not closed holds everything from its opener: what
+        // arrives next is what decides whether those are two stars or the start of bold.
+        assert_eq!(stream.push("is **very "), "is ");
+        let rest = stream.push("bold** now\n");
+        assert!(rest.contains("very bold"), "got {:?}", rest);
+        assert!(!rest.contains("**"), "got {:?}", rest);
+
+        // A heading is painted as a whole, so none of it shows until it ends.
+        let mut stream = MarkdownStream::new();
+        assert_eq!(stream.push("# A title stil"), "");
+        assert!(stream.push("l coming\n").contains("A title still coming"));
+
+        // And so is every row of a code block.
+        let mut stream = MarkdownStream::new();
+        assert_eq!(stream.push("```rust\nlet x = 1"), "");
+        assert!(stream.push(";\n").contains("let x = 1;"));
+    }
+
+    #[test]
+    fn a_word_at_a_time_still_comes_to_the_same_bytes() {
+        // Everything the renderer treats specially, in one text: a heading, a link, a code
+        // span, bold, an indented continuation, a fence, and a blank line between
+        // paragraphs.
+        const TEXT: &str = "# Title\nA [link](http://x/y), `code`, **bold** here.\n\n- a list item\n  indented continuation\n```rust\nlet x = 1;\n```\ndone\n";
+        let whole = render_markdown(TEXT);
+        let chars: Vec<char> = TEXT.chars().collect();
+
+        // Every chunk size from one character up, because a chunk boundary falling in the
+        // middle of a marker — between the two stars of a bold, before a fence's third
+        // backtick — is exactly what this has to survive.
+        for size in 1..=7 {
+            let mut stream = MarkdownStream::new();
+            let mut piecemeal = String::new();
+            for chunk in chars.chunks(size) {
+                piecemeal.push_str(&stream.push(&chunk.iter().collect::<String>()));
+            }
+            piecemeal.push_str(&stream.finish(true));
+            assert_eq!(piecemeal, whole, "chunks of {}", size);
+        }
     }
 
     #[test]
