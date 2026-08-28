@@ -38,6 +38,50 @@ pub(crate) async fn serve_once(body: &'static str, content_type: &'static str) -
     format!("http://{}", addr)
     }
 
+// A server that answers by path, for as long as the test needs it rather than once.
+//
+// Probing for a loaded model asks two different endpoints and stops at whichever answers,
+// so which one replies — and which 404s — is the whole thing being tested.
+pub(crate) async fn serve_routes(routes: &'static [(&'static str, &'static str)]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+
+                let head = String::from_utf8_lossy(&request);
+                let path = head.split_whitespace().nth(1).unwrap_or("");
+                // Closed after every reply rather than kept alive: a pooled connection to
+                // a socket this handler has already dropped is a retry the test does not
+                // need to be flaky about.
+                let response = match routes.iter().find(|(route, _)| *route == path) {
+                    Some((_, body)) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    ),
+                    None => "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string(),
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+
+    format!("http://{}", addr)
+}
+
     // Like serve_once, but hands back what the client actually sent.
 
 pub(crate) async fn serve_once_capturing(

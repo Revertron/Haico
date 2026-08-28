@@ -533,6 +533,89 @@ impl StreamAssembler {
 
 // Tool parameter structs
 
+// Which models the server actually has in memory, as opposed to merely knows about.
+//
+// Best effort by design, and it never fails: neither endpoint is part of the
+// OpenAI-compatible surface, so a server that has never heard of either simply looks like
+// one with nothing loaded — which is the case the picker already handles. An empty answer
+// is not an error worth showing anybody.
+//
+// `/v1/models` is no help for this. Depending on the version it lists everything
+// downloaded or only what is in memory, and it carries no field to tell the two apart.
+pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> Vec<String> {
+    // LM Studio's own REST API: every model it knows, each with the state it is in.
+    // Embedding models are loaded alongside chat ones and would be a nonsense choice here.
+    #[derive(Deserialize)]
+    struct LmStudioModels {
+        #[serde(default)]
+        data: Vec<LmStudioModel>,
+    }
+    #[derive(Deserialize)]
+    struct LmStudioModel {
+        id: String,
+        #[serde(default)]
+        state: String,
+        #[serde(default, rename = "type")]
+        kind: String,
+    }
+
+    // Ollama's: only what is loaded right now, which is exactly the question being asked.
+    #[derive(Deserialize)]
+    struct OllamaRunning {
+        #[serde(default)]
+        models: Vec<OllamaModel>,
+    }
+    #[derive(Deserialize)]
+    struct OllamaModel {
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        name: String,
+    }
+
+    let base = normalize_base_url(base_url);
+    let client = reqwest::Client::new();
+    let get = |path: &str| {
+        let request = client.get(format!("{}{}", base, path));
+        match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+        .send()
+    };
+
+    if let Ok(response) = get("/api/v0/models").await {
+        if response.status().is_success() {
+            if let Ok(listed) = response.json::<LmStudioModels>().await {
+                let loaded: Vec<String> = listed
+                    .data
+                    .into_iter()
+                    .filter(|model| model.state == "loaded" && model.kind != "embeddings")
+                    .map(|model| model.id)
+                    .collect();
+                if !loaded.is_empty() {
+                    return loaded;
+                }
+            }
+        }
+    }
+
+    if let Ok(response) = get("/api/ps").await {
+        if response.status().is_success() {
+            if let Ok(running) = response.json::<OllamaRunning>().await {
+                return running
+                    .models
+                    .into_iter()
+                    .map(|model| if model.model.is_empty() { model.name } else { model.model })
+                    .filter(|name| !name.is_empty())
+                    .collect();
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 pub(crate) async fn fetch_available_models(base_url: &str, token: Option<&str>) -> Result<Vec<String>> {
     let client = reqwest::Client::new();
     let request = client.get(format!("{}/v1/models", normalize_base_url(base_url)));
@@ -716,6 +799,37 @@ mod tests {
         assert!(sent.get("top_p").is_none(), "sent: {}", sent);
     }
 
+
+
+    #[tokio::test]
+    async fn only_what_is_actually_loaded_counts_as_running() {
+        // LM Studio lists everything it knows, in whatever state it is in. Only the loaded
+        // ones are running, and an embedding model is not a thing to hold a conversation
+        // with even when it is.
+        const LM_STUDIO: &str = concat!(
+            r#"{"data":[
+                {"id":"qwen2.5-14b","type":"llm","state":"loaded"},
+                {"id":"llama-3.1-8b","type":"llm","state":"not-loaded"},
+                {"id":"nomic-embed","type":"embeddings","state":"loaded"}
+            ]}"#
+        );
+        let url = serve_routes(&[("/api/v0/models", LM_STUDIO)]).await;
+        assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5-14b"]);
+    }
+
+    #[tokio::test]
+    async fn ollama_is_asked_when_lm_studio_does_not_answer() {
+        // The other server answers a different endpoint and 404s this one, so the probe
+        // has to fall through rather than conclude that nothing is loaded.
+        const OLLAMA: &str = r#"{"models":[{"name":"qwen2.5:14b","model":"qwen2.5:14b"}]}"#;
+        let url = serve_routes(&[("/api/ps", OLLAMA)]).await;
+        assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5:14b"]);
+
+        // And a server that has heard of neither simply has nothing running, which is not
+        // an error: the picker takes it from there.
+        let url = serve_routes(&[("/v1/models", r#"{"data":[{"id":"m"}]}"#)]).await;
+        assert!(fetch_loaded_models(&url, None).await.is_empty());
+    }
 
     #[tokio::test]
     async fn streams_server_sent_events_end_to_end() {

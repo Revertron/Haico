@@ -381,27 +381,42 @@ async fn main() -> Result<()> {
         outln!("Using specified model: {}\n", model_name);
         model_name
     } else {
-        // No model specified, fetch available models and let user select
-        outln!("Fetching available models...");
-        let models = match fetch_available_models(&config.llm_url, config.token.as_deref()).await {
-            Ok(models) => models,
-            Err(e) => {
-                outln!("Error connecting to LLM: {e}");
-                return Ok(());
+        outln!("Looking for a model...");
+
+        // Whatever is already in memory is almost always what was meant: the server was
+        // started with it, and asking which model to use when there is only one loaded is
+        // a question with a single answer. More than one and it is worth asking, but only
+        // among those — the rest are downloads, not something that is running. The full
+        // list is what the picker falls back to when nothing is loaded at all.
+        let loaded = fetch_loaded_models(&config.llm_url, config.token.as_deref()).await;
+        if let [only] = loaded.as_slice() {
+            outln!("Using the loaded model: {}\n", only);
+            only.clone()
+        } else {
+            let models = if loaded.is_empty() {
+                match fetch_available_models(&config.llm_url, config.token.as_deref()).await {
+                    Ok(models) => models,
+                    Err(e) => {
+                        outln!("Error connecting to LLM: {e}");
+                        return Ok(());
+                    }
+                }
+            } else {
+                loaded
+            };
+
+            if models.is_empty() {
+                return Err(anyhow::anyhow!("No models available from server"));
             }
-        };
 
-        if models.is_empty() {
-            return Err(anyhow::anyhow!("No models available from server"));
-        }
-
-        // Let user select a model interactively
-        match keys.as_mut() {
-            Some(keys) => select_model_interactive(keys, models).await?,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "choosing a model needs an interactive terminal; pass --model"
-                ))
+            // Let user select a model interactively
+            match keys.as_mut() {
+                Some(keys) => select_model_interactive(keys, models).await?,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "choosing a model needs an interactive terminal; pass --model"
+                    ))
+                }
             }
         }
     };
