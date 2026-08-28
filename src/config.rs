@@ -223,6 +223,12 @@ pub(crate) struct FileConfig {
     pub(crate) searxng: Option<String>,
     pub(crate) system_prompt: Option<String>,
 
+    // Which way round the terminal's own colors run: "light" or "dark". Top level only,
+    // and deliberately not a per-model setting — it is a property of the screen haico is
+    // running on, which does not change when the model does. /light and /dark override it
+    // for the session.
+    pub(crate) theme: Option<String>,
+
     // Directories the file tools may read but never write, on top of the working
     // directory. Empty by default and deliberately so: the value of the boundary is that
     // nothing outside it is reachable unless it was named on purpose.
@@ -401,6 +407,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("\n  url   = \"http://127.0.0.1:1234\"");
     println!("  token = \"sk-lm-...\"");
     println!("  model = \"qwen2.5:14b\"");
+    println!("  theme = \"dark\"          # the terminal's own colors: \"light\" or \"dark\"");
     println!("\n  [models.\"qwen2.5:14b\"]");
     println!("  context        = 32768");
     println!("  temperature    = 0.2");
@@ -467,6 +474,18 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn the_theme_belongs_to_the_screen_rather_than_to_a_model() {
+        let config = config_with("theme = \"dark\"");
+        assert_eq!(config.file.theme.as_deref(), Some("dark"));
+
+        // And per model it is refused outright rather than accepted and ignored: the
+        // screen does not change when the model does, so a key that looks like it works
+        // there would only ever be a surprise.
+        let per_model = "[models.\"a\"]\ntheme = \"dark\"";
+        assert!(toml::from_str::<FileConfig>(per_model).is_err());
+    }
 
     #[test]
     fn config_layers_resolve_in_the_documented_order() {

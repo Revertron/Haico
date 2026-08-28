@@ -15,6 +15,26 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Which way round the terminal's own colors run.
+//
+// Everything haico paints was picked against a light background, and all of it holds up
+// against a dark one except the diff: its lines are left in the terminal's own text color,
+// which is exactly what makes them read as a quotation of the file rather than as
+// something haico wrote, and against the red and the green of a change that color is too
+// dim to sit on. Nothing here detects it — the query that would (OSC 11) needs the
+// keyboard that `Keys` owns, and answers only on a timeout that not every terminal keeps —
+// so `/dark` and `/light` say which it is, for the session.
+static DARK: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_dark(dark: bool) {
+    DARK.store(dark, Ordering::Relaxed);
+}
+
+pub(crate) fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
 
 pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &str) -> Result<String> {
     let diff = TextDiff::from_lines(old_content, new_content);
@@ -107,6 +127,17 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
     }
     regions.push((current_start, current_end.min(changes.len() - 1)));
 
+    // Both empty on a light background, where the terminal's own text color is the right
+    // one and the output stays byte for byte what it always was.
+    let (text_color, text_reset) = if is_dark() {
+        (
+            SetForegroundColor(Color::White).to_string(),
+            ResetColor.to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
     // Render regions
     for (region_idx, (start, end)) in regions.iter().enumerate() {
         if region_idx > 0 {
@@ -123,7 +154,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
                         execute!(&mut output, SetBackgroundColor(Color::Red))?;
-                        write!(&mut output, "- {}", change.text)?;
+                        write!(&mut output, "{}- {}", text_color, change.text)?;
                         execute!(&mut output, ResetColor)?;
                         writeln!(&mut output)?;
                     }
@@ -135,7 +166,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
                         execute!(&mut output, SetBackgroundColor(Color::Green))?;
-                        write!(&mut output, "+ {}", change.text)?;
+                        write!(&mut output, "{}+ {}", text_color, change.text)?;
                         execute!(&mut output, ResetColor)?;
                         writeln!(&mut output)?;
                     }
@@ -146,7 +177,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
                         write!(&mut output, "{:6}", line_num)?;
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
-                        writeln!(&mut output, "  {}", change.text)?;
+                        writeln!(&mut output, "{}  {}{}", text_color, change.text, text_reset)?;
                     }
                 }
             }
@@ -736,6 +767,36 @@ pub(crate) fn tool_result_line(text: &str) -> Option<String> {
         if clipped.len() < first.len() { "…" } else { "" },
         ResetColor
     ))
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn a_dark_terminal_gets_the_diff_in_white() {
+        // The flag is global, and this is the only test that reads or writes it. It is put
+        // back afterwards so the rest of the suite sees what it always did.
+        let white = SetForegroundColor(Color::White).to_string();
+
+        set_dark(false);
+        let light = generate_diff("a.txt", "keep\none\n", "keep\ntwo\n").unwrap();
+        set_dark(true);
+        let dark = generate_diff("a.txt", "keep\none\n", "keep\ntwo\n").unwrap();
+        set_dark(false);
+
+        // Light leaves the text in the terminal's own color, exactly as it always has.
+        assert!(!light.contains(&white), "got {:?}", light);
+        // Dark colors all three kinds of line: the one removed, the one added, and the
+        // context around them.
+        assert_eq!(dark.matches(&white).count(), 3, "got {:?}", dark);
+        // And the color is the only difference: same lines, same numbers, same markers.
+        let plain = |diff: &str| {
+            diff.replace(&white, "")
+                .replace(&ResetColor.to_string(), "")
+        };
+        assert_eq!(plain(&dark), plain(&light));
+    }
 }
 
 #[cfg(test)]
