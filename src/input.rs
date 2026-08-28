@@ -195,6 +195,26 @@ impl Editor {
         }
     }
 
+    // Put a message that was typed but never sent back where it came from.
+    //
+    // Interrupting a turn is the user taking it back, and what they had queued behind it
+    // is part of what they are taking back: handing it to the model as the next prompt
+    // instead would send the one thing they just cancelled. It goes in front of whatever
+    // is half-typed rather than at the caret, which is wherever it happened to be left —
+    // splicing an unsent message through the middle of a new one helps nobody. The caret
+    // ends up between the two, so typing carries on where it stopped.
+    pub(crate) fn restore(&mut self, text: &str) {
+        let separated = if self.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n", text)
+        };
+        self.row = 0;
+        self.column = 0;
+        self.browsing = None;
+        self.paste(&separated);
+    }
+
     fn split_line(&mut self) {
         let at = self.offset();
         let tail = self.lines[self.row].split_off(at);
@@ -499,6 +519,10 @@ pub(crate) struct Chrome<'a> {
     // The plan as todo_write last left it, drawn above everything else. Empty until the
     // model writes one, and then the panel takes no rows at all.
     pub(crate) todos: &'a [TodoItem],
+    // Messages typed while this was running that have not reached the model yet. Held
+    // above the bar rather than written into the transcript, because the transcript is
+    // what was said and these have not been said yet.
+    pub(crate) queued: &'a [String],
     // How much of it to show. Owned by the caller, since it outlives any one draw.
     pub(crate) plan: PlanView,
 }
@@ -510,6 +534,13 @@ pub(crate) struct Chrome<'a> {
 // the last twenty years, and the exact shade is not worth a truecolor requirement.
 const BAR_BACKGROUND: Color = Color::AnsiValue(153);
 const BAR_TEXT: Color = Color::Black;
+
+// A message waiting its turn. Painted rather than tinted, like the bars — but only behind
+// the text itself, and in a gray that says furniture rather than message: it is on screen
+// because it has *not* happened yet, and the moment it does it moves into the transcript
+// as an ordinary line.
+const QUEUED_BACKGROUND: Color = Color::AnsiValue(252);
+const QUEUED_TEXT: Color = Color::Black;
 
 // Paint one row of chrome the whole way across.
 //
@@ -597,6 +628,41 @@ fn status_bar(mode: Mode, status: &str, width: usize) -> String {
     let used = left.chars().count() + status.chars().count();
     let gap = room.saturating_sub(used).max(1);
     bar(&format!("{}{}{}", left, " ".repeat(gap), status), width)
+}
+
+// What was typed while something was running, one row each, above the bar.
+//
+// These used to go straight into the transcript, which read as though they had already
+// been sent — a message queued behind a long tool call would sit in the scrollback for a
+// minute or more looking exactly like one the model had already been given. Held here
+// instead, in gray, until the round ends and they are actually pushed into the
+// conversation.
+//
+// Flattened and cut to one row apiece for the same reason `bar` does it: a region row
+// that turns out to be two is a row the writer cannot count.
+fn queued_rows(queued: &[String], width: usize) -> Vec<String> {
+    let room = width.saturating_sub(1);
+    if room == 0 {
+        return Vec::new();
+    }
+
+    queued
+        .iter()
+        .map(|text| {
+            let flattened: String = text
+                .chars()
+                .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                .collect();
+            let content = fit(&format!("{}{}", PROMPT, flattened.trim()), room);
+            format!(
+                "{}{}{}{}",
+                SetBackgroundColor(QUEUED_BACKGROUND),
+                SetForegroundColor(QUEUED_TEXT),
+                content,
+                ResetColor
+            )
+        })
+        .collect()
 }
 
 // The plan, pinned above the activity bar.
@@ -718,17 +784,26 @@ pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     rows.insert(0, activity_bar(chrome, width));
     rows.push(status_bar(chrome.mode, chrome.status, width));
 
-    // What is left for the plan once the box and the bars have had their rows, less two:
-    // one so the transcript never disappears entirely, and one for a streamed line that
-    // has not ended yet, which is drawn above the region and counts against the screen
-    // just the same.
-    let room = terminal_height().saturating_sub(rows.len() + 2);
+    // Between the plan and the bar: near enough to the box to read as something the user
+    // typed, above the bar because what is waiting to be sent is not what is running.
+    let waiting = queued_rows(chrome.queued, width);
+    let waiting_rows = waiting.len();
+    rows.splice(0..0, waiting);
+
+    // What is left for the plan once the box, the bars and the blank row above them have
+    // had their rows, less two: one so the transcript never disappears entirely, and one
+    // for a streamed line that has not ended yet, which is drawn above the region and
+    // counts against the screen just the same.
+    let room = terminal_height().saturating_sub(rows.len() + 3);
     let plan = plan_rows(chrome.todos, width, room, chrome.plan);
 
-    // The plan sits above the activity bar, so everything below it — the box included —
+    // The plan sits above the activity bar, and one blank row sits above the lot: without
+    // it the pinned block butts straight up against the transcript and the last line of
+    // output reads as another row of chrome. Everything below them — the box included —
     // is that many rows further down than it used to be.
-    let above = plan.len() + 1;
+    let above = plan.len() + waiting_rows + 2;
     rows.splice(0..0, plan);
+    rows.insert(0, String::new());
 
     out::set_region(rows, caret_row + above, caret_column);
 }
@@ -796,6 +871,9 @@ pub(crate) async fn read_command(
                 last,
                 status,
                 todos,
+                // Nothing can be waiting here: a queued message becomes the next prompt
+                // rather than reaching this one.
+                queued: &[],
                 plan: *plan,
             },
         );
@@ -1049,6 +1127,7 @@ mod tests {
             last: Some("ran cargo build"),
             status: "a-model  ctx 3%",
             todos: &[],
+            queued: &[],
             plan: PlanView::Windowed,
         });
 
@@ -1073,6 +1152,7 @@ mod tests {
             last: Some("ran cargo build"),
             status: "a-model  ctx 3%",
             todos: &[],
+            queued: &[],
             plan: PlanView::Windowed,
         });
         assert!(idle.contains("○ ran cargo build"), "got {:?}", idle);
@@ -1084,9 +1164,83 @@ mod tests {
             last: None,
             status: "a-model  ctx 3%",
             todos: &[],
+            queued: &[],
             plan: PlanView::Windowed,
         });
         assert!(fresh.contains("○ ready"), "got {:?}", fresh);
+    }
+
+
+    #[test]
+    fn an_unsent_message_comes_back_to_the_box_ahead_of_what_is_half_typed() {
+        // Nothing being typed: it simply lands, ready to send or edit.
+        let mut editor = Editor::new(Vec::new());
+        editor.restore("what about the tests");
+        let (rows, caret_row, caret_column) = editor.rows(PROMPT, 80);
+        assert_eq!(rows, vec!["> what about the tests".to_string()]);
+        assert_eq!((caret_row, caret_column), (0, 22));
+
+        // Something being typed: the unsent message goes in front of it rather than
+        // through the middle of it, and the caret stays with the new text.
+        let mut editor = Editor::new(Vec::new());
+        type_text(&mut editor, "half typed");
+        editor.restore("first message");
+        let (rows, caret_row, caret_column) = editor.rows(PROMPT, 80);
+        assert_eq!(
+            rows,
+            vec!["> first message".to_string(), "  half typed".to_string()]
+        );
+        assert_eq!((caret_row, caret_column), (1, 2));
+
+        // Two of them keep their own lines, so Enter still sends what was typed.
+        let mut editor = Editor::new(Vec::new());
+        editor.restore("one\ntwo");
+        let (rows, ..) = editor.rows(PROMPT, 80);
+        assert_eq!(rows, vec!["> one".to_string(), "  two".to_string()]);
+    }
+    #[test]
+    fn a_queued_message_waits_above_the_bar_rather_than_in_the_transcript() {
+        let mut editor = Editor::new(Vec::new());
+        type_text(&mut editor, "hello");
+
+        let _guard = crate::out::capture_guard();
+        crate::out::start_capture();
+        draw(
+            &editor,
+            &Chrome {
+                mode: Mode::Normal,
+                busy: Some("thinking"),
+                last: None,
+                status: "a-model  ctx 3%",
+                todos: &[],
+                queued: &["ask about the tests".to_string()],
+                plan: PlanView::Windowed,
+            },
+        );
+        let written = crate::out::take_capture();
+
+        let waiting = written
+            .find("> ask about the tests")
+            .expect("the queued message");
+        let bar = written.find("○ thinking").expect("the activity bar");
+        let box_row = written.rfind("> hello").expect("the input box");
+        assert!(
+            waiting < bar && bar < box_row,
+            "wrong order in {:?}",
+            written
+        );
+    }
+
+    #[test]
+    fn a_queued_message_takes_exactly_one_row_however_it_was_typed() {
+        let rows = queued_rows(&["one\ntwo\nthree".to_string(), "x".repeat(200)], 40);
+        assert_eq!(rows.len(), 2, "one row each: {:?}", rows);
+        for row in &rows {
+            // A region row that turns out to be two is a row the writer cannot count.
+            assert!(!row.contains('\n'), "more than one row: {:?}", row);
+            assert!(crate::out::visible_width(row) < 40, "too wide: {:?}", row);
+        }
+        assert!(rows[0].contains("one two three"), "got {:?}", rows[0]);
     }
 
     fn todo(task: &str, status: &str) -> TodoItem {
@@ -1213,6 +1367,7 @@ mod tests {
                 last: None,
                 status: "a-model  ctx 3%",
                 todos: &todos,
+                queued: &[],
                 plan: PlanView::Windowed,
             },
         );

@@ -248,6 +248,7 @@ async fn work_with_input<T>(
                     last: None,
                     status,
                     todos: &plan,
+                    queued,
                     plan: *plan_view,
                 },
             );
@@ -277,12 +278,18 @@ async fn work_with_input<T>(
                 match crate::input::while_working(editor, mode, plan_view, event) {
                     crate::input::WhileWorking::Interrupt => {
                         out::clear_region();
+                        // What was waiting above the bar was never sent, and the user has
+                        // just said they did not want this turn. It goes back into the box
+                        // rather than on to the model as the next prompt.
+                        if !queued.is_empty() {
+                            let held: Vec<String> = queued.drain(..).collect();
+                            editor.restore(&held.join("\n"));
+                        }
                         return None;
                     }
-                    crate::input::WhileWorking::Queued(text) => {
-                        outln!("{}", crate::input::echo(PROMPT, &text));
-                        queued.push(text);
-                    }
+                    // Not echoed into the transcript here: it has not been sent yet,
+                    // and the row above the bar is where it waits until it has.
+                    crate::input::WhileWorking::Queued(text) => queued.push(text),
                     crate::input::WhileWorking::Nothing => {}
                 }
             }
@@ -530,7 +537,11 @@ async fn main() -> Result<()> {
         // Read user input — unless there is already something waiting that was typed
         // while the last turn was running.
         let input = if !queued.is_empty() {
-            queued.remove(0)
+            // It waited above the bar for as long as it was unsent. Now that it is the
+            // prompt, it becomes a plain line of the transcript like anything else typed.
+            let text = queued.remove(0);
+            outln!("{}", echo(PROMPT, &text));
+            text
         } else {
             match keys.as_mut() {
                 Some(keys) => {
@@ -1755,6 +1766,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 // message between an assistant turn and the tool results it is waiting
                 // for, which is a message order servers reject outright.
                 for text in queued.drain(..) {
+                    outln!("{}", echo(PROMPT, &text));
                     messages.push(json!({"role": "user", "content": text}));
                 }
 
