@@ -15,6 +15,7 @@ mod out;
 
 mod ask;
 mod config;
+mod debug;
 mod input;
 mod llm;
 mod modes;
@@ -1114,6 +1115,12 @@ Usage: /set <name> <value>, or /set <name> unset
             input
         };
 
+        // Wall clock, started here rather than at the first request: what the summary at
+        // the end of the turn reports is how long the user waited, which includes the tool
+        // runs, the permission prompts they answered and every round of the loop below —
+        // not just the time the model spent generating.
+        let turn_started = std::time::Instant::now();
+
         // Add user message
         messages.push(json!({
             "role": "user",
@@ -1832,6 +1839,17 @@ Usage: /set <name> <value>, or /set <name> unset
             }
         }
 
+        // Every way out of the loop above lands here, an interrupt and a server error
+        // included: the line says how long the turn ran for, not whether it got anywhere,
+        // and a turn that ended badly after four minutes is exactly the one worth timing.
+        // Dimmed for the same reason the chain of thought is — it is not the answer.
+        outln!(
+            "\n{}{}{}\n",
+            SetForegroundColor(Color::DarkGrey),
+            turn_summary(get_done_verb(), turn_started.elapsed(), chrono::Local::now()),
+            ResetColor
+        );
+
         // The file /init just wrote is the one that belongs in the system message, and what
         // was loaded at startup — usually nothing, since /init is what you run when the
         // project has no instructions yet — is now out of date. Re-read it here rather than
@@ -1962,4 +1980,143 @@ fn get_thinking_message() -> &'static str {
         .as_millis() as usize % MESSAGES.len();
 
     MESSAGES[idx]
+}
+
+// The verb in the line printed when a turn ends. A companion to the list above: the
+// spinner says what it is doing in the present tense, this says what it did.
+//
+// Every one of these has to read as an intransitive past tense — "Baked for 3m 34s" —
+// so verbs that want an object ("Untangled", "Assembled") stay out however well they
+// fit the spinner.
+fn get_done_verb() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const VERBS: &[&str] = &[
+        // Kitchen
+        "Baked",
+        "Brewed",
+        "Simmered",
+        "Stewed",
+        "Marinated",
+        "Percolated",
+        "Steeped",
+        "Kneaded",
+
+        // Thought
+        "Pondered",
+        "Ruminated",
+        "Cogitated",
+        "Deliberated",
+        "Mused",
+        "Reasoned",
+        "Reflected",
+        "Deduced",
+
+        // Puttering
+        "Noodled",
+        "Tinkered",
+        "Puttered",
+        "Pottered",
+        "Fiddled",
+        "Meandered",
+        "Rummaged",
+        "Foraged",
+
+        // Machinery
+        "Churned",
+        "Whirred",
+        "Hummed",
+        "Ticked",
+        "Crunched",
+        "Toiled",
+        "Labored",
+        "Computed",
+    ];
+
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize % VERBS.len();
+
+    VERBS[idx]
+}
+
+// How long the turn took, in the largest two units that carry information.
+//
+// Seconds are dropped past the hour on purpose: a turn that ran for over an hour is not
+// one anybody is counting seconds on, and "1h 4m 12s" is three numbers to read where two
+// say the same thing.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+// The line that closes a turn: what it did, how long for, and the time it finished at.
+//
+// Both halves earn their place. A turn on a local model can run for minutes with its own
+// start scrolled far off the top of the terminal, so the duration is not recoverable from
+// what is on screen; and a turn that finished while nobody was watching wants a clock
+// time, because a duration alone does not say how stale the answer is.
+fn turn_summary(verb: &str, elapsed: std::time::Duration, finished: chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "✻ {} for {} · done {}",
+        verb,
+        format_elapsed(elapsed),
+        finished.format("%-I:%M %p")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::time::Duration;
+
+    #[test]
+    fn elapsed_uses_two_units_at_most() {
+        assert_eq!(format_elapsed(Duration::from_millis(400)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(12)), "12s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        // The minute boundary keeps the seconds, even when there are none of them: a bare
+        // "1m" reads as a rounded figure where "1m 0s" reads as the measurement it is.
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_elapsed(Duration::from_secs(214)), "3m 34s");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
+        // Past the hour the seconds go, rather than becoming a third number.
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_elapsed(Duration::from_secs(3852)), "1h 4m");
+    }
+
+    #[test]
+    fn summary_reads_as_one_sentence() {
+        let finished = chrono::Local.with_ymd_and_hms(2026, 8, 28, 2, 13, 0).unwrap();
+        assert_eq!(
+            turn_summary("Baked", Duration::from_secs(214), finished),
+            "✻ Baked for 3m 34s · done 2:13 AM"
+        );
+
+        // The hour is unpadded — "2:13 AM", never "02:13 AM" — and the afternoon still
+        // reads on a twelve-hour clock.
+        let finished = chrono::Local.with_ymd_and_hms(2026, 8, 28, 14, 5, 0).unwrap();
+        assert_eq!(
+            turn_summary("Pottered", Duration::from_secs(9), finished),
+            "✻ Pottered for 9s · done 2:05 PM"
+        );
+    }
+
+    #[test]
+    fn every_done_verb_reads_intransitively() {
+        // The list is picked from by clock, so nothing here can check the choice — what it
+        // can check is that whatever comes out slots into the sentence without a space or
+        // a stray capital in the middle of it.
+        let verb = get_done_verb();
+        assert!(!verb.is_empty());
+        assert!(verb.chars().all(|c| c.is_ascii_alphabetic()));
+        assert!(verb.starts_with(|c: char| c.is_uppercase()));
+    }
 }

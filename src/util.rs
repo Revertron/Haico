@@ -32,6 +32,35 @@ pub(crate) fn truncate_at_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+// Terminal escape sequences, removed.
+//
+// The diff behind a permission prompt is rendered for a terminal, so it is full of color
+// codes — and the very same string is what the auto-mode reviewer is handed to judge. To a
+// model those are pure noise: tokens spent on "ESC[38;5;8m" before a single line of the
+// code is read, and one more thing in the evidence that is not the change itself.
+//
+// CSI (ESC [ ... final byte in @..~) is what crossterm emits and all this has to recognize.
+// Any other escape is dropped together with the byte after it, which is right for the
+// two-byte forms and at least leaves nothing dangling from the ones that never turn up here.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 // Resolve "." and ".." textually, without touching the filesystem.
 //
 // Done before canonicalizing so a ".." buried in a not-yet-existing part of the path cannot
@@ -252,5 +281,18 @@ mod tests {
 
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn ansi_escapes_come_off_before_a_model_sees_them() {
+        // A delete line exactly as generate_diff writes it: grey line number, red
+        // background, white text, and a reset after each.
+        let colored = "\x1b[38;5;8m     6\x1b[0m \x1b[48;5;9m\x1b[38;5;15m- use std::path::Path;\x1b[0m";
+        assert_eq!(strip_ansi(colored), "     6 - use std::path::Path;");
+
+        // Text with nothing to strip is returned unchanged, byte for byte.
+        assert_eq!(strip_ansi("plain line"), "plain line");
+        // A lone escape at the end must not run off the end of the string.
+        assert_eq!(strip_ansi("tail\x1b"), "tail");
     }
 }

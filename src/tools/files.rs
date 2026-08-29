@@ -7,6 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::io::{self, BufRead, BufReader};
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -139,6 +141,7 @@ pub(crate) fn glob_matches(matcher: &globset::GlobMatcher, path: &std::path::Pat
 pub(crate) fn walk_source_files(
     root: &str,
     glob: Option<&str>,
+    cancel: &AtomicBool,
 ) -> std::result::Result<Vec<PathBuf>, String> {
     let matcher = match glob {
         Some(pattern) => Some(build_glob_matcher(pattern)?),
@@ -157,6 +160,13 @@ pub(crate) fn walk_source_files(
 
     let mut files = Vec::new();
     for entry in walker {
+        // Over a tree with no .gitignore to thin it out the walk is the slow half all by
+        // itself — ~/.cargo/registry is ninety thousand entries — so giving up has to be
+        // possible here, and not only once the whole list has been collected.
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
         let entry = match entry {
             Ok(entry) => entry,
             // An unreadable directory should not abort the whole search.
@@ -183,6 +193,147 @@ pub(crate) fn walk_source_files(
     }
 
     Ok(files)
+}
+
+// Sets a search's cancel flag when the future that owns it goes away.
+//
+// Dropping the handle of a `spawn_blocking` task does not stop it — there is no way to
+// abort a thread mid-call — so without this an interrupted grep would go on reading files
+// for minutes after the user gave up on it, with nothing left to receive the answer. The
+// flag is the only way back: the blocking half checks it and returns early.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+// The blocking half of `glob_search`: the walk, and the mtime of every match behind the sort.
+fn glob_search_blocking(
+    params: &GlobParams,
+    cancel: &AtomicBool,
+) -> std::result::Result<String, String> {
+    let base_path = params.path.as_deref().unwrap_or(".");
+
+    let mut matches = walk_source_files(base_path, Some(&params.pattern), cancel)?;
+
+    matches.sort_by_cached_key(|path| {
+        std::cmp::Reverse(fs::metadata(path).and_then(|m| m.modified()).ok())
+    });
+
+    // A broad pattern in a big tree can match thousands of files; dumping all of them
+    // costs more context than the answer is worth.
+    const MAX_RESULTS: usize = 500;
+    let total = matches.len();
+    let shown = total.min(MAX_RESULTS);
+
+    Ok(if matches.is_empty() {
+        format!("No files found matching pattern: {}", params.pattern)
+    } else {
+        let paths: Vec<String> = matches[..shown]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let mut output = format!("Found {} file(s):\n{}", total, paths.join("\n"));
+        if total > shown {
+            output.push_str(&format!(
+                "\n\n[showing the {} most recently modified of {}; narrow the pattern to see more]",
+                shown, total
+            ));
+        }
+        output
+    })
+}
+
+// The blocking half of `grep`: the walk, and then reading every file it turned up.
+fn grep_blocking(
+    params: &GrepParams,
+    regex: &regex::Regex,
+    cancel: &AtomicBool,
+) -> std::result::Result<String, String> {
+    let output_mode = params.output_mode.as_deref().unwrap_or("files_with_matches");
+    let head_limit = params.head_limit;
+
+    let search_path = params.path.as_deref().unwrap_or(".");
+    let files = walk_source_files(search_path, params.glob.as_deref(), cancel)?;
+
+    let mut results = Vec::new();
+    let mut count = 0;
+    let mut truncated = false;
+
+    'files: for path in files {
+        // Per file rather than per line: a file is the unit of work here, so the most a
+        // late check costs is one more read, not the rest of the tree.
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if let Ok(metadata) = fs::metadata(&path) {
+            if metadata.len() > 10_000_000 {
+                continue;
+            }
+        }
+
+        // read_to_string fails on invalid UTF-8, which is what skips binaries.
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        let mut file_matches = Vec::new();
+        for (line_num, line) in content.lines().enumerate() {
+            if regex.is_match(line) {
+                file_matches.push((line_num + 1, line));
+            }
+        }
+
+        if file_matches.is_empty() {
+            continue;
+        }
+
+        let path_str = path.display().to_string();
+
+        match output_mode {
+            "content" => {
+                for (line_num, line) in file_matches {
+                    // Cap the line itself: one minified bundle line would otherwise
+                    // blow out the whole result.
+                    results.push(format!(
+                        "{}:{}:{}",
+                        path_str,
+                        line_num,
+                        truncate_at_boundary(line, 2000)
+                    ));
+                    count += 1;
+                    if head_limit.is_some_and(|limit| count >= limit) {
+                        truncated = true;
+                        break 'files;
+                    }
+                }
+            }
+            "count" => {
+                results.push(format!("{}:{}", path_str, file_matches.len()));
+                count += 1;
+            }
+            _ => {
+                results.push(path_str);
+                count += 1;
+            }
+        }
+
+        if head_limit.is_some_and(|limit| count >= limit) {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(if results.is_empty() {
+        format!("No matches found for pattern: {}", params.pattern)
+    } else if truncated {
+        format!("{}\n\n[stopped at head_limit]", results.join("\n"))
+    } else {
+        results.join("\n")
+    })
 }
 
 // Drain one of a child process's pipes to completion, optionally echoing each finished line
@@ -509,37 +660,16 @@ impl MyMcpServer {
 
     #[tool(description = "Use when you know how a file is named or where it lives but not its exact path — locating files by name or extension across a tree. Fast file pattern matching that supports glob patterns (\"*.rs\", \"**/*.{ts,tsx}\"). Respects .gitignore, so build output (target/, node_modules/) is skipped automatically. Returns paths sorted by modification time, newest first. Batch multiple searches when useful.")]
     pub(crate) async fn glob_search(&self, params: Parameters<GlobParams>) -> Result<CallToolResult, McpError> {
-        let base_path = params.0.path.as_deref().unwrap_or(".");
+        // Walking a tree and stat-ing every match is blocking work; see `grep` below for
+        // why none of it may happen on this future's own thread.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _abort = CancelOnDrop(cancel.clone());
 
-        let mut matches = walk_source_files(base_path, Some(&params.0.pattern))
+        let params = params.0;
+        let output = tokio::task::spawn_blocking(move || glob_search_blocking(&params, &cancel))
+            .await
+            .map_err(|e| McpError::internal_error(format!("glob_search failed: {}", e), None))?
             .map_err(|e| McpError::invalid_params(e, None))?;
-
-        matches.sort_by_cached_key(|path| {
-            std::cmp::Reverse(fs::metadata(path).and_then(|m| m.modified()).ok())
-        });
-
-        // A broad pattern in a big tree can match thousands of files; dumping all of them
-        // costs more context than the answer is worth.
-        const MAX_RESULTS: usize = 500;
-        let total = matches.len();
-        let shown = total.min(MAX_RESULTS);
-
-        let output = if matches.is_empty() {
-            format!("No files found matching pattern: {}", params.0.pattern)
-        } else {
-            let paths: Vec<String> = matches[..shown]
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            let mut output = format!("Found {} file(s):\n{}", total, paths.join("\n"));
-            if total > shown {
-                output.push_str(&format!(
-                    "\n\n[showing the {} most recently modified of {}; narrow the pattern to see more]",
-                    shown, total
-                ));
-            }
-            output
-        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
@@ -547,95 +677,36 @@ impl MyMcpServer {
 
     #[tool(description = "Use when you need to find where something appears in the code — a function, variable, string literal, or any regex pattern — across many files at once. Searches file contents using regex. Respects .gitignore, so build output (target/, node_modules/) is skipped automatically. Filter by glob (\"*.rs\", \"**/*.{ts,tsx}\"). Output modes: content (lines), files_with_matches (paths, default), count. Escape literal braces.")]
     pub(crate) async fn grep(&self, params: Parameters<GrepParams>) -> Result<CallToolResult, McpError> {
-        let pattern = params.0.pattern.clone();
-        let case_insensitive = params.0.case_insensitive.unwrap_or(false);
-        let output_mode = params.0.output_mode.as_deref().unwrap_or("files_with_matches");
-        let head_limit = params.0.head_limit;
+        let params = params.0;
 
-        let regex = if case_insensitive {
-            regex::RegexBuilder::new(&pattern)
+        // Compiled before anything is spawned: a bad pattern is the caller's own mistake
+        // and should come straight back, not after a thread has been started for it.
+        let regex = if params.case_insensitive.unwrap_or(false) {
+            regex::RegexBuilder::new(&params.pattern)
                 .case_insensitive(true)
                 .build()
         } else {
-            regex::Regex::new(&pattern)
+            regex::Regex::new(&params.pattern)
         }.map_err(|e| {
             McpError::invalid_params(format!("Invalid regex pattern: {}", e), None)
         })?;
 
-        let search_path = params.0.path.as_deref().unwrap_or(".");
-        let files = walk_source_files(search_path, params.0.glob.as_deref())
+        // Reading every file in a tree is blocking work, and in the REPL this future is
+        // polled by the same `select!` that reads the keyboard: run inline, a grep over
+        // ~/.cargo/registry — ninety thousand files, and it is in `read_paths` for anyone
+        // who wants crate sources readable — froze the bar, the spinner and Esc itself for
+        // as long as it ran. There is no await inside the search to hand control back with.
+        //
+        // So it goes to the blocking pool, and the flag is set when this future is dropped,
+        // which is exactly what Esc does — otherwise the detached thread would keep reading
+        // for minutes with nobody left to receive the answer.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _abort = CancelOnDrop(cancel.clone());
+
+        let output = tokio::task::spawn_blocking(move || grep_blocking(&params, &regex, &cancel))
+            .await
+            .map_err(|e| McpError::internal_error(format!("grep failed: {}", e), None))?
             .map_err(|e| McpError::invalid_params(e, None))?;
-
-        let mut results = Vec::new();
-        let mut count = 0;
-        let mut truncated = false;
-
-        'files: for path in files {
-            if let Ok(metadata) = fs::metadata(&path) {
-                if metadata.len() > 10_000_000 {
-                    continue;
-                }
-            }
-
-            // read_to_string fails on invalid UTF-8, which is what skips binaries.
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-
-            let mut file_matches = Vec::new();
-            for (line_num, line) in content.lines().enumerate() {
-                if regex.is_match(line) {
-                    file_matches.push((line_num + 1, line));
-                }
-            }
-
-            if file_matches.is_empty() {
-                continue;
-            }
-
-            let path_str = path.display().to_string();
-
-            match output_mode {
-                "content" => {
-                    for (line_num, line) in file_matches {
-                        // Cap the line itself: one minified bundle line would otherwise
-                        // blow out the whole result.
-                        results.push(format!(
-                            "{}:{}:{}",
-                            path_str,
-                            line_num,
-                            truncate_at_boundary(line, 2000)
-                        ));
-                        count += 1;
-                        if head_limit.is_some_and(|limit| count >= limit) {
-                            truncated = true;
-                            break 'files;
-                        }
-                    }
-                }
-                "count" => {
-                    results.push(format!("{}:{}", path_str, file_matches.len()));
-                    count += 1;
-                }
-                _ => {
-                    results.push(path_str);
-                    count += 1;
-                }
-            }
-
-            if head_limit.is_some_and(|limit| count >= limit) {
-                truncated = true;
-                break;
-            }
-        }
-
-        let output = if results.is_empty() {
-            format!("No matches found for pattern: {}", pattern)
-        } else if truncated {
-            format!("{}\n\n[stopped at head_limit]", results.join("\n"))
-        } else {
-            results.join("\n")
-        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
@@ -721,6 +792,8 @@ impl MyMcpServer {
 mod tests {
     #![allow(unused_imports)]
     use crate::config::*;
+    use super::CancelOnDrop;
+    use std::sync::atomic::AtomicBool;
     use crate::llm::*;
     use crate::permissions::*;
     use crate::render::*;
@@ -756,7 +829,7 @@ mod tests {
     fn walker_skips_build_output_and_the_git_dir() {
         // Runs against haico's own tree, which always has a target/ and a .git/ when the
         // tests are run — the exact case that used to bury every search result.
-        let files = walk_source_files(".", None).unwrap();
+        let files = walk_source_files(".", None, &AtomicBool::new(false)).unwrap();
         assert!(!files.is_empty());
 
         let has_component = |name: &str| {
@@ -770,7 +843,7 @@ mod tests {
         // Dotfiles a coding agent legitimately needs stay visible.
         assert!(files.iter().any(|p| p.file_name().unwrap() == ".gitignore"));
 
-        let rust = walk_source_files(".", Some("*.rs")).unwrap();
+        let rust = walk_source_files(".", Some("*.rs"), &AtomicBool::new(false)).unwrap();
         assert!(rust.iter().any(|p| p.ends_with("main.rs")));
         assert!(rust.iter().all(|p| p.extension().unwrap() == "rs"));
 
@@ -778,7 +851,7 @@ mod tests {
         // "./src/main.rs", and matching that raw makes every such pattern return nothing —
         // a bare "*.rs" hid it, because it matches on the file name instead.
         for pattern in ["src/*.rs", "src/**/*.rs", "**/*.rs"] {
-            let found = walk_source_files(".", Some(pattern)).unwrap();
+            let found = walk_source_files(".", Some(pattern), &AtomicBool::new(false)).unwrap();
             assert!(
                 found.iter().any(|p| p.ends_with("main.rs")),
                 "pattern {} found {:?}",
@@ -788,10 +861,10 @@ mod tests {
         }
 
         // And a directory pattern must still exclude what it does not name.
-        let only_src = walk_source_files(".", Some("src/*.rs")).unwrap();
+        let only_src = walk_source_files(".", Some("src/*.rs"), &AtomicBool::new(false)).unwrap();
         assert!(only_src.iter().all(|p| p.to_string_lossy().contains("src")));
 
-        assert!(walk_source_files(".", Some("[")).is_err());
+        assert!(walk_source_files(".", Some("["), &AtomicBool::new(false)).is_err());
     }
 
 
@@ -1007,4 +1080,86 @@ mod tests {
         let _ = std::fs::remove_file(&binary);
     }
 
+    #[test]
+    fn a_cancelled_walk_stops_where_it_is() {
+        // Set before the walk starts, so there is nothing to race with: what it proves is
+        // that the flag is looked at at all, which is what an interrupted grep depends on.
+        let cancel = AtomicBool::new(true);
+        let files = walk_source_files(".", None, &cancel).unwrap();
+        assert!(files.is_empty(), "a cancelled walk returned {} files", files.len());
+    }
+
+    #[test]
+    fn the_guard_cancels_the_search_when_the_future_holding_it_goes_away() {
+        // The guard lives in the async fn's own frame, so this drop is what Esc does: the
+        // future is dropped mid-await and the detached thread has to be told to stop.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let _abort = CancelOnDrop(cancel.clone());
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "the search was left running after its future was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_still_returns_its_matches_from_the_thread_pool() {
+        // The search moved off the future's own thread; the result must not have moved
+        // with it. Both the REPL and the MCP router come through execute_tool.
+        let server = crate::testutil::test_server();
+        let found = server
+            .execute_tool(
+                "grep",
+                serde_json::json!({
+                    "pattern": "fn walk_source_files",
+                    "path": "src",
+                    "output_mode": "files_with_matches"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(found.contains("files.rs"), "got: {}", found);
+
+        // Joined at runtime: written out in one piece, the needle would be sitting in
+        // this very file and the search would find it.
+        let needle = format!("{}{}", "nothing-matches", "-this-xyzzy");
+        let missing = server
+            .execute_tool("grep", serde_json::json!({"pattern": needle}))
+            .await
+            .unwrap();
+        assert!(missing.starts_with("No matches found"), "got: {}", missing);
+
+        // An unparseable pattern still comes back as an error rather than reaching a thread.
+        assert!(server
+            .execute_tool("grep", serde_json::json!({"pattern": "("}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_search_hands_control_back_before_it_reads_anything() {
+        // The property the REPL depends on, and the one a future rewrite could quietly
+        // take away: the first poll must spawn the work and return, not do it. The bar,
+        // the spinner and Esc all live in the `select!` that polls this future, and while
+        // a poll is running none of them exist.
+        use std::future::Future;
+
+        let server = crate::testutil::test_server();
+        let mut search = Box::pin(server.execute_tool(
+            "grep",
+            serde_json::json!({"pattern": "fn ", "path": "src", "output_mode": "count"}),
+        ));
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            search.as_mut().poll(&mut cx).is_pending(),
+            "the search did its reading on the first poll, which is the freeze itself"
+        );
+
+        // And it still finishes, with the counts it was asked for.
+        let counted = search.await.unwrap();
+        assert!(counted.contains("files.rs:"), "got: {}", counted);
+    }
 }

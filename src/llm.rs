@@ -183,6 +183,15 @@ impl LMStudioClient {
 
         let response = self.post_chat(&body).await?;
 
+        // Logged whole, before anything is picked out of it: when this reply cannot be
+        // parsed the interesting part is usually what the server did instead of answering
+        // — a finish_reason of "length" for a model still thinking, an empty message with
+        // the text in a field nobody read, a prompt that filled the window on its own.
+        // None of that survives into the one-line error the caller ends up reporting.
+        if crate::debug::enabled() {
+            crate::debug::log("plain completion reply", &describe_plain_reply(&response));
+        }
+
         if let Some(error) = response["error"]["message"].as_str() {
             bail!("{}", truncate_at_boundary(error, 500));
         }
@@ -388,6 +397,51 @@ impl LMStudioClient {
 
         Ok(content)
     }
+}
+
+// A non-streaming reply, laid out for the debug log.
+//
+// Written field by field rather than as the raw JSON because the text is the point: in a
+// JSON dump a reasoning block arrives as one enormous line with every newline escaped,
+// which is exactly the thing that has to be read to see where the answer went.
+fn describe_plain_reply(response: &Value) -> String {
+    let choice = &response["choices"][0];
+    let mut out = format!(
+        "finish_reason: {}\n",
+        choice["finish_reason"].as_str().unwrap_or("(none)")
+    );
+
+    if let Some(usage) = response["usage"].as_object() {
+        // The token counts say whether the cap was the problem and, just as often,
+        // whether the prompt left any room for an answer at all.
+        let mut counts: Vec<String> = usage
+            .iter()
+            .filter_map(|(k, v)| v.as_u64().map(|n| format!("{}={}", k, n)))
+            .collect();
+        counts.sort();
+        if !counts.is_empty() {
+            out.push_str(&format!("usage: {}\n", counts.join(" ")));
+        }
+    }
+
+    if let Some(error) = response["error"]["message"].as_str() {
+        out.push_str(&format!("error: {}\n", error));
+    }
+
+    let message = &choice["message"];
+    let mut had_text = false;
+    for key in ["content", "reasoning_content", "reasoning"] {
+        let text = message[key].as_str().unwrap_or("");
+        if !text.is_empty() {
+            out.push_str(&format!("{} ({} bytes):\n{}\n", key, text.len(), text));
+            had_text = true;
+        }
+    }
+    if !had_text {
+        out.push_str("no text in content, reasoning_content or reasoning\n");
+    }
+
+    out
 }
 
 // One tool call being reassembled from stream fragments.

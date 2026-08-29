@@ -402,6 +402,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
     println!("  SEARXNG_URL   SearxNG instance for web_search (overridden by --searxng)");
     println!("  HAICO_CONTEXT Model context window in tokens (overridden by --context)");
+    println!("  HAICO_DEBUG   Set to 1 to append diagnostics to ~/.haico/debug.log");
     println!("\nConfig file: ~/.haico/config.toml — supplies defaults for all of the above,");
     println!("plus per-model sections. Command line and environment take precedence over it.");
     println!("\n  url   = \"http://127.0.0.1:1234\"");

@@ -300,6 +300,14 @@ pub(crate) fn referenced_script(command: &str) -> Option<PathBuf> {
 // Everything the reviewer gets to see about a call.
 
 pub(crate) fn build_evidence(tool_name: &str, arguments: &Value) -> String {
+    // Stripped on the way out, in one place, because everything gathered below was written
+    // for a terminal: the diff arrives full of color escapes, and a script read off disk can
+    // carry its own. The reviewer is a model, and to it an "ESC[38;5;8m" in front of every
+    // line is noise it pays for and has to read past to reach the change itself.
+    crate::util::strip_ansi(&gather_evidence(tool_name, arguments))
+}
+
+fn gather_evidence(tool_name: &str, arguments: &Value) -> String {
     let mut evidence = format!("Tool: {}\n", tool_name);
 
     // For a write, the diff carries the path and the content both, so the raw arguments
@@ -354,15 +362,34 @@ pub(crate) fn parse_verdict(raw: &str) -> Result<Verdict> {
     if end < start {
         return Err(anyhow!("no JSON object in the reply"));
     }
+    let object = &text[start..=end];
 
-    let parsed: Value = serde_json::from_str(&text[start..=end])
-        .map_err(|e| anyhow!("reply was not valid JSON: {}", e))?;
-
-    let verdict = parsed["verdict"]
-        .as_str()
-        .ok_or_else(|| anyhow!("reply had no 'verdict' field"))?
-        .trim()
-        .to_lowercase();
+    let (verdict, reason) = match serde_json::from_str::<Value>(object) {
+        Ok(parsed) => {
+            let verdict = parsed["verdict"]
+                .as_str()
+                .ok_or_else(|| anyhow!("reply had no 'verdict' field"))?
+                .trim()
+                .to_lowercase();
+            let reason = parsed["reason"].as_str().unwrap_or("").trim().to_string();
+            (verdict, reason)
+        }
+        // One byte of fumbled punctuation should not cost a verdict the model plainly
+        // reached. Seen in the log, on an ordinary edit:
+        //
+        //     {"verdict": "allow", "reason": "...ordinary development work.""}
+        //
+        // A doubled closing quote, serde stops at column 163 of 164, and a call the
+        // reviewer had approved — its reasoning said so in as many words — arrives at the
+        // user's prompt as "Review failed".
+        //
+        // This does not cross the line the comment above draws. Nothing is invented: the
+        // same two fields are read out of the same reply, only without requiring the
+        // punctuation around them to be well formed. A reply that never names a verdict
+        // still fails, and the original parse error is what gets reported when it does.
+        Err(e) => salvaged_fields(object)
+            .ok_or_else(|| anyhow!("reply was not valid JSON: {}", e))?,
+    };
 
     let allow = if verdict.starts_with("allow") {
         true
@@ -372,9 +399,42 @@ pub(crate) fn parse_verdict(raw: &str) -> Result<Verdict> {
         return Err(anyhow!("unrecognized verdict '{}'", verdict));
     };
 
-    let reason = parsed["reason"].as_str().unwrap_or("").trim().to_string();
-
     Ok(Verdict { allow, reason, cached: false })
+}
+
+// The verdict and its reason, read out of a reply whose JSON will not parse.
+//
+// Compiled per call rather than kept in a static: this runs only when a reply was already
+// malformed, which is rare enough that a few microseconds are cheaper than the machinery
+// to avoid them.
+fn salvaged_fields(object: &str) -> Option<(String, String)> {
+    // The opening quote of the value is optional, so an unquoted `"verdict": allow` is
+    // read too — the other way the same models get this wrong.
+    let verdict = regex::Regex::new(r#"(?is)"verdict"\s*:\s*"?\s*(allow|deny)"#)
+        .ok()?
+        .captures(object)?
+        .get(1)?
+        .as_str()
+        .to_lowercase();
+
+    // Greedy to the last quote in the object on purpose: the reason is the long free-text
+    // field, so it is where a stray quote lands, and stopping at the first one would cut
+    // the sentence in half. Whatever punctuation that leaves on the end comes off after.
+    let reason = regex::Regex::new(r#"(?is)"reason"\s*:\s*"(.*)""#)
+        .ok()
+        .and_then(|re| Some(re.captures(object)?.get(1)?.as_str().to_string()))
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(['"', ',', ' '])
+        .trim()
+        .to_string();
+
+    // Left in the audit trail on the way out: a verdict rescued from a malformed reply is
+    // worth telling apart from one that simply parsed, and this is the only place that
+    // knows the difference.
+    crate::debug::log("review reply salvaged", object);
+
+    Some((verdict, reason))
 }
 
 // Verdicts already reached, so the same proposal is not paid for twice.
@@ -427,6 +487,9 @@ pub(crate) async fn judge_tool_call(
     let evidence = build_evidence(tool_name, arguments);
 
     if let Some(reason) = cache.allowed.get(&evidence) {
+        // Logged too, so a debug log that shows no request for a call is not read as the
+        // reviewer having been skipped.
+        crate::debug::log("review cache hit", &format!("Tool: {}\nallow - {}", tool_name, reason));
         return Ok(Verdict { allow: true, reason: reason.clone(), cached: true });
     }
 
@@ -435,12 +498,31 @@ pub(crate) async fn judge_tool_call(
         json!({"role": "user", "content": evidence.clone()}),
     ];
 
+    // What the reviewer was actually shown. Worth having next to the reply it produced:
+    // an evidence block that turns out to be a hundred-kilobyte diff explains an empty or
+    // truncated verdict better than the verdict itself ever could.
+    crate::debug::log(&format!("review request: {}", tool_name), &evidence);
+
     // Generous for a two-field answer, because the answer is not all that gets generated:
     // a reasoning model thinks first, and a cap that cuts it off mid-thought yields a reply
     // with no JSON in it at all. That surfaced as "Review failed: no JSON object" on a
     // perfectly ordinary `cargo build`.
     let reply = client.chat_completion_plain(messages, 1000).await?;
-    let verdict = parse_verdict(&reply)?;
+
+    // The reply is already in the log, written by the client. This adds only which end of
+    // the parse it came out of, so a run of failures can be read back without re-reading
+    // every reply above them.
+    let verdict = match parse_verdict(&reply) {
+        Ok(verdict) => {
+            let outcome = if verdict.allow { "allow" } else { "deny" };
+            crate::debug::log("review verdict", &format!("{} - {}", outcome, verdict.reason));
+            verdict
+        }
+        Err(e) => {
+            crate::debug::log("review failed", &format!("{:#}", e));
+            return Err(e);
+        }
+    };
 
     if verdict.allow {
         cache.allowed.insert(evidence, verdict.reason.clone());
@@ -645,6 +727,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_quote_does_not_cost_a_verdict_the_model_reached() {
+        // Copied byte for byte out of the debug log: one doubled closing quote, and serde
+        // gives up at column 163 of 164 on a reply that had plainly decided to allow.
+        let doubled = "{\"verdict\": \"allow\", \"reason\": \"It's a small in-place code edit \
+                       (removing an unnecessary Ok wrapper) within the project file, which is \
+                       ordinary development work.\"\"}";
+        let salvaged = parse_verdict(doubled).unwrap();
+        assert!(salvaged.allow);
+        assert!(
+            salvaged.reason.ends_with("ordinary development work."),
+            "the reason came back mangled: {}",
+            salvaged.reason
+        );
+
+        // A deny is salvaged on the same terms — this is not a way of turning a refusal
+        // into consent.
+        let denied = parse_verdict("{\"verdict\": \"deny\", \"reason\": \"reads a private key\",}")
+            .unwrap();
+        assert!(!denied.allow);
+        assert_eq!(denied.reason, "reads a private key");
+
+        // An unquoted value, the other way the same models get this wrong.
+        assert!(parse_verdict("{\"verdict\": allow}").unwrap().allow);
+
+        // And the line that does not move: a malformed reply that never names a verdict is
+        // still an error, reported as the JSON failure it was.
+        let e = parse_verdict("{\"verdict\": \"probably fine\",}").unwrap_err();
+        assert!(format!("{:#}", e).contains("not valid JSON"), "got: {:#}", e);
+    }
+
+    #[test]
     fn the_reviewer_is_shown_the_script_a_command_would_run() {
         let script = crate::testutil::scratch("deploy.py", "import os\nos.system('rm -rf /')\n");
 
@@ -663,6 +776,30 @@ mod tests {
         assert_eq!(referenced_script("python nope-not-here.py"), None);
 
         let _ = std::fs::remove_file(&script);
+    }
+
+    #[test]
+    fn the_reviewer_is_not_shown_terminal_color_codes() {
+        // The diff is rendered for a terminal — grey line numbers, red and green
+        // backgrounds — and the reviewer is handed the same string. The escapes used to
+        // reach the model verbatim, ESC[38;5;8m in front of every line of the change.
+        let file = crate::testutil::scratch(
+            "colorless-evidence.rs",
+            "use std::path::Path;\nfn main() {}\n",
+        );
+        let evidence = build_evidence(
+            "write_file",
+            &json!({
+                "file_path": file.display().to_string(),
+                "content": "fn main() {}\n",
+            }),
+        );
+
+        // The change itself still survives, line markers and all.
+        assert!(evidence.contains("- use std::path::Path;"), "got: {}", evidence);
+        assert!(!evidence.contains('\x1b'), "escapes left in: {:?}", evidence);
+
+        let _ = std::fs::remove_file(&file);
     }
 
     // One OpenAI-shaped completion whose content is the reviewer's JSON object. Leaked by
