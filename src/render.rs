@@ -1139,8 +1139,13 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
         crate::out::flush();
 
         // Read key event
-        let Some(Event::Key(key_event)) = keys.next().await else {
+        let Some(event) = keys.next().await else {
             return Err(anyhow::anyhow!("no interactive terminal to pick a model"));
+        };
+        // Anything that is not a keystroke redraws the list at the top of the loop instead
+        // of ending the picker: a window losing focus is not a choice of model.
+        let Event::Key(key_event) = event else {
+            continue;
         };
 
         // Only process key press events, ignore key release

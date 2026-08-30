@@ -370,9 +370,19 @@ pub(crate) async fn ask_permission(
     crate::out::flush();
 
     let response = loop {
-        let Some(Event::Key(key_event)) = keys.next().await else {
+        let Some(event) = keys.next().await else {
             // The keyboard reader is gone, which is not consent.
             return Err(anyhow!("no interactive terminal to ask for permission"));
+        };
+
+        // Only a closed channel means nobody is there to answer. Everything else that can
+        // arrive here is not an answer but is not an absent user either, and matching the
+        // key event directly above used to lump the two together: on Windows the console
+        // emits a focus event whenever the window is clicked away from or minimized, so
+        // stepping away from the keyboard refused the pending call - and every call after
+        // it - as if the terminal had gone.
+        let Event::Key(key_event) = event else {
+            continue;
         };
 
         // Only process key press events, ignore key release

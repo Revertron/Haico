@@ -201,8 +201,13 @@ pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecis
     crate::out::flush();
 
     let decision = loop {
-        let Some(Event::Key(key)) = keys.next().await else {
+        let Some(event) = keys.next().await else {
             return Err(anyhow!("no interactive terminal to review the plan"));
+        };
+        // A focus change or a resize is not a decision, but it is not a missing terminal
+        // either; see the permission prompt for the failure that motivated the split.
+        let Event::Key(key) = event else {
+            continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
