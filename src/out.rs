@@ -100,7 +100,19 @@ impl Out {
             let mut wrap = self.wrap.clone();
             wrap.width = width;
             let pending = wrap.feed(&self.pending);
-            rows.extend(pending.split('\n').map(str::to_string));
+            // Every row carries the colors it is written in, including the ones switched
+            // on before the break that put it here. `patch` rewrites only the rows that
+            // changed, so a row painted on its own starts in whatever color the terminal
+            // was last left in — and a word carried onto a new row by the wrap arrives
+            // with its escape left behind on the row above. That is what used to leave
+            // the first word of a wrapped line of thinking in the terminal's own text
+            // color until the line ended and the whole of it went to the scrollback in
+            // one piece.
+            let mut open = String::new();
+            for row in pending.split('\n') {
+                rows.push(format!("{}{}", open, row));
+                open = open_colors(&open, row);
+            }
         }
         let pending_rows = rows.len();
         rows.extend(self.region.iter().cloned());
@@ -307,6 +319,35 @@ pub(crate) fn visible_width(text: &str) -> usize {
 // input box keeps, for the same reason.
 fn wrap_width() -> usize {
     terminal_width().saturating_sub(1).max(1)
+}
+
+// Which colors are still switched on at the end of a row, given the ones that were on at
+// the start of it. Only SGR sequences — the ones ending in "m" — say anything about color;
+// a cursor move carries nothing over. A reset closes everything, so it clears what has
+// been collected; anything else joins it in the order it was written, which is the order
+// it has to be written again in to put the terminal back the way the row left it.
+fn open_colors(open: &str, row: &str) -> String {
+    let mut colors = open.to_string();
+    let mut chars = row.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            continue;
+        }
+        let escape = take_escape(&mut chars);
+        let Some(params) = escape
+            .strip_prefix("\u{1b}[")
+            .and_then(|rest| rest.strip_suffix('m'))
+        else {
+            continue;
+        };
+        // "\x1b[m" and "\x1b[0m" are the same reset; a list of them still resets.
+        if params.split(';').all(|param| param.is_empty() || param == "0") {
+            colors.clear();
+        } else {
+            colors.push_str(&escape);
+        }
+    }
+    colors
 }
 
 // Consume one escape sequence, the ESC itself already taken, and give it back whole. A
@@ -802,6 +843,43 @@ mod tests {
         let box_row = written.rfind("> hello").expect("the box");
         let line = written.rfind("some words").expect("the line above it");
         assert!(box_row < line, "wrong order in {:?}", written);
+    }
+
+    #[test]
+    fn a_color_carried_across_a_wrap_is_switched_on_again_on_the_next_row() {
+        let _guard = super::capture_guard();
+        const RED: &str = "\u{1b}[31m";
+
+        super::start_capture();
+        super::set_region(vec!["> ".to_string()], 0, 2);
+        // Long enough to wrap however wide the terminal running the test happens to be,
+        // and written in one piece so the color is switched on exactly once.
+        let line = "word ".repeat(400);
+        out!("{}{}\u{1b}[0m", RED, line.trim_end());
+        let written = super::take_capture();
+
+        let rows: Vec<&str> = written.split('\n').collect();
+        let carrying = rows.iter().filter(|row| row.contains("word")).count();
+        assert!(carrying > 1, "nothing wrapped: {} rows", rows.len());
+        // Written once and painted once per row: a row is repainted on its own, so the
+        // one the wrap carried a word onto has to say the color again rather than take
+        // whatever the terminal was left in.
+        assert_eq!(written.matches(RED).count(), carrying, "got {:?}", written);
+    }
+
+    #[test]
+    fn only_the_colors_still_open_are_carried_to_the_next_row() {
+        let carried = super::open_colors;
+
+        // Switched on and left that way.
+        assert_eq!(carried("", "\u{1b}[31mred"), "\u{1b}[31m");
+        // Two of them, in the order they have to be written again.
+        assert_eq!(carried("", "\u{1b}[31m\u{1b}[1mboth"), "\u{1b}[31m\u{1b}[1m");
+        // Closed again, by either spelling of the reset.
+        assert_eq!(carried("\u{1b}[31m", "red\u{1b}[0m plain"), "");
+        assert_eq!(carried("\u{1b}[31m", "red\u{1b}[m plain"), "");
+        // A cursor move says nothing about color, so it carries nothing either way.
+        assert_eq!(carried("\u{1b}[31m", "\u{1b}[2Cred"), "\u{1b}[31m");
     }
 
     #[test]

@@ -101,7 +101,6 @@ fn print_repl_help() {
     outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty or");
     outln!("                     max_tokens ('/set <name> unset' to undo). '/temp' is short");
     outln!("                     for '/set temperature'.");
-    outln!("  /light /dark       Which way round the terminal's own colors run");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
@@ -351,21 +350,6 @@ async fn main() -> Result<()> {
     // Server mode: hand off to the MCP stdio server and return (no banner, no REPL).
     if config.server {
         return run_mcp_server(config).await;
-    }
-
-    // Which way round the terminal's colors run. Read before anything is printed, and not
-    // resolved per model the way the sampling settings are: this is a property of the
-    // screen, and the screen does not change when the model does. A value that is neither
-    // is reported rather than quietly ignored, for the same reason `deny_unknown_fields`
-    // rejects a typo'd key — a setting that does nothing looks exactly like a broken one.
-    match config.file.theme.as_deref().map(str::trim) {
-        None => {}
-        Some(value) if value.eq_ignore_ascii_case("dark") => set_dark(true),
-        Some(value) if value.eq_ignore_ascii_case("light") => set_dark(false),
-        Some(other) => outln!(
-            "[config] theme = \"{}\" is neither \"light\" nor \"dark\"; using light.",
-            other
-        ),
     }
 
     // From here on the keyboard is read a key at a time rather than a line at a time,
@@ -748,21 +732,6 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if input == "/light" || input == "/dark" {
-            let dark = input == "/dark";
-            set_dark(dark);
-            outln!("Theme: {}.", if dark { "dark" } else { "light" });
-            // Said plainly because it is the only thing that moves: the rest of what haico
-            // paints reads either way, and a user who expected a whole palette to change
-            // should find that out here rather than by hunting for the difference.
-            outln!(
-                "Only the diff changes with it — on a dark background its lines are \
-                 written in white, where the terminal's own text color is too dim against \
-                 the red and the green.\n"
-            );
-            continue;
-        }
-
         if input == "/model" || input.starts_with("/model ") {
             let requested = input.strip_prefix("/model").unwrap_or("").trim().to_string();
             // Copied out so the borrow ends before lm_client is reassigned below.
@@ -868,17 +837,10 @@ In force for '{}':", lm_client.model);
                 }
             );
             outln!(
-                "  theme           {}",
-                if is_dark() { "dark" } else { "light" }
-            );
-            outln!(
                 "\nA '-' means the field is left out of the request, so the server's own \
                  setting for that model applies."
             );
-            outln!(
-                "Change one for this session with /set <name> <value>, or the theme with \
-                 /light and /dark.\n"
-            );
+            outln!("Change one for this session with /set <name> <value>.\n");
             continue;
         }
 
