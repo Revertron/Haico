@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 description = "Interactive CLI coding assistant for local LLMs (via LM Studio) with a custom “MCP” tool router."
 

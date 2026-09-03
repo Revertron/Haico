@@ -1,5 +1,5 @@
 use super::MyMcpServer;
-use crate::util::{file_key, modified_time, truncate_at_boundary};
+use crate::util::{modified_time, truncate_at_boundary};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -429,10 +429,7 @@ impl MyMcpServer {
         // The read completed, so the file now counts as seen — at the modification time it
         // had when we opened it, not now.
         if let Some(mtime) = mtime_at_open {
-            self.seen_files
-                .lock()
-                .unwrap()
-                .insert(file_key(&file_path), mtime);
+            self.mark_read(&file_path, mtime);
         }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
@@ -470,7 +467,7 @@ impl MyMcpServer {
 
         // The file now matches what the model just produced, so a follow-up edit is working
         // from known contents and must not be rejected as unread or stale.
-        self.mark_read(&file_path);
+        self.mark_written(&file_path, params.0.content.as_bytes());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Successfully wrote {} bytes to {}",
@@ -546,8 +543,8 @@ impl MyMcpServer {
             McpError::internal_error(format!("Failed to write file: {}", e), None)
         })?;
 
-        // Keep the recorded mtime current so a follow-up edit is not rejected as stale.
-        self.mark_read(&file_path);
+        // Keep the record current so a follow-up edit is not rejected as stale.
+        self.mark_written(&file_path, new_content.as_bytes());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Successfully replaced {} occurrence(s) in {}",
@@ -647,7 +644,7 @@ impl MyMcpServer {
             McpError::internal_error(format!("Failed to write file: {}", e), None)
         })?;
 
-        self.mark_read(&file_path);
+        self.mark_written(&file_path, working.as_bytes());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Applied {} edit(s), {} replacement(s), to {}",
@@ -934,6 +931,56 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "edited in another editor\n"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[tokio::test]
+    async fn a_wrong_timestamp_does_not_make_our_own_write_look_like_an_outside_edit() {
+        // The failure this guards against: on Windows the mtime read back straight after a
+        // write can be the directory entry's older one, and the tools then refused the next
+        // change to a file they had themselves just written, telling the model to re-read it.
+        // The bytes we wrote are the thing we actually know, so they get the final say.
+        let server = test_server();
+        let path = scratch("timestamp-liar.rs", "original\n");
+        read_file(&server, &path).await;
+
+        let (ok, message) = try_edit(&server, &path, "original", "changed", false).await;
+        assert!(ok, "got: {}", message);
+
+        // Whatever the filesystem reported, pretend it reported something else.
+        server
+            .seen_files
+            .lock()
+            .unwrap()
+            .get_mut(&crate::util::file_key(&path))
+            .unwrap()
+            .modified = Some(std::time::UNIX_EPOCH);
+
+        // The file still holds exactly what the tool put there, so the edit goes through.
+        let (ok, message) = try_edit(&server, &path, "changed", "changed twice", false).await;
+        assert!(ok, "got: {}", message);
+
+        // And the recorded time is repaired on the way past, so the next call does not have
+        // to read the whole file again to find that out.
+        assert_eq!(
+            server
+                .seen_files
+                .lock()
+                .unwrap()
+                .get(&crate::util::file_key(&path))
+                .unwrap()
+                .modified,
+            modified_time(&path)
+        );
+
+        // A real outside edit is still caught: the contents no longer match either.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "someone else was here\n").unwrap();
+        let (ok, message) = try_edit(&server, &path, "someone", "clobbered", false).await;
+        assert!(!ok);
+        assert!(message.contains("changed on disk"), "got: {}", message);
 
         let _ = std::fs::remove_file(&path);
     }

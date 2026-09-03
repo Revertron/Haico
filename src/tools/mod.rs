@@ -37,10 +37,10 @@ pub(crate) struct MyMcpServer {
     // Base URL of a SearxNG instance (--searxng / SEARXNG_URL). When set, web_search goes
     // through it instead of DuckDuckGo.
     pub(crate) searxng: Option<String>,
-    // Files seen by `read`, with the modification time they had at the time. `edit` and
+    // Files this session has seen, and what was true of them when it saw them. `edit` and
     // `write_file` consult this so a model cannot rewrite a file it has never looked at, or
     // one that changed underneath it since it looked. Shared across clones via Arc.
-    pub(crate) seen_files: Arc<Mutex<std::collections::HashMap<PathBuf, std::time::SystemTime>>>,
+    pub(crate) seen_files: Arc<Mutex<std::collections::HashMap<PathBuf, Seen>>>,
     // The current task list, as last written by todo_write. Shared across clones so the
     // REPL and the tool see the same list.
     pub(crate) todos: Arc<Mutex<Vec<TodoItem>>>,
@@ -70,6 +70,39 @@ pub(crate) struct FileCheckpoint {
 // How many changes can be undone. Bounded because the contents are held in memory.
 
 pub(crate) const MAX_CHECKPOINTS: usize = 50;
+
+// What was true of a file the last time this session saw it.
+//
+// The modification time is the cheap check and answers almost every call. The fingerprint is
+// what settles a disagreement, and it exists because the timestamp turned out to be a liar:
+// on Windows a stat taken shortly after a write can come back with the directory entry's
+// older time rather than the file's real one (`fs::metadata` falls back to the directory
+// entry when it cannot open a handle — a scanner holding the file for a moment is enough).
+// A tool's own write then looked like somebody else's edit, and the model was told to re-read
+// a file it had itself just written, over and over.
+
+#[derive(Clone, Copy)]
+pub(crate) struct Seen {
+    // None when the stat failed; the fingerprint then carries the check on its own.
+    pub(crate) modified: Option<std::time::SystemTime>,
+    // Set only when we know the file's whole contents — that is, when we wrote them. `read`
+    // sees a window of a file, never necessarily all of it, so it has no fingerprint to give.
+    pub(crate) hash: Option<u64>,
+}
+
+// Fingerprint of a file's exact bytes.
+//
+// The standard hasher is enough: fingerprints are only ever compared with others taken in the
+// same process, so its lack of a stability guarantee across Rust versions does not matter, and
+// nothing here is persisted.
+
+pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
 
 // Key for `seen_files`. Canonicalized so "./src/a.rs", "src/a.rs" and an absolute path all
 // land on the same entry; a path that cannot be canonicalized (a file being created) falls
@@ -164,6 +197,9 @@ impl MyMcpServer {
             Some(contents) => {
                 fs::write(&checkpoint.path, contents)
                     .map_err(|e| format!("Could not restore {}: {}", checkpoint.path.display(), e))?;
+                // The file now holds what it did when it was last read, so a following edit
+                // must not be turned away as stale.
+                self.mark_written(&checkpoint.path, contents);
             }
             None => {
                 // The change created this file, so undoing it means removing it. Already
@@ -173,25 +209,54 @@ impl MyMcpServer {
                         format!("Could not remove {}: {}", checkpoint.path.display(), e)
                     })?;
                 }
+                // Nothing there to have seen any more. Writing the path again is a creation,
+                // which needs no prior read, so an entry describing a file that no longer
+                // exists could only ever be wrong.
+                self.seen_files.lock().unwrap().remove(&file_key(&checkpoint.path));
             }
         }
-
-        // The file now holds what it did when it was last read, so a following edit must not
-        // be turned away as stale.
-        self.mark_read(&checkpoint.path);
 
         Ok(checkpoint.description)
     }
 
-    // Record that a file has been read, at its current modification time.
+    // Record that a file has been read, at the modification time it had when the read began.
+    //
+    // The time is the caller's rather than taken here: `read` streams the file, and the mtime
+    // that matters is the one from before it started, so a file changed mid-read counts as
+    // stale instead of as seen.
 
-    pub(crate) fn mark_read(&self, path: &std::path::Path) {
-        if let Some(modified) = modified_time(path) {
-            self.seen_files
-                .lock()
-                .unwrap()
-                .insert(file_key(path), modified);
-        }
+    pub(crate) fn mark_read(&self, path: &std::path::Path, modified: std::time::SystemTime) {
+        let key = file_key(path);
+        let mut seen = self.seen_files.lock().unwrap();
+        // Reading a file cannot make us know less about it: if it has not moved on since a
+        // tool wrote it, that write's fingerprint still describes what is there.
+        let hash = seen
+            .get(&key)
+            .filter(|previous| previous.modified == Some(modified))
+            .and_then(|previous| previous.hash);
+        seen.insert(
+            key,
+            Seen {
+                modified: Some(modified),
+                hash,
+            },
+        );
+    }
+
+    // Record that a tool just wrote these exact bytes.
+    //
+    // The fingerprint comes from the bytes we handed to the filesystem, not from reading the
+    // file back: it is the one thing here we know for certain, and it stays true however the
+    // recorded timestamp turns out.
+
+    pub(crate) fn mark_written(&self, path: &std::path::Path, bytes: &[u8]) {
+        self.seen_files.lock().unwrap().insert(
+            file_key(path),
+            Seen {
+                modified: modified_time(path),
+                hash: Some(content_hash(bytes)),
+            },
+        );
     }
 
     // Gate a modification to an existing file on having read it first, and on it not having
@@ -209,9 +274,10 @@ impl MyMcpServer {
             return None;
         }
 
-        let seen = self.seen_files.lock().unwrap().get(&file_key(path)).copied();
+        let key = file_key(path);
+        let seen = self.seen_files.lock().unwrap().get(&key).copied();
 
-        let Some(seen_at) = seen else {
+        let Some(seen) = seen else {
             return Some(format!(
                 "Refusing to modify {} because it has not been read in this session. \
                  Call read on it first, so the change is based on its actual contents.",
@@ -219,14 +285,31 @@ impl MyMcpServer {
             ));
         };
 
-        match modified_time(path) {
-            Some(now) if now != seen_at => Some(format!(
-                "Refusing to modify {} because it changed on disk after you read it. \
-                 Call read on it again, then redo the change against the current contents.",
-                path.display()
-            )),
-            _ => None,
+        let now = modified_time(path);
+        if now.is_some() && now == seen.modified {
+            return None;
         }
+
+        // The timestamp disagrees, which is not the same thing as the file having changed —
+        // see `Seen`. When we know which bytes we left there, ask the file itself before
+        // calling it somebody else's edit.
+        if let Some(hash) = seen.hash {
+            if fs::read(path).is_ok_and(|bytes| content_hash(&bytes) == hash) {
+                // Same bytes, different timestamp: adopt the new one so the next call takes
+                // the cheap path instead of re-reading the file every time.
+                self.seen_files
+                    .lock()
+                    .unwrap()
+                    .insert(key, Seen { modified: now, hash: Some(hash) });
+                return None;
+            }
+        }
+
+        Some(format!(
+            "Refusing to modify {} because it changed on disk after you read it. \
+             Call read on it again, then redo the change against the current contents.",
+            path.display()
+        ))
     }
 
 
