@@ -1,6 +1,6 @@
 //! Saving, resuming and compacting a conversation.
 
-use crate::config::compact_hint_threshold;
+use crate::config::{compact_hint_threshold, Reasoning};
 use crate::llm::LMStudioClient;
 use crate::tools::TodoItem;
 use crate::util::truncate_at_boundary;
@@ -153,7 +153,11 @@ pub(crate) fn estimate_tokens(messages: &[Value]) -> usize {
 // a hard-coded guess would either nag constantly on a large window or warn too late on a
 // small one.
 
-pub(crate) fn report_context(messages: &[Value], context_tokens: usize) {
+pub(crate) fn report_context(
+    messages: &[Value],
+    context_tokens: usize,
+    reasoning: &ReasoningStats,
+) {
     let turns = messages.iter().filter(|m| m["role"] == "user").count();
     let used = estimate_tokens(messages);
     let percent = (used as f64 / context_tokens as f64) * 100.0;
@@ -166,6 +170,19 @@ pub(crate) fn report_context(messages: &[Value], context_tokens: usize) {
         context_tokens,
         percent
     );
+
+    // Only once there is something to report. A line of zeroes under every /context would
+    // be noise for the default policy, which never compresses anything.
+    if reasoning.turns > 0 {
+        outln!(
+            "Reasoning compressed on {} repl{}: ~{} -> ~{} tokens, saving ~{}.",
+            reasoning.turns,
+            if reasoning.turns == 1 { "y" } else { "ies" },
+            reasoning.before,
+            reasoning.after,
+            reasoning.saved()
+        );
+    }
 
     if used > compact_hint_threshold(context_tokens) {
         outln!("Run /compact to replace the history with a summary.");
@@ -256,6 +273,202 @@ pub(crate) async fn compact_history(client: &LMStudioClient, messages: &mut Vec<
         before,
         estimate_tokens(messages)
     ))
+}
+
+// The key `into_message` writes a chain of thought under, and the one the thinking-model
+// chat templates read back. Only the one spelling is written here even though the stream
+// may have arrived under either, because the assembler has already normalized it.
+
+const REASONING_KEY: &str = "reasoning_content";
+
+// What the compressor is told to produce.
+//
+// The voice matters more than it looks. With reasoning preserved, the template feeds this
+// field back to the model as its own thinking, so a summary written as minutes about a
+// thought ("The model considered X, then rejected it") is further out of distribution than
+// the long thought it replaces. Asking for first-person compressed thinking keeps the
+// replacement the same kind of text as the original.
+//
+// What it keeps is chosen for what dropping the trace outright would actually lose. Tool
+// results already carry the evidence for anything the model went and checked; what nothing
+// else records is the reasoning that never became a tool call — the approach weighed and
+// abandoned, and the reason it was abandoned. Without that the next round is free to
+// propose it again.
+
+const COMPRESS_PROMPT: &str = "You compress your own chain of thought so you can carry on \
+     without re-reading it. Keep only: approaches you tried or considered and then \
+     rejected, and why; facts you established along the way; and the intent you ended on. \
+     Drop restatements of the question, anything already visible in the conversation, and \
+     any working you would reach the same way again. Write it in the first person as \
+     compressed thinking, the way the trace itself is written — not as a report about it. \
+     No preamble, no headings, no more than a short paragraph.";
+
+// Generous for what should be a short answer, for the same reason the auto-mode reviewer's
+// cap is: the compressor is the same model, so it may well think before it summarizes, and
+// a cap that lands mid-thought yields a reply with no summary in it at all.
+
+const COMPRESS_MAX_TOKENS: u64 = 1000;
+
+// The chain of thought on an assistant message, if it has one worth acting on.
+
+pub(crate) fn reasoning_text(message: &Value) -> Option<&str> {
+    message[REASONING_KEY]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+// A reasoning model asked to summarize thinks first, and its scratchpad arrives ahead of
+// the answer in the same field. Kept out of the stored summary for the obvious reason —
+// storing the thinking about the compression instead of the compression would defeat the
+// whole exercise.
+
+fn without_think_block(text: &str) -> &str {
+    match text.find("</think>") {
+        Some(end) => text[end + "</think>".len()..].trim(),
+        None => text.trim(),
+    }
+}
+
+// What the policy did to one reply, in numbers rather than in prose.
+//
+// Returned instead of a formatted line because two callers want different things from it:
+// the transcript wants a sentence, and the session totals want the figures. Formatting it
+// here would mean the totals had to parse their own output back.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningOutcome {
+    Dropped { tokens: usize },
+    Compressed { before: usize, after: usize },
+}
+
+// What compression has bought on the conversation so far, for /context.
+//
+// Cleared by /clear with the history it describes, and only by that: /compact and /model
+// both keep the conversation, so the savings made on it still stand. Kept out here rather
+// than derived from `messages` because it cannot be derived — once a trace is replaced, the
+// history holds the compressed version and no record of what it cost before.
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReasoningStats {
+    pub(crate) turns: usize,
+    pub(crate) before: usize,
+    pub(crate) after: usize,
+}
+
+impl ReasoningStats {
+    pub(crate) fn record(&mut self, outcome: ReasoningOutcome) {
+        if let ReasoningOutcome::Compressed { before, after } = outcome {
+            self.turns += 1;
+            self.before += before;
+            self.after += after;
+        }
+    }
+
+    pub(crate) fn saved(&self) -> usize {
+        self.before.saturating_sub(self.after)
+    }
+}
+
+// Whether applying the policy will cost a request to the server.
+//
+// The activity bar is drawn before the work starts, so the caller has to know this without
+// doing the work first. Dropping a field and declining a trace too short to be worth
+// compressing are both over before a frame could be painted; announcing either as work in
+// progress would report something that is not happening.
+
+pub(crate) fn reasoning_needs_a_request(
+    message: &Value,
+    policy: Reasoning,
+    threshold: usize,
+) -> bool {
+    policy == Reasoning::Compress
+        && reasoning_text(message).is_some_and(|text| estimate_reasoning_tokens(text) >= threshold)
+}
+
+// Apply the session's reasoning policy to the reply that just finished.
+//
+// Called on the tail of the conversation and only there, which is what makes this safe to
+// do every turn. The KV cache on the server is a prefix cache: rewriting the message that
+// was just generated invalidates from that message forward, and nothing is in front of it
+// yet, so the re-prefill is this reply and no more. Rewriting anything older would
+// invalidate every turn after it and cost far more than the tokens it saved.
+//
+// That same property is what stops a trace being compressed twice. Once this returns, the
+// message moves into the history and is never revisited, so there is no state to track and
+// no marker to write into the message — a compressed trace is simply one that is already
+// behind the write point.
+//
+// A failure here keeps the original. Compression is an optimization, and losing a chain of
+// thought to a summarizer that timed out would be a worse outcome than the tokens it was
+// trying to save.
+
+pub(crate) async fn apply_reasoning(
+    client: &LMStudioClient,
+    message: &mut Value,
+    policy: Reasoning,
+    threshold: usize,
+) -> Option<ReasoningOutcome> {
+    let Some(original) = reasoning_text(message) else {
+        return None;
+    };
+
+    match policy {
+        Reasoning::Keep => None,
+
+        Reasoning::Drop => {
+            let tokens = estimate_reasoning_tokens(original);
+            if let Some(object) = message.as_object_mut() {
+                object.remove(REASONING_KEY);
+            }
+            Some(ReasoningOutcome::Dropped { tokens })
+        }
+
+        Reasoning::Compress => {
+            let before = estimate_reasoning_tokens(original);
+            if before < threshold {
+                return None;
+            }
+
+            let original = original.to_string();
+            let summary = match client
+                .chat_completion_plain(
+                    vec![
+                        json!({"role": "system", "content": COMPRESS_PROMPT}),
+                        json!({"role": "user", "content": original.clone()}),
+                    ],
+                    COMPRESS_MAX_TOKENS,
+                )
+                .await
+            {
+                Ok(reply) => without_think_block(&reply).to_string(),
+                Err(e) => {
+                    crate::debug::log("reasoning compression failed", &format!("{:#}", e));
+                    return None;
+                }
+            };
+
+            // A summary that came back empty, or that is no shorter than what it replaces,
+            // is not worth the substitution: the original is at least the model's own words
+            // in its own voice, and a compressor that expanded the trace has misunderstood
+            // the job. Both happen with small models often enough to be worth the guard.
+            let after = estimate_reasoning_tokens(&summary);
+            if summary.is_empty() || after >= before {
+                return None;
+            }
+
+            message[REASONING_KEY] = json!(summary);
+            Some(ReasoningOutcome::Compressed { before, after })
+        }
+    }
+}
+
+// The same chars/4 estimate `estimate_tokens` uses, applied to one string rather than to a
+// whole conversation. Rough, and deliberately the same roughness: a threshold tuned against
+// one number and reported against another would be confusing to reason about.
+
+pub(crate) fn estimate_reasoning_tokens(text: &str) -> usize {
+    text.chars().count() / 4
 }
 
 
@@ -366,6 +579,220 @@ mod tests {
         assert!(compact_history(&client, &mut messages).await.is_err());
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["content"], "important context");
+    }
+
+
+    // A completion whose content is built at runtime. `serve_once` wants a `&'static str`
+    // because it answers from a spawned task, and a test body long enough to be worth
+    // measuring is not worth writing out as a literal.
+    fn reply(content: &str) -> &'static str {
+        let body = json!({"choices": [{"message": {"role": "assistant", "content": content}}]});
+        Box::leak(body.to_string().into_boxed_str())
+    }
+
+    // A reply carrying `long` tokens of chain of thought, as the assembler would build it.
+    fn thought(chars: usize) -> serde_json::Value {
+        json!({
+            "role": "assistant",
+            "content": "Done.",
+            "reasoning_content": "z".repeat(chars),
+        })
+    }
+
+
+
+    #[tokio::test]
+    async fn keep_leaves_the_chain_of_thought_where_it_is() {
+        let url = serve_once("{}", "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        let mut message = thought(8_000);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Keep, 800).await;
+
+        // The default must not touch the message at all — no request, no rewrite.
+        assert!(note.is_none());
+        assert_eq!(message["reasoning_content"].as_str().unwrap().len(), 8_000);
+    }
+
+
+    #[tokio::test]
+    async fn drop_removes_the_field_rather_than_emptying_it() {
+        let url = serve_once("{}", "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        let mut message = thought(8_000);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Drop, 800).await;
+
+        // Removed outright: an empty string is still a key the chat template will read and
+        // render as an empty thought, which is not the same as never having sent one.
+        assert!(message.get("reasoning_content").is_none());
+        assert_eq!(message["content"], "Done.");
+        // 8000 chars at four to the token, reported so /context can total it up.
+        assert_eq!(note, Some(ReasoningOutcome::Dropped { tokens: 2_000 }));
+    }
+
+
+    #[tokio::test]
+    async fn compress_ignores_a_thought_too_short_to_be_worth_a_round_trip() {
+        let body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"summary\"}}]}";
+        let url = serve_once(body, "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        // 400 chars is ~100 estimated tokens, well under the threshold.
+        let mut message = thought(400);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Compress, 800).await;
+
+        assert!(note.is_none());
+        assert_eq!(message["reasoning_content"].as_str().unwrap().len(), 400);
+    }
+
+
+    #[tokio::test]
+    async fn compress_replaces_a_long_thought_and_strips_the_compressors_own_thinking() {
+        // The compressor is the same model, so it may think about the summary before
+        // writing it. Storing that instead of the summary would defeat the whole exercise.
+        let body = concat!(
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":",
+            "\"<think>What matters here?</think>Tried the regex path, too slow.\"}}]}"
+        );
+        // Capturing rather than `serve_once`: a request this size is not drained by the
+        // one-shot server, and a socket closed over an unread body is an RST on Windows —
+        // which the client reports as a failed compression rather than as a bad fixture.
+        let (url, sent) = serve_once_capturing(body, "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        let mut message = thought(8_000);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Compress, 800).await;
+
+        // The trace itself is what the compressor was asked about, not a summary of the
+        // conversation around it: this request has no history in it at all.
+        let sent = sent.lock().unwrap().clone();
+        assert!(sent.contains(&"z".repeat(100)), "the trace was not sent");
+
+        let stored = message["reasoning_content"].as_str().unwrap();
+        assert_eq!(stored, "Tried the regex path, too slow.");
+        assert!(!stored.contains("What matters here"));
+        // The content of the reply is untouched — only the thinking is rewritten.
+        assert_eq!(message["content"], "Done.");
+        // Both figures come back, not a sentence: the transcript line and the session
+        // totals want different things out of the same result.
+        let before = crate::estimate_reasoning_tokens(&"z".repeat(8_000));
+        let after = crate::estimate_reasoning_tokens("Tried the regex path, too slow.");
+        assert_eq!(note, Some(ReasoningOutcome::Compressed { before, after }));
+    }
+
+
+    #[tokio::test]
+    async fn a_failed_compression_keeps_the_original_thought() {
+        // Nothing listening: the request cannot succeed. Losing a chain of thought to a
+        // summarizer that fell over would be a worse outcome than the tokens it saves.
+        let client = crate::LMStudioClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "m".to_string(),
+            None,
+        );
+
+        let mut message = thought(8_000);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Compress, 800).await;
+
+        assert!(note.is_none());
+        assert_eq!(message["reasoning_content"].as_str().unwrap().len(), 8_000);
+    }
+
+
+    #[tokio::test]
+    async fn a_compression_that_grew_the_thought_is_rejected() {
+        // Small models do expand rather than compress when the trace is terse. The
+        // substitution is only worth making when it actually shrinks something, and the
+        // model's own words are the better fallback when it does not.
+        let (url, _sent) = serve_once_capturing(
+            reply(&"much longer than the original ".repeat(200)),
+            "application/json",
+        )
+        .await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        let mut message = thought(4_000);
+        let note = apply_reasoning(&client, &mut message, Reasoning::Compress, 800).await;
+
+        assert!(note.is_none());
+        assert_eq!(message["reasoning_content"].as_str().unwrap().len(), 4_000);
+    }
+
+
+    #[tokio::test]
+    async fn a_reply_with_no_thinking_is_left_alone_under_every_policy() {
+        let url = serve_once("{}", "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        // A non-thinking model, and the empty-string case a server can send instead.
+        for mut message in [
+            json!({"role": "assistant", "content": "Done."}),
+            json!({"role": "assistant", "content": "Done.", "reasoning_content": "   "}),
+        ] {
+            for policy in [Reasoning::Keep, Reasoning::Compress, Reasoning::Drop] {
+                let note = apply_reasoning(&client, &mut message, policy, 800).await;
+                assert!(note.is_none(), "{:?} acted on a reply with no thinking", policy);
+            }
+            assert_eq!(message["content"], "Done.");
+        }
+    }
+
+
+    #[test]
+    fn the_session_total_counts_compressions_and_ignores_drops() {
+        let mut stats = ReasoningStats::default();
+        assert_eq!(stats.turns, 0);
+        assert_eq!(stats.saved(), 0);
+
+        stats.record(ReasoningOutcome::Compressed { before: 1_200, after: 300 });
+        stats.record(ReasoningOutcome::Compressed { before: 800, after: 100 });
+
+        // Dropping is not compression and must not inflate the figure /context reports —
+        // the question that line answers is whether the extra request is paying for
+        // itself, and a drop costs no request.
+        stats.record(ReasoningOutcome::Dropped { tokens: 5_000 });
+
+        assert_eq!(stats.turns, 2);
+        assert_eq!(stats.before, 2_000);
+        assert_eq!(stats.after, 400);
+        assert_eq!(stats.saved(), 1_600);
+    }
+
+
+    #[test]
+    fn only_a_compression_over_the_threshold_counts_as_work() {
+        // What the activity bar is gated on. It has to agree with what `apply_reasoning`
+        // then actually does, or the bar announces a request that never goes out — or
+        // worse, a compression runs with no bar and a frozen input box.
+        let long = thought(8_000);
+        let short = thought(400);
+        let none = json!({"role": "assistant", "content": "Done."});
+
+        assert!(reasoning_needs_a_request(&long, Reasoning::Compress, 800));
+        assert!(!reasoning_needs_a_request(&short, Reasoning::Compress, 800));
+        assert!(!reasoning_needs_a_request(&none, Reasoning::Compress, 800));
+
+        // Neither of the other two ever reaches the server.
+        for policy in [Reasoning::Keep, Reasoning::Drop] {
+            assert!(!reasoning_needs_a_request(&long, policy, 800));
+        }
+
+        // Exactly at the threshold is over it, the same comparison the compressor makes.
+        assert!(reasoning_needs_a_request(&thought(3_200), Reasoning::Compress, 800));
+    }
+
+
+    #[test]
+    fn reasoning_names_parse_the_way_the_config_file_spells_them() {
+        assert_eq!(Reasoning::parse("keep"), Some(Reasoning::Keep));
+        assert_eq!(Reasoning::parse(" Compress "), Some(Reasoning::Compress));
+        assert_eq!(Reasoning::parse("DROP"), Some(Reasoning::Drop));
+        assert_eq!(Reasoning::parse("compact"), None);
+
+        // /reasoning prints these back and the config file reads them, so the two
+        // spellings have to stay the same string.
+        assert_eq!(Reasoning::Compress.to_string(), "compress");
     }
 
 

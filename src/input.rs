@@ -583,7 +583,11 @@ pub(crate) struct Chrome<'a> {
 //
 // A 256-color light blue rather than an RGB one: it lands the same on any terminal from
 // the last twenty years, and the exact shade is not worth a truecolor requirement.
-const BAR_BACKGROUND: Color = Color::AnsiValue(153);
+// Shared rather than private because the transcript borrows the shade for the line that
+// reports a compressed chain of thought — that line is haico talking about the reply
+// rather than part of it, and wearing the chrome's color is what says so. Kept as one
+// constant so the two cannot drift apart into two nearly-identical blues.
+pub(crate) const BAR_BACKGROUND: Color = Color::AnsiValue(153);
 const BAR_TEXT: Color = Color::Black;
 
 // A message waiting its turn. Painted rather than tinted, like the bars — but only behind

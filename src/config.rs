@@ -39,6 +39,52 @@ pub(crate) enum Mouse {
     Off,
 }
 
+// What happens to a thinking model's chain of thought once its turn is over.
+//
+// `Keep` is the default because it is what haico has always done, and because it is not
+// the obviously wrong answer it looks like: llama.cpp's own `--reasoning-preserve` exists
+// to keep reasoning across the whole history rather than only the last assistant message,
+// and the measurements attached to it report multi-turn recall several times better with
+// it on. Reasoning is load-bearing context on templates built for it, not noise.
+//
+// `Drop` is the other end — strip it the moment the turn is over, which is what most
+// clients do and what the classic Qwen3 and DeepSeek-R1 templates do for themselves.
+// It is here as the baseline to measure the other two against.
+//
+// `Compress` is the middle that neither the server nor the template offers: replace the
+// trace with the hard points of it — what was tried and rejected, and the intent it ended
+// on — so the useful part survives at a fraction of the tokens. It costs one extra
+// generation per turn, which is why it is off unless asked for.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Reasoning {
+    #[default]
+    Keep,
+    Compress,
+    Drop,
+}
+
+impl std::fmt::Display for Reasoning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Reasoning::Keep => "keep",
+            Reasoning::Compress => "compress",
+            Reasoning::Drop => "drop",
+        })
+    }
+}
+
+impl Reasoning {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "keep" => Some(Reasoning::Keep),
+            "compress" => Some(Reasoning::Compress),
+            "drop" => Some(Reasoning::Drop),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct Config {
     pub(crate) llm_url: String,
     pub(crate) token: Option<String>,
@@ -258,6 +304,12 @@ pub(crate) struct ModelSettingsFile {
     pub(crate) top_p: Option<f64>,
     pub(crate) top_k: Option<u64>,
     pub(crate) repeat_penalty: Option<f64>,
+    // "keep" (default), "compress" or "drop". Layered like the sampling settings rather
+    // than per-model only, but it belongs here first: whether a model even produces a
+    // chain of thought is a property of the model, so the useful setting is usually the
+    // per-model one.
+    pub(crate) reasoning: Option<Reasoning>,
+    pub(crate) reasoning_threshold: Option<usize>,
 }
 
 // ~/.haico/config.toml, so the usual invocation is just `haico`.
@@ -292,6 +344,8 @@ pub(crate) struct FileConfig {
     pub(crate) top_p: Option<f64>,
     pub(crate) top_k: Option<u64>,
     pub(crate) repeat_penalty: Option<f64>,
+    pub(crate) reasoning: Option<Reasoning>,
+    pub(crate) reasoning_threshold: Option<usize>,
 
     #[serde(default)]
     pub(crate) models: std::collections::HashMap<String, ModelSettingsFile>,
@@ -386,6 +440,37 @@ pub(crate) struct ResolvedSettings {
     // Not layered like the rest: it only exists per model, so there is nothing to fall
     // through to. Absent means true.
     pub(crate) use_system_prompt: bool,
+    // What to do with a reply's chain of thought once the turn moves on, and how long a
+    // trace has to be before compressing it is worth a round trip. Carried with the
+    // provenance of the rest so /config can say where it came from, but read through
+    // `reasoning`/`reasoning_threshold` below rather than unwrapped at each use — /reasoning
+    // overrides it for the session, and the default has to be the same in both places.
+    pub(crate) reasoning_setting: Setting<Reasoning>,
+    pub(crate) reasoning_threshold_setting: Setting<usize>,
+}
+
+impl ResolvedSettings {
+    pub(crate) fn reasoning(&self) -> Reasoning {
+        self.reasoning_setting.value.unwrap_or_default()
+    }
+
+    // Where the policy in force came from. Not `Setting::describe`'s wording: the shared
+    // FROM_UNSET reads "server decides", which is true of a sampling field left out of the
+    // request and false of this one — an unset reasoning policy is haico keeping the chain
+    // of thought, and nothing is asked of the server either way.
+    pub(crate) fn reasoning_source(&self) -> &'static str {
+        if self.reasoning_setting.value.is_some() {
+            self.reasoning_setting.source
+        } else {
+            "built-in default"
+        }
+    }
+
+    pub(crate) fn reasoning_threshold(&self) -> usize {
+        self.reasoning_threshold_setting
+            .value
+            .unwrap_or(DEFAULT_REASONING_THRESHOLD)
+    }
 }
 
 // Apply the layers for a specific model: command line / environment first, then that
@@ -425,6 +510,15 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
             config.file.repeat_penalty,
         ),
         use_system_prompt: per_model.use_system_prompt.unwrap_or(true),
+        // No command-line layer for either: both are properties of the model and of what
+        // the user wants done with its output, neither of which is worth a flag when the
+        // per-model section is right there and /reasoning covers the one-off case.
+        reasoning_setting: pick(None, per_model.reasoning, config.file.reasoning),
+        reasoning_threshold_setting: pick(
+            None,
+            per_model.reasoning_threshold,
+            config.file.reasoning_threshold,
+        ),
     }
 }
 
@@ -437,6 +531,15 @@ pub(crate) const DEFAULT_CONTEXT_TOKENS: usize = 131_072;
 // early enough to leave room for the summarization round-trip itself.
 
 pub(crate) const COMPACT_HINT_FRACTION: f64 = 0.75;
+
+// Estimated tokens of chain of thought below which compressing it is not worth the round
+// trip. Set by the arithmetic rather than by taste: compression pays off when the tokens
+// saved, multiplied by the turns that will carry them, beat one extra generation. A few
+// hundred tokens saved on a trace this short does not, and firing the compressor on every
+// brief thought would add seconds per turn to save almost nothing. Raise it on a slow
+// model, lower it on a fast one.
+
+pub(crate) const DEFAULT_REASONING_THRESHOLD: usize = 800;
 
 
 pub(crate) fn compact_hint_threshold(context_tokens: usize) -> usize {
@@ -465,6 +568,13 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  top_k          = 40");
     println!("  repeat_penalty = 1.1");
     println!("  use_system_prompt = false  # send only the project's own instructions");
+    println!("  reasoning      = \"keep\"    # keep | compress | drop the chain of thought");
+    println!("  reasoning_threshold = 800  # tokens of thinking before compressing is worth it");
+    println!("\nreasoning decides what happens to a thinking model's chain of thought once its");
+    println!("turn is over. 'keep' sends it back with the rest of the history, which is what");
+    println!("llama.cpp's --reasoning-preserve is for; 'drop' strips it, as most clients do;");
+    println!("'compress' replaces it with its hard points, at the cost of one extra request");
+    println!("per reply. /reasoning switches it for one session.");
     println!("\nInstructions: ~/.haico/HAICO.md holds preferences that apply everywhere; a");
     println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
     println!("own, and takes precedence over both. Both are sent even to a model configured");
@@ -524,6 +634,42 @@ mod tests {
             tui: crate::config::Tui::Inline,
             mouse: crate::config::Mouse::Scroll,
         }
+    }
+
+    #[test]
+    fn reasoning_layers_per_model_over_the_file_and_defaults_to_keep() {
+        use crate::{resolve_settings, Reasoning, DEFAULT_REASONING_THRESHOLD};
+        use crate::{FROM_GLOBAL, FROM_MODEL, FROM_UNSET};
+
+        let text = r#"
+            reasoning = "drop"
+
+            [models."thinker"]
+            reasoning = "compress"
+            reasoning_threshold = 2000
+        "#;
+        let config = config_with(text);
+
+        // The model's own section outranks the top level.
+        let thinker = resolve_settings(&config, "thinker");
+        assert_eq!(thinker.reasoning(), Reasoning::Compress);
+        assert_eq!(thinker.reasoning_threshold(), 2_000);
+        assert_eq!(thinker.reasoning_setting.source, FROM_MODEL);
+
+        // A model with no section of its own still gets the file's top level, and the
+        // threshold falls through to the built-in rather than to the other model's.
+        let other = resolve_settings(&config, "other");
+        assert_eq!(other.reasoning(), Reasoning::Drop);
+        assert_eq!(other.reasoning_threshold(), DEFAULT_REASONING_THRESHOLD);
+        assert_eq!(other.reasoning_setting.source, FROM_GLOBAL);
+
+        // Unset anywhere is `keep` — what haico did before the setting existed. A default
+        // that silently started discarding chains of thought would change every existing
+        // user's conversation without them asking for it.
+        let bare = config_with("");
+        let settings = resolve_settings(&bare, "any");
+        assert_eq!(settings.reasoning(), Reasoning::Keep);
+        assert_eq!(settings.reasoning_setting.source, FROM_UNSET);
     }
 
     #[test]

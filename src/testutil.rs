@@ -259,6 +259,8 @@ pub(crate) fn settings_of(
         top_k: at(top_k),
         repeat_penalty: at(repeat_penalty),
         use_system_prompt: true,
+        reasoning_setting: at(None),
+        reasoning_threshold_setting: at(None),
     }
     }
 

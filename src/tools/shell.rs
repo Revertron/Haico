@@ -225,6 +225,47 @@ pub(crate) struct BackgroundJobs {
 // A dev server can log indefinitely, so what it produced an hour ago is not worth holding.
 const BACKGROUND_OUTPUT_CAP: usize = 256 * 1024;
 
+// Build the shell invocation for a command line.
+//
+// On Windows this is deliberately not the obvious `Command::new("cmd").arg("/C").arg(command)`.
+// A Windows process is handed one flat command line rather than an argument array, so `arg` has
+// to serialize back into a string, and it does that by the MSVC C runtime's rules: an argument
+// containing spaces is wrapped in quotes and every quote inside it is escaped as `\"`. cmd.exe
+// does not parse by those rules and has no escape character at all, so the backslashes arrive
+// literally and every quote in the command is destroyed. `curl -H "Host: example.com" URL`
+// reached curl as `-H`, `"Host:` and a stray `example.com"` — the header was never sent, the
+// request fell through to the default vhost, and the model was left concluding its own code was
+// broken. A JSON `-d` payload and a quoted path with spaces failed the same way, the latter
+// while the tool description was busy advising "quote paths with spaces". `raw_arg` appends the
+// text with no quoting or escaping whatsoever; it exists for exactly this case.
+//
+// The wrapping quotes and `/S` go together, and neither works without the other. Plain `/C`
+// preserves the outer quotes only under a list of conditions (two quotes exactly, no `&<>()@^|`
+// between them, the text between them naming a real executable) and otherwise strips the first
+// and *last* quote of the whole line — which cuts apart any command whose program path is
+// itself quoted, as `"C:\Program Files\x.exe" --flag` is. `/S` makes the strip unconditional,
+// so it removes exactly the pair added here and leaves everything between them untouched.
+//
+// Unix never had the problem: `sh -c` receives a real argument array, so nothing is
+// re-serialized and the command reaches the shell as written.
+pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    let builder = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/S").arg("/C").raw_arg(format!("\"{}\"", command));
+        c
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+
+    builder
+}
+
 #[tool_router(router = shell_router, vis = "pub(crate)")]
 impl MyMcpServer {
     #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
@@ -233,19 +274,9 @@ impl MyMcpServer {
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
 
         use std::time::Duration;
-        use tokio::process::Command;
 
-        // Determine shell based on platform
-        let (shell, shell_arg) = if cfg!(target_os = "windows") {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
-        };
-
-        let mut builder = Command::new(shell);
+        let mut builder = shell_command(&command);
         builder
-            .arg(shell_arg)
-            .arg(&command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -388,21 +419,12 @@ impl MyMcpServer {
         params: Parameters<RunBackgroundParams>,
     ) -> Result<CallToolResult, McpError> {
         use std::time::{Duration, Instant};
-        use tokio::process::Command;
 
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(30).min(300);
 
-        let (shell, shell_arg) = if cfg!(target_os = "windows") {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
-        };
-
-        let mut builder = Command::new(shell);
+        let mut builder = shell_command(&command);
         builder
-            .arg(shell_arg)
-            .arg(&command)
             // No stdin: a background process that blocks on a prompt would hang unseen.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -871,6 +893,63 @@ mod tests {
         let (ok, out) = run(&server, "echo x", None, Some("no/such/dir".to_string())).await;
         assert!(!ok);
         assert!(out.contains("Working directory not found"), "got: {}", out);
+    }
+
+
+    #[tokio::test]
+    async fn run_command_delivers_quoted_arguments_to_the_child_intact() {
+        let server = test_server();
+
+        // A quoted argument holding a space must reach the child as one argument. Windows
+        // hands a process a single command line rather than an argv, and passing the command
+        // through `Command::arg` re-escaped every quote as `\"` on the way — which cmd.exe
+        // has no rule for — so `-H "Host: example.com"` arrived as `"Host:` plus a stray
+        // `example.com"`, and the header was silently never sent.
+        //
+        // This has to be checked against a real child process: a shell builtin is handed the
+        // text before any argv is built, so it would pass even while every external command
+        // was broken.
+        let haystack = scratch("quoted-args-haystack.txt", "alpha beta gamma\n");
+        let search = if cfg!(windows) {
+            format!("findstr /c:\"beta gamma\" \"{}\"", haystack.display())
+        } else {
+            format!("grep -F \"beta gamma\" \"{}\"", haystack.display())
+        };
+        let (ok, out) = run(&server, &search, None, None).await;
+        assert!(ok, "got: {}", out);
+        assert!(out.contains("alpha beta gamma"), "got: {}", out);
+
+        // The tool description tells the model to quote paths with spaces, so that has to
+        // work; it did not.
+        let spaced = scratch("name with spaces.txt", "payload-token\n");
+        let show = if cfg!(windows) { "type" } else { "cat" };
+        let (ok, out) = run(&server, &format!("{} \"{}\"", show, spaced.display()), None, None).await;
+        assert!(ok, "got: {}", out);
+        assert!(out.contains("payload-token"), "got: {}", out);
+
+        // Nothing may inject backslashes into the command on the way to the shell. cmd's echo
+        // prints its argument verbatim, so this reports exactly what cmd received: it used to
+        // be `{\"key\": \"value\"}`. Windows-only — sh consumes the quotes itself.
+        if cfg!(windows) {
+            let (ok, out) = run(&server, r#"echo {"key": "value"}"#, None, None).await;
+            assert!(ok, "got: {}", out);
+            assert!(out.contains(r#"{"key": "value"}"#), "got: {}", out);
+            assert!(!out.contains('\\'), "backslash injected: {}", out);
+        }
+
+        // A command whose program path is itself quoted is the case that plain `/C` cuts in
+        // half, by stripping the first and last quote of the whole line rather than a pair.
+        // `/S` is what makes the strip apply only to the quotes haico added.
+        let quoted_program = if cfg!(windows) {
+            format!("\"{}\\System32\\find.exe\" \"beta\" \"{}\"",
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+                haystack.display())
+        } else {
+            format!("\"/bin/grep\" -F \"beta gamma\" \"{}\"", haystack.display())
+        };
+        let (ok, out) = run(&server, &quoted_program, None, None).await;
+        assert!(ok, "got: {}", out);
+        assert!(out.contains("alpha beta gamma"), "got: {}", out);
     }
 
 

@@ -98,13 +98,14 @@ fn print_repl_help() {
     outln!("  /tools             List available tools and whether they prompt");
     outln!("  /model [name]      Switch model; with no name, pick from the server's list");
     outln!("  /config            Show the settings in force and where each came from");
-    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty or");
-    outln!("                     max_tokens ('/set <name> unset' to undo). '/temp' is short");
-    outln!("                     for '/set temperature'.");
+    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty,");
+    outln!("                     max_tokens or reasoning_threshold ('/set <name> unset' to");
+    outln!("                     undo). '/temp' is short for '/set temperature'.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
     outln!("  /context           Show how much context the conversation is using");
+    outln!("  /reasoning [what]  Keep, compress or drop the model's chain of thought");
     outln!("  /compact           Replace the history with a summary, freeing context");
     outln!("  /clear /new /reset Start over, keeping the system prompt");
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
@@ -457,6 +458,16 @@ async fn main() -> Result<()> {
     let mut settings = resolve_settings(&config, &lm_client.model);
     lm_client.apply_settings(&settings);
     let mut context_tokens = settings.context_tokens;
+    // Pulled out of the settings like the context budget is, and for the same reason:
+    // /reasoning changes it for the session without touching the config file, so the value
+    // in force has to live somewhere the resolved settings can be re-read over.
+    let mut reasoning = settings.reasoning();
+    let mut reasoning_threshold = settings.reasoning_threshold();
+    // Runs for the life of the conversation, and is reset by /clear along with it: the
+    // figure is savings made on this history, and reporting it against a history that was
+    // just thrown away would be the one reading of it that is wrong. /compact and /model
+    // do leave it alone — neither discards the conversation, so the savings still stand.
+    let mut reasoning_stats = ReasoningStats::default();
 
     let mut server = MyMcpServer::new(lm_client.clone(), true, config.searxng.clone(), true);
     let openai_tools = mcp_tools_to_openai_format(&server);
@@ -736,6 +747,10 @@ async fn main() -> Result<()> {
             // /todo ever looked at it — but pinned above the box, a plan for work that was
             // just thrown away would sit there for the rest of the session.
             server.todos.lock().unwrap().clear();
+            // The savings were savings on the history that just went. Carrying the figure
+            // forward would have /context reporting tokens reclaimed from a conversation
+            // that no longer exists, which is the one reading of it that is simply wrong.
+            reasoning_stats = ReasoningStats::default();
             outln!("Conversation cleared.\n");
             continue;
         }
@@ -788,6 +803,12 @@ async fn main() -> Result<()> {
                 // a 131072 budget against a 32k model warns far too late.
                 settings = resolve_settings(&config, &model);
                 context_tokens = settings.context_tokens;
+                // Re-resolved with the rest: whether a chain of thought is worth keeping
+                // is a property of the model that produced it, so a policy chosen for a
+                // thinking model has no business surviving a switch to one that does not
+                // think at all.
+                reasoning = settings.reasoning();
+                reasoning_threshold = settings.reasoning_threshold();
 
                 // Both copies: the REPL drives one, and web_fetch summarizes through the
                 // server's. Leaving one behind would silently keep using the old model.
@@ -850,6 +871,18 @@ In force for '{}':", lm_client.model);
             outln!("  top_k           {}", settings.top_k.describe());
             outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
             outln!("  max_tokens      {}", settings.max_tokens.describe());
+            // Shown as what is actually in force rather than as what the file said, since
+            // /reasoning can have moved it since. The source string is only honest for the
+            // former case, so it is replaced rather than kept when they differ.
+            outln!(
+                "  reasoning       {}{}",
+                reasoning,
+                if reasoning == settings.reasoning() {
+                    format!("  [{}]", settings.reasoning_source())
+                } else {
+                    "  [/reasoning, this session]".to_string()
+                }
+            );
             outln!(
                 "  system prompt   {}",
                 match (settings.use_system_prompt, &system_prompt_content) {
@@ -884,6 +917,7 @@ In force for '{}':", lm_client.model);
                 outln!("  top_k           {}", settings.top_k.describe());
                 outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
                 outln!("  max_tokens      {}", settings.max_tokens.describe());
+                outln!("  reasoning_threshold  {} tokens", reasoning_threshold);
                 outln!("
 Usage: /set <name> <value>, or /set <name> unset
 ");
@@ -897,15 +931,48 @@ Usage: /set <name> <value>, or /set <name> unset
                 "top_k" | "top-k" | "topk" => "top_k",
                 "repeat_penalty" | "repeat-penalty" | "repeat" | "penalty" => "repeat_penalty",
                 "max_tokens" | "max-tokens" | "max" => "max_tokens",
+                "reasoning_threshold" | "reasoning-threshold" | "threshold" => {
+                    "reasoning_threshold"
+                }
                 other => {
                     outln!(
-                        "Unknown setting '{}'. Try: temperature, top_p, top_k,                          repeat_penalty, max_tokens.
+                        "Unknown setting '{}'. Try: temperature, top_p, top_k,                          repeat_penalty, max_tokens, reasoning_threshold.
 ",
                         other
                     );
                     continue;
                 }
             };
+
+            // Handled here rather than through the machinery below, because this one is
+            // haico's own and not the server's: it never goes into a request, so there is
+            // nothing to apply to the two clients afterwards, and "unset" has to mean
+            // falling back to the config file rather than leaving a field out for the
+            // server to decide. Everything below this line is about the sampling knobs.
+            if canonical == "reasoning_threshold" {
+                if value.is_empty() {
+                    outln!("  reasoning_threshold  {} tokens
+", reasoning_threshold);
+                } else if value == "unset" || value == "default" || value == "-" {
+                    reasoning_threshold = settings.reasoning_threshold();
+                    outln!(
+                        "reasoning_threshold back to {} tokens, as configured.
+",
+                        reasoning_threshold
+                    );
+                } else if let Ok(parsed) = value.parse::<usize>() {
+                    reasoning_threshold = parsed;
+                    outln!("reasoning_threshold = {} tokens for this session.
+", parsed);
+                } else {
+                    outln!(
+                        "reasoning_threshold needs a whole number of tokens, got '{}'.
+",
+                        value
+                    );
+                }
+                continue;
+            }
 
             if value.is_empty() {
                 let shown = match canonical {
@@ -1056,7 +1123,40 @@ Usage: /set <name> <value>, or /set <name> unset
         }
 
         if input == "/context" {
-            report_context(&messages, context_tokens);
+            report_context(&messages, context_tokens, &reasoning_stats);
+            continue;
+        }
+
+        // Session-only, like /set: the config file is where a lasting choice belongs, and
+        // the whole point of this one is trying the three against each other on the same
+        // task without editing a file between the runs.
+        if input == "/reasoning" || input.starts_with("/reasoning ") {
+            let rest = input.strip_prefix("/reasoning").unwrap_or("").trim().to_string();
+            if rest.is_empty() {
+                let source = if reasoning == settings.reasoning() {
+                    settings.reasoning_source()
+                } else {
+                    "/reasoning, this session"
+                };
+                outln!("Chain of thought: {}  [{}]", reasoning, source);
+                outln!(
+                    "  keep      send it back to the model with the rest of the history"
+                );
+                outln!(
+                    "  compress  replace it with its hard points once the turn is over"
+                );
+                outln!("  drop      strip it the moment the turn is over");
+                outln!(
+                    "\nCompressing costs one extra request per reply and only runs on a \
+                     trace over ~{} tokens (/set reasoning_threshold).\n",
+                    reasoning_threshold
+                );
+            } else if let Some(chosen) = Reasoning::parse(&rest) {
+                reasoning = chosen;
+                outln!("Chain of thought: {} (this session).\n", reasoning);
+            } else {
+                outln!("[error] unknown setting '{}'. Use keep, compress or drop.\n", rest);
+            }
             continue;
         }
 
@@ -1259,7 +1359,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 break;
             };
 
-            let message = match result {
+            let mut message = match result {
                 Ok(message) => message,
                 Err(e) => {
                     // A dropped connection, a server-side error, or an unparseable body
@@ -1286,6 +1386,66 @@ Usage: /set <name> <value>, or /set <name> unset
             }
             if streamed_any || streamed_thinking {
                 crate::out::ensure_line_start();
+            }
+
+            // The one place the reasoning policy is applied, deliberately ahead of every
+            // `messages.push(message.clone())` below rather than at each of them: all three
+            // push this same value, and a policy enforced at two of the three sites would
+            // leave whole traces in the history depending on how the turn happened to end.
+            //
+            // Only the compression of a long enough trace costs a request, and only that
+            // goes through `work_with_input` — several seconds with a frozen input box
+            // every turn would be worse than the tokens are worth. Esc during it means
+            // `None`, which lands in the same place a failure does: the original chain of
+            // thought is kept and the turn carries on. Dropping a field, and declining a
+            // trace under the threshold, are both over before a frame could be painted, so
+            // they are awaited directly rather than announced as work in progress.
+            if reasoning != Reasoning::Keep {
+                let note = if reasoning_needs_a_request(&message, reasoning, reasoning_threshold) {
+                    work_with_input(
+                        &mut keys,
+                        &mut editor,
+                        &mut mode,
+                        &mut queued,
+                        &status,
+                        &server.todos,
+                        &mut plan_view,
+                        "Compressing reasoning…",
+                        None,
+                        apply_reasoning(&lm_client, &mut message, reasoning, reasoning_threshold),
+                    )
+                    .await
+                    .flatten()
+                } else {
+                    apply_reasoning(&lm_client, &mut message, reasoning, reasoning_threshold).await
+                };
+
+                match note {
+                    // Shown rather than folded, and wearing the chrome's light blue: the
+                    // whole point of compressing is to find out whether it is paying for
+                    // itself, which cannot be judged from a line that is hidden by
+                    // default. Tinted, not painted — the bars are the only thing on
+                    // screen that gets a background, and that is what makes them read as
+                    // furniture rather than as output.
+                    Some(ReasoningOutcome::Compressed { before, after }) => {
+                        reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
+                        outln!(
+                            "{}Compressed reasoning from {} to {} tokens.{}",
+                            SetForegroundColor(crate::input::BAR_BACKGROUND),
+                            before,
+                            after,
+                            ResetColor
+                        );
+                    }
+                    // Dropping says nothing the policy did not already say: it removes
+                    // every trace, every turn, so a line per reply would be a line per
+                    // reply saying the same thing.
+                    Some(ReasoningOutcome::Dropped { tokens }) => {
+                        let line = format!("[reasoning dropped (~{} tokens)]", tokens);
+                        crate::out::foldable(&line, &line);
+                    }
+                    None => {}
+                }
             }
 
             // Check if model wants to call a tool
