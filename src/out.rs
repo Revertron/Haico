@@ -11,9 +11,17 @@
 //! by this module and redrawn around anything else that gets printed. Finished
 //! output still scrolls into the terminal's own scrollback above it, so selecting
 //! and copying it works the way it does in any other program.
+//!
+//! That is the *inline* renderer, and it is still here. The other one — `Screen`, below —
+//! takes the alternate screen and owns the whole viewport instead. It costs the
+//! terminal's own scrollback and buys the three things that are impossible without it:
+//! a transcript that can be scrolled with the input box staying put, one that re-wraps
+//! when the window is resized, and one whose lines can still be changed after they were
+//! written. Which one runs is decided once at startup by `config.tui`.
 
-use crossterm::cursor::{Hide, MoveDown, MoveRight, MoveToColumn, MoveUp, Show};
+use crossterm::cursor::{Hide, MoveDown, MoveRight, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::terminal::{Clear, ClearType};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -52,12 +60,22 @@ struct Out {
     wrap: Wrap,
     // Set by the tests so they can assert on what would have been written.
     capture: Option<String>,
+    // The full-screen renderer, when it is the one running. While this is `Some` none of
+    // the inline machinery above is used: nothing is committed to the terminal's
+    // scrollback, so there is no half-finished line to hold back and no region to step
+    // around — every row on the screen is redrawn from the transcript.
+    screen: Option<Screen>,
 }
 
 impl Out {
     // Show something, stepping around whatever is currently pinned to the bottom.
     fn emit(&mut self, text: &str) {
         if text.is_empty() {
+            return;
+        }
+
+        if self.screen.is_some() {
+            self.screen_write(text);
             return;
         }
 
@@ -260,6 +278,24 @@ impl Out {
         }
     }
 
+    // The two ways into the full-screen renderer. Both destructure `self` rather than
+    // reaching through it, because the screen needs `&mut` while the region it is drawing
+    // needs `&` — borrowing the fields apart is what lets one call do both.
+    fn screen_write(&mut self, text: &str) {
+        let Out { screen, region, caret, capture, .. } = self;
+        if let Some(screen) = screen {
+            screen.write(text);
+            screen.paint(region, *caret, capture, (terminal_width(), terminal_height()));
+        }
+    }
+
+    fn screen_paint(&mut self) {
+        let Out { screen, region, caret, capture, .. } = self;
+        if let Some(screen) = screen {
+            screen.paint(region, *caret, capture, (terminal_width(), terminal_height()));
+        }
+    }
+
     // Take the region off the screen, leaving the cursor where the region started.
     // Everything below that point is the region's own, so clearing to the end of the
     // screen cannot eat anything else.
@@ -281,10 +317,655 @@ impl Out {
     }
 }
 
+// ---- The full-screen renderer ------------------------------------------------------
+
+// Taking and giving back the alternate screen.
+const ENTER_ALT: &str = "\x1b[?1049h";
+const LEAVE_ALT: &str = "\x1b[?1049l";
+
+// A frame is written between these two so the terminal shows the finished frame rather
+// than the middle of one. This is the whole of "flicker-free": a frame that repaints many
+// rows takes several milliseconds to write, and without the pair around it the screen can
+// be caught halfway through. Terminals that do not know the sequence ignore it.
+const BEGIN_SYNC: &str = "\x1b[?2026h";
+const END_SYNC: &str = "\x1b[?2026l";
+
+// Auto-wrap is off while a frame is painted and on again afterwards.
+//
+// Every row is written at an absolute position and is supposed to be exactly one row. A
+// row that turns out to be wider than the screen — a tab counted as one column and drawn
+// as eight, a double-width character counted as one and drawn as two, an off-by-one in
+// whatever built it — would otherwise wrap, and a wrap on the bottom row scrolls the
+// whole screen. That does not merely look wrong: everything shifts up by a row while the
+// diff still believes it knows what is on the screen, so nothing is ever repainted to fix
+// it. With auto-wrap off the overspill is simply cut off at the edge, which is wrong in a
+// way that repaints away by itself.
+const WRAP_OFF: &str = "\x1b[?7l";
+const WRAP_ON: &str = "\x1b[?7h";
+
+// Wheel and button reporting with SGR coordinates, and deliberately nothing else.
+//
+// 1002 (drag) and 1003 (any motion) are the two that make a terminal hand every mouse
+// movement to the application, and a terminal that is reporting motion has stopped doing
+// its own drag-selection. Asking for 1000 alone leaves selecting and copying where they
+// belong — with the terminal — while the wheel still reaches the transcript here. Where a
+// terminal does it differently, holding Shift while dragging is the usual way back to
+// native selection.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
+// Ask the terminal to say which modifiers were held, for the keys that otherwise cannot
+// carry them.
+//
+// The legacy encoding has room for a modifier only on keys that are sent as CSI sequences:
+// that is how `ESC[1;5D` manages to mean Ctrl+Left. A key sent as a bare control character
+// has nowhere to put one — Enter is the single byte 0x0D, and Shift+Enter is the same
+// single byte. Shift+Tab survives only because xterm gave it a sequence of its own,
+// `ESC[Z`, not because anything is encoded in it.
+//
+// The Kitty keyboard protocol's first flag — "disambiguate escape codes" — replaces that
+// with a form that has a modifier field for every key. `terminput` already parses it, so
+// if the terminal honors this there is nothing else to do; a terminal that does not
+// understand the sequence ignores it and the only loss is Shift+Enter, which Alt+Enter
+// covers. Pushed rather than set, so leaving pops it and whatever ran before gets its own
+// setting back.
+const KEYS_ON: &str = "\x1b[>1u";
+const KEYS_OFF: &str = "\x1b[<u";
+
+// Turning the Windows console's VT input mode on and off.
+//
+// Everything measured in a real cmd window: leaving quick edit on means the console keeps
+// every mouse event for itself; turning quick edit off gets the wheel but destroys
+// selection outright, with no Shift override to bring it back; and asking for VT mouse
+// mode without VT input gets nothing at all. Only VT input delivers the wheel, and with it
+// Shift+drag still selects — so this is the one configuration that gives both.
+//
+// It is not free: VT input makes the console deliver every key as an escape sequence too,
+// which is why `Keys` reads and parses the byte stream itself when this is on. The
+// original mode is put back on the way out, because a console left in VT input mode
+// confuses whatever runs next.
+#[cfg(windows)]
+mod console {
+    extern "system" {
+        fn GetStdHandle(which: u32) -> isize;
+        fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: isize, mode: u32) -> i32;
+    }
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    fn mode() -> Option<u32> {
+        unsafe {
+            let mut mode = 0;
+            if GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) == 0 {
+                return None;
+            }
+            Some(mode)
+        }
+    }
+
+    // Gives back the mode as it was, for putting back later.
+    pub(super) fn enable_vt_input() -> Option<u32> {
+        let original = mode()?;
+        unsafe {
+            if SetConsoleMode(
+                GetStdHandle(STD_INPUT_HANDLE),
+                original | ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ) == 0
+            {
+                return None;
+            }
+        }
+        Some(original)
+    }
+
+    pub(super) fn restore(original: u32) {
+        unsafe {
+            SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), original);
+        }
+    }
+}
+
+// The row that says the view is being held back, and by how much.
+//
+// It costs a row of transcript, and it is worth it: output carries on arriving while the
+// view stays where it was put, which without something saying so looks exactly like haico
+// having stopped.
+fn held_back_row(below: usize, width: usize) -> String {
+    let text = format!(
+        "── held back · {} line{} below · PageDown or the wheel to follow ──",
+        below,
+        if below == 1 { "" } else { "s" }
+    );
+    let text: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("\x1b[90m{}\x1b[0m", text)
+}
+
+// How many logical lines of transcript are kept. The buffer has to be bounded — the
+// inline renderer needed no limit because a line became the terminal's problem the moment
+// it was written, and these never do. A session long enough to reach this has scrolled
+// well past anything anyone is going back for.
+const SCROLLBACK_LINES: usize = 10_000;
+
+// Wrap one logical line into the screen rows it occupies, each row carrying the colors
+// that were open where it starts.
+//
+// The rows have to stand alone for the same reason the inline renderer's do: `paint`
+// rewrites individual rows and leaves the rest untouched, so a row repainted on its own
+// cannot rely on the terminal still being in the color the row above left it in.
+fn wrap_rows(line: &str, width: usize) -> Vec<String> {
+    let wrapped = Wrap::new(width).feed(line);
+    let mut rows = Vec::new();
+    let mut open = String::new();
+    for row in wrapped.split('\n') {
+        rows.push(format!("{}{}", open, row));
+        open = open_colors(&open, row);
+    }
+    rows
+}
+
+// Everything in a stored line except the parts that move the cursor or clear the screen.
+//
+// The transcript holds text and the colors it is written in, and nothing else. A line is
+// painted wherever the frame puts it, over and over, long after whatever wrote it has
+// stopped caring — so an escape that moves the cursor or clears the screen is not a thing
+// that happened once, it is a thing that happens on every repaint from now on. The model
+// picker used to clear the screen by printing the escape for it through `out!`, which the
+// inline renderer passes to the terminal and forgets: here it landed in a transcript row
+// and wiped the screen from the middle of a frame every time that row was drawn again.
+// Everything painted before it in that frame died with it, and the rows the diff had
+// decided were already correct — the input box, the status bar — were never drawn again.
+//
+// Only SGR sequences survive, which is exactly what `open_colors` already tracks.
+fn text_and_color(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            kept.push(ch);
+            continue;
+        }
+        let escape = take_escape(&mut chars);
+        if escape.starts_with("\u{1b}[") && escape.ends_with('m') {
+            kept.push_str(&escape);
+        }
+    }
+    std::borrow::Cow::Owned(kept)
+}
+
+// What a stored line is, and therefore when it is shown.
+//
+// The summary and the detail of the same thing are both written into the transcript when
+// it happens; which of the two is on screen is decided at paint time. That is the whole of
+// the folding, and it is why it needs no block identity and no per-block state: one flag
+// says which kind is currently being shown, and a line knows which kind it is.
+//
+// It is also the only reason any of this is possible. The inline renderer hands a line to
+// the terminal and forgets it, so what was printed is what there is forever; here the text
+// is still ours and can be shown or not long after it was written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    // Always shown.
+    Normal,
+    // The one row standing in for something folded away.
+    Summary,
+    // What that row stands in for.
+    Detail,
+}
+
+struct Line {
+    text: String,
+    kind: Kind,
+}
+
+// Where the top of the viewport sits when the view is being held back.
+//
+// The line is named by a sequence number rather than by its index, because the buffer
+// drops its oldest lines once it is full and an index would quietly come to mean a
+// different line. The row says which of that line's wrapped rows is the first one shown:
+// a single line can be taller than the screen, so the top of the viewport is not always
+// the top of a line.
+//
+// This is the whole reason a resize does not throw the view somewhere arbitrary. An offset
+// counted in rows from the end means nothing once the rows are a different width; a line
+// and a row within it still means the same place.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Anchor {
+    seq: u64,
+    row: usize,
+}
+
+// The transcript, and the screen it is painted onto.
+//
+// Lines are kept *logical* — as they were written, not as they were last shown — and
+// wrapped only when a frame is built. That is the whole trick: a resize changes nothing
+// here, it just produces different rows next time, and a line rewritten later takes its
+// new width from wherever the screen happens to be by then.
+struct Screen {
+    // Finished lines, oldest first. Each is self-contained: it begins with whatever colors
+    // were still open when the line before it ended, so it can be wrapped and painted
+    // without reading anything that came earlier.
+    lines: VecDeque<Line>,
+    // The line being written that has not found its newline yet. It is part of the frame
+    // like any other, which is why a streamed reply appears as it arrives rather than a
+    // line at a time — but it stays out of `lines` until it ends, because until then its
+    // last word is still free to move to another row.
+    open: String,
+    // The colors open at the end of the last finished line, prefixed onto the next one.
+    carry: String,
+    // What kind the lines being written now are. Set by `begin_fold` and put back by
+    // `end_fold`, so a whole streamed run of output can be marked as detail without every
+    // writer along the way having to know about it.
+    writing: Kind,
+    // Whether the detail is being shown instead of the summaries. One flag for the whole
+    // transcript, which is what makes this a toggle rather than a thing to navigate.
+    expanded: bool,
+    // How many lines have fallen off the front, which is what turns a sequence number into
+    // an index and back.
+    dropped: u64,
+    // Where the top of the viewport is, or `None` to stay at the end and follow whatever
+    // arrives. Scrolling back down to the end puts it back to `None` rather than leaving
+    // an anchor pinned there, so new output starts moving the view again by itself.
+    scroll: Option<Anchor>,
+    // The rows exactly as they are on the screen, and where the cursor was left. The next
+    // frame is compared against these and only the rows that differ are painted again.
+    drawn: Vec<String>,
+    drawn_caret: (usize, usize),
+    // The size the frame was laid out for. A different one means every row has moved and
+    // none of them can be patched.
+    drawn_size: (usize, usize),
+    // Whether mouse reporting was asked for, so leaving can turn off exactly what
+    // entering turned on.
+    mouse: bool,
+    // The Windows console input mode as it was before VT input was switched on.
+    #[cfg(windows)]
+    console_mode: Option<u32>,
+}
+
+impl Screen {
+    fn new() -> Self {
+        Screen {
+            lines: VecDeque::new(),
+            open: String::new(),
+            carry: String::new(),
+            writing: Kind::Normal,
+            expanded: false,
+            dropped: 0,
+            scroll: None,
+            drawn: Vec::new(),
+            drawn_caret: (0, 0),
+            drawn_size: (0, 0),
+            mouse: false,
+            #[cfg(windows)]
+            console_mode: None,
+        }
+    }
+
+    fn write(&mut self, text: &str) {
+        let text = text_and_color(text);
+        for (index, part) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.end_line();
+            }
+            self.open.push_str(part);
+        }
+    }
+
+    fn end_line(&mut self) {
+        let line = std::mem::take(&mut self.open);
+        // Worked out before the line is stored with its prefix, so the colors of the
+        // prefix count toward what the next line inherits.
+        let carried = std::mem::take(&mut self.carry);
+        self.carry = open_colors(&carried, &line);
+        self.lines.push_back(Line {
+            text: carried + &line,
+            kind: self.writing,
+        });
+        while self.lines.len() > SCROLLBACK_LINES {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    fn shows(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Normal => true,
+            Kind::Summary => !self.expanded,
+            Kind::Detail => self.expanded,
+        }
+    }
+
+    // Every logical line in order, the unfinished one included: it is as much a part of the
+    // transcript as the rest, it just has not stopped growing yet. `None` where the index is
+    // past the end *or* the line is one the fold is currently hiding — the walkers below
+    // step over both the same way, which is what keeps folding out of their arithmetic.
+    fn line_at(&self, index: usize) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(line) = self.lines.get(index) {
+            if !self.shows(line.kind) {
+                return None;
+            }
+            return Some(std::borrow::Cow::Borrowed(&line.text));
+        }
+        if index == self.lines.len() && !self.open.is_empty() && self.shows(self.writing) {
+            return Some(std::borrow::Cow::Owned(self.carry.clone() + &self.open));
+        }
+        None
+    }
+
+    // Whether there is anything at this index at all, shown or not. `line_at` cannot answer
+    // that: it says `None` for a hidden line too, on purpose.
+    fn exists(&self, index: usize) -> bool {
+        index < self.line_count()
+    }
+
+    fn line_count(&self) -> usize {
+        self.lines.len() + usize::from(!self.open.is_empty())
+    }
+
+    fn rows_in(&self, index: usize, width: usize) -> usize {
+        self.line_at(index)
+            .map(|line| Wrap::new(width).feed(&line).split('\n').count())
+            .unwrap_or(0)
+    }
+
+    // The anchor that shows the last `height` rows — where the view sits when it is
+    // following. Walked backward from the end, which is the only direction that can find
+    // it without wrapping the whole transcript.
+    fn bottom_anchor(&self, width: usize, height: usize) -> Anchor {
+        let mut seen = 0;
+        let mut index = self.line_count();
+        while index > 0 {
+            let rows = self.rows_in(index - 1, width);
+            // A folded-away line takes no rows and cannot be the top of the viewport.
+            if rows > 0 && seen + rows >= height {
+                return Anchor {
+                    seq: self.dropped + (index - 1) as u64,
+                    row: rows - (height - seen),
+                };
+            }
+            seen += rows;
+            index -= 1;
+        }
+        Anchor { seq: self.dropped, row: 0 }
+    }
+
+    // Rows from an anchor forward, for a view that is being held back.
+    fn rows_from(&self, anchor: Anchor, width: usize, height: usize) -> Vec<String> {
+        let mut index = anchor.seq.saturating_sub(self.dropped) as usize;
+        let mut skip = anchor.row;
+        let mut rows = Vec::with_capacity(height);
+        while rows.len() < height {
+            if !self.exists(index) {
+                break;
+            }
+            let Some(line) = self.line_at(index) else {
+                // Hidden by the fold: step over it rather than stopping, or everything
+                // below a folded run would be unreachable.
+                index += 1;
+                skip = 0;
+                continue;
+            };
+            for row in wrap_rows(&line, width).into_iter().skip(skip) {
+                if rows.len() == height {
+                    break;
+                }
+                rows.push(row);
+            }
+            skip = 0;
+            index += 1;
+        }
+        rows
+    }
+
+    // A row at a time in both directions. A wheel notch is three of them and a page is a
+    // screenful, so the walk is short even though each step may have to wrap a line to
+    // find out how tall it is.
+    fn step_back(&self, mut anchor: Anchor, count: usize, width: usize) -> Anchor {
+        for _ in 0..count {
+            if anchor.row > 0 {
+                anchor.row -= 1;
+                continue;
+            }
+            // Past the start of this line, so back through the lines before it until one of
+            // them has a row to land on. A folded-away line has none.
+            loop {
+                if anchor.seq <= self.dropped {
+                    return anchor;
+                }
+                anchor.seq -= 1;
+                let index = (anchor.seq - self.dropped) as usize;
+                let rows = self.rows_in(index, width);
+                if rows > 0 {
+                    anchor.row = rows - 1;
+                    break;
+                }
+            }
+        }
+        anchor
+    }
+
+    fn step_forward(&self, mut anchor: Anchor, count: usize, width: usize, bottom: Anchor) -> Anchor {
+        for _ in 0..count {
+            if anchor >= bottom {
+                return bottom;
+            }
+            let index = (anchor.seq - self.dropped) as usize;
+            if anchor.row + 1 < self.rows_in(index, width) {
+                anchor.row += 1;
+                continue;
+            }
+            // On to the next line with anything to show, stopping at the end either way.
+            loop {
+                anchor.seq += 1;
+                anchor.row = 0;
+                if anchor >= bottom {
+                    return bottom;
+                }
+                let index = (anchor.seq - self.dropped) as usize;
+                if !self.exists(index) || self.rows_in(index, width) > 0 {
+                    break;
+                }
+            }
+        }
+        anchor.min(bottom)
+    }
+
+    fn scroll_by(&mut self, delta: isize, width: usize, height: usize) {
+        let bottom = self.bottom_anchor(width, height);
+        let from = self.scroll.unwrap_or(bottom);
+        let anchor = if delta < 0 {
+            self.step_back(from, delta.unsigned_abs(), width)
+        } else {
+            self.step_forward(from, delta as usize, width, bottom)
+        };
+        // Back at the end means following again, rather than an anchor pinned to the
+        // bottom that new output would have to keep pushing along.
+        self.scroll = if anchor >= bottom { None } else { Some(anchor) };
+    }
+
+    // The last `height` rows of the transcript.
+    //
+    // Walked backward from the newest line and stopped as soon as the viewport is full.
+    // Wrapping the whole transcript to find the last twenty rows of it would cost the
+    // length of the session on every frame, and frames are painted several times a second
+    // while a reply streams.
+    fn rows(&self, width: usize, height: usize) -> Vec<String> {
+        if height == 0 {
+            return Vec::new();
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+        let mut total = 0;
+        if !self.open.is_empty() && self.shows(self.writing) {
+            let rows = wrap_rows(&(self.carry.clone() + &self.open), width);
+            total += rows.len();
+            blocks.push(rows);
+        }
+        for line in self.lines.iter().rev() {
+            if total >= height {
+                break;
+            }
+            if !self.shows(line.kind) {
+                continue;
+            }
+            let rows = wrap_rows(&line.text, width);
+            total += rows.len();
+            blocks.push(rows);
+        }
+        blocks.reverse();
+
+        let rows: Vec<String> = blocks.into_iter().flatten().collect();
+        let start = rows.len().saturating_sub(height);
+        rows[start..].to_vec()
+    }
+
+    // Bring the screen up to date. The transcript takes whatever the region leaves.
+    //
+    // The size is passed in rather than read here so that a frame can be built for a
+    // screen that is not the one haico happens to be running on, which is the only way the
+    // tests can say anything about what gets painted.
+    fn paint(
+        &mut self,
+        region: &[String],
+        caret: (usize, usize),
+        capture: &mut Option<String>,
+        (width, height): (usize, usize),
+    ) {
+        let region_rows = region.len().min(height);
+        let body = height - region_rows;
+
+        // A column short of the edge, for the same reason everything else stops there: a
+        // row exactly as wide as the screen wraps in some terminals and not others.
+        let wrap = width.saturating_sub(1).max(1);
+
+        // An anchor that has ended up at or past the end is not holding anything back any
+        // more — the region may have shrunk, or lines may have fallen off the front — so it
+        // goes back to following rather than sitting one row short of the bottom forever.
+        if let Some(anchor) = self.scroll {
+            if anchor >= self.bottom_anchor(wrap, body) {
+                self.scroll = None;
+            }
+        }
+
+        // The row that says the view is held back costs a row of transcript, and there has
+        // to be one to spare for it.
+        let held = self.scroll.filter(|_| body >= 2);
+        let content = body - usize::from(held.is_some());
+        let transcript = match held {
+            Some(anchor) => self.rows_from(anchor, wrap, content),
+            None => self.rows(wrap, content),
+        };
+
+        let mut rows = Vec::with_capacity(height);
+        // A transcript shorter than the viewport sits against the bottom, the way a shell
+        // leaves one, rather than at the top with the input box stranded in the middle.
+        rows.extend(std::iter::repeat(String::new()).take(content - transcript.len()));
+        rows.extend(transcript);
+        if let Some(anchor) = held {
+            let index = anchor.seq.saturating_sub(self.dropped) as usize;
+            rows.push(held_back_row(
+                self.line_count().saturating_sub(index + 1),
+                width,
+            ));
+        }
+        // A region taller than the screen loses its top rows rather than its bottom ones.
+        // `input::draw` budgets the plan panel so this cannot normally happen, but if it
+        // ever does the thing to keep is the box and the bar under it — dropping those
+        // would leave the user typing into a screen with no visible input.
+        let dropped = region.len() - region_rows;
+        rows.extend(region.iter().skip(dropped).cloned());
+
+        let caret = (
+            (body + caret.0.saturating_sub(dropped)).min(height.saturating_sub(1)),
+            caret.1.min(width.saturating_sub(1)),
+        );
+
+        // A resize invalidates the whole frame rather than any part of it: every row was
+        // laid out for the old width and the rows below the first change have all moved.
+        // Cheaper and far more reliable than working out what survived.
+        let full = self.drawn_size != (width, height) || self.drawn.len() != rows.len();
+        if !full && rows == self.drawn && caret == self.drawn_caret {
+            return;
+        }
+
+        let mut frame = String::with_capacity(1024);
+        frame.push_str(BEGIN_SYNC);
+        frame.push_str(WRAP_OFF);
+        frame.push_str(&Hide.to_string());
+        if full {
+            frame.push_str(&Clear(ClearType::All).to_string());
+        }
+        for (row, text) in rows.iter().enumerate() {
+            if !full && self.drawn[row] == *text {
+                continue;
+            }
+            frame.push_str(&MoveTo(0, row as u16).to_string());
+            frame.push_str(text);
+            // A row that ends with a color still open would paint it across everything the
+            // clear touches, all the way to the right edge.
+            frame.push_str("\x1b[0m");
+            frame.push_str(&Clear(ClearType::UntilNewLine).to_string());
+        }
+        frame.push_str(&MoveTo(caret.1 as u16, caret.0 as u16).to_string());
+        frame.push_str(&Show.to_string());
+        frame.push_str(WRAP_ON);
+        frame.push_str(END_SYNC);
+
+        if let Some(buffer) = capture {
+            buffer.push_str(&frame);
+        } else {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(frame.as_bytes());
+            let _ = stdout.flush();
+        }
+
+        self.drawn = rows;
+        self.drawn_caret = caret;
+        self.drawn_size = (width, height);
+    }
+
+    // The transcript as it would have looked had it been printed to the terminal all
+    // along, for writing back to the main screen on the way out.
+    //
+    // Without this the whole session goes with the alternate screen when it is restored,
+    // which is the one thing the inline renderer got for free. Wrapped at haico's width
+    // rather than left to the terminal, so what lands in the scrollback is what was on
+    // the screen.
+    fn dump(&self, width: usize) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            // What was on the screen is what goes into the scrollback: a detail that was
+            // folded away was not on the screen.
+            if !self.shows(line.kind) {
+                continue;
+            }
+            out.push_str(&wrap_rows(&line.text, width).join("\n"));
+            out.push('\n');
+        }
+        if !self.open.is_empty() && self.shows(self.writing) {
+            out.push_str(&wrap_rows(&(self.carry.clone() + &self.open), width).join("\n"));
+            out.push('\n');
+        }
+        out
+    }
+}
+
 fn terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(columns, _)| columns as usize)
         .unwrap_or(80)
+        .max(1)
+}
+
+fn terminal_height() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, rows)| rows as usize)
+        .unwrap_or(24)
         .max(1)
 }
 
@@ -628,6 +1309,7 @@ fn lock() -> MutexGuard<'static, Out> {
             pending: String::new(),
             wrap: Wrap::new(80),
             capture: None,
+            screen: None,
         })
     })
     .lock()
@@ -653,7 +1335,13 @@ pub(crate) fn write_line(args: fmt::Arguments) {
 // its ending, and the next thing written would otherwise land on the same row.
 pub(crate) fn ensure_line_start() {
     let mut out = lock();
-    if !out.at_line_start || !out.pending.is_empty() {
+    // The full-screen renderer keeps its unfinished line in the transcript rather than in
+    // `pending`, and never touches `at_line_start` at all.
+    let unfinished = match &out.screen {
+        Some(screen) => !screen.open.is_empty(),
+        None => !out.at_line_start || !out.pending.is_empty(),
+    };
+    if unfinished {
         out.emit("\n");
     }
 }
@@ -677,6 +1365,12 @@ pub(crate) fn set_region(rows: Vec<String>, caret_row: usize, caret_col: usize) 
     let mut state = lock();
     state.region = rows;
     state.caret = (caret_row, caret_col);
+    if state.screen.is_some() {
+        // Every row on the screen comes from one frame, so there is nothing to erase and
+        // nothing to step around: the box is simply the bottom of the next one.
+        state.screen_paint();
+        return;
+    }
     // Nothing is erased first. The block is redrawn on a timer as well as on every
     // keystroke, and most of those redraws ask for what is already on the screen, or for
     // one row of it changed: `paint` writes the difference, and writes nothing at all when
@@ -696,6 +1390,12 @@ pub(crate) fn has_region() -> bool {
 // thing printed can simply continue it.
 pub(crate) fn clear_region() {
     let mut state = lock();
+    if state.screen.is_some() {
+        state.region.clear();
+        state.caret = (0, 0);
+        state.screen_paint();
+        return;
+    }
     state.erase_region();
     state.region.clear();
     state.caret = (0, 0);
@@ -705,6 +1405,214 @@ pub(crate) fn clear_region() {
         let wrapped = state.wrap.feed(&pending);
         state.put(&wrapped);
     }
+}
+
+// Take the alternate screen and start owning the viewport.
+//
+// Everything printed from here on belongs to haico rather than to the terminal, which is
+// what pays for scrolling, for re-wrapping on a resize, and for being able to change a
+// line after it was written. Refused while capturing: the tests assert on the inline
+// renderer's output and a frame of absolute cursor moves is not that.
+// Returns whether the console was put into VT input mode, which is a Windows-only thing
+// and the one piece of this the keyboard reader has to know about: from then on it has to
+// read and parse the byte stream itself rather than take crossterm's word for each key.
+pub(crate) fn enter_screen(mouse: bool) -> bool {
+    let mut state = lock();
+    if state.screen.is_some() || state.capture.is_some() {
+        return false;
+    }
+
+    let mut screen = Screen::new();
+    screen.mouse = mouse;
+
+    let mut vt_input = false;
+    if mouse {
+        #[cfg(windows)]
+        {
+            // Without this the escape sequence below is written into a void: the console
+            // never sees it, which is exactly why the wheel used to do nothing.
+            screen.console_mode = console::enable_vt_input();
+            vt_input = screen.console_mode.is_some();
+        }
+        #[cfg(not(windows))]
+        {
+            // A VT terminal needs no such arrangement; the sequence is the whole of it.
+            vt_input = false;
+        }
+    }
+
+    let start = format!(
+        "{}{}{}{}",
+        ENTER_ALT,
+        if mouse { MOUSE_ON } else { "" },
+        // Worth asking for whether or not the mouse is wanted: it is the keyboard this
+        // affects, and it costs nothing where it is not understood.
+        KEYS_ON,
+        Clear(ClearType::All)
+    );
+    state.write_out(&start);
+    state.screen = Some(screen);
+    let _ = io::stdout().flush();
+    vt_input
+}
+
+// Give the terminal its screen back, and write the session into the scrollback behind it.
+//
+// Restoring the alternate screen on its own would take the whole conversation with it.
+// The transcript goes out through `put` while raw mode is still on, so its line feeds
+// still get their carriage returns; the caller drops raw mode afterwards.
+pub(crate) fn leave_screen() {
+    let mut state = lock();
+    let Some(screen) = state.screen.take() else {
+        return;
+    };
+    let transcript = screen.dump(wrap_width());
+    state.write_out(&format!(
+        "{}{}{}",
+        KEYS_OFF,
+        if screen.mouse { MOUSE_OFF } else { "" },
+        LEAVE_ALT
+    ));
+    #[cfg(windows)]
+    if let Some(original) = screen.console_mode {
+        console::restore(original);
+    }
+    state.at_line_start = true;
+    state.wrap = Wrap::new(wrap_width());
+    state.put(&transcript);
+    let _ = io::stdout().flush();
+}
+
+// Start writing detail: everything until `end_fold` is kept but shown only while the
+// transcript is expanded, with `summary` standing in for it until then.
+//
+// A separate begin and end rather than one call taking both, because the thing this most
+// needs to fold is a reply's chain of thought, and that arrives a fragment at a time over
+// several seconds. Nothing in between has to know it is being folded.
+//
+// A no-op under the inline renderer, where a printed line belongs to the terminal and
+// cannot be taken back.
+pub(crate) fn begin_fold(summary: &str) {
+    let mut state = lock();
+    if state.screen.is_none() {
+        // Nothing can be folded away later, so the summary would be a promise that is never
+        // kept. The detail is simply printed, which is what happened before any of this.
+        return;
+    }
+    // The summary is one row of its own; a line still being written would otherwise have
+    // the summary land in the middle of it.
+    ensure_line_start_locked(&mut state);
+    if let Some(screen) = &mut state.screen {
+        screen.writing = Kind::Summary;
+    }
+    state.screen_write(summary);
+    state.screen_write("\n");
+    if let Some(screen) = &mut state.screen {
+        screen.writing = Kind::Detail;
+    }
+}
+
+// Safe to call whether or not anything is open, which is what lets every path out of a
+// streamed reply — finished, interrupted, failed — simply close the fold without first
+// working out whether there is one. Closing nothing must cost nothing: `ensure_line_start`
+// in the middle of a line that is not detail would break the line in two.
+pub(crate) fn end_fold() {
+    let mut state = lock();
+    let open = matches!(
+        state.screen.as_ref().map(|screen| screen.writing),
+        Some(Kind::Detail)
+    );
+    if !open {
+        return;
+    }
+    ensure_line_start_locked(&mut state);
+    if let Some(screen) = &mut state.screen {
+        screen.writing = Kind::Normal;
+    }
+    state.screen_paint();
+}
+
+// The common case in one call: a summary that is already the line haico would have printed
+// anyway, and the full text behind it.
+pub(crate) fn foldable(summary: &str, detail: &str) {
+    if !lock().screen.is_some() {
+        // Same as before folding existed: the summary is all there is room for.
+        write_line(format_args!("{}", summary.trim_end_matches('\n')));
+        return;
+    }
+    begin_fold(summary.trim_end_matches('\n'));
+    // Indented so an opened block reads as belonging to the row above it rather than as
+    // more transcript.
+    for line in detail.trim_end_matches('\n').split('\n') {
+        write_line(format_args!("      {}", line));
+    }
+    end_fold();
+}
+
+// Show the detail instead of the summaries, or the other way about.
+//
+// The view goes back to following: what is on the screen has just changed height by a great
+// deal, and an anchor into the middle of it would land somewhere the reader did not choose.
+pub(crate) fn toggle_expand() {
+    let mut state = lock();
+    let changed = match &mut state.screen {
+        Some(screen) => {
+            screen.expanded = !screen.expanded;
+            screen.scroll = None;
+            true
+        }
+        None => false,
+    };
+    if changed {
+        state.screen_paint();
+    }
+}
+
+// `ensure_line_start` with the lock already held.
+fn ensure_line_start_locked(state: &mut MutexGuard<'static, Out>) {
+    let unfinished = match &state.screen {
+        Some(screen) => !screen.open.is_empty(),
+        None => !state.at_line_start || !state.pending.is_empty(),
+    };
+    if unfinished {
+        state.emit("\n");
+    }
+}
+
+// Move the view back through what has already gone past, or forward again. Negative is
+// backward. A no-op under the inline renderer, where scrolling belongs to the terminal.
+pub(crate) fn scroll(delta: isize) {
+    let mut state = lock();
+    if state.screen.is_none() {
+        return;
+    }
+    let (width, height) = (terminal_width(), terminal_height());
+    let body = height.saturating_sub(state.region.len().min(height)).max(1);
+    let wrap = width.saturating_sub(1).max(1);
+    if let Some(screen) = &mut state.screen {
+        screen.scroll_by(delta, wrap, body);
+    }
+    state.screen_paint();
+}
+
+// Go back to the end and stay there. What the user has just sent is about to be answered,
+// and the answer is at the bottom.
+pub(crate) fn follow() {
+    let mut state = lock();
+    let moved = match &mut state.screen {
+        Some(screen) => screen.scroll.take().is_some(),
+        None => false,
+    };
+    if moved {
+        state.screen_paint();
+    }
+}
+
+// How tall the transcript area is, for a caller working out what a page of it is.
+pub(crate) fn viewport_rows() -> usize {
+    let state = lock();
+    let height = terminal_height();
+    height.saturating_sub(state.region.len().min(height)).max(1)
 }
 
 // The writer is a global, so two tests capturing at once would read each other's
@@ -728,6 +1636,7 @@ pub(crate) fn start_capture() {
     state.drawn_width = 0;
     state.pending.clear();
     state.wrap = Wrap::new(80);
+    state.screen = None;
     state.capture = Some(String::new());
 }
 
@@ -1035,5 +1944,371 @@ mod tests {
         assert_eq!(wrapped("", 40), "");
         // Blank lines keep their rows.
         assert_eq!(wrapped("one\n\ntwo\n", 40), "one\n\ntwo\n");
+    }
+    // ---- the full-screen renderer ----
+
+    fn screen_with(lines: &[&str]) -> super::Screen {
+        let mut screen = super::Screen::new();
+        for line in lines {
+            screen.write(line);
+            screen.write("\n");
+        }
+        screen
+    }
+
+    // Paint into a buffer instead of the terminal and give back what would have been
+    // written.
+    fn frame(screen: &mut super::Screen, region: &[&str], size: (usize, usize)) -> String {
+        let rows: Vec<String> = region.iter().map(|row| row.to_string()).collect();
+        let mut capture = Some(String::new());
+        screen.paint(&rows, (0, 0), &mut capture, size);
+        capture.unwrap_or_default()
+    }
+
+    // The point of keeping lines logical rather than as the rows they were last shown as:
+    // the same line gives different rows on a narrower screen. The inline renderer cannot
+    // do this — once a line is in the terminal's scrollback it keeps the wrap it was
+    // written with forever.
+    #[test]
+    fn a_resize_rewraps_the_transcript_instead_of_leaving_it_as_it_was() {
+        let screen = screen_with(&["the quick brown fox jumps over the lazy dog"]);
+
+        let wide = screen.rows(40, 20);
+        let narrow = screen.rows(20, 20);
+
+        assert!(
+            narrow.len() > wide.len(),
+            "the narrower screen should have needed more rows: {:?} vs {:?}",
+            wide,
+            narrow
+        );
+        for row in &narrow {
+            assert!(
+                super::visible_width(row) <= 20,
+                "row ran past the edge: {:?}",
+                row
+            );
+        }
+        // Nothing was consumed working that out: the line is still there to be wrapped
+        // again, at either width.
+        assert_eq!(screen.rows(40, 20), wide);
+    }
+
+    // A session shorter than the screen leaves the gap at the top, so the input box stays
+    // on the bottom row rather than floating in the middle of an empty screen.
+    #[test]
+    fn a_short_transcript_sits_against_the_bottom_with_the_region_below_it() {
+        let mut screen = screen_with(&["first", "second"]);
+        let painted = frame(&mut screen, &["> ", "status"], (40, 8));
+
+        let rows: Vec<&str> = painted.match_indices("first").map(|_| "first").collect();
+        assert_eq!(rows.len(), 1, "the transcript should be painted once");
+
+        // Six rows for the transcript, two for the region, and the two lines of transcript
+        // land on the last two of the six.
+        assert!(
+            painted.contains(&format!("{}first", super::MoveTo(0, 4))),
+            "transcript should be pushed to the bottom of its area: {:?}",
+            painted
+        );
+        assert!(
+            painted.contains(&format!("{}> ", super::MoveTo(0, 6))),
+            "the box should be the second row from the bottom: {:?}",
+            painted
+        );
+    }
+
+    // The reason a token counter ticking in the bar does not make the whole screen blink.
+    #[test]
+    fn only_the_rows_that_changed_are_painted_again() {
+        let mut screen = screen_with(&["hello"]);
+        frame(&mut screen, &["> ", "Thinking (1)"], (40, 6));
+
+        let second = frame(&mut screen, &["> ", "Thinking (2)"], (40, 6));
+
+        assert!(second.contains("Thinking (2)"));
+        assert!(
+            !second.contains("hello"),
+            "the transcript was repainted for a change in the bar: {:?}",
+            second
+        );
+        assert_eq!(
+            second.matches(&super::MoveTo(0, 5).to_string()).count(),
+            1,
+            "only the bar's own row should have been moved to: {:?}",
+            second
+        );
+    }
+
+    #[test]
+    fn a_frame_that_says_the_same_thing_writes_nothing() {
+        let mut screen = screen_with(&["hello"]);
+        frame(&mut screen, &["> "], (40, 6));
+
+        assert_eq!(frame(&mut screen, &["> "], (40, 6)), "");
+    }
+
+    // Every row is painted on its own, so a row can never rely on the terminal still being
+    // in the color the row above left it in.
+    #[test]
+    fn a_color_left_open_on_one_line_is_switched_on_again_on_the_next() {
+        let screen = screen_with(&["\u{1b}[31mred", "still red"]);
+
+        let rows = screen.rows(40, 20);
+
+        assert!(rows[1].starts_with("\u{1b}[31m"), "{:?}", rows);
+    }
+
+    // The buffer is bounded, unlike the terminal's own scrollback.
+    #[test]
+    fn the_oldest_lines_fall_off_once_the_buffer_is_full() {
+        let mut screen = super::Screen::new();
+        for index in 0..super::SCROLLBACK_LINES + 50 {
+            screen.write(&format!("line {}\n", index));
+        }
+
+        assert_eq!(screen.lines.len(), super::SCROLLBACK_LINES);
+        assert!(screen.lines.front().unwrap().text.contains("line 50"));
+        assert!(screen.lines.back().unwrap().text.contains(&format!(
+            "line {}",
+            super::SCROLLBACK_LINES + 49
+        )));
+    }
+
+    // A row is painted again and again, so an escape that clears the screen is not
+    // something that happened once — it is something that happens on every repaint. This
+    // is what used to wipe the input box and the status bar and leave them wiped, because
+    // the diff had already decided those two rows were correct.
+    #[test]
+    fn cursor_moves_and_screen_clears_never_reach_the_transcript() {
+        let mut screen = super::Screen::new();
+        screen.write(&format!(
+            "{}{}kept\n",
+            super::MoveTo(0, 0),
+            super::Clear(super::ClearType::All)
+        ));
+
+        let rows = screen.rows(40, 20);
+
+        assert_eq!(rows, vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn the_colors_a_line_is_written_in_are_kept() {
+        let mut screen = super::Screen::new();
+        screen.write("\u{1b}[31mred\u{1b}[0m\n");
+
+        assert_eq!(screen.rows(40, 20), vec!["\u{1b}[31mred\u{1b}[0m".to_string()]);
+    }
+
+    // A row too wide for the screen must not be allowed to wrap: a wrap on the bottom row
+    // scrolls everything up and the diff never finds out.
+    #[test]
+    fn a_frame_paints_with_auto_wrap_switched_off() {
+        let mut screen = screen_with(&["hello"]);
+        let painted = frame(&mut screen, &["> "], (40, 6));
+
+        assert!(painted.starts_with(super::BEGIN_SYNC));
+        assert!(painted.contains(super::WRAP_OFF));
+        assert!(painted.ends_with(super::END_SYNC));
+        assert!(painted.contains(super::WRAP_ON));
+    }
+
+    // ---- folding ----
+
+    // Writes a summary and its detail the way `foldable` does, without going near the
+    // global writer.
+    fn with_fold(before: &[&str], summary: &str, detail: &[&str], after: &[&str]) -> super::Screen {
+        let mut screen = super::Screen::new();
+        for line in before {
+            screen.write(line);
+            screen.write("\n");
+        }
+        screen.writing = super::Kind::Summary;
+        screen.write(summary);
+        screen.write("\n");
+        screen.writing = super::Kind::Detail;
+        for line in detail {
+            screen.write(line);
+            screen.write("\n");
+        }
+        screen.writing = super::Kind::Normal;
+        for line in after {
+            screen.write(line);
+            screen.write("\n");
+        }
+        screen
+    }
+
+    // The whole point: both are written when it happens, and which one is on screen is
+    // decided later — long after the inline renderer would have handed the line to the
+    // terminal and lost the choice.
+    #[test]
+    fn the_summary_shows_until_it_is_expanded_and_then_the_detail_does() {
+        let mut screen = with_fold(&["before"], "* ran a tool", &["line one", "line two"], &["after"]);
+
+        let folded = screen.rows(40, 20);
+        assert_eq!(folded, vec!["before", "* ran a tool", "after"], "{:?}", folded);
+
+        screen.expanded = true;
+        let opened = screen.rows(40, 20);
+        assert_eq!(
+            opened,
+            vec!["before", "line one", "line two", "after"],
+            "{:?}",
+            opened
+        );
+    }
+
+    // Folded lines are skipped, not stopped at: everything written after a fold has to stay
+    // reachable when scrolled to.
+    #[test]
+    fn scrolling_reads_straight_through_a_folded_run() {
+        let screen = with_fold(&["before"], "* summary", &["hidden one", "hidden two"], &["after"]);
+
+        let anchor = super::Anchor { seq: 0, row: 0 };
+        let rows = screen.rows_from(anchor, 40, 20);
+
+        assert_eq!(rows, vec!["before", "* summary", "after"], "{:?}", rows);
+    }
+
+    // A fold changes the height of the transcript by a great deal, so the anchor it was
+    // holding means somewhere else entirely afterwards.
+    #[test]
+    fn expanding_puts_the_view_back_to_following() {
+        let mut screen = with_fold(&["a", "b", "c"], "* summary", &["x", "y"], &["d"]);
+        screen.scroll_by(-2, 40, 3);
+        assert!(screen.scroll.is_some(), "the view should be held back");
+
+        let mut capture = Some(String::new());
+        screen.expanded = true;
+        screen.scroll = None;
+        screen.paint(&["> ".to_string()], (0, 0), &mut capture, (40, 8));
+
+        assert_eq!(screen.scroll, None);
+    }
+
+    // What was on the screen is what goes into the scrollback on the way out.
+    #[test]
+    fn the_exit_dump_follows_whichever_way_the_fold_is_set() {
+        let mut screen = with_fold(&["before"], "* summary", &["secret detail"], &[]);
+
+        let folded = screen.dump(40);
+        assert!(folded.contains("* summary"), "{:?}", folded);
+        assert!(!folded.contains("secret detail"), "{:?}", folded);
+
+        screen.expanded = true;
+        let opened = screen.dump(40);
+        assert!(opened.contains("secret detail"), "{:?}", opened);
+        assert!(!opened.contains("* summary"), "{:?}", opened);
+    }
+
+    // ---- scrolling ----
+
+    fn numbered(count: usize) -> super::Screen {
+        let mut screen = super::Screen::new();
+        for index in 0..count {
+            screen.write(&format!("line {}\n", index));
+        }
+        screen
+    }
+
+    // What arrives while the view is held back must not drag it along: the whole point of
+    // scrolling back during a turn is to read something while the turn carries on.
+    #[test]
+    fn output_arriving_does_not_move_a_view_that_is_held_back() {
+        let mut screen = numbered(50);
+        screen.scroll_by(-10, 40, 10);
+        let held = screen.scroll.expect("the view should be held back");
+
+        for index in 50..70 {
+            screen.write(&format!("line {}\n", index));
+        }
+
+        assert_eq!(screen.scroll, Some(held), "new output moved the view");
+        assert!(screen.rows_from(held, 40, 3)[0].contains("line 30"));
+    }
+
+    // The reason the anchor is a line and a row within it rather than a count of rows from
+    // the end. Rows are a different size at a different width, so an offset counted in them
+    // means somewhere else entirely once the screen changes; a line still means that line.
+    #[test]
+    fn a_resize_leaves_the_view_looking_at_the_same_line() {
+        let mut screen = super::Screen::new();
+        for name in ["aaa", "bbb", "ccc", "ddd", "eee"] {
+            screen.write(&format!("{} {}\n", name, name.repeat(30)));
+        }
+
+        screen.scroll_by(-6, 40, 6);
+        let held = screen.scroll.expect("the view should be held back");
+        let before = screen.rows_from(held, 40, 1)[0].clone();
+
+        // The same anchor, a screen half the width.
+        let after = screen.rows_from(held, 20, 1)[0].clone();
+
+        let name = |row: &str| row.chars().take(3).collect::<String>();
+        assert_eq!(
+            name(&before),
+            name(&after),
+            "the resize moved the view: {:?} then {:?}",
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn scrolling_back_down_to_the_end_starts_following_again() {
+        let mut screen = numbered(50);
+
+        screen.scroll_by(-5, 40, 10);
+        assert!(screen.scroll.is_some());
+
+        screen.scroll_by(5, 40, 10);
+        assert_eq!(screen.scroll, None, "reaching the end should follow again");
+    }
+
+    #[test]
+    fn the_view_stops_at_the_start_rather_than_running_off_it() {
+        let mut screen = numbered(20);
+
+        screen.scroll_by(-1000, 40, 5);
+
+        let rows = screen.rows_from(screen.scroll.unwrap(), 40, 1);
+        assert!(rows[0].contains("line 0"), "{:?}", rows);
+    }
+
+    // Output carries on arriving while the view stays put, which without something saying
+    // so looks exactly like haico having stopped.
+    #[test]
+    fn a_held_back_view_says_so_and_pays_a_row_for_it() {
+        let mut screen = numbered(50);
+        screen.scroll_by(-10, 40, 8);
+
+        let painted = frame(&mut screen, &["> ", "status"], (40, 10));
+
+        assert!(painted.contains("held back"), "{:?}", painted);
+        // Eight rows of transcript area: seven of content and the row that says so.
+        assert!(
+            painted.contains(&format!("{}\u{1b}[90m── held back", super::MoveTo(0, 7))),
+            "the notice should be the last row above the region: {:?}",
+            painted
+        );
+    }
+
+    // Without this the whole session goes with the alternate screen when it is restored.
+    #[test]
+    fn the_transcript_is_written_back_out_when_the_screen_is_given_up() {
+        let mut screen = screen_with(&["first", "second"]);
+        screen.write("a line that never ended");
+
+        let dumped = screen.dump(40);
+
+        assert!(dumped.contains("first"), "{:?}", dumped);
+        assert!(dumped.contains("second"), "{:?}", dumped);
+        assert!(
+            dumped.contains("a line that never ended"),
+            "the unfinished line was dropped: {:?}",
+            dumped
+        );
     }
 }

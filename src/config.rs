@@ -7,6 +7,38 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// Which renderer draws the REPL.
+//
+// `Inline` is the original: finished output goes into the terminal's own scrollback and
+// only the input box is redrawn. `Fullscreen` takes the alternate screen and owns the
+// whole viewport, which is what lets the transcript be scrolled, re-wrapped on a resize
+// and edited after the fact — none of which is possible once a line belongs to the
+// terminal. Inline stays reachable because it is the fallback whenever the alternate
+// screen is the wrong answer: a dumb terminal, a session being piped somewhere, or a
+// user who would rather keep native scrollback.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Tui {
+    #[default]
+    Inline,
+    Fullscreen,
+}
+
+// Whether the full-screen renderer asks the terminal for the mouse wheel.
+//
+// `Scroll` asks for wheel and button reporting and nothing else — never motion reporting,
+// which is what would take drag-selection away from the terminal. On Windows this also
+// means turning on the console's VT input mode, and there selecting text needs Shift held
+// while dragging. `Off` leaves the mouse entirely to the terminal; PageUp and PageDown
+// still scroll.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Mouse {
+    #[default]
+    Scroll,
+    Off,
+}
+
 pub(crate) struct Config {
     pub(crate) llm_url: String,
     pub(crate) token: Option<String>,
@@ -31,6 +63,10 @@ pub(crate) struct Config {
     pub(crate) config_path: Option<PathBuf>,
     // Continue this directory's previous conversation instead of starting fresh.
     pub(crate) resume: bool,
+    // Which renderer to use. Not model-dependent, so it never goes through
+    // `resolve_settings` — it is decided once, before the first thing is drawn.
+    pub(crate) tui: Tui,
+    pub(crate) mouse: Mouse,
 }
 
 // Parse configuration from command-line arguments and environment variables
@@ -169,6 +205,9 @@ pub(crate) fn parse_config() -> Result<Config> {
         .opt_str("repeat-penalty")
         .and_then(|value| value.trim().parse::<f64>().ok());
 
+    let file_tui = file_config.tui;
+    let file_mouse = file_config.mouse;
+
     Ok(Config {
         llm_url,
         token,
@@ -186,6 +225,18 @@ pub(crate) fn parse_config() -> Result<Config> {
         file: file_config,
         config_path,
         resume: matches.opt_present("r"),
+        // The environment wins so a terminal that cannot cope with the alternate screen
+        // can be worked around without editing the config file.
+        tui: match env::var("HAICO_TUI").ok().as_deref().map(str::trim) {
+            Some("fullscreen") => Tui::Fullscreen,
+            Some("inline") => Tui::Inline,
+            _ => file_tui.unwrap_or_default(),
+        },
+        mouse: match env::var("HAICO_MOUSE").ok().as_deref().map(str::trim) {
+            Some("off") => Mouse::Off,
+            Some("scroll") => Mouse::Scroll,
+            _ => file_mouse.unwrap_or_default(),
+        },
     })
 }
 
@@ -228,6 +279,11 @@ pub(crate) struct FileConfig {
     // nothing outside it is reachable unless it was named on purpose.
     #[serde(default)]
     pub(crate) read_paths: Vec<String>,
+
+    // "inline" (default) or "fullscreen".
+    pub(crate) tui: Option<Tui>,
+    // "scroll" (default) or "off".
+    pub(crate) mouse: Option<Mouse>,
 
     // Top-level fallbacks, used when the selected model has no entry of its own.
     pub(crate) context: Option<usize>,
@@ -465,6 +521,8 @@ mod tests {
             file: toml::from_str(toml_text).expect("test config should parse"),
             config_path: None,
             resume: false,
+            tui: crate::config::Tui::Inline,
+            mouse: crate::config::Mouse::Scroll,
         }
     }
 

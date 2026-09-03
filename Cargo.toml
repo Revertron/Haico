@@ -29,3 +29,20 @@ ego-tree = "0.11.0"
 ignore = "0.4.33"
 globset = "0.4.20"
 toml = "1.1.4"
+
+# Windows only, and only for the full-screen renderer's mouse.
+#
+# Getting the wheel out of the Windows console means ENABLE_VIRTUAL_TERMINAL_INPUT, which
+# makes the console deliver *everything* as escape sequences — and crossterm's Windows
+# reader maps INPUT_RECORDs one at a time with no parser, so it reports an arrow key as
+# the characters "[", "A" and then Up. `terminput` is crossterm's own Unix escape parser
+# published as a standalone crate, so the byte stream can be read and parsed the way it
+# is meant to be. The adapter converts its events back to crossterm's, which is what the
+# rest of haico is written against.
+[target.'cfg(windows)'.dependencies]
+terminput = "0.5"
+terminput-crossterm = "0.4"
+# Shift+Insert is the console's own paste shortcut, and VT input mode takes it away by
+# forwarding the key to haico instead of acting on it. Pasting therefore has to be done
+# here, which means reading the clipboard.
+clipboard-win = "5"

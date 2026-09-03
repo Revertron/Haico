@@ -3,11 +3,9 @@
 use crate::input::Keys;
 use anyhow::Result;
 use crossterm::{
-    cursor,
     event::{Event, KeyCode, KeyEventKind},
     execute,
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
-    terminal::{Clear, ClearType},
 };
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
@@ -1076,6 +1074,52 @@ mod log_tests {
 
 // Interactive model selection using arrow keys
 
+// The model list as rows of the bottom region, and which of them the selection is on.
+//
+// This used to clear the terminal and redraw the list at the top of it, by printing the
+// escape for a clear through `out!`. The inline renderer hands such a thing to the
+// terminal and forgets it; the full-screen renderer keeps every line it is given and
+// paints it again whenever that row comes round, so a stored "clear the screen" wiped the
+// frame from the middle of itself and took the input box with it. The region is what both
+// renderers already have for something that belongs on the screen rather than in the
+// transcript — the permission prompt and the plan review are drawn the same way.
+fn picker_rows(
+    models: &[String],
+    selected: usize,
+    width: usize,
+    room: usize,
+) -> (Vec<String>, usize) {
+    let columns = width.saturating_sub(1);
+    // One row goes to the heading; the rest is the list.
+    let body = room.saturating_sub(1).max(1);
+
+    // A window around the selection once the list is longer than there is room for, so a
+    // machine with thirty models loaded does not need a screen thirty rows tall.
+    let start = if models.len() <= body {
+        0
+    } else {
+        selected
+            .saturating_sub(body / 2)
+            .min(models.len().saturating_sub(body))
+    };
+    let end = (start + body).min(models.len());
+
+    let mut rows = vec![crate::input::fit(
+        "Select a model — Up/Down to move, Enter to confirm, Esc to cancel",
+        columns,
+    )];
+    for (offset, model) in models[start..end].iter().enumerate() {
+        let line = if start + offset == selected {
+            format!("> {} <", model)
+        } else {
+            format!("  {}", model)
+        };
+        rows.push(crate::input::fit(&line, columns));
+    }
+
+    (rows, 1 + selected - start)
+}
+
 pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String>) -> Result<String> {
     if models.is_empty() {
         return Err(anyhow::anyhow!("No models available"));
@@ -1084,24 +1128,16 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
     let mut selected_index = 0;
 
     loop {
-        // Clear screen and move cursor to top
-        out!("{}{}", cursor::MoveTo(0, 0), Clear(ClearType::All));
-
-        outln!("Select a model (use Up/Down arrows, Enter to confirm):\n");
-
-        // Display models
-        for (index, model) in models.iter().enumerate() {
-            if index == selected_index {
-                outln!("> {} <", model);
-            } else {
-                outln!("  {}  ", model);
-            }
-        }
-
-        crate::out::flush();
+        let (width, height) = crossterm::terminal::size()
+            .map(|(columns, rows)| (columns as usize, rows as usize))
+            .unwrap_or((80, 24));
+        // Two rows left to the transcript, so the picker never becomes the whole screen.
+        let (rows, caret) = picker_rows(&models, selected_index, width.max(20), height.saturating_sub(2));
+        crate::out::set_region(rows, caret, 0);
 
         // Read key event
         let Some(event) = keys.next().await else {
+            crate::out::clear_region();
             return Err(anyhow::anyhow!("no interactive terminal to pick a model"));
         };
         // Anything that is not a keystroke redraws the list at the top of the loop instead
@@ -1131,6 +1167,7 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
                 break;
             }
             KeyCode::Esc => {
+                crate::out::clear_region();
                 return Err(anyhow::anyhow!("Model selection cancelled"));
             }
             _ => {
@@ -1139,8 +1176,9 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
         }
     }
 
-    // Clear screen one final time and show selection
-    out!("{}{}", cursor::MoveTo(0, 0), Clear(ClearType::All));
+    // The list comes off the screen; what was chosen goes into the transcript, which is
+    // where the rest of the session will be looking for it.
+    crate::out::clear_region();
     outln!("Selected model: {}\n", models[selected_index]);
 
     Ok(models[selected_index].clone())

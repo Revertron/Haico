@@ -9,14 +9,14 @@
 use crate::modes::Mode;
 use crate::out;
 use crate::tools::TodoItem;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::tty::IsTty;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 // The one thing that reads the keyboard.
 //
@@ -29,8 +29,21 @@ pub(crate) struct Keys {
 }
 
 impl Keys {
-    pub(crate) fn start() -> Self {
+    // `vt_input` says the console is delivering everything as escape sequences, which on
+    // Windows is the price of the mouse reporting anything at all. Crossterm's Windows
+    // reader has no escape parser — it maps one input record to one event — so in that
+    // mode the byte stream has to be read and parsed here instead.
+    pub(crate) fn start(vt_input: bool) -> Self {
         let (sender, events) = unbounded_channel();
+
+        #[cfg(windows)]
+        if vt_input {
+            vt::start(sender);
+            return Keys { events };
+        }
+        #[cfg(not(windows))]
+        let _ = vt_input;
+
         // A plain thread rather than a task: `event::read` blocks, and blocking a
         // tokio worker would stall every other future on that thread. It ends when
         // the receiver goes, which is when the process is on its way out anyway.
@@ -90,6 +103,10 @@ pub(crate) enum Input {
     // Ctrl+T, and the same arrangement: the editor does not own the plan panel either,
     // and the prompts that draw no panel simply ignore this.
     TogglePlan,
+    // Ctrl+O: show what the transcript folded away, or fold it back. The state lives in the
+    // writer rather than here, so unlike the two above this carries nothing — the caller
+    // just tells `out` to flip it.
+    ToggleExpand,
 }
 
 // How much of the plan the panel shows, cycled with Ctrl+T.
@@ -192,6 +209,18 @@ impl Editor {
             for ch in piece.chars() {
                 self.insert(ch);
             }
+        }
+    }
+
+    // What Ctrl+V and Shift+Insert both do. Goes through `paste` rather than inserting
+    // the text directly, so a clipboard holding several lines becomes several lines here
+    // instead of one long one with the breaks swallowed.
+    //
+    // Nothing happens where there is no clipboard to read — see the `clipboard` module for
+    // why that is only Windows.
+    fn paste_from_clipboard(&mut self) {
+        if let Some(text) = clipboard::read() {
+            self.paste(&text);
         }
     }
 
@@ -405,8 +434,15 @@ impl Editor {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match key.code {
-            // Shift+Enter is what most people reach for; Alt+Enter is the one that
-            // survives terminals which cannot tell Shift+Enter from Enter.
+            // Shift+Enter is what most people reach for; Alt+Enter is accepted too, for
+            // terminals that cannot tell Shift+Enter from Enter — though not on Windows,
+            // where the console keeps Alt+Enter for toggling its own full-screen mode and
+            // it never reaches here.
+            //
+            // The Windows console in VT input mode is one of those terminals, and that is
+            // the mode the full-screen renderer needs to get the wheel at all. `vt` puts
+            // the modifier back by asking Windows whether Shift is down at the moment the
+            // byte arrives; see `restore_shift`.
             KeyCode::Enter if shift || alt => self.split_line(),
             KeyCode::Enter => {
                 let text = self.lines.join("\n");
@@ -431,7 +467,18 @@ impl Editor {
             KeyCode::Char('u') if control => self.kill_to_start(),
             KeyCode::Char('k') if control => self.kill_to_end(),
             KeyCode::Char('w') if control => self.delete_word_back(),
+            KeyCode::Char('v') if control => self.paste_from_clipboard(),
+            KeyCode::Char('o') if control => return Some(Input::ToggleExpand),
             KeyCode::Char(ch) if !control => self.insert(ch),
+            // Shift+Insert is how a terminal has always pasted, and in the console it
+            // used to be the console's own doing. VT input mode ends that: the key is
+            // forwarded here like any other, so pasting is now haico's job.
+            //
+            // The modifier is not required. Insert means nothing else here, and accepting
+            // it either way means the paste still works whatever the terminal decides to
+            // do with the Shift — which, on the one key where the encoding drops modifiers,
+            // is not something to be relying on.
+            KeyCode::Insert => self.paste_from_clipboard(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete_forward(),
             KeyCode::Left if control || alt => self.column = self.word_start(),
@@ -454,7 +501,11 @@ impl Editor {
     // terminal wrapped on its own is two rows it would not know about.
     pub(crate) fn rows(&self, prompt: &str, width: usize) -> (Vec<String>, usize, usize) {
         let indent = " ".repeat(prompt.chars().count());
-        let width = width.max(prompt.chars().count() + 8);
+        // A column short of the edge, for the reason `bar` gives: a row that fills the
+        // last cell leaves the terminal with a wrap pending, and a wrap on the bottom row
+        // scrolls the screen out from under a writer that is counting rows. Every other
+        // row of the region already stopped here; this one did not.
+        let width = width.saturating_sub(1).max(prompt.chars().count() + 8);
 
         let mut rows: Vec<String> = Vec::new();
         let mut caret = (0usize, 0usize);
@@ -679,7 +730,7 @@ const PLAN_MAX_ROWS: usize = 10;
 // Cut a plain-text row down to the room it has, for the same reason `bar` does it: a row
 // the terminal wraps on its own is a row the writer cannot count, and the region's height
 // is wrong from then on.
-fn fit(text: &str, columns: usize) -> String {
+pub(crate) fn fit(text: &str, columns: usize) -> String {
     let length = text.chars().count();
     if length <= columns || columns == 0 {
         return text.to_string();
@@ -777,6 +828,32 @@ pub(crate) fn plan_rows(
     rows
 }
 
+// How far an event asks the transcript to move, if it asks at all. Negative is backward,
+// into what has already gone past.
+//
+// The wheel only ever arrives because the full-screen renderer asked the terminal for
+// button reporting; under the inline renderer the terminal keeps the wheel to itself and
+// `out::scroll` does nothing anyway. Home and End are already the editor's, so paging is
+// on PageUp and PageDown, which nothing else wanted.
+fn scroll_rows(event: &Event) -> Option<isize> {
+    // A page is a screenful less two rows, so a couple of lines of context carry over and
+    // the reader can see where they were.
+    let page = || out::viewport_rows().saturating_sub(2).max(1) as isize;
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-3),
+            MouseEventKind::ScrollDown => Some(3),
+            _ => None,
+        },
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::PageUp => Some(-page()),
+            KeyCode::PageDown => Some(page()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     let width = terminal_width();
     let (mut rows, caret_row, caret_column) = editor.rows(PROMPT, width);
@@ -832,21 +909,29 @@ pub(crate) async fn read_text(keys: &mut Keys, editor: &mut Editor, prompt: &str
     loop {
         let (rows, caret_row, caret_column) = editor.rows(prompt, terminal_width());
         out::set_region(rows, caret_row, caret_column);
-        match keys.next().await {
-            None => return Input::Eof,
-            Some(Event::Key(key)) => match editor.key(key) {
+        let Some(event) = keys.next().await else {
+            return Input::Eof;
+        };
+        if let Some(delta) = scroll_rows(&event) {
+            out::scroll(delta);
+            continue;
+        }
+        match event {
+            Event::Key(key) => match editor.key(key) {
                 // This prompt draws no plan panel, so there is nothing to fold.
                 Some(Input::TogglePlan) => {}
+                Some(Input::ToggleExpand) => out::toggle_expand(),
                 Some(input) => {
+                    out::follow();
                     out::clear_region();
                     return input;
                 }
                 None => {}
             },
-            Some(Event::Paste(text)) => editor.paste(&text),
+            Event::Paste(text) => editor.paste(&text),
             // Redrawn at the top of the loop with the new width.
-            Some(Event::Resize(..)) => {}
-            Some(_) => {}
+            Event::Resize(..) => {}
+            _ => {}
         }
     }
 }
@@ -877,20 +962,30 @@ pub(crate) async fn read_command(
                 plan: *plan,
             },
         );
-        match keys.next().await {
-            None => return Input::Eof,
-            Some(Event::Key(key)) => match editor.key(key) {
+        let Some(event) = keys.next().await else {
+            return Input::Eof;
+        };
+        if let Some(delta) = scroll_rows(&event) {
+            out::scroll(delta);
+            continue;
+        }
+        match event {
+            Event::Key(key) => match editor.key(key) {
                 Some(Input::CycleMode) => *mode = mode.next(),
                 Some(Input::TogglePlan) => *plan = plan.next(),
+                Some(Input::ToggleExpand) => out::toggle_expand(),
                 Some(input) => {
+                    // Whatever was just typed is about to be answered, and the answer goes
+                    // on the end: a view still held back would miss its own reply.
+                    out::follow();
                     out::clear_region();
                     return input;
                 }
                 None => {}
             },
-            Some(Event::Paste(text)) => editor.paste(&text),
-            Some(Event::Resize(..)) => {}
-            Some(_) => {}
+            Event::Paste(text) => editor.paste(&text),
+            Event::Resize(..) => {}
+            _ => {}
         }
     }
 }
@@ -913,13 +1008,24 @@ pub(crate) fn while_working(
     plan: &mut PlanView,
     event: Event,
 ) -> WhileWorking {
+    // Reading back through the transcript while the model works is the whole point of
+    // being able to scroll at all, so this comes before anything that might consume the
+    // key. What arrives while the view is held back leaves it where it is.
+    if let Some(delta) = scroll_rows(&event) {
+        out::scroll(delta);
+        return WhileWorking::Nothing;
+    }
+
     match event {
         Event::Key(key) => {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
                 return WhileWorking::Interrupt;
             }
             match editor.key(key) {
-                Some(Input::Text(text)) => WhileWorking::Queued(text),
+                Some(Input::Text(text)) => {
+                    out::follow();
+                    WhileWorking::Queued(text)
+                }
                 // Ctrl+C means the same thing here as Esc does.
                 Some(Input::Interrupted) => WhileWorking::Interrupt,
                 Some(Input::CycleMode) => {
@@ -931,6 +1037,10 @@ pub(crate) fn while_working(
                     *plan = plan.next();
                     WhileWorking::Nothing
                 }
+                Some(Input::ToggleExpand) => {
+                    out::toggle_expand();
+                    WhileWorking::Nothing
+                }
                 // Ctrl+D is for leaving, and leaving mid-turn is what Esc is for.
                 Some(Input::Eof) | None => WhileWorking::Nothing,
             }
@@ -940,6 +1050,275 @@ pub(crate) fn while_working(
             WhileWorking::Nothing
         }
         _ => WhileWorking::Nothing,
+    }
+}
+
+// Reading the Windows console as a byte stream.
+//
+// Only reached when the full-screen renderer has put the console into VT input mode, which
+// it does because that is the only configuration where the wheel reports at all *and*
+// Shift+drag still selects text. The cost is that every key now arrives as an escape
+// sequence, and crossterm reports those a character at a time: an arrow key comes through
+// as "[", "A", then Up, and a mouse report comes through as its characters and nothing
+// else. Filtering that after the fact would mean guessing whether a "[" starts a sequence
+// or is someone typing `arr[i]`, and guessing wrong eats pasted code. Parsing the bytes
+// removes the guess.
+//
+// `terminput` is crossterm's own escape parser published separately, so this is the same
+// parsing that happens on Unix, just applied where crossterm declines to.
+#[cfg(windows)]
+mod vt {
+    use super::{Event, UnboundedSender};
+    use std::io::Read;
+
+    pub(super) fn start(sender: UnboundedSender<Event>) {
+        let sizes = sender.clone();
+        std::thread::spawn(move || read_stream(sender));
+        std::thread::spawn(move || watch_size(sizes));
+    }
+
+    fn read_stream(sender: UnboundedSender<Event>) {
+        let mut stdin = std::io::stdin();
+        let mut chunk = [0u8; 1024];
+        let mut buffer: Vec<u8> = Vec::new();
+
+        loop {
+            let read = match stdin.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            buffer.extend_from_slice(&chunk[..read]);
+
+            loop {
+                if buffer.is_empty() {
+                    break;
+                }
+                // An Escape all on its own is an Escape; an Escape with anything behind it
+                // is the start of a sequence. The console writes a sequence in one piece,
+                // so by the time the buffer holds nothing but the Escape, that is what it
+                // was — which is what lets Esc interrupt a turn without waiting on a timer.
+                if buffer.len() == 1 && buffer[0] == 0x1B {
+                    buffer.clear();
+                    if sender.send(Event::Key(super::KeyCode::Esc.into())).is_err() {
+                        return;
+                    }
+                    break;
+                }
+                match take_event(&mut buffer) {
+                    Some(Some(event)) => {
+                        if sender.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    // Consumed, but nothing haico has a use for.
+                    Some(None) => {}
+                    // Incomplete: the rest of it is still on its way.
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // One event off the front of the buffer, or `None` while it is still incomplete.
+    //
+    // The shortest prefix that parses is the event, and is also how many bytes it took.
+    // Asking about the whole buffer instead would be wrong in both directions: `parse_from`
+    // ignores trailing bytes, so it would swallow the keystroke behind this one.
+    fn take_event(buffer: &mut Vec<u8>) -> Option<Option<Event>> {
+        // A leading Escape is never the whole event here — the caller has already dealt
+        // with the case where it is — so the search starts past it.
+        let first = if buffer[0] == 0x1B { 2 } else { 1 };
+        for end in first..=buffer.len() {
+            match terminput::Event::parse_from(&buffer[..end]) {
+                Ok(Some(parsed)) => {
+                    buffer.drain(..end);
+                    return Some(
+                        terminput_crossterm::to_crossterm(parsed)
+                            .ok()
+                            .map(restore_shift),
+                    );
+                }
+                Ok(None) => continue,
+                Err(_) => {
+                    // Nothing beginning here can ever parse, so it goes rather than
+                    // blocking every keystroke that follows it.
+                    buffer.drain(..1);
+                    return Some(None);
+                }
+            }
+        }
+        None
+    }
+
+    // The one thing the byte stream cannot say, asked of Windows directly.
+    //
+    // Enter is the single byte 0x0D whether or not Shift was held. The legacy encoding has
+    // a modifier field only for keys sent as CSI sequences — that is how `ESC[1;5D` manages
+    // to mean Ctrl+Left — and a key sent as a bare control character has nowhere to put
+    // one. So the state is gone before any parser could see it, and no amount of parsing
+    // brings it back.
+    //
+    // But it is only gone from the *encoding*. The key is still physically down: this runs
+    // within microseconds of the console writing the byte, and nobody releases Shift that
+    // fast. `GetAsyncKeyState` reports the live physical state and, unlike `GetKeyState`,
+    // needs no message queue — which a console program does not have.
+    //
+    // Deliberately only Enter. Every other key carries its own modifiers correctly, and
+    // second-guessing state we already have would be strictly worse than trusting it.
+    fn restore_shift(event: Event) -> Event {
+        let Event::Key(mut key) = event else {
+            return event;
+        };
+        if key.code == super::KeyCode::Enter
+            && key.modifiers.is_empty()
+            && shift_is_down()
+        {
+            key.modifiers |= super::KeyModifiers::SHIFT;
+        }
+        Event::Key(key)
+    }
+
+    fn shift_is_down() -> bool {
+        extern "system" {
+            fn GetAsyncKeyState(key: i32) -> i16;
+        }
+        const VK_SHIFT: i32 = 0x10;
+        // The high bit is "down right now"; the low bit is "was pressed since last asked"
+        // and is not what this wants.
+        unsafe { GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000 != 0 }
+    }
+
+    // VT input reports keys and the mouse and says nothing about the window changing size,
+    // and the console records that used to carry that are no longer being read. Polling is
+    // the whole of the fix: dragging a window edge is a human-speed thing, and four times a
+    // second is faster than anyone can do it.
+    fn watch_size(sender: UnboundedSender<Event>) {
+        let mut last = crossterm::terminal::size().unwrap_or((80, 24));
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let Ok(size) = crossterm::terminal::size() else {
+                continue;
+            };
+            if size != last {
+                last = size;
+                if sender.send(Event::Resize(size.0, size.1)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::take_event;
+        use crossterm::event::{Event, KeyCode, MouseEventKind};
+
+        fn drain(bytes: &[u8]) -> (Vec<Event>, Vec<u8>) {
+            let mut buffer = bytes.to_vec();
+            let mut events = Vec::new();
+            while !buffer.is_empty() {
+                match take_event(&mut buffer) {
+                    Some(Some(event)) => events.push(event),
+                    Some(None) => {}
+                    None => break,
+                }
+            }
+            (events, buffer)
+        }
+
+        // The whole reason the bytes are parsed rather than crossterm's per-record events
+        // being filtered: an arrow key is one event, not "[" then "A" then Up.
+        #[test]
+        fn an_arrow_key_is_one_event_and_not_its_characters() {
+            let (events, rest) = drain(b"\x1b[A");
+
+            assert_eq!(events.len(), 1, "{:?}", events);
+            assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::Up));
+            assert!(rest.is_empty());
+        }
+
+        // `parse_from` is happy to ignore trailing bytes, so asking it about the whole
+        // buffer would take the next keystroke along with this one. Only the shortest
+        // prefix that parses may be consumed.
+        #[test]
+        fn two_sequences_running_together_stay_two_events() {
+            let (events, rest) = drain(b"\x1b[A\x1b[B");
+
+            assert_eq!(events.len(), 2, "{:?}", events);
+            assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::Up));
+            assert!(matches!(events[1], Event::Key(key) if key.code == KeyCode::Down));
+            assert!(rest.is_empty());
+        }
+
+        // The point of the exercise.
+        #[test]
+        fn a_wheel_report_becomes_a_scroll_event() {
+            let (events, _) = drain(b"\x1b[<64;10;5M");
+
+            assert_eq!(events.len(), 1, "{:?}", events);
+            let Event::Mouse(mouse) = events[0] else {
+                panic!("not a mouse event: {:?}", events[0]);
+            };
+            assert!(
+                matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown),
+                "{:?}",
+                mouse.kind
+            );
+        }
+
+        // A filter working on crossterm's per-character events could not tell this from the
+        // start of a sequence, and eating it would corrupt pasted code.
+        #[test]
+        fn ordinary_text_with_a_bracket_in_it_survives() {
+            let (events, rest) = drain(b"arr[i]");
+
+            let typed: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Key(key) => match key.code {
+                        KeyCode::Char(ch) => Some(ch),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(typed, "arr[i]");
+            assert!(rest.is_empty());
+        }
+
+        // Half a sequence is not an event yet, and must not be mistaken for one.
+        #[test]
+        fn an_unfinished_sequence_waits_for_the_rest_of_itself() {
+            let mut buffer = b"\x1b[".to_vec();
+
+            assert!(take_event(&mut buffer).is_none());
+            assert_eq!(buffer, b"\x1b[", "an incomplete sequence was consumed");
+
+            buffer.push(b'C');
+            let event = take_event(&mut buffer).expect("now complete").expect("an event");
+            assert!(matches!(event, Event::Key(key) if key.code == KeyCode::Right));
+        }
+    }
+}
+
+// Reading the clipboard, for the paste the terminal is no longer doing for us.
+//
+// Windows only, and deliberately so: this exists because VT input mode stops the console
+// acting on Shift+Insert itself. Every other terminal still handles that key on its own
+// and never forwards it, so there is nothing here to do and no dependency worth taking on
+// to do it.
+mod clipboard {
+    #[cfg(windows)]
+    pub(super) fn read() -> Option<String> {
+        // Empty is not worth a paste, and a clipboard holding an image rather than text
+        // reports an error rather than something to insert.
+        clipboard_win::get_clipboard_string()
+            .ok()
+            .filter(|text| !text.is_empty())
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn read() -> Option<String> {
+        None
     }
 }
 

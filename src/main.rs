@@ -110,23 +110,36 @@ fn print_repl_help() {
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
     outln!();
     outln!("At the prompt: up/down for history, Shift+Enter for another line,");
+    outln!("               Ctrl+V or Shift+Insert to paste,");
     outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
     outln!("While working: keep typing — Enter queues the message for when the turn");
     outln!("               ends. Esc interrupts and returns to the prompt.");
     outln!("Either way:    Ctrl+T cycles the plan panel — windowed, all of it, one line.");
+    outln!("               Ctrl+O opens what the transcript folded away — the full tool");
+    outln!("               output, whole diffs, the reasoning — and folds it back.");
+    outln!("Fullscreen:    the wheel and PageUp/PageDown scroll the transcript; the view");
+    outln!("               stays put while output arrives and follows again at the end.");
+    outln!("               Set tui = \"fullscreen\" in the config, or HAICO_TUI=fullscreen.");
+    outln!("               On Windows the wheel needs Shift held to select text; set");
+    outln!("               mouse = \"off\" to keep plain drag-selection instead.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
     outln!();
 }
 
-// Raw mode has to come off however the program leaves, including the error paths that
-// return early. A terminal left in raw mode stops echoing what is typed into it, which
-// looks exactly like a hung shell.
+// Raw mode and the alternate screen both have to come off however the program leaves,
+// including the error paths that return early and a panic on its way out. A terminal left
+// in raw mode stops echoing what is typed into it, which looks exactly like a hung shell;
+// one left on the alternate screen loses the session entirely.
+//
+// The order matters. `leave_screen` writes the transcript back to the main screen, and it
+// does that while raw mode is still on so its line feeds still get their carriage returns.
 struct TerminalGuard(bool);
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.0 {
             out::clear_region();
+            out::leave_screen();
             let _ = crossterm::terminal::disable_raw_mode();
             out::set_raw(false);
         }
@@ -358,10 +371,19 @@ async fn main() -> Result<()> {
     // haico still works.
     let interactive = crate::input::stdin_is_a_terminal();
     let _terminal = TerminalGuard(interactive);
+    // Which renderer draws the session, and then the keyboard — in that order, because
+    // taking the screen is what decides how the keyboard has to be read. On Windows the
+    // mouse reports nothing at all until the console is in VT input mode, and from then on
+    // every key arrives as an escape sequence that has to be parsed rather than read off a
+    // record. Only ever the inline renderer when there is no terminal to own: a piped
+    // session has no viewport, and taking the alternate screen of something that is not a
+    // screen would put the escape sequences into whatever is reading the output.
     let mut keys = if interactive {
         crossterm::terminal::enable_raw_mode()?;
         out::set_raw(true);
-        Some(Keys::start())
+        let vt_input = config.tui == Tui::Fullscreen
+            && out::enter_screen(config.mouse == Mouse::Scroll);
+        Some(Keys::start(vt_input))
     } else {
         None
     };
@@ -588,8 +610,8 @@ async fn main() -> Result<()> {
                             outln!("Goodbye!");
                             break;
                         }
-                        // read_command handles these two itself; neither ends an entry.
-                        Input::CycleMode | Input::TogglePlan => continue,
+                        // read_command handles these itself; none of them ends an entry.
+                        Input::CycleMode | Input::TogglePlan | Input::ToggleExpand => continue,
                     }
                 }
                 None => match crate::input::read_piped_line() {
@@ -1174,6 +1196,16 @@ Usage: /set <name> <value>, or /set <name> unset
                                 streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
                                 if !streamed_thinking {
                                     streamed_thinking = true;
+                                    // Folded from the start rather than after the fact: the
+                                    // reasoning can run for pages, and the activity bar is
+                                    // already counting the characters as they arrive, so
+                                    // nothing about the wait goes unreported while it is
+                                    // closed. Ctrl+O opens it, and it stays open.
+                                    crate::out::begin_fold(&format!(
+                                        "{}○ (thinking){}",
+                                        SetForegroundColor(Color::DarkGrey),
+                                        ResetColor
+                                    ));
                                     out!(
                                         "{}○ {}",
                                         SetForegroundColor(Color::DarkGrey),
@@ -1192,8 +1224,12 @@ Usage: /set <name> <value>, or /set <name> unset
                                 if !streamed_any {
                                     streamed_any = true;
                                     // The answer starts on a row of its own, so it is not
-                                    // mistaken for the tail of the thinking above it.
+                                    // mistaken for the tail of the thinking above it. The
+                                    // reasoning is over the moment the answer begins, so
+                                    // its fold closes here and the answer is not swept into
+                                    // it.
                                     if streamed_thinking {
+                                        crate::out::end_fold();
                                         crate::out::ensure_line_start();
                                         outln!();
                                     }
@@ -1212,6 +1248,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 // The partial reply is dropped rather than stored: half a tool call in the
                 // history is worse than no reply at all. Everything before this turn stays
                 // consistent, so the conversation is still usable.
+                crate::out::end_fold();
                 if streamed_any {
                     out!("{}", markdown.finish(false));
                 }
@@ -1228,6 +1265,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // A dropped connection, a server-side error, or an unparseable body
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
+                    crate::out::end_fold();
                     if streamed_any || streamed_thinking {
                         outln!();
                     }
@@ -1241,6 +1279,8 @@ Usage: /set <name> <value>, or /set <name> unset
             // model whose entire reply is chain of thought with no content at all, which
             // is why nothing is re-printed from `message` here. All that is left is to
             // close whichever of the two was last on screen.
+            // A reply that was nothing but reasoning ends with its fold still open.
+            crate::out::end_fold();
             if streamed_any {
                 out!("{}", markdown.finish(false));
             }
@@ -1674,7 +1714,9 @@ Usage: /set <name> <value>, or /set <name> unset
                     if !prompted {
                         if let Some(diff) = file_change_diff(tool_name, &arguments) {
                             if let Some(preview) = change_preview(&diff) {
-                                out!("{}", preview);
+                                // The preview is a few lines of the change; the whole diff
+                                // waits behind it.
+                                crate::out::foldable(preview.trim_end_matches('\n'), &diff);
                             }
                         }
                     }
@@ -1728,8 +1770,11 @@ Usage: /set <name> <value>, or /set <name> unset
                         format!("Error: {}", e)
                     });
 
+                    // The summary is the row that used to be all there was: the first
+                    // line of the result, cut to fit. The result itself is kept behind it
+                    // now rather than thrown away, and Ctrl+O opens it.
                     if let Some(line) = tool_result_line(&tool_result) {
-                        outln!("{}", line);
+                        crate::out::foldable(&line, &tool_result);
                     }
 
                     // Add tool result

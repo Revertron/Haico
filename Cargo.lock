@@ -226,6 +226,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipboard-win"
+version = "5.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+dependencies = [
+ "error-code",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -614,6 +623,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "error-code"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,6 +852,7 @@ version = "0.2.9"
 dependencies = [
  "anyhow",
  "chrono",
+ "clipboard-win",
  "crossterm",
  "dom_smoothie",
  "ego-tree",
@@ -855,6 +871,8 @@ dependencies = [
  "serde",
  "serde_json",
  "similar 3.2.0",
+ "terminput",
+ "terminput-crossterm",
  "tokio",
  "toml",
  "url",
@@ -2337,6 +2355,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08"
 dependencies = [
  "new_debug_unreachable",
+]
+
+[[package]]
+name = "terminput"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fe296cb813b5bad99a8eb911e6a08e48f0854ee1e8b427073e657a509a7097"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "terminput-crossterm"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513aa30d046c9f1c2e31f119513bc058ad075c6b2266422372594bf900788738"
+dependencies = [
+ "crossterm",
+ "terminput",
 ]
 
 [[package]]
