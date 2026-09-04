@@ -171,14 +171,16 @@ impl LMStudioClient {
     pub(crate) async fn chat_completion_plain(
         &self,
         messages: Vec<Value>,
-        max_tokens: u64,
+        max_tokens: Option<u64>,
     ) -> Result<String> {
         let mut body = json!({
             "messages": messages,
             "stream": false,
             "temperature": 0.0,
-            "max_tokens": max_tokens,
         });
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         self.set_model(&mut body);
 
         let response = self.post_chat(&body).await?;
@@ -206,10 +208,19 @@ impl LMStudioClient {
         // back to it beats reporting an empty reply as a server failure. Both spellings are
         // in the wild, and a reviewer verdict lost to the wrong key would gate a call that
         // the model actually approved.
-        for key in ["reasoning_content", "reasoning"] {
-            let reasoning = message[key].as_str().unwrap_or("").trim();
-            if !reasoning.is_empty() {
-                return Ok(reasoning.to_string());
+        //
+        // Only trusted when the model actually finished. A reply cut short by max_tokens
+        // while still inside its own reasoning (finish_reason "length") leaves that field
+        // holding an unfinished scratchpad, not an answer — returning it verbatim is how a
+        // compressor's own mid-thought about how to summarize ends up stored as the
+        // compressed trace it was asked to produce instead.
+        let finish_reason = response["choices"][0]["finish_reason"].as_str();
+        if finish_reason != Some("length") {
+            for key in ["reasoning_content", "reasoning"] {
+                let reasoning = message[key].as_str().unwrap_or("").trim();
+                if !reasoning.is_empty() {
+                    return Ok(reasoning.to_string());
+                }
             }
         }
 
@@ -1050,6 +1061,48 @@ mod tests {
             normalize_base_url("http://example.com/api/v1"),
             "http://example.com/api"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_completion_trusts_the_reasoning_field_only_once_the_model_is_done() {
+        // Empty content, finish_reason "stop": this model always answers through the
+        // reasoning field, and that reply is complete, so it is the answer.
+        let body = json!({"choices": [{
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "", "reasoning_content": "the answer"}
+        }]})
+        .to_string();
+        let url = crate::testutil::serve_once(
+            Box::leak(body.into_boxed_str()),
+            "application/json",
+        )
+        .await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        let reply = client
+            .chat_completion_plain(vec![json!({"role": "user", "content": "hi"})], Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(reply, "the answer");
+
+        // Empty content, finish_reason "length": max_tokens landed while the model was
+        // still inside its own reasoning, so that field holds an unfinished scratchpad,
+        // not an answer. Trusting it verbatim is how a compressor's thinking about how to
+        // summarize ends up stored as the summary itself, so this must fail instead.
+        let body = json!({"choices": [{
+            "finish_reason": "length",
+            "message": {"role": "assistant", "content": "", "reasoning_content": "still working out how to"}
+        }]})
+        .to_string();
+        let url = crate::testutil::serve_once(
+            Box::leak(body.into_boxed_str()),
+            "application/json",
+        )
+        .await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        assert!(client
+            .chat_completion_plain(vec![json!({"role": "user", "content": "hi"})], Some(1000))
+            .await
+            .is_err());
     }
 
 }

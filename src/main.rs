@@ -1236,6 +1236,12 @@ Usage: /set <name> <value>, or /set <name> unset
         let mut run = (0usize, String::new());
         let mut nudged_at = 0usize;
 
+        // Cleared when compacting fails to get the history back under the line, which
+        // means the window is too small to hold even a summary of it. Trying again the
+        // next round would summarize the summary and throw the round away with it, so
+        // the turn runs on instead and lets the server error be the honest end of it.
+        let mut autocompact = true;
+
         loop {
             round += 1;
             // Re-read every round rather than captured once: approving a plan can switch
@@ -1243,6 +1249,77 @@ Usage: /set <name> <value>, or /set <name> unset
             if mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
                 outln!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
                 break;
+            }
+
+            // Auto mode is meant to run unattended, so the one thing it must not do at the
+            // edge of the window is stop and ask for /compact: there is nobody there to
+            // type it, and a job left running overnight would be found dead at the prompt.
+            // Checked here rather than at the end of a turn, where the old hint printed,
+            // because a long job lives inside this loop for hours and may never reach the
+            // end of a turn at all. The history is balanced at this point — every tool call
+            // from the round before already has its reply — so replacing it wholesale
+            // cannot orphan a tool_call_id, which is not true further down.
+            if mode == Mode::Auto
+                && autocompact
+                && estimate_tokens(&messages) > autocompact_threshold(context_tokens)
+            {
+                let status = status_line(&lm_client.model, &messages, context_tokens);
+                let compacted = work_with_input(
+                    &mut keys,
+                    &mut editor,
+                    &mut mode,
+                    &mut queued,
+                    &status,
+                    &server.todos,
+                    &mut plan_view,
+                    "Compacting context…",
+                    None,
+                    compact_history(&lm_client, &mut messages),
+                )
+                .await;
+
+                match compacted {
+                    Some(Ok(report)) => {
+                        // The same reclaim /compact does, for the same reason: the cache is
+                        // keyed to a history that no longer exists.
+                        review_cache.clear();
+                        outln!(
+                            "{}{}{}",
+                            SetForegroundColor(crate::input::BAR_BACKGROUND),
+                            report,
+                            ResetColor
+                        );
+                        // The compacted history ends on the assistant agreeing that it has
+                        // the notes, and asking for a reply straight after that is asking
+                        // the model to talk past itself. This says the one thing the notes
+                        // cannot: the task was mid-flight when the summarizer ran, and it
+                        // is the same task that continues.
+                        messages.push(json!({
+                            "role": "user",
+                            "content": "Your context was compacted mid-task. Continue the \
+                                        work described in the notes above from where it left \
+                                        off; do not start over."
+                        }));
+
+                        if estimate_tokens(&messages) > autocompact_threshold(context_tokens) {
+                            autocompact = false;
+                            outln!(
+                                "[the summary is still over {}% of the window; carrying on without compacting again]",
+                                (AUTOCOMPACT_FRACTION * 100.0) as usize
+                            );
+                        }
+                    }
+                    // Not fatal by itself: the request below may still fit, and if it does
+                    // not, the server's own error ends the turn — exactly what would have
+                    // happened with none of this here.
+                    Some(Err(e)) => outln!("\n[error] could not compact: {:#}\n", e),
+                    // Esc during the summarization is Esc during the turn, as everywhere
+                    // else in this loop.
+                    None => {
+                        outln!("\n[interrupted]\n");
+                        break;
+                    }
+                }
             }
 
             let thinking = get_thinking_message().to_string();
@@ -1716,7 +1793,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             &status,
                             &server.todos,
                             &mut plan_view,
-                            "🤖 Reviewing this call…",
+                            "🤖 Reviewing tool call…",
                             // The reviewer's own reply is not streamed, so there is
                             // nothing to count.
                             None,
@@ -2038,17 +2115,6 @@ Usage: /set <name> <value>, or /set <name> unset
                 );
                 set_system_message(&mut messages, system_prompt_content.as_deref());
             }
-        }
-
-        // Say something before the context runs out rather than after: a local model that
-        // silently drops the front of the conversation just starts behaving oddly, with no
-        // indication why. Compaction stays manual — dropping detail is the user's call.
-        let used = estimate_tokens(&messages);
-        if used > compact_hint_threshold(context_tokens) {
-            outln!(
-                "\n[context: ~{} of {} tokens. Run /compact to summarize and free space.]",
-                used, context_tokens
-            );
         }
 
         // Persisted every turn, so a crash does not cost the session's history.

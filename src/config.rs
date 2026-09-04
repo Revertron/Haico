@@ -547,6 +547,20 @@ pub(crate) fn compact_hint_threshold(context_tokens: usize) -> usize {
 }
 
 
+// Fraction of the window at which auto mode compacts itself instead of asking. Higher than
+// the hint above because this one throws detail away with nobody consulted: everything
+// under it is still a conversation the user could have chosen to keep whole. It does not
+// need to leave room for the summarization request itself — that goes out as a fresh two
+// message conversation whose transcript `render_transcript` caps at 60k characters, not as
+// the history it is about to replace.
+
+pub(crate) const AUTOCOMPACT_FRACTION: f64 = 0.90;
+
+pub(crate) fn autocompact_threshold(context_tokens: usize) -> usize {
+    (context_tokens as f64 * AUTOCOMPACT_FRACTION) as usize
+}
+
+
 pub(crate) fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
     print!("{}", opts.usage(&brief));
@@ -802,6 +816,20 @@ mod tests {
         assert!(large > 90_000, "got {}", large);
         // And it has to leave room for the summarization round-trip itself.
         assert!(large < DEFAULT_CONTEXT_TOKENS);
+    }
+
+
+    #[test]
+    fn auto_compaction_fires_after_the_hint_and_before_the_window_ends() {
+        use crate::{autocompact_threshold, compact_hint_threshold, DEFAULT_CONTEXT_TOKENS};
+
+        for window in [8_192usize, 32_768, DEFAULT_CONTEXT_TOKENS] {
+            // Auto mode summarizes itself only once the point where a user sitting there
+            // would have been told to has gone by unheeded...
+            assert!(compact_hint_threshold(window) < autocompact_threshold(window));
+            // ...and while there is still window left for the turn to carry on into.
+            assert!(autocompact_threshold(window) < window);
+        }
     }
 
 

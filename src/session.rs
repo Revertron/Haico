@@ -303,11 +303,11 @@ const COMPRESS_PROMPT: &str = "You compress your own chain of thought so you can
      compressed thinking, the way the trace itself is written — not as a report about it. \
      No preamble, no headings, no more than a short paragraph.";
 
-// Generous for what should be a short answer, for the same reason the auto-mode reviewer's
-// cap is: the compressor is the same model, so it may well think before it summarizes, and
-// a cap that lands mid-thought yields a reply with no summary in it at all.
-
-const COMPRESS_MAX_TOKENS: u64 = 1000;
+// Uncapped: the compressor is the same model, so it thinks before it summarizes, and a cap
+// that lands mid-thought would leave nothing but an unfinished scratchpad to store. Letting
+// it run to its own stop is what `chat_completion_plain`'s finish_reason check is for — a
+// reply that still hit "length" (the model's own context limit, not an artificial one here)
+// is treated as a failure rather than trusted as a summary.
 
 // The chain of thought on an assistant message, if it has one worth acting on.
 
@@ -437,7 +437,7 @@ pub(crate) async fn apply_reasoning(
                         json!({"role": "system", "content": COMPRESS_PROMPT}),
                         json!({"role": "user", "content": original.clone()}),
                     ],
-                    COMPRESS_MAX_TOKENS,
+                    None,
                 )
                 .await
             {

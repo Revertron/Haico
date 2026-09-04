@@ -512,7 +512,7 @@ pub(crate) async fn judge_tool_call(
     // a reasoning model thinks first, and a cap that cuts it off mid-thought yields a reply
     // with no JSON in it at all. That surfaced as "Review failed: no JSON object" on a
     // perfectly ordinary `cargo build`.
-    let reply = client.chat_completion_plain(messages, 1000).await?;
+    let reply = client.chat_completion_plain(messages, Some(2000)).await?;
 
     // The reply is already in the log, written by the client. This adds only which end of
     // the parse it came out of, so a run of failures can be read back without re-reading
