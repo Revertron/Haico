@@ -266,12 +266,65 @@ pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
     builder
 }
 
+// What a command chained with `;` is told when it is refused on Windows.
+//
+// It has to name the replacement, not just the problem: a model that is only told `;` failed
+// re-sends the same line with the halves reordered.
+#[cfg(target_os = "windows")]
+pub(crate) const SEMICOLON_REFUSAL: &str = "Not run: `;` does not chain commands in Windows cmd — \
+    it is an ordinary argument delimiter, so everything after it would be handed to the first \
+    program as extra arguments instead of being run. Use `&&` to run the next command only if \
+    this one succeeds, `&` to run it either way, or send separate run_command calls.";
+
+// Does this command line try to chain with `;`?
+//
+// cmd.exe has no `;` operator, and the way that fails is worse than not running at all:
+// `curl -sS URL ; if exist hdr.txt type hdr.txt` reached curl as one long argument list, so
+// curl went off trying to resolve `if`, `exist` and `hdr.txt` as hostnames. The errors all
+// come from the *first* program, which reads like that program misbehaving rather than like
+// the second command never having existed — the model debugs the wrong thing. The tool
+// description has said "chain with &&" all along and a small model writes `;` anyway, so it is
+// caught here instead, where the answer can name the fix.
+//
+// Only a `;` with whitespace on one side of it is a separator. `set PATH=C:\a;C:\b` and
+// `for %i in (a;b) do ...` are ordinary cmd lines and must still run.
+//
+// Double quotes are tracked and single quotes deliberately are not: `'` has no quoting meaning
+// in cmd, so a `;` between single quotes really is a separator there. This is the one place
+// that differs from `command_segments`, which is cross-platform and must assume sh.
+#[cfg(target_os = "windows")]
+pub(crate) fn chains_with_semicolon(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_double = false;
+
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => in_double = !in_double,
+            ';' if !in_double => {
+                let before = i.checked_sub(1).map(|j| chars[j]);
+                let after = chars.get(i + 1).copied();
+                if before.is_none_or(char::is_whitespace) || after.is_none_or(char::is_whitespace) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 #[tool_router(router = shell_router, vis = "pub(crate)")]
 impl MyMcpServer {
     #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
     pub(crate) async fn run_command(&self, params: Parameters<RunCommandParams>) -> Result<CallToolResult, McpError> {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
+
+        #[cfg(target_os = "windows")]
+        if chains_with_semicolon(&command) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
+        }
 
         use std::time::Duration;
 
@@ -422,6 +475,11 @@ impl MyMcpServer {
 
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(30).min(300);
+
+        #[cfg(target_os = "windows")]
+        if chains_with_semicolon(&command) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
+        }
 
         let mut builder = shell_command(&command);
         builder
@@ -1002,6 +1060,38 @@ mod tests {
         // coming back empty.
         assert!(out.contains("[Output truncated"), "got {} bytes", out.len());
         assert!(out.len() > 29_000, "only got {} bytes", out.len());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn semicolon_is_a_separator_only_where_cmd_would_have_run_two_commands() {
+        use crate::tools::shell::chains_with_semicolon;
+
+        assert!(chains_with_semicolon("curl URL ; type hdr.txt"));
+        assert!(chains_with_semicolon("curl URL; type hdr.txt"));
+        assert!(chains_with_semicolon("cargo build ;"));
+
+        // Ordinary cmd lines that happen to contain a semicolon, and must still run.
+        assert!(!chains_with_semicolon("set PATH=C:\\a;C:\\b"));
+        assert!(!chains_with_semicolon("for %i in (a;b) do @echo %i"));
+        assert!(!chains_with_semicolon("cargo build"));
+
+        // Quoted text is an argument, not a chain — but only double quotes quote in cmd, so a
+        // semicolon between single quotes is still a separator there.
+        assert!(!chains_with_semicolon("echo \"a ; b\""));
+        assert!(chains_with_semicolon("echo 'a ; b'"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn run_command_refuses_a_semicolon_chain_and_says_what_to_use_instead() {
+        let server = test_server();
+
+        // Without the refusal cmd hands "; echo second" to the first echo as arguments, so the
+        // command "succeeds" having run only half of what was asked.
+        let (ok, out) = run(&server, "echo first ; echo second", Some(30), None).await;
+        assert!(!ok, "the chain should have been refused, got: {}", out);
+        assert!(out.contains("&&"), "the refusal must name the fix, got: {}", out);
     }
 
 }

@@ -106,6 +106,7 @@ Working directory: $pwd
 Is directory a git repo: $is_repo
 Platform: $platform
 OS Version: $os_version
+Shell run_command uses: $shell
 Today's date: $date
 </env>
 You are powered by the model named $model.

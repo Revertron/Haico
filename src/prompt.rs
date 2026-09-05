@@ -56,6 +56,15 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
 
     let os_version = std::env::consts::OS;
 
+    // Naming the shell is not a detail: cmd and sh disagree on the things a model reaches for
+    // without thinking — `;`, `/dev/null`, heredocs — and "Platform: win32" above was evidently
+    // not enough to stop a POSIX one-liner being written for it.
+    let shell = if cfg!(target_os = "windows") {
+        "cmd.exe — use cmd syntax: chain with && or &, never ';'; no /dev/null and no heredocs"
+    } else {
+        "sh"
+    };
+
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let (branch, git_status, last_5_commits) = if is_repo {
@@ -80,6 +89,7 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
         .replace("$is_repo", &is_repo.to_string())
         .replace("$platform", platform)
         .replace("$os_version", os_version)
+        .replace("$shell", shell)
         .replace("$date", &date)
         .replace("$branch", &branch)
         .replace("$main_branch", &main_branch)
