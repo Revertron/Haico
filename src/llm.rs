@@ -73,6 +73,7 @@ pub(crate) struct LMStudioClient {
     pub(crate) max_tokens: Option<u64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) top_k: Option<u64>,
+    pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
 }
 
@@ -88,6 +89,7 @@ impl LMStudioClient {
             max_tokens: None,
             top_p: None,
             top_k: None,
+            min_p: None,
             repeat_penalty: None,
         }
     }
@@ -98,6 +100,7 @@ impl LMStudioClient {
         self.max_tokens = settings.max_tokens.value;
         self.top_p = settings.top_p.value;
         self.top_k = settings.top_k.value;
+        self.min_p = settings.min_p.value;
         self.repeat_penalty = settings.repeat_penalty.value;
     }
 
@@ -117,6 +120,9 @@ impl LMStudioClient {
         // unless the user asked for them.
         if let Some(top_k) = self.top_k {
             body["top_k"] = json!(top_k);
+        }
+        if let Some(min_p) = self.min_p {
+            body["min_p"] = json!(min_p);
         }
         if let Some(repeat_penalty) = self.repeat_penalty {
             body["repeat_penalty"] = json!(repeat_penalty);
@@ -840,12 +846,20 @@ mod tests {
 
         // A strictly-OpenAI endpoint must never see the extensions unasked.
         assert!(sent.get("top_k").is_none(), "sent: {}", sent);
+        assert!(sent.get("min_p").is_none(), "sent: {}", sent);
         assert!(sent.get("repeat_penalty").is_none(), "sent: {}", sent);
 
         // Configured: they must actually arrive.
         let (url, captured) = serve_once_capturing(sse, "text/event-stream").await;
         let mut client = crate::LMStudioClient::new(url, "m".to_string(), None);
-        client.apply_settings(&settings_of(Some(0.2), Some(512), None, Some(40), Some(1.15)));
+        client.apply_settings(&settings_of(
+            Some(0.2),
+            Some(512),
+            None,
+            Some(40),
+            Some(0.05),
+            Some(1.15),
+        ));
         client
             .chat_completion_streaming(vec![], vec![], |_| {})
             .await
@@ -857,6 +871,7 @@ mod tests {
         // Extensions rather than OpenAI fields, but the local servers this targets read
         // them, so they have to arrive under exactly these names.
         assert_eq!(sent["top_k"], 40);
+        assert_eq!(sent["min_p"], 0.05);
         assert_eq!(sent["repeat_penalty"], 1.15);
         // top_k is a count: sending 40.0 where an integer is wanted invites a 400.
         assert!(sent["top_k"].is_u64(), "top_k went out as {}", sent["top_k"]);
@@ -1015,13 +1030,13 @@ mod tests {
         let client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
         let mut body = json!({"messages": []});
         client.set_sampling(&mut body);
-        for field in ["temperature", "max_tokens", "top_p", "top_k", "repeat_penalty"] {
+        for field in ["temperature", "max_tokens", "top_p", "top_k", "min_p", "repeat_penalty"] {
             assert!(body.get(field).is_none(), "{} should not be sent", field);
         }
 
         // Only what is configured gets sent.
         let mut client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
-        client.apply_settings(&settings_of(Some(0.25), None, Some(0.8), None, None));
+        client.apply_settings(&settings_of(Some(0.25), None, Some(0.8), None, None, None));
         let mut body = json!({"messages": []});
         client.set_sampling(&mut body);
         assert_eq!(body["temperature"], 0.25);

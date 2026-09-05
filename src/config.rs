@@ -103,6 +103,7 @@ pub(crate) struct Config {
     pub(crate) max_tokens_arg: Option<u64>,
     pub(crate) top_p_arg: Option<f64>,
     pub(crate) top_k_arg: Option<u64>,
+    pub(crate) min_p_arg: Option<f64>,
     pub(crate) repeat_penalty_arg: Option<f64>,
     // The parsed config file, consulted again whenever the model changes.
     pub(crate) file: FileConfig,
@@ -132,6 +133,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("", "max-tokens", "Cap on tokens generated per reply (default: leave it to the server)", "N");
     opts.optopt("", "top-p", "Nucleus sampling cutoff (default: leave it to the server)", "VALUE");
     opts.optopt("", "top-k", "Top-k sampling cutoff (default: leave it to the server)", "N");
+    opts.optopt("", "min-p", "Minimum-probability sampling cutoff (default: leave it to the server)", "VALUE");
     opts.optopt("", "repeat-penalty", "Repetition penalty (default: leave it to the server)", "VALUE");
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
@@ -247,6 +249,9 @@ pub(crate) fn parse_config() -> Result<Config> {
     let top_k_arg = matches
         .opt_str("top-k")
         .and_then(|value| value.trim().parse::<u64>().ok());
+    let min_p_arg = matches
+        .opt_str("min-p")
+        .and_then(|value| value.trim().parse::<f64>().ok());
     let repeat_penalty_arg = matches
         .opt_str("repeat-penalty")
         .and_then(|value| value.trim().parse::<f64>().ok());
@@ -267,6 +272,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         max_tokens_arg,
         top_p_arg,
         top_k_arg,
+        min_p_arg,
         repeat_penalty_arg,
         file: file_config,
         config_path,
@@ -303,6 +309,7 @@ pub(crate) struct ModelSettingsFile {
     pub(crate) max_tokens: Option<u64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) top_k: Option<u64>,
+    pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
     // "keep" (default), "compress" or "drop". Layered like the sampling settings rather
     // than per-model only, but it belongs here first: whether a model even produces a
@@ -343,6 +350,7 @@ pub(crate) struct FileConfig {
     pub(crate) max_tokens: Option<u64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) top_k: Option<u64>,
+    pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
@@ -436,6 +444,7 @@ pub(crate) struct ResolvedSettings {
     pub(crate) max_tokens: Setting<u64>,
     pub(crate) top_p: Setting<f64>,
     pub(crate) top_k: Setting<u64>,
+    pub(crate) min_p: Setting<f64>,
     pub(crate) repeat_penalty: Setting<f64>,
     // Not layered like the rest: it only exists per model, so there is nothing to fall
     // through to. Absent means true.
@@ -504,6 +513,7 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
         ),
         top_p: pick(config.top_p_arg, per_model.top_p, config.file.top_p),
         top_k: pick(config.top_k_arg, per_model.top_k, config.file.top_k),
+        min_p: pick(config.min_p_arg, per_model.min_p, config.file.min_p),
         repeat_penalty: pick(
             config.repeat_penalty_arg,
             per_model.repeat_penalty,
@@ -580,6 +590,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  temperature    = 0.2");
     println!("  top_p          = 0.95");
     println!("  top_k          = 40");
+    println!("  min_p          = 0.05");
     println!("  repeat_penalty = 1.1");
     println!("  use_system_prompt = false  # send only the project's own instructions");
     println!("  reasoning      = \"keep\"    # keep | compress | drop the chain of thought");
@@ -594,8 +605,8 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("own, and takes precedence over both. Both are sent even to a model configured");
     println!("with use_system_prompt = false.");
     println!("\nAnything left out is omitted from the request, so the server's own setting");
-    println!("for that model still applies. top_k and repeat_penalty are extensions that");
-    println!("llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
+    println!("for that model still applies. top_k, min_p and repeat_penalty are extensions");
+    println!("that llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
     println!("\nExamples:");
     println!("  {} --url http://127.0.0.1:15200  # Connect to LM Studio", program);
     println!("  {} --url http://127.0.0.1:11434  # Connect to Ollama (default)", program);
@@ -641,6 +652,7 @@ mod tests {
             max_tokens_arg: None,
             top_p_arg: None,
             top_k_arg: None,
+            min_p_arg: None,
             repeat_penalty_arg: None,
             file: toml::from_str(toml_text).expect("test config should parse"),
             config_path: None,
@@ -701,6 +713,7 @@ mod tests {
             [models."small-model"]
             context = 32768
             top_k = 40
+            min_p = 0.05
             repeat_penalty = 1.15
         "#;
 
@@ -719,10 +732,12 @@ mod tests {
         // The extensions layer the same way as everything else.
         assert_eq!(small.top_k.value, Some(40));
         assert_eq!(small.top_k.source, FROM_MODEL);
+        assert_eq!(small.min_p.value, Some(0.05));
         assert_eq!(small.repeat_penalty.value, Some(1.15));
         // ...and a model that does not name them leaves them unset, not inherited from a
         // sibling model's section.
         assert_eq!(big.top_k.value, None);
+        assert_eq!(big.min_p.value, None);
         assert_eq!(big.repeat_penalty.value, None);
 
         // A model with no section gets the top level.
@@ -748,6 +763,7 @@ mod tests {
         assert_eq!(bare.max_tokens.value, None);
         assert_eq!(bare.top_p.value, None);
         assert_eq!(bare.top_k.value, None);
+        assert_eq!(bare.min_p.value, None);
         assert_eq!(bare.repeat_penalty.value, None);
     }
 

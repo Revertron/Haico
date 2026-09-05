@@ -320,6 +320,7 @@ pub(crate) fn settings_of(
     max_tokens: Option<u64>,
     top_p: Option<f64>,
     top_k: Option<u64>,
+    min_p: Option<f64>,
     repeat_penalty: Option<f64>,
     ) -> crate::ResolvedSettings {
     // A fn, not a closure: closures cannot be generic, and these are f64 and u64.
@@ -333,6 +334,7 @@ pub(crate) fn settings_of(
         max_tokens: at(max_tokens),
         top_p: at(top_p),
         top_k: at(top_k),
+        min_p: at(min_p),
         repeat_penalty: at(repeat_penalty),
         use_system_prompt: true,
         reasoning_setting: at(None),

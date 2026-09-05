@@ -98,9 +98,10 @@ fn print_repl_help() {
     outln!("  /tools             List available tools and whether they prompt");
     outln!("  /model [name]      Switch model; with no name, pick from the server's list");
     outln!("  /config            Show the settings in force and where each came from");
-    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, repeat_penalty,");
-    outln!("                     max_tokens or reasoning_threshold ('/set <name> unset' to");
-    outln!("                     undo). '/temp' is short for '/set temperature'.");
+    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, min_p,");
+    outln!("                     repeat_penalty, max_tokens or reasoning_threshold ('/set");
+    outln!("                     <name> unset' to undo). '/temp' is short for '/set");
+    outln!("                     temperature'.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
@@ -869,6 +870,7 @@ In force for '{}':", lm_client.model);
             outln!("  temperature     {}", settings.temperature.describe());
             outln!("  top_p           {}", settings.top_p.describe());
             outln!("  top_k           {}", settings.top_k.describe());
+            outln!("  min_p           {}", settings.min_p.describe());
             outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
             outln!("  max_tokens      {}", settings.max_tokens.describe());
             // Shown as what is actually in force rather than as what the file said, since
@@ -915,6 +917,7 @@ In force for '{}':", lm_client.model);
                 outln!("  temperature     {}", settings.temperature.describe());
                 outln!("  top_p           {}", settings.top_p.describe());
                 outln!("  top_k           {}", settings.top_k.describe());
+                outln!("  min_p           {}", settings.min_p.describe());
                 outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
                 outln!("  max_tokens      {}", settings.max_tokens.describe());
                 outln!("  reasoning_threshold  {} tokens", reasoning_threshold);
@@ -929,6 +932,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 "temp" | "temperature" => "temperature",
                 "top_p" | "top-p" | "topp" => "top_p",
                 "top_k" | "top-k" | "topk" => "top_k",
+                "min_p" | "min-p" | "minp" => "min_p",
                 "repeat_penalty" | "repeat-penalty" | "repeat" | "penalty" => "repeat_penalty",
                 "max_tokens" | "max-tokens" | "max" => "max_tokens",
                 "reasoning_threshold" | "reasoning-threshold" | "threshold" => {
@@ -936,8 +940,8 @@ Usage: /set <name> <value>, or /set <name> unset
                 }
                 other => {
                     outln!(
-                        "Unknown setting '{}'. Try: temperature, top_p, top_k,                          repeat_penalty, max_tokens, reasoning_threshold.
-",
+                        "Unknown setting '{}'. Try: temperature, top_p, top_k, min_p, \
+                         repeat_penalty, max_tokens, reasoning_threshold.\n",
                         other
                     );
                     continue;
@@ -979,6 +983,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     "temperature" => settings.temperature.describe(),
                     "top_p" => settings.top_p.describe(),
                     "top_k" => settings.top_k.describe(),
+                    "min_p" => settings.min_p.describe(),
                     "repeat_penalty" => settings.repeat_penalty.describe(),
                     _ => settings.max_tokens.describe(),
                 };
@@ -995,6 +1000,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     "temperature" => settings.temperature = Setting::unset(FROM_UNSET),
                     "top_p" => settings.top_p = Setting::unset(FROM_UNSET),
                     "top_k" => settings.top_k = Setting::unset(FROM_UNSET),
+                    "min_p" => settings.min_p = Setting::unset(FROM_UNSET),
                     "repeat_penalty" => settings.repeat_penalty = Setting::unset(FROM_UNSET),
                     _ => settings.max_tokens = Setting::unset(FROM_UNSET),
                 }
@@ -1025,6 +1031,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             match canonical {
                                 "temperature" => settings.temperature = setting,
                                 "top_p" => settings.top_p = setting,
+                                "min_p" => settings.min_p = setting,
                                 _ => settings.repeat_penalty = setting,
                             }
                             true

@@ -438,8 +438,8 @@ fn readme(root: &Path) -> Option<(&'static str, String)> {
 // no indication why the model behaves differently through haico.
 // Key names match the wire field exactly, so what you write here is what the server sees.
 //
-// top_k and repeat_penalty are not part of the OpenAI API — they are extensions that
-// llama.cpp, Ollama, LM Studio and vLLM all understand. A strictly-OpenAI endpoint will
+// top_k, min_p and repeat_penalty are not part of the OpenAI API — they are extensions
+// that llama.cpp, Ollama, LM Studio and vLLM all understand. A strictly-OpenAI endpoint will
 // ignore or reject them, which is why nothing is sent unless it was asked for.
 
 #[cfg(test)]
