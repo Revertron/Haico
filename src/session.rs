@@ -323,7 +323,7 @@ pub(crate) fn reasoning_text(message: &Value) -> Option<&str> {
 // storing the thinking about the compression instead of the compression would defeat the
 // whole exercise.
 
-fn without_think_block(text: &str) -> &str {
+pub(crate) fn without_think_block(text: &str) -> &str {
     match text.find("</think>") {
         Some(end) => text[end + "</think>".len()..].trim(),
         None => text.trim(),

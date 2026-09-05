@@ -420,7 +420,7 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use when you have a specific URL and suspect that it is very big, and want a focused answer pulled from it rather than the whole page — the page is fetched, converted to readable text, and an assistant extracts just what your prompt asks for. Takes a URL and a prompt describing what information to extract. This tool saves context, but takes more time to process. Use web_get instead when you want the full raw text yourself.")]
+    #[tool(description = "Use when you already have a specific URL and suspect that it is very big, and want a focused answer pulled from it rather than the whole page — the page is fetched, converted to readable text, and an assistant extracts just what your prompt asks for. Takes a URL and a prompt describing what information to extract. This tool saves context, but takes more time to process. Use web_get instead when you want the full raw text yourself. Use research instead when you do not already have the URL — research is this same tool with the finding of the page included.")]
     pub(crate) async fn web_fetch(&self, params: Parameters<WebFetchParams>) -> Result<CallToolResult, McpError> {
         let (final_url, truncated_text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
@@ -454,7 +454,7 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use when you have a URL and want to read or process the full page yourself, with no filtering — fetches the page and returns the cleaned text directly (no summarization). Choose web_fetch instead if you suspect that the page will be very big, but you only need a specific fact and want it extracted for you.")]
+    #[tool(description = "Use when you already have the exact URL and want to read or process the full page yourself, with no filtering — fetches the page and returns the cleaned text directly (no summarization). Choose web_fetch instead if you suspect that the page will be very big, but you only need a specific fact and want it extracted for you. Choose research instead whenever you do not already know which page holds the answer, or when one page is unlikely to settle it — reading pages yourself to find out is what research is for.")]
     pub(crate) async fn web_get(&self, params: Parameters<WebGetParams>) -> Result<CallToolResult, McpError> {
         let (final_url, text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
@@ -472,7 +472,7 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use when you need information you don't have or that may be newer than your knowledge, or when you don't yet have a URL to open — search the web by keywords to discover relevant pages. Searches using DuckDuckGo (or a configured SearxNG instance) and returns results with titles, URLs, and snippets; follow up with web_fetch or web_get on a promising URL.")]
+    #[tool(description = "Use when the snippets alone will answer you — search the web by keywords and get back titles, URLs and snippets, using DuckDuckGo (or a configured SearxNG instance). If the snippets settle it, you are done. If they do not, and you are about to start opening the results one by one, stop and call research with the question instead: it does the searching and the reading and hands back the answer, without the pages landing in your context.")]
     pub(crate) async fn web_search(&self, params: Parameters<WebSearchParams>) -> Result<CallToolResult, McpError> {
         let query = params.0.query.clone();
         let max_results = params.0.max_results.unwrap_or(10);

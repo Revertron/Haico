@@ -64,7 +64,7 @@ impl Mode {
 // The web tools are not in AUTO_ALLOWED_TOOLS because they send content off the machine,
 // and that stays true here: plan mode offers them still carrying their normal prompt.
 // Research is most of what planning is, and cutting it off would make plans worse.
-const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch"];
+const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch", "research"];
 
 // The two tools that move between modes rather than doing anything to the machine. Each
 // is offered only in the mode it leads out of: nothing to enter when already planning,

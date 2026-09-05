@@ -18,12 +18,14 @@ use std::sync::{Arc, Mutex};
 mod basics;
 mod crates;
 mod files;
+mod research;
 mod shell;
 mod web;
 
 pub(crate) use basics::*;
 pub(crate) use crates::*;
 pub(crate) use files::*;
+pub(crate) use research::*;
 pub(crate) use shell::*;
 pub(crate) use web::*;
 
@@ -117,15 +119,20 @@ impl MyMcpServer {
     ) -> Self {
         // One router per impl block, merged here. This is what allows the tools to live in
         // separate files at all.
+        // research before the web tools it wraps: a small model reads the list in order,
+        // and the tool it should reach for first should not be the last one it sees.
         let mut tool_router = Self::basics_router()
             + Self::files_router()
+            + Self::research_router()
             + Self::web_router()
             + Self::shell_router()
             + Self::crates_router();
-        // web_get (raw page text) is always available. web_fetch additionally summarizes
-        // via the LLM, so only expose it when we know where the LLM lives.
+        // web_get (raw page text) is always available. web_fetch summarizes a page through
+        // the LLM and research drives a whole loop through it, so both are exposed only when
+        // we know where the LLM lives.
         if !expose_web_fetch {
             tool_router.remove_route("web_fetch");
+            tool_router.remove_route("research");
         }
         Self {
             tool_router,
@@ -356,6 +363,10 @@ impl MyMcpServer {
             "web_search" => {
                 let params: WebSearchParams = serde_json::from_value(arguments)?;
                 self.web_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "research" => {
+                let params: ResearchParams = serde_json::from_value(arguments)?;
+                self.research(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "ls" => {
                 let params: LSParams = serde_json::from_value(arguments)?;

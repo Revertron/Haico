@@ -145,6 +145,82 @@ pub(crate) async fn serve_once_capturing(
     (format!("http://{}", addr), captured)
     }
 
+// A chat-completions server that answers a different body each time, for testing a loop
+// rather than a single call.
+//
+// The last body repeats for every request after it, which is what lets a test say "keep
+// asking for a tool call forever" in one entry and then check that something else stopped
+// the loop. The count of requests served comes back alongside the URL, because for a loop
+// the interesting assertion is usually how many rounds it took rather than what it said.
+
+pub(crate) async fn serve_sequence(
+    bodies: &'static [&'static str],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<usize>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let count = served.clone();
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let count = count.clone();
+            tokio::spawn(async move {
+                // Head, then the body named by Content-Length: a client left blocked on a
+                // write it cannot finish is a test that hangs instead of failing.
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => {
+                            request.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(pos + 4);
+                            }
+                        }
+                    }
+                };
+
+                if let Some(head_end) = head_end {
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                    let length: usize = head
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|rest| rest.split(['\r', '\n']).next())
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    while request.len() < head_end + length {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                }
+
+                let index = {
+                    let mut served = count.lock().unwrap();
+                    let index = *served;
+                    *served += 1;
+                    index
+                };
+                let body = bodies[index.min(bodies.len() - 1)];
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+
+    (format!("http://{}", addr), served)
+}
+
 
 pub(crate) fn test_server() -> crate::MyMcpServer {
     crate::MyMcpServer::new(

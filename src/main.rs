@@ -2010,8 +2010,14 @@ Usage: /set <name> <value>, or /set <name> unset
                     // The summary is the row that used to be all there was: the first
                     // line of the result, cut to fit. The result itself is kept behind it
                     // now rather than thrown away, and Ctrl+O opens it.
-                    if let Some(line) = tool_result_line(&tool_result) {
-                        crate::out::foldable(&line, &tool_result);
+                    //
+                    // research is the exception: it has already printed its progress and
+                    // its whole answer while it ran, so a summary here would repeat the
+                    // answer's first line immediately underneath the answer.
+                    if tool_name != "research" {
+                        if let Some(line) = tool_result_line(&tool_result) {
+                            crate::out::foldable(&line, &tool_result);
+                        }
                     }
 
                     // Add tool result
