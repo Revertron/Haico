@@ -121,7 +121,8 @@ fn print_repl_help() {
     outln!("               output, whole diffs, the reasoning — and folds it back.");
     outln!("Fullscreen:    the wheel and PageUp/PageDown scroll the transcript; the view");
     outln!("               stays put while output arrives and follows again at the end.");
-    outln!("               Set tui = \"fullscreen\" in the config, or HAICO_TUI=fullscreen.");
+    outln!("               Set tui = \"inline\" in the config, or HAICO_TUI=inline, to go");
+    outln!("               back to the terminal's own scrollback.");
     outln!("               On Windows the wheel needs Shift held to select text; set");
     outln!("               mouse = \"off\" to keep plain drag-selection instead.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");

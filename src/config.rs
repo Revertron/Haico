@@ -13,14 +13,18 @@ use std::path::PathBuf;
 // only the input box is redrawn. `Fullscreen` takes the alternate screen and owns the
 // whole viewport, which is what lets the transcript be scrolled, re-wrapped on a resize
 // and edited after the fact — none of which is possible once a line belongs to the
-// terminal. Inline stays reachable because it is the fallback whenever the alternate
-// screen is the wrong answer: a dumb terminal, a session being piped somewhere, or a
-// user who would rather keep native scrollback.
+// terminal. It is the default because those are what a streaming REPL needs: the input
+// box stays where it is while a long turn scrolls past above it, and scrolling back to
+// read something no longer means losing the box off the top of the screen. Inline stays
+// reachable because it is the fallback whenever the alternate screen is the wrong
+// answer: a dumb terminal, a session being piped somewhere, or a user who would rather
+// keep native scrollback. The piped case needs no setting of its own — `enter_screen`
+// is only reached when stdin is a terminal.
 #[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Tui {
-    #[default]
     Inline,
+    #[default]
     Fullscreen,
 }
 
@@ -339,7 +343,7 @@ pub(crate) struct FileConfig {
     #[serde(default)]
     pub(crate) read_paths: Vec<String>,
 
-    // "inline" (default) or "fullscreen".
+    // "fullscreen" (default) or "inline".
     pub(crate) tui: Option<Tui>,
     // "scroll" (default) or "off".
     pub(crate) mouse: Option<Mouse>,
