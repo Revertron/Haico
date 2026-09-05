@@ -287,11 +287,11 @@ impl MarkdownStream {
         }
 
         if self.in_code_block {
-            // Render code with dark grey background
+            // Same look as an inline span: blue on the terminal's own background, so a
+            // dark theme is not banded with a light strip per row.
             return format!(
-                "{}{}  {}{}{}",
-                SetBackgroundColor(Color::Grey),
-                SetForegroundColor(Color::Black),
+                "{}  {}{}{}",
+                SetForegroundColor(Color::Blue),
                 line,
                 ResetColor,
                 ending
@@ -328,8 +328,8 @@ impl MarkdownStream {
 // something whose look depends on the whole line and so cannot be written until it ends.
 // `None` while too little of it has arrived to tell the two apart.
 fn looks_like_prose(in_code_block: bool, line: &str) -> Option<bool> {
-    // Every row of a code block carries the block's background, and the fence itself is
-    // never printed at all.
+    // A row of a code block is painted whole — it takes no inline formatting, and the
+    // fence that ends the block is never printed at all.
     if in_code_block {
         return Some(false);
     }
@@ -456,16 +456,11 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
         // Check for inline code (`code`)
         if chars[i] == '`' {
             if let Some(end) = find_closing('`', &chars, i + 1) {
-                let _ = write!(
-                    rendered,
-                    "{}{} ",
-                    SetBackgroundColor(Color::Grey),
-                    SetForegroundColor(Color::Black)
-                );
+                let _ = write!(rendered, "{}", SetForegroundColor(Color::Blue));
                 for j in (i + 1)..end {
                     rendered.push(chars[j]);
                 }
-                let _ = write!(rendered, " {}", ResetColor);
+                let _ = write!(rendered, "{}", ResetColor);
                 i = end + 1;
                 continue;
             }
@@ -739,7 +734,19 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
     let summary = tool_call_summary(tool_name, arguments);
     let mut line = String::new();
 
-    let _ = write!(line, "{}  → {}", SetForegroundColor(Color::DarkGrey), tool_name);
+    // The name is the only part painted: the arrow, the summary and the result line
+    // underneath stay dim, so the call reads as the heading of the step and what it did
+    // stays subordinate to it. Cyan because that is already what a heading is here.
+    let _ = write!(
+        line,
+        "{}  → {}{}{}{}{}",
+        SetForegroundColor(Color::DarkGrey),
+        SetAttribute(Attribute::Bold),
+        SetForegroundColor(Color::Cyan),
+        tool_name,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey)
+    );
     if !summary.is_empty() {
         let summary: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
         let clipped = crate::util::truncate_at_boundary(&summary, 110);
@@ -1299,12 +1306,14 @@ mod markdown_tests {
         let mut rendered = stream.push("```rust\nlet x = 1;\n");
         rendered.push_str(&stream.push("```\nafter\n"));
 
-        // The fenced line got the code background; the line after it did not.
+        // The fenced line got the code color; the line after it did not.
         assert!(rendered.contains("let x = 1;"));
         let code = rendered.find("let x = 1;").unwrap();
         let after = rendered.find("after").unwrap();
-        assert!(rendered[..code].contains("48;5;7"), "no code background: {:?}", rendered);
-        assert!(!rendered[code..after].ends_with("48;5;7"));
+        assert!(rendered[..code].ends_with("38;5;12m  "), "no code color: {:?}", rendered);
+        assert!(!rendered[code..after].contains("38;5;12m"));
+        // And nothing paints a background behind it.
+        assert!(!rendered.contains("48;5;"), "code is banded: {:?}", rendered);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
@@ -1379,18 +1379,26 @@ Usage: /set <name> <value>, or /set <name> unset
                                     // nothing about the wait goes unreported while it is
                                     // closed. Ctrl+O opens it, and it stays open.
                                     crate::out::begin_fold(&format!(
-                                        "{}○ (thinking){}",
+                                        "{}{}○ (thinking){}",
+                                        SetAttribute(Attribute::Italic),
                                         SetForegroundColor(Color::DarkGrey),
                                         ResetColor
                                     ));
                                     out!(
-                                        "{}○ {}",
+                                        "{}{}○ {}",
+                                        SetAttribute(Attribute::Italic),
                                         SetForegroundColor(Color::DarkGrey),
                                         ResetColor
                                     );
                                 }
+                                // Italic as well as dim: a tool call and its result are
+                                // dim too, and until this the three were the same grey.
+                                // A terminal that cannot do italic is no worse off than
+                                // before — conhost drops the attribute and prints the
+                                // dim text it printed already.
                                 out!(
-                                    "{}{}{}",
+                                    "{}{}{}{}",
+                                    SetAttribute(Attribute::Italic),
                                     SetForegroundColor(Color::DarkGrey),
                                     text,
                                     ResetColor
