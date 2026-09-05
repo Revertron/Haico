@@ -330,6 +330,24 @@ impl MyMcpServer {
 
         let mut builder = shell_command(&command);
         builder
+            // No stdin, and on Windows that is what keeps the terminal working at all.
+            //
+            // Measured in a real console: cmd.exe sets the console input mode to its own
+            // idea of one about ten milliseconds after it starts — ENABLE_PROCESSED_INPUT,
+            // ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT all back on — and never puts back what
+            // it found. So raw mode was off from the first run_command onward while VT input
+            // and the terminal's mouse reporting were both still on, and the next wheel
+            // report was read a line at a time and echoed by the console into the input box
+            // as `^[[<64;65;59M` with nothing reaching haico until Enter. It only does that
+            // when its stdin is the console handle: the same command with no stdin leaves
+            // the mode untouched, and ordinary programs (git, cargo, rustc, taskkill) never
+            // touch it at all, which is what pins this on the shell rather than on them.
+            //
+            // Nothing is lost. A child sharing the console keyboard was already competing
+            // with `Keys` for keystrokes, so a command that prompts could never have been
+            // answered anyway; now it reads EOF and fails at once instead of waiting on a
+            // terminal it cannot have. `run_background` has taken the same line all along.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -1041,6 +1059,29 @@ mod tests {
         );
     }
 
+
+    #[tokio::test]
+    async fn run_command_gives_the_child_no_stdin_of_its_own() {
+        let server = test_server();
+
+        // Reads stdin to the end and prints what it got, which is nothing.
+        let reader = if cfg!(windows) { "sort" } else { "cat" };
+
+        let started = std::time::Instant::now();
+        let (ok, out) = run(&server, reader, Some(5), None).await;
+        let elapsed = started.elapsed();
+
+        assert!(ok, "got: {}", out);
+        // The timing is the assertion. With the console's own stdin handed to the child, this
+        // waits for a line that only the user can type — and on Windows the shell has by then
+        // put the console back into cooked mode, which is the bug this pins down: the input
+        // box fills with echoed mouse reports and the keyboard stops reaching haico.
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "took {:?}: the child was waiting on a terminal it should not have",
+            elapsed
+        );
+    }
 
     #[tokio::test]
     async fn run_command_survives_output_larger_than_a_pipe_buffer() {

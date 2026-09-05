@@ -1163,38 +1163,69 @@ mod vt {
         let mut buffer: Vec<u8> = Vec::new();
 
         loop {
+            // The mode has to be right at the moment the read starts, not merely at startup:
+            // anything sharing this console can leave it in cooked mode, and a read that
+            // begins there is echoed by the console and returns nothing until Enter.
+            crate::out::reassert_input_mode();
             let read = match stdin.read(&mut chunk) {
                 Ok(0) | Err(_) => return,
                 Ok(read) => read,
             };
-            buffer.extend_from_slice(&chunk[..read]);
+            // A read that filled the chunk did not reach the end of what was typed — the rest
+            // is already buffered behind it — and the cut falls wherever the boundary lands,
+            // including between an Escape and the sequence it introduces. That matters for one
+            // rule below and nothing else.
+            let cut_short = read == chunk.len();
+            if !feed(&mut buffer, &chunk[..read], cut_short, &sender) {
+                return;
+            }
+        }
+    }
 
-            loop {
-                if buffer.is_empty() {
-                    break;
-                }
-                // An Escape all on its own is an Escape; an Escape with anything behind it
-                // is the start of a sequence. The console writes a sequence in one piece,
-                // so by the time the buffer holds nothing but the Escape, that is what it
-                // was — which is what lets Esc interrupt a turn without waiting on a timer.
-                if buffer.len() == 1 && buffer[0] == 0x1B {
-                    buffer.clear();
-                    if sender.send(Event::Key(super::KeyCode::Esc.into())).is_err() {
-                        return;
+    // Everything that becomes of a chunk once it has been read, and all of the reader the
+    // tests can reach — a console is not something they have. `false` means the receiver has
+    // gone and there is nobody left to read for.
+    //
+    // `cut_short` is the one thing this cannot work out for itself, and the Escape rule below
+    // is the only thing that wants it.
+    fn feed(
+        buffer: &mut Vec<u8>,
+        bytes: &[u8],
+        cut_short: bool,
+        sender: &UnboundedSender<Event>,
+    ) -> bool {
+        buffer.extend_from_slice(bytes);
+
+        loop {
+            if buffer.is_empty() {
+                return true;
+            }
+            // An Escape all on its own is an Escape; an Escape with anything behind it
+            // is the start of a sequence. The console writes a sequence in one piece, so an
+            // Escape that is all the buffer holds is one that arrived alone — which is what
+            // lets Esc interrupt a turn without waiting on a timer.
+            //
+            // Unless the read was cut short, in which case an Escape at the end of the buffer
+            // is as likely to be the head of a sequence whose tail is in the next read: taking
+            // it for a keypress would interrupt the turn *and* type the remainder —
+            // `[<64;65;59M` — into the input box. So it waits for the rest of itself instead.
+            // The cost is a real Esc pressed as the last byte of a burst that exactly filled
+            // the chunk, which waits for the next key rather than acting; pressing it again is
+            // then a short read, and works.
+            if !cut_short && buffer.len() == 1 && buffer[0] == 0x1B {
+                buffer.clear();
+                return sender.send(Event::Key(super::KeyCode::Esc.into())).is_ok();
+            }
+            match take_event(buffer) {
+                Some(Some(event)) => {
+                    if sender.send(event).is_err() {
+                        return false;
                     }
-                    break;
                 }
-                match take_event(&mut buffer) {
-                    Some(Some(event)) => {
-                        if sender.send(event).is_err() {
-                            return;
-                        }
-                    }
-                    // Consumed, but nothing haico has a use for.
-                    Some(None) => {}
-                    // Incomplete: the rest of it is still on its way.
-                    None => break,
-                }
+                // Consumed, but nothing haico has a use for.
+                Some(None) => {}
+                // Incomplete: the rest of it is still on its way.
+                None => return true,
             }
         }
     }
@@ -1289,8 +1320,65 @@ mod vt {
     }
     #[cfg(test)]
     mod tests {
-        use super::take_event;
+        use super::{feed, take_event};
         use crossterm::event::{Event, KeyCode, MouseEventKind};
+
+        // One chunk through the reader, and everything it sent. No console is involved, which
+        // is the whole reason `feed` is a function of its own.
+        fn feed_chunk(buffer: &mut Vec<u8>, bytes: &[u8], cut_short: bool) -> Vec<Event> {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            assert!(feed(buffer, bytes, cut_short, &sender), "the receiver is still here");
+            let mut events = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        // The console does not always hand a sequence over in one piece. A read that fills the
+        // chunk cuts the burst wherever the boundary falls, and it can fall directly after the
+        // Escape — at which point calling it a keypress interrupts the turn *and* types the
+        // rest of the report into the input box.
+        #[test]
+        fn an_escape_left_by_a_cut_read_waits_for_the_rest_of_its_sequence() {
+            let mut buffer = Vec::new();
+
+            let events = feed_chunk(&mut buffer, b"\x1b", true);
+            assert!(events.is_empty(), "{:?}", events);
+            assert_eq!(buffer, b"\x1b", "the Escape was acted on rather than held");
+
+            let events = feed_chunk(&mut buffer, b"[<64;65;59M", false);
+            assert_eq!(events.len(), 1, "{:?}", events);
+            assert!(matches!(events[0], Event::Mouse(_)), "{:?}", events[0]);
+            assert!(buffer.is_empty());
+        }
+
+        // And the rule that guard qualifies still holds: nothing behind it and nothing cut off
+        // it, so it is the key, which is what lets Esc interrupt a turn with no timer involved.
+        #[test]
+        fn an_escape_that_is_all_there_is_still_interrupts() {
+            let mut buffer = Vec::new();
+
+            let events = feed_chunk(&mut buffer, b"\x1b", false);
+
+            assert_eq!(events.len(), 1, "{:?}", events);
+            assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::Esc));
+            assert!(buffer.is_empty());
+        }
+
+        // Being cut short bears on the Escape rule and on nothing else: a chunk that did end on
+        // a sequence boundary still delivers everything in it.
+        #[test]
+        fn a_cut_read_still_delivers_the_sequences_it_did_contain() {
+            let mut buffer = Vec::new();
+
+            let events = feed_chunk(&mut buffer, b"\x1b[A\x1b[B", true);
+
+            assert_eq!(events.len(), 2, "{:?}", events);
+            assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::Up));
+            assert!(matches!(events[1], Event::Key(key) if key.code == KeyCode::Down));
+            assert!(buffer.is_empty());
+        }
 
         fn drain(bytes: &[u8]) -> (Vec<Event>, Vec<u8>) {
             let mut buffer = bytes.to_vec();
