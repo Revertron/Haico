@@ -454,7 +454,7 @@ const SCROLLBACK_LINES: usize = 10_000;
 // The rows have to stand alone for the same reason the inline renderer's do: `paint`
 // rewrites individual rows and leaves the rest untouched, so a row repainted on its own
 // cannot rely on the terminal still being in the color the row above left it in.
-fn wrap_rows(line: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_rows(line: &str, width: usize) -> Vec<String> {
     let wrapped = Wrap::new(width).feed(line);
     let mut rows = Vec::new();
     let mut open = String::new();
@@ -998,7 +998,7 @@ pub(crate) fn visible_width(text: &str) -> usize {
 // The width text is broken at. A row exactly as wide as the terminal wraps in some
 // terminals and not others, so everything stops a column short — the same margin the
 // input box keeps, for the same reason.
-fn wrap_width() -> usize {
+pub(crate) fn wrap_width() -> usize {
     terminal_width().saturating_sub(1).max(1)
 }
 

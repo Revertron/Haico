@@ -183,6 +183,14 @@ pub(crate) struct MarkdownStream {
     // it arrives, and this is how much of it has gone — the rest of the line, when it
     // finally ends, is all that is left to write.
     streamed: usize,
+    // The rows of a table that has started but not yet ended.
+    //
+    // The one thing here that cannot be rendered a line at a time. A column is as wide as
+    // its widest cell, so the shape of the first row is not known until the last one has
+    // arrived — the rows wait here, and the first line that is not one draws the table and
+    // is then rendered after it. A single row is only a candidate: it becomes a table when
+    // a delimiter row lands under it, and goes out as prose when one never does.
+    table: Vec<String>,
 }
 
 impl MarkdownStream {
@@ -192,6 +200,7 @@ impl MarkdownStream {
             in_code_block: false,
             held_blanks: 0,
             streamed: 0,
+            table: Vec::new(),
         }
     }
 
@@ -208,6 +217,10 @@ impl MarkdownStream {
             // the block, so only prose blanks are held back. A line that has already had
             // part of itself written cannot be blank, so this never fires under one.
             if !self.in_code_block && line.trim().is_empty() {
+                // A blank line ends a table, and the rows belong above the gap rather than
+                // below it. The blanks are held back, so without this they would be paid
+                // out in front of a table that had not been drawn yet.
+                rendered.push_str(&self.flush_table(true));
                 self.held_blanks += 1;
                 continue;
             }
@@ -228,6 +241,11 @@ impl MarkdownStream {
     // that no inline markup crosses — an opener with no closer yet is exactly the case
     // where the next few characters decide what the ones already here mean.
     fn stream_settled(&mut self) -> String {
+        // Rows are waiting to be drawn, and anything written now would land in front of
+        // them. The line being streamed here is the one that will end the table.
+        if !self.table.is_empty() {
+            return String::new();
+        }
         if self.buffer.is_empty() || looks_like_prose(self.in_code_block, &self.buffer) != Some(true) {
             return String::new();
         }
@@ -270,13 +288,56 @@ impl MarkdownStream {
         self.held_blanks = 0;
         if self.buffer.is_empty() {
             self.streamed = 0;
-            return String::new();
+            return self.flush_table(newline);
         }
         let line = std::mem::take(&mut self.buffer);
-        self.rest_of_line(&line, newline)
+        let rendered = self.rest_of_line(&line, newline);
+        // A table that runs to the end of a reply never meets the line that would have
+        // ended it, so this is the only place left to draw it.
+        rendered + &self.flush_table(newline)
+    }
+
+    // The table drawn, and the rows forgotten. A candidate that never found a delimiter
+    // row was not a table at all, and goes out as the prose it always was.
+    fn flush_table(&mut self, newline: bool) -> String {
+        let rows = std::mem::take(&mut self.table);
+        if rows.is_empty() {
+            return String::new();
+        }
+        let mut rendered = if rows.len() < 2 {
+            self.plain_line(&rows[0], true)
+        } else {
+            render_table(&rows)
+        };
+        if !newline {
+            rendered.truncate(rendered.trim_end_matches('\n').len());
+        }
+        rendered
     }
 
     fn line(&mut self, line: &str, newline: bool) -> String {
+        // Inside a fence a pipe is code, and none of this applies.
+        if self.in_code_block {
+            return self.plain_line(line, newline);
+        }
+        let held = self.table.len();
+        // A row joins the table it belongs to; the first line that is not one draws what
+        // has collected and is then rendered after it, in the place it would have had.
+        if held == 1 && is_delimiter_row(line) || held > 1 && is_table_row(line) {
+            self.table.push(line.to_string());
+            return String::new();
+        }
+        if held > 0 {
+            return self.flush_table(true) + &self.line(line, newline);
+        }
+        if is_table_row(line) {
+            self.table.push(line.to_string());
+            return String::new();
+        }
+        self.plain_line(line, newline)
+    }
+
+    fn plain_line(&mut self, line: &str, newline: bool) -> String {
         let ending = if newline { "\n" } else { "" };
         let trimmed = line.trim();
 
@@ -349,12 +410,234 @@ fn looks_like_prose(in_code_block: bool, line: &str) -> Option<bool> {
     if ["# ", "## ", "### "].iter().any(|marker| trimmed.starts_with(marker)) {
         return Some(false);
     }
+    // A table row waits for longer than that: not only what it is but how wide each of
+    // its columns prints depends on rows that have not arrived.
+    if trimmed.starts_with('|') {
+        return Some(false);
+    }
     // The same for the hashes: "##" is a heading if a space comes next and prose if a
     // fourth hash does.
     if trimmed.len() <= 3 && trimmed.chars().all(|ch| ch == '#') {
         return None;
     }
     Some(true)
+}
+
+// Tables.
+//
+// The one construct here that cannot be drawn a line at a time, which is why the stream
+// holds rows instead: a column is as wide as its widest cell, so the header cannot be laid
+// out until the last row has arrived. Before this every row went out as prose — pipes,
+// dashes and all — and that only lines up if the cells happen to be the same length, which
+// they never are.
+
+// A row is any line starting with a pipe. That is deliberately looser than the delimiter
+// test below: a row on its own means nothing until the line under it says whether this is
+// a table, and it is that line which has to be matched exactly.
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.len() > 1
+}
+
+fn is_delimiter_row(line: &str) -> bool {
+    if !is_table_row(line) {
+        return false;
+    }
+    let cells = split_row(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|ch| ch == '-')
+        })
+}
+
+// The cells of one row. A pipe the writer escaped is content rather than a divider, and is
+// the only way a cell can hold one at all — so the trailing pipe of a row ending in an
+// escaped one is not the row's own.
+fn split_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = match inner.strip_suffix('|') {
+        Some(rest) if !rest.ends_with('\\') => rest,
+        _ => inner,
+    };
+
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' => cells.push(std::mem::take(&mut cell)),
+            _ => cell.push(ch),
+        }
+    }
+    cells.push(cell);
+    cells.iter().map(|cell| cell.trim().to_string()).collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+fn alignment(delimiter: &str) -> Align {
+    match (delimiter.starts_with(':'), delimiter.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+// The narrowest a column may be squeezed to. Under this a wrapped cell is more line breaks
+// than text, and nothing is gained by making room for it.
+const MIN_COLUMN: usize = 4;
+
+fn render_table(rows: &[String]) -> String {
+    layout_table(rows, crate::out::wrap_width())
+}
+
+// The width is passed in rather than read here so that a test lays a table out at a width
+// it chose, instead of at whatever the terminal running the test happens to be.
+fn layout_table(rows: &[String], available: usize) -> String {
+    let mut parsed: Vec<Vec<String>> = rows.iter().map(|row| split_row(row)).collect();
+    if parsed.len() < 2 {
+        return String::new();
+    }
+    // The delimiter row is not content: it carries the alignments and nothing else.
+    let delimiter = parsed.remove(1);
+    let columns = parsed[0].len().max(1);
+    let aligns: Vec<Align> = (0..columns)
+        .map(|column| {
+            delimiter
+                .get(column)
+                .map(|cell| alignment(cell))
+                .unwrap_or(Align::Left)
+        })
+        .collect();
+
+    // Rendered once, here, and measured as rendered: the markers come out of the text on
+    // the way through, so `**done**` prints four columns narrower than it was written. The
+    // header row decides how many columns there are — a short row is padded out and a long
+    // one is cut, rather than knocking the rest of the table out of line.
+    let cells: Vec<Vec<String>> = parsed
+        .iter()
+        .map(|row| {
+            (0..columns)
+                .map(|column| {
+                    // `render_inline_markdown` ends the line for a caller that is
+                    // printing one. A cell is not a line: left on, that newline counts a
+                    // column toward the width and wraps every row to two rows tall.
+                    let cell =
+                        render_inline_markdown(row.get(column).map(String::as_str).unwrap_or(""));
+                    cell.trim_end().to_string()
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            cells
+                .iter()
+                .map(|row| crate::out::visible_width(&row[column]))
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect();
+
+    // Every column costs a space either side of itself, and there is one border more than
+    // there are columns. What gives when that does not fit is the widest column, one step
+    // at a time: a version or a yes/no keeps its natural width, and the prose column —
+    // which is what a too-wide table always turns out to have — is the one that wraps.
+    let frame = 3 * columns + 1;
+    while frame + widths.iter().sum::<usize>() > available {
+        let widest = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, width)| **width)
+            .map(|(column, _)| column);
+        match widest {
+            Some(column) if widths[column] > MIN_COLUMN => widths[column] -= 1,
+            // All of them are at the floor already. A table with more columns than the
+            // terminal has room for is drawn too wide rather than not drawn at all.
+            _ => break,
+        }
+    }
+
+    let mut table = String::new();
+    table.push_str(&table_rule("┌", "┬", "┐", &widths));
+    for (index, row) in cells.iter().enumerate() {
+        if index == 1 {
+            table.push_str(&table_rule("├", "┼", "┤", &widths));
+        }
+        table.push_str(&table_row(row, &widths, &aligns, index == 0));
+    }
+    table.push_str(&table_rule("└", "┴", "┘", &widths));
+    table
+}
+
+fn table_rule(left: &str, joint: &str, right: &str, widths: &[usize]) -> String {
+    let mut rule = String::new();
+    let _ = write!(rule, "{}{}", SetForegroundColor(Color::DarkGrey), left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            rule.push_str(joint);
+        }
+        rule.push_str(&"─".repeat(width + 2));
+    }
+    let _ = write!(rule, "{}{}\n", right, ResetColor);
+    rule
+}
+
+// One row of cells, as many screen rows tall as its tallest cell wraps to. The wrapping is
+// `out`'s own, so a cell whose color runs past a break has it reopened on the row below
+// exactly as a wrapped line of prose does — and `out` will not wrap these lines a second
+// time, because the layout above already fitted them.
+fn table_row(cells: &[String], widths: &[usize], aligns: &[Align], header: bool) -> String {
+    let wrapped: Vec<Vec<String>> = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| crate::out::wrap_rows(cell, *width))
+        .collect();
+    let height = wrapped.iter().map(|cell| cell.len()).max().unwrap_or(1).max(1);
+
+    let mut rows = String::new();
+    for row in 0..height {
+        let _ = write!(rows, "{}│", SetForegroundColor(Color::DarkGrey));
+        for (column, cell) in wrapped.iter().enumerate() {
+            let piece = cell.get(row).map(String::as_str).unwrap_or("");
+            let pad = widths[column].saturating_sub(crate::out::visible_width(piece));
+            let (before, after) = match aligns[column] {
+                Align::Left => (0, pad),
+                Align::Right => (pad, 0),
+                Align::Center => (pad / 2, pad - pad / 2),
+            };
+            let _ = write!(
+                rows,
+                "{} {}{}{}{}{} {}│",
+                ResetColor,
+                " ".repeat(before),
+                if header {
+                    SetAttribute(Attribute::Bold).to_string()
+                } else {
+                    String::new()
+                },
+                piece,
+                ResetColor,
+                " ".repeat(after),
+                SetForegroundColor(Color::DarkGrey)
+            );
+        }
+        let _ = write!(rows, "{}\n", ResetColor);
+    }
+    rows
 }
 
 // Inline markup starting at a position, as far as the text that has arrived can say.
@@ -1246,9 +1529,9 @@ mod markdown_tests {
     #[test]
     fn a_word_at_a_time_still_comes_to_the_same_bytes() {
         // Everything the renderer treats specially, in one text: a heading, a link, a code
-        // span, bold, an indented continuation, a fence, and a blank line between
+        // span, bold, an indented continuation, a fence, a table, and a blank line between
         // paragraphs.
-        const TEXT: &str = "# Title\nA [link](http://x/y), `code`, **bold** here.\n\n- a list item\n  indented continuation\n```rust\nlet x = 1;\n```\ndone\n";
+        const TEXT: &str = "# Title\nA [link](http://x/y), `code`, **bold** here.\n\n- a list item\n  indented continuation\n```rust\nlet x = 1;\n```\n| a | bb |\n|---|--:|\n| 1 | 2 |\ndone\n";
         let whole = render_markdown(TEXT);
         let chars: Vec<char> = TEXT.chars().collect();
 
@@ -1314,6 +1597,164 @@ mod markdown_tests {
         assert!(!rendered[code..after].contains("38;5;12m"));
         // And nothing paints a background behind it.
         assert!(!rendered.contains("48;5;"), "code is banded: {:?}", rendered);
+    }
+
+    // What a table actually looks like on the screen, with the colors taken back out. The
+    // frame is the assertion here, so it is compared as text rather than as bytes.
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\u{1b}' {
+                out.push(ch);
+                continue;
+            }
+            if chars.next() == Some('[') {
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn rows(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn a_table_is_laid_out_from_its_widest_cell() {
+        let table = rows(&[
+            "| Dependency | Version |",
+            "|---|---:|",
+            "| actix-files | 0.7.0 |",
+            "| toml | 1.1.5 |",
+        ]);
+        let drawn = plain(&layout_table(&table, 60));
+        let lines: Vec<&str> = drawn.lines().collect();
+
+        // "Dependency" is the header, but "actix-files" is a row lower down and one
+        // column wider — which is the whole reason none of this can be drawn until the
+        // last row has arrived.
+        assert_eq!(
+            lines,
+            vec![
+                "┌─────────────┬─────────┐",
+                "│ Dependency  │ Version │",
+                "├─────────────┼─────────┤",
+                "│ actix-files │   0.7.0 │",
+                "│ toml        │   1.1.5 │",
+                "└─────────────┴─────────┘",
+            ],
+            "got {:?}",
+            drawn
+        );
+    }
+
+    #[test]
+    fn a_table_too_wide_for_the_terminal_wraps_its_widest_column() {
+        let table = rows(&[
+            "| Dependency | Version | Role |",
+            "|---|---|---|",
+            "| toml | 1.1.5 | TOML config parsing built with only parse and serde features |",
+        ]);
+        let drawn = plain(&layout_table(&table, 40));
+
+        // Every row of the frame is the same width, and it is the width asked for rather
+        // than whatever the widest cell wanted: nothing here is left for `out` to wrap a
+        // second time, which would have broken the frame apart.
+        for line in drawn.lines() {
+            assert_eq!(line.chars().count(), 40, "got {:?}", drawn);
+        }
+
+        // The columns that were already narrow kept their width; what gave is the prose
+        // column, which is now several rows tall.
+        assert!(drawn.contains("Dependency"), "got {:?}", drawn);
+        assert!(drawn.lines().count() > 6, "got {:?}", drawn);
+
+        // And nothing was dropped on the way: every word of the long cell is still there.
+        let words: String = drawn
+            .lines()
+            .flat_map(|line| line.split('│').skip(3).next())
+            .collect::<Vec<&str>>()
+            .join(" ");
+        for word in "TOML config parsing built with only parse and serde features".split(' ') {
+            assert!(words.contains(word), "{} missing from {:?}", word, drawn);
+        }
+    }
+
+    #[test]
+    fn a_table_waits_for_the_line_that_ends_it() {
+        let mut stream = MarkdownStream::new();
+        // Not one of these can be painted yet, so not one of them prints.
+        assert_eq!(stream.push("| Dependency | Version |\n"), "");
+        assert_eq!(stream.push("|---|---|\n"), "");
+        assert_eq!(stream.push("| actix-files | 0.7.0 |\n"), "");
+
+        // The first line that is not a row draws the table, and then follows it.
+        let rendered = plain(&stream.push("after\n"));
+        assert!(rendered.starts_with('┌'), "got {:?}", rendered);
+        assert!(rendered.contains("actix-files"), "got {:?}", rendered);
+        assert!(rendered.ends_with("┘\nafter\n"), "got {:?}", rendered);
+        // The pipes and dashes it was written with are gone.
+        assert!(!rendered.contains('|'), "got {:?}", rendered);
+
+        // A blank line ends one too, and the rows go above the gap rather than below it.
+        let mut stream = MarkdownStream::new();
+        stream.push("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let rendered = plain(&stream.push("\nafter\n"));
+        assert!(rendered.starts_with('┌'), "got {:?}", rendered);
+        assert!(rendered.ends_with("┘\n\nafter\n"), "got {:?}", rendered);
+
+        // And a table that runs to the end of the reply is drawn by `finish`, which is
+        // the only thing left that can: no line ever arrives to end it.
+        let mut stream = MarkdownStream::new();
+        assert_eq!(stream.push("| a | b |\n|---|---|\n| 1 | 2 |\n"), "");
+        let rendered = plain(&stream.finish(true));
+        assert!(rendered.starts_with('┌'), "got {:?}", rendered);
+        assert!(rendered.contains('│'), "got {:?}", rendered);
+    }
+
+    #[test]
+    fn a_row_with_nothing_under_it_is_prose() {
+        // A line can start with a pipe and mean nothing by it. It is the delimiter row
+        // that makes a table, so without one the line is printed as it was written.
+        let mut stream = MarkdownStream::new();
+        assert_eq!(stream.push("| just | text |\n"), "");
+        assert_eq!(plain(&stream.push("more\n")), "| just | text |\nmore\n");
+
+        // Including when it is the last thing in the reply.
+        let mut stream = MarkdownStream::new();
+        assert_eq!(stream.push("| just | text |\n"), "");
+        assert_eq!(plain(&stream.finish(true)), "| just | text |\n");
+
+        // Inside a fence a pipe is code, not the start of anything.
+        let mut stream = MarkdownStream::new();
+        let rendered = plain(&stream.push("```\n| a | b |\n```\ndone\n"));
+        assert!(rendered.contains("| a | b |"), "got {:?}", rendered);
+    }
+
+    #[test]
+    fn a_cell_keeps_its_own_markup_and_its_escaped_pipes() {
+        assert_eq!(split_row("| a | b |"), vec!["a", "b"]);
+        // A pipe the writer escaped divides nothing — it is the only way a cell can
+        // hold one at all.
+        assert_eq!(split_row(r"| a \| b | c |"), vec!["a | b", "c"]);
+        assert_eq!(split_row(r"| a | b \|"), vec!["a", "b |"]);
+
+        assert!(is_delimiter_row("|---|:---:|---:|"));
+        assert!(is_delimiter_row("| - | - |"));
+        assert!(!is_delimiter_row("| -- | text |"));
+        assert!(!is_delimiter_row("| :: | :: |"));
+
+        // The markers come out of the text, so the cell is measured as it prints: this
+        // fits a column that "**done**" would have overflowed by four.
+        let table = rows(&["| Status |", "|---|", "| **done** |"]);
+        let drawn = plain(&layout_table(&table, 60));
+        assert!(drawn.contains("│ done   │"), "got {:?}", drawn);
+        assert!(!drawn.contains('*'), "got {:?}", drawn);
     }
 
     #[test]
