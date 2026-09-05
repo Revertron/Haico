@@ -515,20 +515,21 @@ impl Editor {
             let text: Vec<char> = prefix.chars().chain(line.chars()).collect();
             let first = rows.len();
 
-            if text.is_empty() {
+            let points = wrap_points(&text, width, prefix.chars().count());
+            if points.is_empty() {
                 rows.push(String::new());
             } else {
-                let mut start = 0;
-                while start < text.len() {
-                    let end = (start + width).min(text.len());
-                    rows.push(text[start..end].iter().collect());
-                    start = end;
-                }
+                rows.extend(
+                    points
+                        .iter()
+                        .map(|&(start, end, _)| text[start..end].iter().collect::<String>()),
+                );
             }
 
             if index == self.row {
                 let at = prefix.chars().count() + self.column;
-                caret = (first + at / width, at % width);
+                let (row, column) = caret_in(&points, at, width);
+                caret = (first + row, column);
             }
         }
 
@@ -541,6 +542,81 @@ impl Editor {
         (rows, caret.0, caret.1)
     }
 
+}
+
+// Where each row of one wrapped line begins and ends, broken at a blank rather than
+// wherever the right edge happens to fall. What this used to do — and what the terminal
+// does when left to it — cuts a word through the middle, which is what a pasted paragraph
+// looked like in the box while the same paragraph in the transcript above wrapped between
+// words. `out::Wrap` already does this for output, but not in a form that can be reused
+// here: it works on a string and reports only the text, and the box needs to know where
+// the breaks landed in order to put the caret on the right one.
+//
+// A row is `start..end`, and `next` is where the row after it begins. The two differ by
+// the one blank a break swallows: the space at the edge *is* the break and is not drawn
+// again at the start of the row below, but the caret can still be sitting on it, which is
+// the only reason `next` is reported apart from `end`.
+//
+// `floor` is the first index a break may fall on. Without it the prompt's own trailing
+// space is a break like any other, and a first word too long for the row would wrap to a
+// row holding nothing but ">".
+fn wrap_points(text: &[char], width: usize, floor: usize) -> Vec<(usize, usize, usize)> {
+    let mut points = Vec::new();
+    let mut start = 0;
+
+    while start < text.len() {
+        if text.len() - start <= width {
+            points.push((start, text.len(), text.len()));
+            break;
+        }
+        // The row holds `width` characters, and a blank in the column just past it is a
+        // break that costs nothing — the row in front of it is full either way.
+        let blank = (start.max(floor)..=start + width)
+            .rev()
+            .find(|&index| matches!(text[index], ' ' | '\t'))
+            // A blank the row starts with is no break at all: honoring it would emit an
+            // empty row and leave the word exactly where it was.
+            .filter(|&index| index > start);
+
+        match blank {
+            Some(index) => {
+                points.push((start, index, index + 1));
+                start = index + 1;
+            }
+            // A word too long for a row of its own, broken wherever the edge falls.
+            // There is no better place for it, and refusing would push it off the screen
+            // instead of moving the break one column.
+            None => {
+                points.push((start, start + width, start + width));
+                start += width;
+            }
+        }
+    }
+
+    points
+}
+
+// Which row of a wrapped line the caret is on, and where along it.
+//
+// Not arithmetic any more, now that the rows are not all the same length: the caret is on
+// the first row whose text still reaches it. A caret on a swallowed blank has no column
+// of its own and sits at the end of the row that break ended.
+fn caret_in(points: &[(usize, usize, usize)], at: usize, width: usize) -> (usize, usize) {
+    for (row, &(start, end, next)) in points.iter().enumerate() {
+        if at < next {
+            return (row, (at - start).min(end - start));
+        }
+    }
+
+    // One past the last character, which is where a caret at the end of the line is: it
+    // belongs immediately after that character, unless the row is full and has no column
+    // left to stand in — then it takes the row below, the one the caller is about to add.
+    match points.last() {
+        Some(&(start, end, _)) if at == end && end - start < width => {
+            (points.len() - 1, end - start)
+        }
+        _ => (points.len(), 0),
+    }
 }
 
 fn terminal_width() -> usize {
@@ -1392,10 +1468,40 @@ mod tests {
         let mut editor = Editor::new(Vec::new());
         type_text(&mut editor, &"x".repeat(12));
 
-        // Width 10, prompt 2 wide: "> " plus 8 x's, then the remaining 4.
+        // Width 10, prompt 2 wide: "> " plus 8 x's, then the remaining 4. One word with
+        // nowhere to break still breaks at the edge, and the prompt's own space is not a
+        // break — a row holding just ">" would be worse than the cut.
         let (rows, caret_row, caret_column) = editor.rows("> ", 10);
         assert_eq!(rows, vec!["> xxxxxxxx".to_string(), "xxxx".to_string()]);
         assert_eq!((caret_row, caret_column), (1, 4));
+    }
+
+    #[test]
+    fn a_wrapped_line_breaks_between_words_and_the_caret_follows_it() {
+        let mut editor = Editor::new(Vec::new());
+        editor.paste("the quick brown fox jumps");
+
+        // Width 20, prompt 2 wide: "brown" ends at column 17 and "fox" will not fit, so
+        // the break is the space after it rather than four characters into the word.
+        let (rows, caret_row, caret_column) = editor.rows("> ", 21);
+        assert_eq!(
+            rows,
+            vec!["> the quick brown".to_string(), "fox jumps".to_string()]
+        );
+        assert_eq!((caret_row, caret_column), (1, 9));
+
+        // Back to the "f" of "fox", which is where the second row starts.
+        for _ in 0..9 {
+            editor.key(press(KeyCode::Left, KeyModifiers::NONE));
+        }
+        let (.., caret_row, caret_column) = editor.rows("> ", 21);
+        assert_eq!((caret_row, caret_column), (1, 0));
+
+        // And one more, onto the space the break swallowed. It has no column of its own
+        // on the row below, so it keeps the one at the end of the row it broke.
+        editor.key(press(KeyCode::Left, KeyModifiers::NONE));
+        let (.., caret_row, caret_column) = editor.rows("> ", 21);
+        assert_eq!((caret_row, caret_column), (0, 17));
     }
 
     #[test]
