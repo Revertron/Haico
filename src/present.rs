@@ -9,7 +9,10 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 
 use crate::input::{echo, PROMPT};
 use crate::render::{change_preview, tool_call_line, tool_result_line, MarkdownStream};
-use crate::turn::{AgentEvent, Notice};
+use serde_json::Value;
+
+use crate::render::indented_command;
+use crate::turn::{AgentEvent, Notice, ReviewNote};
 
 /// Renders events, and owns the state rendering needs: the markdown stream, and
 /// whether anything has been put on screen for the reply in progress.
@@ -280,4 +283,72 @@ impl Presenter {
             }
         }
     }
+}
+
+/// The sentence a permission prompt puts above the buttons.
+///
+/// Rendering, not policy: the turn sends the call it wants to make and this
+/// decides how to say it — how much of a command to show, whether a byte count
+/// or a diff is the useful summary, and where the reviewer's objection goes.
+/// It lived in the turn loop until the event stream gave it somewhere better.
+pub(crate) fn permission_description(
+    tool_name: &str,
+    arguments: &Value,
+    review: Option<&ReviewNote>,
+) -> String {
+    let mut description = match tool_name {
+        "web_search" => {
+            let query = arguments["query"].as_str().unwrap_or("unknown");
+            format!("Search the web for: '{}'", query)
+        }
+        "web_fetch" | "web_get" => {
+            let url = arguments["url"].as_str().unwrap_or("unknown");
+            format!("Fetch content from URL: {}", url)
+        }
+        "write_file" => {
+            let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+            let size = arguments["content"].as_str().map(|s| s.len()).unwrap_or(0);
+            format!("Write {} bytes to file: {}", size, file_path)
+        }
+        "edit" => {
+            let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+            let from = arguments["old_string"].as_str().unwrap_or("unknown");
+            let to = arguments["new_string"].as_str().unwrap_or("unknown");
+            let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
+            if replace_all {
+                format!("Edit file (replace all '{from}'->'{to}') in {}", file_path)
+            } else {
+                format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
+            }
+        }
+        "multi_edit" => {
+            let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+            let count = arguments["edits"].as_array().map(|e| e.len()).unwrap_or(0);
+            format!("Apply {} edit(s) to file: {}", count, file_path)
+        }
+        // The command is laid out over several indented rows rather than cut to a
+        // width: a generated one-liner cut short is a script approved sight unseen.
+        "run_background" => {
+            let command = arguments["command"].as_str().unwrap_or("unknown");
+            format!("Start in the background:\n{}", indented_command(command))
+        }
+        "run_command" => {
+            let command = arguments["command"].as_str().unwrap_or("unknown");
+            format!("Execute command:\n{}", indented_command(command))
+        }
+        _ => format!("Execute '{}' tool", tool_name),
+    };
+
+    // The reviewer's objection goes inside the prompt rather than on a line of
+    // its own: shown twice it reads as two separate verdicts, and a refusal here
+    // is advice, not a decision.
+    if let Some(review) = review {
+        let line = match review {
+            ReviewNote::Denied(reason) => format!("🤖 Review: DENY — {}", reason),
+            ReviewNote::Failed(detail) => format!("🤖 Review failed: {}", detail),
+            ReviewNote::Interrupted => "🤖 Review interrupted.".to_string(),
+        };
+        description.push_str(&format!("\n\n{}", line));
+    }
+    description
 }

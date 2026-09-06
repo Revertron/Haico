@@ -29,26 +29,23 @@ use crate::config::{
     autocompact_threshold, resolve_settings, Config, Reasoning, ResolvedSettings,
     AUTOCOMPACT_FRACTION,
 };
-use crate::llm::LMStudioClient;
-use crate::modes::{Mode, ReviewCache};
-use crate::permissions::PermissionManager;
-use crate::prompt::{compose_system_prompt, load_project_context, load_user_context};
-use crate::session::{
-    set_system_message,
-    load_session, session_file_path, ReasoningStats,
-};
 use crate::ask::{self, ASK_USER};
-use crate::llm::Chunk;
+use crate::llm::{Chunk, LMStudioClient};
 use crate::modes::{
-    gate_for_mode, judge_tool_call, tools_for_mode, with_mode_note, PlanDecision, Verdict,
-    PRESENT_PLAN, START_PLAN,
+    gate_for_mode, judge_tool_call, tools_for_mode, with_mode_note, Mode, PlanDecision,
+    ReviewCache, Verdict, PRESENT_PLAN, START_PLAN,
 };
-use crate::permissions::{Gate, PermissionResponse};
+use crate::permissions::{Gate, PermissionManager, PermissionResponse};
+use crate::prompt::{compose_system_prompt, load_project_context, load_user_context};
+// The one `render` import, and it earns its place: a diff is the *content* of a
+// pending change, which the turn has to compute because only it has the old file.
+// How much of it to show is the frontend's, and that half lives there.
+use crate::render::file_change_diff;
 use crate::session::{
-    apply_reasoning, compact_history, estimate_tokens, reasoning_needs_a_request,
-    save_session, ReasoningOutcome,
+    apply_reasoning, compact_history, estimate_tokens, load_session,
+    reasoning_needs_a_request, save_session, session_file_path, set_system_message,
+    ReasoningOutcome, ReasoningStats,
 };
-use crate::render::{file_change_diff, indented_command};
 use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer};
 use crate::turn::*;
 use crate::util::truncate_at_boundary;
@@ -840,7 +837,7 @@ pub(crate) async fn run_turn(
                     // Why the call is running unasked, and what to add to the prompt when
                     // it still has to be asked. Only one is ever set.
                     let mut auto_note: Option<String> = None;
-                    let mut review_line: Option<String> = None;
+                    let mut review_note: Option<ReviewNote> = None;
                     if link.mode() == Mode::Auto && ask.is_some() {
                         // Transient: a review takes seconds, and a silent pause reads as a
                         // hang. Erased once it lands, because the outcome belongs on the
@@ -866,13 +863,13 @@ pub(crate) async fn run_turn(
                                 ask = None;
                             }
                             Some(Ok(Verdict { allow: false, reason, .. })) => {
-                                review_line = Some(format!("🤖 Review: DENY — {}", reason));
+                                review_note = Some(ReviewNote::Denied(reason));
                             }
                             Some(Err(e)) => {
-                                review_line = Some(format!("🤖 Review failed: {:#}", e));
+                                review_note = Some(ReviewNote::Failed(format!("{:#}", e)));
                             }
                             None => {
-                                review_line = Some("🤖 Review interrupted.".to_string());
+                                review_note = Some(ReviewNote::Interrupted);
                             }
                         }
                     }
@@ -885,64 +882,18 @@ pub(crate) async fn run_turn(
                         // Generate diff if needed
                         let diff_content: Option<String> = file_change_diff(tool_name, &arguments);
 
-                        // Create human-readable description
-                        let mut description = match tool_name {
-                            "web_search" => {
-                                let query = arguments["query"].as_str().unwrap_or("unknown");
-                                format!("Search the web for: '{}'", query)
-                            }
-                            "web_fetch" | "web_get" => {
-                                let url = arguments["url"].as_str().unwrap_or("unknown");
-                                format!("Fetch content from URL: {}", url)
-                            }
-                            "write_file" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let size = arguments["content"].as_str().map(|s| s.len()).unwrap_or(0);
-                                format!("Write {} bytes to file: {}", size, file_path)
-                            }
-                            "edit" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let from = arguments["old_string"].as_str().unwrap_or("unknown");
-                                let to = arguments["new_string"].as_str().unwrap_or("unknown");
-                                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
-                                if replace_all {
-                                    format!("Edit file (replace all '{from}'->'{to}') in {}", file_path)
-                                } else {
-                                    format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
-                                }
-                            }
-                            "multi_edit" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let count = arguments["edits"].as_array().map(|e| e.len()).unwrap_or(0);
-                                format!("Apply {} edit(s) to file: {}", count, file_path)
-                            }
-                            "run_background" => {
-                                let command = arguments["command"].as_str().unwrap_or("unknown");
-                                format!(
-                                    "Start in the background:\n{}",
-                                    indented_command(command)
-                                )
-                            }
-                            "run_command" => {
-                                let command = arguments["command"].as_str().unwrap_or("unknown");
-                                format!("Execute command:\n{}", indented_command(command))
-                            }
-                            _ => format!("Execute '{}' tool", tool_name)
-                        };
-
-                        // The reviewer declined to wave this through. Its reason goes in the
-                        // prompt rather than on its own line: shown twice it reads as two
-                        // separate verdicts, and a refusal here is advice, not a decision.
-                        if let Some(line) = &review_line {
-                            description.push_str(&format!("\n\n{}", line));
-                        }
-
-                        // Ask for permission with diff if available. A terminal we cannot
-                        // read from (piped stdin, no TTY) must not end the session, and must
-                        // never be taken as consent: refuse the call and tell the model.
+                        // The call itself goes to the frontend, not a sentence
+                        // about it: how much of a command to show and where the
+                        // reviewer's objection belongs are rendering decisions.
+                        //
+                        // A terminal we cannot read from (piped stdin, no TTY) must
+                        // not end the session, and must never be taken as consent:
+                        // refuse the call and tell the model.
                         let answered = ask_frontend(tx, |reply| Ask::Permission {
+                            tool_name: tool_name.to_string(),
+                            arguments: arguments.clone(),
+                            review: review_note.clone(),
                             allow_all_label: allow_all_label.clone(),
-                            description: description.clone(),
                             diff: diff_content.clone(),
                             reply,
                         })

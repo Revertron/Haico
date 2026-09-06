@@ -406,7 +406,9 @@ async fn answer_or_show(
                 let _ = reply.send(answer);
             }
         }
-        Ask::Permission { allow_all_label, description, diff, reply } => {
+        Ask::Permission { tool_name, arguments, review, allow_all_label, diff, reply } => {
+            // The turn sent the call; the sentence above the buttons is made here.
+            let description = permission_description(&tool_name, &arguments, review.as_ref());
             let response =
                 ask_about_call(keys.as_mut(), &allow_all_label, &description, diff.as_deref()).await;
             if let Ok(response) = response {

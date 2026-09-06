@@ -190,12 +190,38 @@ pub(crate) enum Ask {
         reply: oneshot::Sender<crate::ask::Answer>,
     },
     /// A gated call needs consent.
+    ///
+    /// The call itself, not a sentence about it. Describing a pending write as
+    /// "Write 412 bytes to file: src/main.rs" is a rendering decision — how much
+    /// of the command to show, how to lay it out, whether to put the diff above
+    /// or below — and it was the last piece of that decision left in the core.
+    /// `allow_all_label` stays a string because it is the *gate's* own name for
+    /// the scope being granted, which is policy rather than presentation.
     Permission {
+        tool_name: String,
+        arguments: Value,
+        /// What the auto-mode reviewer said, when it declined to wave this
+        /// through. `None` when there was no reviewer or it approved.
+        review: Option<ReviewNote>,
         allow_all_label: String,
-        description: String,
         diff: Option<String>,
         reply: oneshot::Sender<PermissionResponse>,
     },
+}
+
+/// Why a gated call reached the user despite auto mode being on.
+///
+/// Auto mode can only ever *spend* consent, never withhold it, so each of these
+/// means the same thing to the turn — ask the user — and different things to the
+/// person reading the prompt, which is why they stay apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReviewNote {
+    /// The reviewer said no, and this is its reason.
+    Denied(String),
+    /// The reviewer could not be asked at all.
+    Failed(String),
+    /// Esc arrived while the review was running.
+    Interrupted,
 }
 
 /// Something that happened during a turn, worth one line and carrying no
