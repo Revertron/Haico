@@ -25,10 +25,7 @@
 //! The transcript is a `Frame` of `RichText` children inside a `ScrollView`
 //! rather than a virtualized `RecyclerView`, which is fine for a session and
 //! wrong for a long one. Code blocks are not syntax-highlighted; that wants
-//! `syntect` emitting spans. And the permission dialog offers two answers where
-//! the terminal offers three: "allow for the rest of the session" is a scope
-//! decision a yes/no box cannot express, so it is not offered rather than being
-//! quietly folded into "yes".
+//! `syntect` emitting spans.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -46,10 +43,12 @@ use crate::ask::Answer;
 use crate::modes::{Mode, PlanDecision};
 use crate::permissions::PermissionResponse;
 use crate::turn::{AgentEvent, Ask, Notice, TurnLink, Waiting};
+use tokio::sync::oneshot;
 
 const TRANSCRIPT: &str = "transcript";
 const SCROLL: &str = "scroll";
 const INPUT: &str = "input";
+const COMPOSER: &str = "composer";
 const STATUS: &str = "status";
 const BUSY: &str = "busy";
 const SEND: &str = "send";
@@ -63,6 +62,16 @@ const OPEN_REASONING: &str = "reasoning-open";
 /// monospace face at the same nominal size reads bigger than a proportional one.
 const PROSE: f32 = 15.0;
 const CODE: f32 = 13.0;
+
+/// The permission panel and its parts. It takes the composer's place while a
+/// gated call waits for an answer, so the two are never on screen together.
+const GATE: &str = "gate";
+const GATE_ALLOW: &str = "gate-allow";
+const GATE_ALL: &str = "gate-all";
+const GATE_REJECT: &str = "gate-reject";
+const GATE_REPLY: &str = "gate-reply";
+const GATE_TEXT: &str = "gate-text";
+const GATE_SEND: &str = "gate-send";
 
 const MENUBAR: &str = "menubar";
 
@@ -135,7 +144,16 @@ const LAYOUT: &str = r#"
         <Frame id="transcript" width="max" height="min" direction="vertical" padding="12"/>
     </ScrollView>
     <Label id="busy" width="max" height="min" text="" margin_left="12" margin_top="2"/>
-    <Frame width="max" height="min" direction="horizontal" padding="8">
+    <Frame id="gate" width="max" height="min" direction="vertical" padding="8" visibility="gone">
+        <Button id="gate-allow" width="max" height="32" text="1. Allow once"/>
+        <Button id="gate-all" width="max" height="32" text="2. Allow all" margin_top="4"/>
+        <Button id="gate-reject" width="max" height="32" text="3. Reject and provide alternative" margin_top="4"/>
+        <Frame id="gate-reply" width="max" height="min" direction="horizontal" margin_top="4" visibility="gone">
+            <Edit id="gate-text" width="max" height="32"/>
+            <Button id="gate-send" text="Send" width="90" height="32" margin_left="8"/>
+        </Frame>
+    </Frame>
+    <Frame id="composer" width="max" height="min" direction="horizontal" padding="8">
         <Memo id="input" width="max" height="70"/>
         <Button id="send" text="Send" width="90" height="70" margin_left="8"/>
     </Frame>
@@ -169,6 +187,8 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
     }
     let tx = input_tx.clone();
     ui.add_shortcut("Ctrl+Enter", Box::new(move |ui| submit(ui, &tx)));
+
+    wire_gate(&mut ui);
 
     // The menubar fires one Click for whichever leaf was chosen; which one it
     // was comes from `clicked_item`. Quit is handled here because closing the
@@ -452,23 +472,211 @@ fn ask_in_window(handle: &UiHandle, ask: Ask) {
             // renderer — reused deliberately, because it is the one piece of
             // wording both frontends genuinely want the same. If a GUI ever wants
             // it laid out differently, this is the line that changes.
-            let mut message =
+            let description =
                 crate::present::permission_description(&tool_name, &arguments, review.as_ref());
-            if let Some(diff) = &diff {
-                message.push_str("\n\n");
-                message.push_str(diff.trim_end());
-            }
-            // Not offered: `allow_all_label` names a session-wide scope, and a
-            // yes/no box cannot ask for it without overstating what was granted.
-            let _ = allow_all_label;
-            confirm(handle, "Permission", message, move |allowed| match allowed {
-                true => PermissionResponse::Allow,
-                false => PermissionResponse::Reject(
-                    "The user declined this call in the GUI.".to_string(),
-                ),
-            }, reply);
+            show(handle, move |ui| {
+                // What is being asked goes in the transcript, where a diff gets
+                // the preformatted block the window already renders well and can
+                // be scrolled and selected like anything else. The panel below
+                // carries only the answers.
+                line(ui, "Allow this tool usage?", Tone::Warning);
+                line(ui, &description, Tone::Normal);
+                if let Some(diff) = &diff {
+                    block(ui, diff);
+                }
+                open_gate(ui, &allow_all_label, reply);
+            });
         }
     }
+}
+
+thread_local! {
+    /// The permission question the panel is putting, and the channel it answers
+    /// on. `None` whenever the panel is closed, which is what makes the number
+    /// keys inert the rest of the time.
+    ///
+    /// UI-thread state, like the asset provider, because the panel's controls
+    /// are wired once at startup and have to find the current question from
+    /// there. Wiring them per question would be the obvious alternative and does
+    /// not work for the accelerators: `fire_shortcut` puts a handler back into
+    /// the registry after running it, so one that unregistered itself while
+    /// answering would survive anyway and go on eating the key afterwards.
+    static PENDING: RefCell<Option<oneshot::Sender<PermissionResponse>>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether a gated call is waiting on the panel right now.
+fn gate_open() -> bool {
+    PENDING.with(|pending| pending.borrow().is_some())
+}
+
+/// Wire the permission panel's controls. Once, at startup — see [`PENDING`].
+fn wire_gate(ui: &mut UI) {
+    on_click(ui, GATE_ALLOW, |ui| answer_gate(ui, PermissionResponse::Allow));
+    on_click(ui, GATE_ALL, |ui| answer_gate(ui, PermissionResponse::AllowAll));
+    on_click(ui, GATE_REJECT, open_reject);
+    on_click(ui, GATE_SEND, send_reject);
+
+    // Enter sends the alternative. A KeyDown listener on the focused view runs
+    // before the view's own handling, so this needs no accelerator — which is
+    // just as well, since a global one for Enter would have to be kept out of
+    // the composer's way.
+    if let Some(element) = ui.get_view(GATE_TEXT) {
+        element.borrow_mut().on_event(
+            EventType::KeyDown,
+            Box::new(|ui, _view, data| match data {
+                EventData::Key { code: Some(VirtualKeyCode::Return), .. } => {
+                    send_reject(ui);
+                    true
+                }
+                _ => false,
+            }),
+        );
+    }
+
+    // The number keys, as the terminal's prompt has them. Left registered for
+    // the whole session because they do nothing unless a question is pending,
+    // and because Lumio fires an accelerator only when the focused view did not
+    // take the key first — so typing "1" into the composer, or into the
+    // alternative field, types a 1 rather than answering.
+    ui.add_shortcut("1", Box::new(|ui| gate_answer(ui, PermissionResponse::Allow)));
+    ui.add_shortcut("2", Box::new(|ui| gate_answer(ui, PermissionResponse::AllowAll)));
+    ui.add_shortcut(
+        "3",
+        Box::new(|ui| {
+            if !gate_open() {
+                return false;
+            }
+            open_reject(ui);
+            true
+        }),
+    );
+}
+
+/// An accelerator that answers the panel, or declines the key if nothing asked.
+fn gate_answer(ui: &mut UI, response: PermissionResponse) -> bool {
+    if !gate_open() {
+        return false;
+    }
+    answer_gate(ui, response);
+    true
+}
+
+/// Put a gated call to the user, in the composer's place.
+fn open_gate(ui: &mut UI, allow_all_label: &str, reply: oneshot::Sender<PermissionResponse>) {
+    // Replacing a pending question drops its sender, which the turn hears as a
+    // refusal. It cannot happen — a turn waits for its answer before going on —
+    // but if that assumption ever breaks, denying is the direction to break in.
+    PENDING.with(|pending| *pending.borrow_mut() = Some(reply));
+    // The label names the scope the approval would have, which is the whole
+    // reason this answer can be offered at all: a yes/no box had nowhere to
+    // put it, so it used to be dropped.
+    set_button(ui, GATE_ALL, &format!("2. {allow_all_label}"));
+    show_view(ui, GATE, true);
+    show_view(ui, COMPOSER, false);
+    ui.relayout();
+}
+
+/// Answer the pending question, once, and put the composer back.
+fn answer_gate(ui: &mut UI, response: PermissionResponse) {
+    let Some(reply) = PENDING.with(|pending| pending.borrow_mut().take()) else { return };
+    let _ = reply.send(response);
+    later(ui, close_gate);
+}
+
+/// Swap the third option for the field that says what to do instead.
+fn open_reject(ui: &mut UI) {
+    later(ui, |ui| {
+        show_view(ui, GATE_REJECT, false);
+        show_view(ui, GATE_REPLY, true);
+        ui.relayout();
+        // Focusing the field is also what disarms the number keys: an
+        // accelerator fires only if the focused view did not take the key, and
+        // an Edit takes them all.
+        if let Some(element) = ui.get_view(GATE_TEXT) {
+            ui.set_focus_to(&element);
+        }
+    });
+}
+
+/// Reject with whatever the field says, empty included — the terminal's third
+/// answer allows an empty alternative too, and the model is told either way.
+fn send_reject(ui: &mut UI) {
+    let alternative = edit_text(ui, GATE_TEXT).trim().to_string();
+    answer_gate(ui, PermissionResponse::Reject(alternative));
+}
+
+/// Hide the panel, restore the composer, and leave the panel ready for the next
+/// question rather than mid-answer.
+fn close_gate(ui: &mut UI) {
+    show_view(ui, GATE, false);
+    show_view(ui, GATE_REPLY, false);
+    show_view(ui, GATE_REJECT, true);
+    set_edit(ui, GATE_TEXT, "");
+    show_view(ui, COMPOSER, true);
+    if let Some(element) = ui.get_view(INPUT) {
+        ui.set_focus_to(&element);
+    }
+    ui.relayout();
+}
+
+/// Run `f` on the next UI tick instead of now.
+///
+/// Mouse dispatch walks the tree holding a `borrow()` on every view on the path
+/// down to the one that was clicked, so a handler that hides its own panel —
+/// or anything containing it — would `borrow_mut()` a view that is still
+/// borrowed, and panic. Queued work runs at the top of the next update, outside
+/// any walk, which is the only safe place to change what is on screen from
+/// inside a click.
+fn later(ui: &UI, f: impl FnOnce(&mut UI) + Send + 'static) {
+    ui.handle().run_on_ui_thread(f);
+}
+
+/// Show or hide a view, taking its space back when it goes.
+fn show_view(ui: &mut UI, id: &str, visible: bool) {
+    if let Some(element) = ui.get_view(id) {
+        element.borrow_mut().set_visibility(match visible {
+            true => Visibility::Visible,
+            false => Visibility::Gone,
+        });
+    }
+}
+
+fn on_click(ui: &mut UI, id: &str, f: impl Fn(&mut UI) + 'static) {
+    if let Some(element) = ui.get_view(id) {
+        element.borrow_mut().on_event(
+            EventType::Click,
+            Box::new(move |ui, _view, _data| {
+                f(ui);
+                true
+            }),
+        );
+    }
+}
+
+fn set_button(ui: &mut UI, id: &str, text: &str) {
+    if let Some(element) = ui.get_view(id) {
+        if let Some(button) = element.borrow().as_any().downcast_ref::<Button>() {
+            button.set_text(text);
+        }
+    }
+}
+
+fn set_edit(ui: &mut UI, id: &str, text: &str) {
+    if let Some(element) = ui.get_view(id) {
+        if let Some(edit) = element.borrow().as_any().downcast_ref::<Edit>() {
+            edit.set_text(text);
+        }
+    }
+}
+
+fn edit_text(ui: &mut UI, id: &str) -> String {
+    ui.get_view(id)
+        .and_then(|element| {
+            let view = element.borrow();
+            view.as_any().downcast_ref::<Edit>().map(|edit| edit.get_text())
+        })
+        .unwrap_or_default()
 }
 
 /// A yes/no dialog whose answer is mapped by `decide` and sent on `reply` once.
@@ -1508,6 +1716,138 @@ mod tests {
             );
         }
     }
+    /// Whether a view is on screen, as the panel's swap is expressed.
+    fn visible(ui: &UI, id: &str) -> bool {
+        ui.get_view(id)
+            .map(|element| element.borrow().get_visibility() == Visibility::Visible)
+            .unwrap_or(false)
+    }
+
+    fn press(ui: &mut UI, code: VirtualKeyCode) {
+        ui.on_key_down(Some(code), 0, ModifiersState::default());
+    }
+
+    fn gate_ui() -> UI {
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
+        wire_gate(&mut ui);
+        ui
+    }
+
+    /// The panel takes the composer's place for exactly as long as a gated call
+    /// is waiting, and the number keys answer it the way the terminal's prompt
+    /// does. The scope of "allow all" is on the button, which is the thing a
+    /// yes/no box could not say and so used to drop.
+    #[test]
+    fn the_panel_replaces_the_composer_while_a_call_waits() {
+        let mut ui = gate_ui();
+        assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE), "closed until asked");
+
+        let (tx, mut rx) = oneshot::channel();
+        open_gate(&mut ui, "Allow all 'edit' calls under src", tx);
+        assert!(visible(&ui, GATE) && !visible(&ui, COMPOSER));
+        assert!(gate_open());
+
+        let label = ui
+            .get_view(GATE_ALL)
+            .map(|element| {
+                let view = element.borrow();
+                view.as_any().downcast_ref::<Button>().expect("a Button").get_text()
+            })
+            .unwrap_or_default();
+        assert_eq!(label, "2. Allow all 'edit' calls under src");
+
+        press(&mut ui, VirtualKeyCode::Key1);
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Allow)));
+        assert!(!gate_open(), "answered once, and only once");
+
+        // Putting the composer back is deferred, because the same call can come
+        // from inside a click on the panel's own button.
+        assert!(visible(&ui, GATE), "not until the UI ticks");
+        ui.update();
+        assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
+    }
+
+    /// The third answer is the one a yes/no box could not carry at all: it needs
+    /// the user's own words. Choosing it turns the option into the field that
+    /// takes them, and Enter sends what was typed.
+    #[test]
+    fn rejecting_swaps_the_third_option_for_a_field() {
+        let mut ui = gate_ui();
+        let (tx, mut rx) = oneshot::channel();
+        open_gate(&mut ui, "Allow all", tx);
+
+        press(&mut ui, VirtualKeyCode::Key3);
+        ui.update();
+        assert!(!visible(&ui, GATE_REJECT), "the option gave up its place");
+        assert!(visible(&ui, GATE_REPLY));
+        // The first two answers stay reachable, so choosing to say something is
+        // not a one-way door.
+        assert!(visible(&ui, GATE_ALLOW) && visible(&ui, GATE_ALL));
+
+        set_edit(&mut ui, GATE_TEXT, "  read it first  ");
+        // Enter reaches the field because it has the focus, which the swap gave
+        // it — the same focus that stops 1/2/3 answering while typing.
+        press(&mut ui, VirtualKeyCode::Return);
+        match rx.try_recv() {
+            Ok(PermissionResponse::Reject(alternative)) => {
+                assert_eq!(alternative, "read it first", "trimmed, and the user's own words")
+            }
+            _ => panic!("Enter did not send the alternative"),
+        }
+
+        ui.update();
+        assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
+        // And the panel is ready for the next question rather than mid-answer.
+        assert!(visible(&ui, GATE_REJECT) && !visible(&ui, GATE_REPLY));
+        assert_eq!(edit_text(&mut ui, GATE_TEXT), "");
+    }
+
+    /// Clicking an option must work, and the click is the dangerous path: mouse
+    /// dispatch walks the tree holding a `borrow()` on every view above the one
+    /// hit, so a handler that hid the panel there and then would `borrow_mut()`
+    /// a view still borrowed and panic. This test is the reason the swap is
+    /// deferred to the next tick — without that it is not a wrong pixel, it is
+    /// a crash on the most ordinary thing a user can do.
+    #[test]
+    fn clicking_an_option_answers_without_panicking() {
+        let mut ui = gate_ui();
+        let (tx, mut rx) = oneshot::channel();
+        open_gate(&mut ui, "Allow all", tx);
+        ui.force_layout();
+
+        // In window coordinates, which is what dispatch is given: a view's own
+        // rect is relative to its parent, because each container subtracts its
+        // origin before offering the point to its children.
+        let rect_of = |id: &str| ui.get_view(id).expect("laid out").borrow().get_rect();
+        let panel = rect_of(GATE);
+        let option = rect_of(GATE_ALLOW);
+        let middle = Point::new(
+            panel.min.x + (option.min.x + option.max.x) / 2,
+            panel.min.y + (option.min.y + option.max.y) / 2,
+        );
+        ui.on_mouse_button_down(middle, MouseButton::Left);
+        ui.on_mouse_button_up(middle, MouseButton::Left);
+
+        assert!(matches!(rx.try_recv(), Ok(PermissionResponse::Allow)));
+        ui.update();
+        assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
+    }
+
+    /// The accelerators are registered for the whole session, so they have to be
+    /// inert when nothing is being asked — otherwise "1" would be spent on a
+    /// panel that is not there.
+    #[test]
+    fn the_number_keys_do_nothing_when_no_call_is_waiting() {
+        let mut ui = gate_ui();
+        for code in [VirtualKeyCode::Key1, VirtualKeyCode::Key2, VirtualKeyCode::Key3] {
+            press(&mut ui, code);
+        }
+        ui.update();
+        assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
+        assert!(visible(&ui, GATE_REJECT) && !visible(&ui, GATE_REPLY));
+    }
+
     /// The check is derived from the current model, never stored — which is
     /// the whole fix. It used to be written once when the list arrived, so
     /// switching left it sitting on the model that was current at startup.
