@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[macro_use]
 mod out;
 
+mod agent;
 mod ask;
 mod config;
 mod debug;
@@ -30,6 +31,7 @@ mod tools;
 mod util;
 mod workspace;
 
+use agent::*;
 use ask::*;
 use config::*;
 use input::*;
@@ -41,7 +43,6 @@ use render::*;
 use session::*;
 use tools::*;
 use util::*;
-use workspace::*;
 
 
 // MCP Server with tools
@@ -447,111 +448,38 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Initialize LM Studio client with selected model
-    let mut lm_client = LMStudioClient::new(
-        config.llm_url.clone(),
-        selected_model,
-        config.token.clone(),
-    );
+    // Everything the conversation itself needs — client, tools, history,
+    // permissions, workspace, mode — now lives in one place with no terminal
+    // attached (`src/agent.rs`). What stays out here is this frontend's own:
+    // the keyboard, the editor, and every line printed.
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resume_requested = config.resume;
+    let mut agent = Agent::new(config, selected_model, &cwd);
 
-    // Initialize MCP server with tools
-    // Now that the model is known, its own config section can be applied. Held in a
-    // variable because /model re-resolves it for whatever is switched to.
-    let mut settings = resolve_settings(&config, &lm_client.model);
-    lm_client.apply_settings(&settings);
-    let mut context_tokens = settings.context_tokens;
-    // Pulled out of the settings like the context budget is, and for the same reason:
-    // /reasoning changes it for the session without touching the config file, so the value
-    // in force has to live somewhere the resolved settings can be re-read over.
-    let mut reasoning = settings.reasoning();
-    let mut reasoning_threshold = settings.reasoning_threshold();
-    // Runs for the life of the conversation, and is reset by /clear along with it: the
-    // figure is savings made on this history, and reporting it against a history that was
-    // just thrown away would be the one reading of it that is wrong. /compact and /model
-    // do leave it alone — neither discards the conversation, so the savings still stand.
-    let mut reasoning_stats = ReasoningStats::default();
-
-    let mut server = MyMcpServer::new(lm_client.clone(), true, config.searxng.clone(), true);
-    let openai_tools = mcp_tools_to_openai_format(&server);
-
-    // outln!("Available tools:");
-    // for tool in server.tool_router.list_all() {
-    //     outln!("  - {}: {}", tool.name, tool.description.as_deref().unwrap_or(""));
-    // }
-    // outln!();
-
-    // Read once and kept: /model rebuilds the system message, and re-reading the file on
-    // every switch would announce it again each time.
-    let mut project_context = load_project_context();
-    if let Some((name, _)) = &project_context {
+    // The core reports what it loaded rather than announcing it, so the saying
+    // of it stays here with the rest of the output.
+    if let Some((name, _)) = &agent.project_context {
         outln!("Loaded project context from {}", name);
     }
-
-    // Read once for the whole session and never reloaded — it lives outside the project and
-    // nothing here writes to it, so the reload points the project's file needs do not apply.
-    let user_context = load_user_context();
-    if user_context.is_some() {
+    if agent.user_context.is_some() {
         outln!("Loaded user context from {}", USER_CONTEXT_FILE);
     }
-
-    // None when this model is configured without our prompt and neither file exists — then
-    // the conversation carries no system message at all.
-    let mut system_prompt_content = compose_system_prompt(
-        config.system_prompt.as_deref(),
-        &lm_client.model,
-        settings.use_system_prompt,
-        user_context.as_deref(),
-        project_context.as_ref(),
-    );
-
-    // Conversation history
-    let mut messages: Vec<Value> = vec![];
-    if let Some(content) = &system_prompt_content {
-        messages.push(json!({
-            "role": "system",
-            "content": content
-        }));
-    }
-
-    // Restoring only the messages, never the stored system prompt: the date, branch and git
-    // status in it would otherwise be whatever they were when the session was saved.
-    let session_path = session_file_path();
-    if config.resume {
-        match session_path.as_deref().map(load_session) {
-            Some(Ok(session)) => {
-                let count = session.messages.len();
-                messages.extend(session.messages);
-                *server.todos.lock().unwrap() = session.todos;
-                outln!(
-                    "Resumed {} message(s) from {} (model then: {}).",
-                    count, session.saved_at, session.model
-                );
-            }
-            Some(Err(e)) => outln!("Could not resume: {:#}. Starting fresh.", e),
-            None => outln!("Could not resume: no home directory. Starting fresh."),
+    if resume_requested {
+        match agent.resume() {
+            Ok(restored) => outln!(
+                "Resumed {} message(s) from {} (model then: {}).",
+                restored.messages, restored.saved_at, restored.model
+            ),
+            Err(e) => outln!("Could not resume: {:#}. Starting fresh.", e),
         }
-    } else if session_path.as_deref().is_some_and(|p| p.exists()) {
+    } else if agent.has_saved_session() {
         outln!("A previous conversation exists here — start with --resume to continue it.");
     }
-
-    // Permission manager. Deliberately not persisted: approvals last for one session, so
-    // resuming never silently carries over permission to run something.
-    let mut perm_manager = PermissionManager::new();
-    let mut review_cache = ReviewCache::new();
-
-    // Not persisted either, and for the same reason: resuming a session that happened to
-    // end in auto mode should not quietly resume deciding things on the user's behalf.
-    let mut mode = Mode::Normal;
-
-    // Which paths the file tools may touch. The working directory to start with; `/add`
-    // widens it for this session only, and `read_paths` in the config file names
-    // directories that may be read but never written.
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut workspace = Workspace::new(&cwd, &config.file.read_paths);
-    if !workspace.readable_roots().is_empty() {
+    if !agent.workspace.readable_roots().is_empty() {
         outln!(
             "Readable outside the project: {}",
-            workspace
+            agent
+                .workspace
                 .readable_roots()
                 .iter()
                 .map(|r| display_path(r))
@@ -596,12 +524,12 @@ async fn main() -> Result<()> {
         } else {
             match keys.as_mut() {
                 Some(keys) => {
-                    let status = status_line(&lm_client.model, &messages, context_tokens);
-                    let plan = server.todos.lock().unwrap().clone();
+                    let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
+                    let plan = agent.plan();
                     match read_command(
                         keys,
                         &mut editor,
-                        &mut mode,
+                        &mut agent.mode,
                         &status,
                         last_activity.as_deref(),
                         &plan,
@@ -658,7 +586,7 @@ async fn main() -> Result<()> {
                 outln!("Usage: /add <path>   (a directory to read and write for this session)\n");
                 continue;
             }
-            match workspace.add(std::path::Path::new(requested)) {
+            match agent.workspace.add(std::path::Path::new(requested)) {
                 Ok(added) => outln!("Added to the workspace: {}\n", display_path(&added)),
                 Err(reason) => outln!("{}\n", reason),
             }
@@ -667,14 +595,14 @@ async fn main() -> Result<()> {
 
         if input == "/workspace" {
             outln!("Readable and writable:");
-            for root in workspace.writable_roots() {
+            for root in agent.workspace.writable_roots() {
                 outln!("  {}", display_path(root));
             }
-            if workspace.readable_roots().is_empty() {
+            if agent.workspace.readable_roots().is_empty() {
                 outln!("Readable only: none configured (see 'read_paths' in the config file).");
             } else {
                 outln!("Readable only:");
-                for root in workspace.readable_roots() {
+                for root in agent.workspace.readable_roots() {
                     outln!("  {}", display_path(root));
                 }
             }
@@ -690,17 +618,17 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             if let Some(requested) = requested {
-                mode = requested;
+                agent.mode = requested;
             }
-            outln!("Mode: {}\n", mode.describe());
-            if mode == Mode::Auto {
+            outln!("Mode: {}\n", agent.mode.describe());
+            if agent.mode == Mode::Auto {
                 // Spelled out, because this is the mode that acts without asking and the
                 // user should know exactly how far that goes before leaving it on.
                 outln!(
                     "{} reviews each call that would have asked you, with no conversation \
                      history. Calls it judges routine run on their own, tagged with the \
                      reason. Anything it refuses — or cannot judge — still comes to you.",
-                    lm_client.model
+                    agent.client.model
                 );
                 outln!(
                     "It is the same model, so treat it as a check against drift and \
@@ -711,55 +639,22 @@ async fn main() -> Result<()> {
         }
 
         if input == "/clear" || input == "/new" || input == "/reset" {
-            // The boundary where a stale copy of the project's instructions actually costs
-            // something: whatever the model knew about the file from having read it is about
-            // to be thrown out with the rest of the history, leaving the system message as
-            // the only copy. One file read at a pause the user asked for, and it picks up an
-            // edit made in an editor just as well as one a tool made.
-            let reloaded = load_project_context();
-            if reloaded != project_context {
-                project_context = reloaded;
-                system_prompt_content = compose_system_prompt(
-                    config.system_prompt.as_deref(),
-                    &lm_client.model,
-                    settings.use_system_prompt,
-                    user_context.as_deref(),
-                    project_context.as_ref(),
-                );
-                match &project_context {
-                    Some((name, _)) => outln!("Reloaded project context from {}", name),
-                    None => outln!("Project context file is gone; carrying on without it"),
+            // What is discarded, what survives and why is `Agent::clear`'s
+            // business; all that is left here is saying what happened.
+            match agent.clear() {
+                ContextReload::Unchanged => {}
+                ContextReload::Reloaded(name) => outln!("Reloaded project context from {}", name),
+                ContextReload::Gone => {
+                    outln!("Project context file is gone; carrying on without it")
                 }
             }
-
-            messages.clear();
-            if let Some(content) = &system_prompt_content {
-                messages.push(json!({
-                    "role": "system",
-                    "content": content
-                }));
-            }
-            // To hand the memory back, not to withdraw anything: an entry is keyed by the
-            // whole evidence string, so it holds a whole script or a whole diff, and a long
-            // session accumulates them. No verdict is invalidated by this — the reviewer
-            // never saw the conversation, so dropping the conversation tells it nothing.
-            // Approvals in `perm_manager` deliberately survive, same as they always have.
-            review_cache.clear();
-            // The plan went with the conversation. It used to be harmless to leave — only
-            // /todo ever looked at it — but pinned above the box, a plan for work that was
-            // just thrown away would sit there for the rest of the session.
-            server.todos.lock().unwrap().clear();
-            // The savings were savings on the history that just went. Carrying the figure
-            // forward would have /context reporting tokens reclaimed from a conversation
-            // that no longer exists, which is the one reading of it that is simply wrong.
-            reasoning_stats = ReasoningStats::default();
             outln!("Conversation cleared.\n");
             continue;
         }
 
         if input == "/tools" {
-            outln!("{} tools available:", server.tool_router.list_all().len());
-            for tool in server.tool_router.list_all() {
+            outln!("{} tools available:", agent.server.tool_router.list_all().len());
+            for tool in agent.server.tool_router.list_all() {
                 let gate = if AUTO_ALLOWED_TOOLS.contains(&tool.name.as_ref()) {
                     "auto"
                 } else {
@@ -773,9 +668,9 @@ async fn main() -> Result<()> {
 
         if input == "/model" || input.starts_with("/model ") {
             let requested = input.strip_prefix("/model").unwrap_or("").trim().to_string();
-            // Copied out so the borrow ends before lm_client is reassigned below.
-            let llm_url = lm_client.base_url.clone();
-            let token = lm_client.token.clone();
+            // Copied out so the borrow ends before agent.client is reassigned below.
+            let llm_url = agent.client.base_url.clone();
+            let token = agent.client.token.clone();
 
             let chosen = if requested.is_empty() {
                 match fetch_available_models(&llm_url, token.as_deref()).await {
@@ -800,49 +695,18 @@ async fn main() -> Result<()> {
             };
 
             if let Some(model) = chosen {
-                // The new model's own config section applies from here on. Carrying the old
-                // model's context budget over would be worse than having no config at all:
-                // a 131072 budget against a 32k model warns far too late.
-                settings = resolve_settings(&config, &model);
-                context_tokens = settings.context_tokens;
-                // Re-resolved with the rest: whether a chain of thought is worth keeping
-                // is a property of the model that produced it, so a policy chosen for a
-                // thinking model has no business surviving a switch to one that does not
-                // think at all.
-                reasoning = settings.reasoning();
-                reasoning_threshold = settings.reasoning_threshold();
-
-                // Both copies: the REPL drives one, and web_fetch summarizes through the
-                // server's. Leaving one behind would silently keep using the old model.
-                lm_client.model = model.clone();
-                lm_client.apply_settings(&settings);
-                server.llm_client.model = model.clone();
-                server.llm_client.apply_settings(&settings);
-
-                // The reviewer is this model too, so its verdicts leave with it.
-                review_cache.clear();
-
-                // The system message belongs to the new model too: it names the model, and
-                // the model's own config section decides whether ours is sent at all.
-                // Replaced in place, so the conversation itself carries on unchanged.
-                let rebuilt = compose_system_prompt(
-                    config.system_prompt.as_deref(),
-                    &model,
-                    settings.use_system_prompt,
-                    user_context.as_deref(),
-                    project_context.as_ref(),
-                );
-                if rebuilt != system_prompt_content {
-                    system_prompt_content = rebuilt;
-                    set_system_message(&mut messages, system_prompt_content.as_deref());
-                }
+                // Everything that is configured per model is re-resolved inside
+                // `switch_model` — the context budget, the sampling, the
+                // reasoning policy, both copies of the client, and the system
+                // message. The conversation itself is kept.
+                agent.switch_model(model.clone());
 
                 outln!("Now using model: {}", model);
                 outln!(
                     "  context {} ({}){}\n",
-                    context_tokens,
-                    settings.context_source,
-                    match settings.temperature.value {
+                    agent.context_tokens,
+                    agent.settings.context_source,
+                    match agent.settings.temperature.value {
                         Some(t) => format!(", temperature {}", t),
                         None => String::new(),
                     }
@@ -852,50 +716,50 @@ async fn main() -> Result<()> {
         }
 
         if input == "/config" {
-            match config.config_path.as_deref() {
+            match agent.config.config_path.as_deref() {
                 Some(path) if path.exists() => outln!("Config file: {}", path.display()),
                 Some(path) => outln!("Config file: {} (not created yet)", path.display()),
                 None => outln!("Config file: unavailable (no home directory)"),
             }
             outln!("
-In force for '{}':", lm_client.model);
-            outln!("  url             {}", lm_client.base_url);
+In force for '{}':", agent.client.model);
+            outln!("  url             {}", agent.client.base_url);
             outln!(
                 "  token           {}",
-                if lm_client.token.is_some() { "set" } else { "not set" }
+                if agent.client.token.is_some() { "set" } else { "not set" }
             );
             outln!(
                 "  context         {}  [{}]",
-                context_tokens, settings.context_source
+                agent.context_tokens, agent.settings.context_source
             );
-            outln!("  temperature     {}", settings.temperature.describe());
-            outln!("  top_p           {}", settings.top_p.describe());
-            outln!("  top_k           {}", settings.top_k.describe());
-            outln!("  min_p           {}", settings.min_p.describe());
-            outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
-            outln!("  max_tokens      {}", settings.max_tokens.describe());
+            outln!("  temperature     {}", agent.settings.temperature.describe());
+            outln!("  top_p           {}", agent.settings.top_p.describe());
+            outln!("  top_k           {}", agent.settings.top_k.describe());
+            outln!("  min_p           {}", agent.settings.min_p.describe());
+            outln!("  repeat_penalty  {}", agent.settings.repeat_penalty.describe());
+            outln!("  max_tokens      {}", agent.settings.max_tokens.describe());
             // Shown as what is actually in force rather than as what the file said, since
             // /reasoning can have moved it since. The source string is only honest for the
             // former case, so it is replaced rather than kept when they differ.
             outln!(
                 "  reasoning       {}{}",
-                reasoning,
-                if reasoning == settings.reasoning() {
-                    format!("  [{}]", settings.reasoning_source())
+                agent.reasoning,
+                if agent.reasoning == agent.settings.reasoning() {
+                    format!("  [{}]", agent.settings.reasoning_source())
                 } else {
                     "  [/reasoning, this session]".to_string()
                 }
             );
             outln!(
                 "  system prompt   {}",
-                match (settings.use_system_prompt, &system_prompt_content) {
+                match (agent.settings.use_system_prompt, &agent.system_prompt) {
                     (true, _) => "haico's own",
                     (false, Some(_)) => "off — project instructions only  [config [models]]",
                     (false, None) => "off — nothing sent  [config [models]]",
                 }
             );
             outln!(
-                "\nA '-' means the field is left out of the request, so the server's own \
+                "\nA '-' means the field is left out of the request, so the agent.server's own \
                  setting for that model applies."
             );
             outln!("Change one for this session with /set <name> <value>.\n");
@@ -915,13 +779,13 @@ In force for '{}':", lm_client.model);
             let value = parts.next().unwrap_or("").to_string();
 
             if name.is_empty() {
-                outln!("  temperature     {}", settings.temperature.describe());
-                outln!("  top_p           {}", settings.top_p.describe());
-                outln!("  top_k           {}", settings.top_k.describe());
-                outln!("  min_p           {}", settings.min_p.describe());
-                outln!("  repeat_penalty  {}", settings.repeat_penalty.describe());
-                outln!("  max_tokens      {}", settings.max_tokens.describe());
-                outln!("  reasoning_threshold  {} tokens", reasoning_threshold);
+                outln!("  temperature     {}", agent.settings.temperature.describe());
+                outln!("  top_p           {}", agent.settings.top_p.describe());
+                outln!("  top_k           {}", agent.settings.top_k.describe());
+                outln!("  min_p           {}", agent.settings.min_p.describe());
+                outln!("  repeat_penalty  {}", agent.settings.repeat_penalty.describe());
+                outln!("  max_tokens      {}", agent.settings.max_tokens.describe());
+                outln!("  reasoning_threshold  {} tokens", agent.reasoning_threshold);
                 outln!("
 Usage: /set <name> <value>, or /set <name> unset
 ");
@@ -942,7 +806,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 other => {
                     outln!(
                         "Unknown setting '{}'. Try: temperature, top_p, top_k, min_p, \
-                         repeat_penalty, max_tokens, reasoning_threshold.\n",
+                         repeat_penalty, max_tokens, agent.reasoning_threshold.\n",
                         other
                     );
                     continue;
@@ -956,22 +820,22 @@ Usage: /set <name> <value>, or /set <name> unset
             // server to decide. Everything below this line is about the sampling knobs.
             if canonical == "reasoning_threshold" {
                 if value.is_empty() {
-                    outln!("  reasoning_threshold  {} tokens
-", reasoning_threshold);
+                    outln!("  agent.reasoning_threshold  {} tokens
+", agent.reasoning_threshold);
                 } else if value == "unset" || value == "default" || value == "-" {
-                    reasoning_threshold = settings.reasoning_threshold();
+                    agent.reasoning_threshold = agent.settings.reasoning_threshold();
                     outln!(
-                        "reasoning_threshold back to {} tokens, as configured.
+                        "agent.reasoning_threshold back to {} tokens, as configured.
 ",
-                        reasoning_threshold
+                        agent.reasoning_threshold
                     );
                 } else if let Ok(parsed) = value.parse::<usize>() {
-                    reasoning_threshold = parsed;
-                    outln!("reasoning_threshold = {} tokens for this session.
+                    agent.reasoning_threshold = parsed;
+                    outln!("agent.reasoning_threshold = {} tokens for this session.
 ", parsed);
                 } else {
                     outln!(
-                        "reasoning_threshold needs a whole number of tokens, got '{}'.
+                        "agent.reasoning_threshold needs a whole number of tokens, got '{}'.
 ",
                         value
                     );
@@ -981,12 +845,12 @@ Usage: /set <name> <value>, or /set <name> unset
 
             if value.is_empty() {
                 let shown = match canonical {
-                    "temperature" => settings.temperature.describe(),
-                    "top_p" => settings.top_p.describe(),
-                    "top_k" => settings.top_k.describe(),
-                    "min_p" => settings.min_p.describe(),
-                    "repeat_penalty" => settings.repeat_penalty.describe(),
-                    _ => settings.max_tokens.describe(),
+                    "temperature" => agent.settings.temperature.describe(),
+                    "top_p" => agent.settings.top_p.describe(),
+                    "top_k" => agent.settings.top_k.describe(),
+                    "min_p" => agent.settings.min_p.describe(),
+                    "repeat_penalty" => agent.settings.repeat_penalty.describe(),
+                    _ => agent.settings.max_tokens.describe(),
                 };
                 outln!("  {}  {}
 ", canonical, shown);
@@ -998,12 +862,12 @@ Usage: /set <name> <value>, or /set <name> unset
 
             let applied = if clearing {
                 match canonical {
-                    "temperature" => settings.temperature = Setting::unset(FROM_UNSET),
-                    "top_p" => settings.top_p = Setting::unset(FROM_UNSET),
-                    "top_k" => settings.top_k = Setting::unset(FROM_UNSET),
-                    "min_p" => settings.min_p = Setting::unset(FROM_UNSET),
-                    "repeat_penalty" => settings.repeat_penalty = Setting::unset(FROM_UNSET),
-                    _ => settings.max_tokens = Setting::unset(FROM_UNSET),
+                    "temperature" => agent.settings.temperature = Setting::unset(FROM_UNSET),
+                    "top_p" => agent.settings.top_p = Setting::unset(FROM_UNSET),
+                    "top_k" => agent.settings.top_k = Setting::unset(FROM_UNSET),
+                    "min_p" => agent.settings.min_p = Setting::unset(FROM_UNSET),
+                    "repeat_penalty" => agent.settings.repeat_penalty = Setting::unset(FROM_UNSET),
+                    _ => agent.settings.max_tokens = Setting::unset(FROM_UNSET),
                 }
                 true
             } else {
@@ -1014,9 +878,9 @@ Usage: /set <name> <value>, or /set <name> unset
                         Ok(parsed) => {
                             let setting = Setting { value: Some(parsed), source: SET_HERE };
                             if canonical == "top_k" {
-                                settings.top_k = setting;
+                                agent.settings.top_k = setting;
                             } else {
-                                settings.max_tokens = setting;
+                                agent.settings.max_tokens = setting;
                             }
                             true
                         }
@@ -1030,10 +894,10 @@ Usage: /set <name> <value>, or /set <name> unset
                         Ok(parsed) => {
                             let setting = Setting { value: Some(parsed), source: SET_HERE };
                             match canonical {
-                                "temperature" => settings.temperature = setting,
-                                "top_p" => settings.top_p = setting,
-                                "min_p" => settings.min_p = setting,
-                                _ => settings.repeat_penalty = setting,
+                                "temperature" => agent.settings.temperature = setting,
+                                "top_p" => agent.settings.top_p = setting,
+                                "min_p" => agent.settings.min_p = setting,
+                                _ => agent.settings.repeat_penalty = setting,
                             }
                             true
                         }
@@ -1048,10 +912,10 @@ Usage: /set <name> <value>, or /set <name> unset
 
             if applied {
                 // Both clients, same as /model: web_fetch summarizes through the server's.
-                lm_client.apply_settings(&settings);
-                server.llm_client.apply_settings(&settings);
+                agent.client.apply_settings(&agent.settings);
+                agent.server.llm_client.apply_settings(&agent.settings);
                 if clearing {
-                    outln!("{} unset — the server decides again.
+                    outln!("{} unset — the agent.server decides again.
 ", canonical);
                 } else {
                     outln!("{} = {} for this session.
@@ -1066,7 +930,7 @@ Usage: /set <name> <value>, or /set <name> unset
 
             if argument.is_empty() {
                 let listing: Vec<String> = {
-                    let registry = server.background.lock().unwrap();
+                    let registry = agent.server.background.lock().unwrap();
                     registry
                         .jobs
                         .iter()
@@ -1079,10 +943,10 @@ Usage: /set <name> <value>, or /set <name> unset
                     outln!("Background jobs:\n{}\n", listing.join("\n"));
                 }
             } else if argument == "stop" {
-                let stopped = server.stop_all_background().await;
+                let stopped = agent.server.stop_all_background().await;
                 outln!("Stopped {} job(s).\n", stopped);
             } else if let Some(id) = argument.strip_prefix("stop ").and_then(|n| n.trim().parse::<u32>().ok()) {
-                let result = server
+                let result = agent.server
                     .background_stop(Parameters(BackgroundStopParams { id: Some(id) }))
                     .await;
                 match result {
@@ -1104,7 +968,7 @@ Usage: /set <name> <value>, or /set <name> unset
         }
 
         if input == "/undo" {
-            match server.undo_last() {
+            match agent.server.undo_last() {
                 Ok(what) => outln!("Reverted: {}\n", what),
                 Err(why) => outln!("{}\n", why),
             }
@@ -1112,7 +976,7 @@ Usage: /set <name> <value>, or /set <name> unset
         }
 
         if input == "/todo" {
-            let todos = server.todos.lock().unwrap().clone();
+            let todos = agent.plan();
             if todos.is_empty() {
                 outln!("No plan yet.\n");
             } else {
@@ -1131,7 +995,7 @@ Usage: /set <name> <value>, or /set <name> unset
         }
 
         if input == "/context" {
-            report_context(&messages, context_tokens, &reasoning_stats);
+            report_context(&agent.messages, agent.context_tokens, &agent.reasoning_stats);
             continue;
         }
 
@@ -1141,12 +1005,12 @@ Usage: /set <name> <value>, or /set <name> unset
         if input == "/reasoning" || input.starts_with("/reasoning ") {
             let rest = input.strip_prefix("/reasoning").unwrap_or("").trim().to_string();
             if rest.is_empty() {
-                let source = if reasoning == settings.reasoning() {
-                    settings.reasoning_source()
+                let source = if agent.reasoning == agent.settings.reasoning() {
+                    agent.settings.reasoning_source()
                 } else {
                     "/reasoning, this session"
                 };
-                outln!("Chain of thought: {}  [{}]", reasoning, source);
+                outln!("Chain of thought: {}  [{}]", agent.reasoning, source);
                 outln!(
                     "  keep      send it back to the model with the rest of the history"
                 );
@@ -1156,12 +1020,12 @@ Usage: /set <name> <value>, or /set <name> unset
                 outln!("  drop      strip it the moment the turn is over");
                 outln!(
                     "\nCompressing costs one extra request per reply and only runs on a \
-                     trace over ~{} tokens (/set reasoning_threshold).\n",
-                    reasoning_threshold
+                     trace over ~{} tokens (/set agent.reasoning_threshold).\n",
+                    agent.reasoning_threshold
                 );
             } else if let Some(chosen) = Reasoning::parse(&rest) {
-                reasoning = chosen;
-                outln!("Chain of thought: {} (this session).\n", reasoning);
+                agent.reasoning = chosen;
+                outln!("Chain of thought: {} (this session).\n", agent.reasoning);
             } else {
                 outln!("[error] unknown setting '{}'. Use keep, compress or drop.\n", rest);
             }
@@ -1169,11 +1033,11 @@ Usage: /set <name> <value>, or /set <name> unset
         }
 
         if input == "/compact" {
-            match compact_history(&lm_client, &mut messages).await {
+            match compact_history(&agent.client, &mut agent.messages).await {
                 // The same reclaim as /clear, on the one path that actually shrank the
                 // session. A compaction that failed freed nothing to go with it.
                 Ok(summary) => {
-                    review_cache.clear();
+                    agent.review_cache.clear();
                     outln!("{}\n", summary)
                 }
                 Err(e) => outln!("[error] could not compact: {:#}\n", e),
@@ -1192,7 +1056,7 @@ Usage: /set <name> <value>, or /set <name> unset
             // It ends in write_file, which plan mode strips from the request. Better to say
             // so now than to have the model research the whole project and then find it
             // cannot save the result.
-            if mode == Mode::Plan {
+            if agent.mode == Mode::Plan {
                 outln!(
                     "/init writes {}, which plan mode does not allow. Switch with /normal first.\n",
                     target
@@ -1214,7 +1078,7 @@ Usage: /set <name> <value>, or /set <name> unset
         let turn_started = std::time::Instant::now();
 
         // Add user message
-        messages.push(json!({
+        agent.messages.push(json!({
             "role": "user",
             "content": input
         }));
@@ -1254,7 +1118,7 @@ Usage: /set <name> <value>, or /set <name> unset
             round += 1;
             // Re-read every round rather than captured once: approving a plan can switch
             // into auto mode mid-turn, and the cap should stop applying from that point.
-            if mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
+            if agent.mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
                 outln!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
                 break;
             }
@@ -1267,22 +1131,22 @@ Usage: /set <name> <value>, or /set <name> unset
             // end of a turn at all. The history is balanced at this point — every tool call
             // from the round before already has its reply — so replacing it wholesale
             // cannot orphan a tool_call_id, which is not true further down.
-            if mode == Mode::Auto
+            if agent.mode == Mode::Auto
                 && autocompact
-                && estimate_tokens(&messages) > autocompact_threshold(context_tokens)
+                && estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens)
             {
-                let status = status_line(&lm_client.model, &messages, context_tokens);
+                let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
                 let compacted = work_with_input(
                     &mut keys,
                     &mut editor,
-                    &mut mode,
+                    &mut agent.mode,
                     &mut queued,
                     &status,
-                    &server.todos,
+                    &agent.server.todos,
                     &mut plan_view,
                     "Compacting context…",
                     None,
-                    compact_history(&lm_client, &mut messages),
+                    compact_history(&agent.client, &mut agent.messages),
                 )
                 .await;
 
@@ -1290,7 +1154,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     Some(Ok(report)) => {
                         // The same reclaim /compact does, for the same reason: the cache is
                         // keyed to a history that no longer exists.
-                        review_cache.clear();
+                        agent.review_cache.clear();
                         outln!(
                             "{}{}{}",
                             SetForegroundColor(crate::input::BAR_BACKGROUND),
@@ -1302,14 +1166,14 @@ Usage: /set <name> <value>, or /set <name> unset
                         // the model to talk past itself. This says the one thing the notes
                         // cannot: the task was mid-flight when the summarizer ran, and it
                         // is the same task that continues.
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "user",
                             "content": "Your context was compacted mid-task. Continue the \
                                         work described in the notes above from where it left \
                                         off; do not start over."
                         }));
 
-                        if estimate_tokens(&messages) > autocompact_threshold(context_tokens) {
+                        if estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens) {
                             autocompact = false;
                             outln!(
                                 "[the summary is still over {}% of the window; carrying on without compacting again]",
@@ -1350,9 +1214,9 @@ Usage: /set <name> <value>, or /set <name> unset
             let mut markdown = MarkdownStream::new();
             // Rebuilt every round rather than once per turn: approving a plan switches the
             // mode mid-turn, and the very next request has to carry the full tool list.
-            let request_messages = with_mode_note(mode, &workspace, &messages);
-            let request_tools = tools_for_mode(mode, &openai_tools);
-            let status = status_line(&lm_client.model, &messages, context_tokens);
+            let request_messages = with_mode_note(agent.mode, &agent.workspace, &agent.messages);
+            let request_tools = tools_for_mode(agent.mode, &agent.tools);
+            let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
 
             // Esc abandons the turn instead of killing the process. It arrives here as a
             // keystroke rather than as a signal because raw mode is on for the whole
@@ -1361,14 +1225,14 @@ Usage: /set <name> <value>, or /set <name> unset
             let result = work_with_input(
                 &mut keys,
                 &mut editor,
-                &mut mode,
+                &mut agent.mode,
                 &mut queued,
                 &status,
-                &server.todos,
+                &agent.server.todos,
                 &mut plan_view,
                 &thinking,
                 Some(&streamed_chars),
-                lm_client.chat_completion_streaming(
+                agent.client.chat_completion_streaming(
                     request_messages,
                     request_tools,
                     |chunk| {
@@ -1482,7 +1346,7 @@ Usage: /set <name> <value>, or /set <name> unset
             }
 
             // The one place the reasoning policy is applied, deliberately ahead of every
-            // `messages.push(message.clone())` below rather than at each of them: all three
+            // `agent.messages.push(message.clone())` below rather than at each of them: all three
             // push this same value, and a policy enforced at two of the three sites would
             // leave whole traces in the history depending on how the turn happened to end.
             //
@@ -1493,24 +1357,24 @@ Usage: /set <name> <value>, or /set <name> unset
             // thought is kept and the turn carries on. Dropping a field, and declining a
             // trace under the threshold, are both over before a frame could be painted, so
             // they are awaited directly rather than announced as work in progress.
-            if reasoning != Reasoning::Keep {
-                let note = if reasoning_needs_a_request(&message, reasoning, reasoning_threshold) {
+            if agent.reasoning != Reasoning::Keep {
+                let note = if reasoning_needs_a_request(&message, agent.reasoning, agent.reasoning_threshold) {
                     work_with_input(
                         &mut keys,
                         &mut editor,
-                        &mut mode,
+                        &mut agent.mode,
                         &mut queued,
                         &status,
-                        &server.todos,
+                        &agent.server.todos,
                         &mut plan_view,
                         "Compressing reasoning…",
                         None,
-                        apply_reasoning(&lm_client, &mut message, reasoning, reasoning_threshold),
+                        apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold),
                     )
                     .await
                     .flatten()
                 } else {
-                    apply_reasoning(&lm_client, &mut message, reasoning, reasoning_threshold).await
+                    apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold).await
                 };
 
                 match note {
@@ -1521,7 +1385,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // screen that gets a background, and that is what makes them read as
                     // furniture rather than as output.
                     Some(ReasoningOutcome::Compressed { before, after }) => {
-                        reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
+                        agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
                         outln!(
                             "{}Compressed reasoning from {} to {} tokens.{}",
                             SetForegroundColor(crate::input::BAR_BACKGROUND),
@@ -1554,12 +1418,12 @@ Usage: /set <name> <value>, or /set <name> unset
                 // Check if array is empty
                 if tool_calls_array.is_empty() {
                     // No actual tool calls, this is the final response — already streamed.
-                    messages.push(message.clone());
+                    agent.messages.push(message.clone());
                     break;
                 }
 
                 // Add assistant message with tool call first
-                messages.push(message.clone());
+                agent.messages.push(message.clone());
 
                 // Set when Ctrl+C lands during a tool call, so the turn ends rather than
                 // only the tool loop.
@@ -1583,7 +1447,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                 truncate_at_boundary(&function.to_string(), 500)
                             );
                             outln!("[ERROR] {}", detail);
-                            messages.push(json!({
+                            agent.messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
                                 "content": detail
@@ -1596,7 +1460,7 @@ Usage: /set <name> <value>, or /set <name> unset
                         Ok(arguments) => arguments,
                         Err(detail) => {
                             outln!("[ERROR] {}: {}", tool_name, detail);
-                            messages.push(json!({
+                            agent.messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
                                 "content": format!(
@@ -1628,18 +1492,18 @@ Usage: /set <name> <value>, or /set <name> unset
                     // a plan rather than for the work. Nothing to approve: this only ever
                     // takes capability away, and present_plan is where consent is needed.
                     if tool_name == START_PLAN {
-                        let content = if mode == Mode::Plan {
-                            "Already in plan mode. Investigate with the reading tools, then \
+                        let content = if agent.mode == Mode::Plan {
+                            "Already in plan agent.mode. Investigate with the reading tools, then \
                              call present_plan."
                         } else {
-                            mode = Mode::Plan;
+                            agent.mode = Mode::Plan;
                             outln!("\n📋 Plan mode — investigating before changing anything.\n");
-                            "Plan mode is active. The tools that change this machine are no \
+                            "Plan agent.mode is active. The tools that change this machine are no \
                              longer available to you. Investigate the real code with read, \
                              grep, ls and glob_search, then call present_plan with what you \
                              propose. Do not start work until the user approves it."
                         };
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": content
@@ -1652,7 +1516,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     if tool_name == PRESENT_PLAN {
                         let plan = arguments["plan"].as_str().unwrap_or("").trim().to_string();
                         if plan.is_empty() {
-                            messages.push(json!({
+                            agent.messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
                                 "content": "The plan was empty. Put the plan itself in the \
@@ -1665,15 +1529,15 @@ Usage: /set <name> <value>, or /set <name> unset
                         // approval — the same rule the permission prompt follows.
                         let content = match ask_about_plan(keys.as_mut(), &plan).await {
                             Ok(PlanDecision::Approve) => {
-                                mode = Mode::Normal;
+                                agent.mode = Mode::Normal;
                                 outln!("\n✓ Plan approved — starting work.\n");
-                                "The user approved the plan. Plan mode is over and the full \
+                                "The user approved the plan. Plan agent.mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
                                     .to_string()
                             }
                             Ok(PlanDecision::ApproveWithAuto) => {
-                                mode = Mode::Auto;
+                                agent.mode = Mode::Auto;
                                 outln!("\n✓ Plan approved — starting work in auto mode.");
                                 // Said plainly, because "auto" sounds like it will stop
                                 // asking and right now it does not.
@@ -1684,7 +1548,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                 // The model is told nothing about the review. It should
                                 // propose the same call either way, and knowing it is being
                                 // checked is an invitation to write for the checker.
-                                "The user approved the plan. Plan mode is over and the full \
+                                "The user approved the plan. Plan agent.mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
                                     .to_string()
@@ -1693,7 +1557,7 @@ Usage: /set <name> <value>, or /set <name> unset
                                 outln!("\n✗ Plan sent back for revision.\n");
                                 format!(
                                     "The user did not approve the plan. Their corrections: {}\n\n\
-                                     You are still in plan mode and must not change anything. \
+                                     You are still in plan agent.mode and must not change anything. \
                                      Fold this in — investigating further if you need to — and \
                                      call present_plan again.",
                                     feedback
@@ -1707,7 +1571,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             }
                         };
 
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": content
@@ -1752,7 +1616,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             }
                         };
 
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": content
@@ -1764,11 +1628,11 @@ Usage: /set <name> <value>, or /set <name> unset
                     // consent under a narrowly scoped key, or an outright refusal. The mode
                     // has the first word — plan mode refuses anything that changes the
                     // machine, whatever the call would normally be entitled to.
-                    let gate = gate_for_mode(mode, &workspace, tool_name, &arguments);
+                    let gate = gate_for_mode(agent.mode, &agent.workspace, tool_name, &arguments);
 
                     if let Gate::Deny(reason) = &gate {
                         outln!("\n⛔ {}\n", reason);
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": reason
@@ -1777,7 +1641,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     }
 
                     let mut ask = match &gate {
-                        Gate::Ask { keys, label } if !perm_manager.is_allowed(keys) => {
+                        Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
                             Some((keys.clone(), label.clone()))
                         }
                         _ => None,
@@ -1795,25 +1659,25 @@ Usage: /set <name> <value>, or /set <name> unset
                     // it still has to be asked. Only one is ever set.
                     let mut auto_note: Option<String> = None;
                     let mut review_line: Option<String> = None;
-                    if mode == Mode::Auto && ask.is_some() {
+                    if agent.mode == Mode::Auto && ask.is_some() {
                         // Transient: a review takes seconds, and a silent pause reads as a
                         // hang. Erased once it lands, because the outcome belongs on the
                         // call line below — left standing, every single call would cost two
                         // lines of log to say one thing.
-                        let status = status_line(&lm_client.model, &messages, context_tokens);
+                        let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
                         let verdict = work_with_input(
                             &mut keys,
                             &mut editor,
-                            &mut mode,
+                            &mut agent.mode,
                             &mut queued,
                             &status,
-                            &server.todos,
+                            &agent.server.todos,
                             &mut plan_view,
                             "🤖 Reviewing tool call…",
                             // The reviewer's own reply is not streamed, so there is
                             // nothing to count.
                             None,
-                            judge_tool_call(&lm_client, &mut review_cache, tool_name, &arguments),
+                            judge_tool_call(&agent.client, &mut agent.review_cache, tool_name, &arguments),
                         )
                         .await;
 
@@ -1914,7 +1778,7 @@ Usage: /set <name> <value>, or /set <name> unset
                             Ok(response) => response,
                             Err(e) => {
                                 outln!("\n[error] could not ask for permission: {}", e);
-                                messages.push(json!({
+                                agent.messages.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": format!(
@@ -1935,14 +1799,14 @@ Usage: /set <name> <value>, or /set <name> unset
                             PermissionResponse::AllowAll => {
                                 // Remembered under the narrow keys this call resolved to,
                                 // not under the tool name.
-                                perm_manager.allow(&gate_keys);
+                                agent.permissions.allow(&gate_keys);
                                 outln!("✓ {}\n", allow_all_label);
                             }
                             PermissionResponse::Reject(alternative) => {
                                 // User rejected, send alternative to LLM
                                 outln!("✗ Permission denied. User suggestion: {}\n", alternative);
 
-                                messages.push(json!({
+                                agent.messages.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": format!("Permission denied by user. User suggests: {}", alternative)
@@ -1974,7 +1838,7 @@ Usage: /set <name> <value>, or /set <name> unset
                         }
                     }
 
-                    let status = status_line(&lm_client.model, &messages, context_tokens);
+                    let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
                     let busy = format!("{}…", tool_name);
 
                     // Captured before the arguments move into the call. For a shell tool
@@ -1990,22 +1854,22 @@ Usage: /set <name> <value>, or /set <name> unset
                     let executed = work_with_input(
                         &mut keys,
                         &mut editor,
-                        &mut mode,
+                        &mut agent.mode,
                         &mut queued,
                         &status,
-                        &server.todos,
+                        &agent.server.todos,
                         &mut plan_view,
                         &busy,
                         // A tool produces its output all at once, so there is no partial
                         // size to report while it runs.
                         None,
-                        server.execute_tool(tool_name, arguments),
+                        agent.server.execute_tool(tool_name, arguments),
                     )
                     .await;
 
                     let Some(result) = executed else {
                         outln!("\n[interrupted]\n");
-                        messages.push(json!({
+                        agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": "Interrupted by the user before this tool finished."
@@ -2037,7 +1901,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     }
 
                     // Add tool result
-                    messages.push(json!({
+                    agent.messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "content": tool_result
@@ -2075,7 +1939,7 @@ Usage: /set <name> <value>, or /set <name> unset
                     // some servers, and this one has to land. The order is legal here for
                     // the same reason the queued text below is — every tool call in this
                     // round already has its result.
-                    messages.push(json!({
+                    agent.messages.push(json!({
                         "role": "user",
                         "content": format!(
                             "You have called '{}' with the same arguments {} times in a \
@@ -2093,14 +1957,14 @@ Usage: /set <name> <value>, or /set <name> unset
                 // for, which is a message order servers reject outright.
                 for text in queued.drain(..) {
                     outln!("{}", echo(PROMPT, &text));
-                    messages.push(json!({"role": "user", "content": text}));
+                    agent.messages.push(json!({"role": "user", "content": text}));
                 }
 
                 // Continue the loop to get next response (might be more tool calls or final answer)
                 continue;
             } else {
                 // No tool call, this is the final response — already streamed above.
-                messages.push(message.clone());
+                agent.messages.push(message.clone());
                 break;
             }
         }
@@ -2123,19 +1987,19 @@ Usage: /set <name> <value>, or /set <name> unset
         // session and survive /clear, which re-pushes this same content.
         if initializing {
             let reloaded = load_project_context();
-            if reloaded != project_context {
-                project_context = reloaded;
-                if let Some((name, _)) = &project_context {
+            if reloaded != agent.project_context {
+                agent.project_context = reloaded;
+                if let Some((name, _)) = &agent.project_context {
                     outln!("\nLoaded project context from {}", name);
                 }
-                system_prompt_content = compose_system_prompt(
-                    config.system_prompt.as_deref(),
-                    &lm_client.model,
-                    settings.use_system_prompt,
-                    user_context.as_deref(),
-                    project_context.as_ref(),
+                agent.system_prompt = compose_system_prompt(
+                    agent.config.system_prompt.as_deref(),
+                    &agent.client.model,
+                    agent.settings.use_system_prompt,
+                    agent.user_context.as_deref(),
+                    agent.project_context.as_ref(),
                 );
-                set_system_message(&mut messages, system_prompt_content.as_deref());
+                set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
             }
         }
 
@@ -2143,9 +2007,9 @@ Usage: /set <name> <value>, or /set <name> unset
         if let Some(path) = &history_path {
             crate::input::save_history(path, editor.history());
         }
-        if let Some(path) = &session_path {
-            let todos = server.todos.lock().unwrap().clone();
-            save_session(path, &messages, &lm_client.model, &todos);
+        if let Some(path) = &agent.session_path {
+            let todos = agent.plan();
+            save_session(path, &agent.messages, &agent.client.model, &todos);
         }
     }
 
@@ -2155,7 +2019,7 @@ Usage: /set <name> <value>, or /set <name> unset
 
     // Every way out of the loop lands here, so a dev server started mid-session does not
     // outlive it holding a port. Silent when there is nothing to do.
-    let stopped = server.stop_all_background().await;
+    let stopped = agent.server.stop_all_background().await;
     if stopped > 0 {
         outln!("Stopped {} background job(s).", stopped);
     }
