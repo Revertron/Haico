@@ -40,6 +40,10 @@ const RULE_INK: u32 = 0xFF5A5A5A;
 /// item under its own text rather than under its bullet.
 const INDENT: f32 = 16.0;
 const HANGING: f32 = 14.0;
+/// How much smaller an inline code span is than the prose around it. See
+/// `Event::Code`; it is compensating for a real difference between the faces,
+/// not a preference.
+const INLINE_CODE_SCALE: f32 = 0.86;
 
 /// Streams markdown into one `RichText`.
 ///
@@ -205,8 +209,15 @@ impl Render<'_> {
             Event::Text(text) => self.text(&text),
             // Inline code: a span, not a block, and monospace rather than merely
             // tinted — which is what the family field in `SpanStyle` was for.
+            //
+            // Scaled down, and this is not a matter of taste. A monospace face at
+            // the same nominal size reads distinctly larger than a proportional
+            // one — wider glyphs and a taller x-height — so `--server` set at the
+            // prose size comes out looking like a heading dropped into a
+            // sentence. The block form dodges this by having its own smaller
+            // size; an inline span inherits the prose's and has to be told.
             Event::Code(text) => {
-                let mut style = self.style.clone().code();
+                let mut style = self.style.clone().code().relative(INLINE_CODE_SCALE);
                 style.background = Some(CODE_BAND);
                 self.write(&text, style);
             }

@@ -579,6 +579,15 @@ fn stream(ui: &mut UI, id: &str, text: &str, dim: bool) {
         true => SpanStyle::default().italic().color(0xFF767676),
         false => SpanStyle::default(),
     };
+    // Reasoning is flowed into one paragraph rather than kept as written. Its
+    // line breaks carry no meaning — it is the model talking to itself, not
+    // structured text — and models habitually end a trace with a blank line or
+    // two, which showed up as an empty gap between the thinking and the answer.
+    let flowed = if dim { flow(text) } else { text.to_string() };
+    let text = flowed.as_str();
+    if text.is_empty() {
+        return;
+    }
     if with_rich(ui, id, |view| view.push(text, style.clone())).is_some() {
         ui.relayout();
         follow_end(ui);
@@ -589,6 +598,33 @@ fn stream(ui: &mut UI, id: &str, text: &str, dim: bool) {
         view.push(text, style);
     }
     append(ui, element);
+}
+
+/// Collapse every run of whitespace containing a newline down to one space.
+///
+/// A chunk boundary can fall inside such a run, so this cannot see the whole run
+/// at once — hence the leading-space case: a chunk that is nothing but a break
+/// becomes a single space, and one that begins with a break contributes one.
+/// Two spaces where a run was split is the worst it can do, and that is
+/// invisible.
+fn flow(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut just_broke = false;
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\r' => {
+                if !just_broke && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                just_broke = true;
+            }
+            ch => {
+                out.push(ch);
+                just_broke = false;
+            }
+        }
+    }
+    out
 }
 
 /// Close whatever reply is open by taking its id away, so a later chunk starts a
@@ -796,6 +832,23 @@ mod tests {
         let running = Arc::new(Mutex::new(None));
         // Returns, rather than blocking forever on a channel nobody can send to.
         converse(agent, rx, handle, running).await;
+    }
+
+    /// Reasoning is flowed, and the reason is the case in the middle: a model
+    /// habitually ends a trace with a blank line or two, and those showed as an
+    /// empty gap between the thinking and the answer. Chunk boundaries can fall
+    /// inside a run of breaks, so the rule has to work per chunk.
+    #[test]
+    fn reasoning_breaks_collapse_to_single_spaces() {
+        assert_eq!(flow("one\ntwo"), "one two");
+        assert_eq!(flow("trailing thought.\n\n"), "trailing thought. ");
+        assert_eq!(flow("a\r\n\r\nb"), "a b");
+        // A chunk that is nothing but the break contributes one space, and a
+        // chunk starting with one does not add a second.
+        assert_eq!(flow("\n"), " ");
+        assert_eq!(flow("\n\n\n"), " ");
+        assert_eq!(flow("already \n"), "already ");
+        assert_eq!(flow(""), "");
     }
 
     #[test]
