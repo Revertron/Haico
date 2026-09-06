@@ -13,16 +13,22 @@
 //! restored rather than announcing it, `clear` reports whether the project file
 //! changed under it rather than printing that it did.
 //!
-//! What is deliberately *not* here yet is the turn loop itself. It is entangled
-//! with output, with the interrupt key and with the permission prompt, and
-//! moving it is the event-stream work (section 11.2 of `plan.md`) rather than
-//! this. This is the state it will run against.
+//! The turn loop lives here too, and it is why the rule above is written down.
+//! It says what happens through an `EventSink`, shares exactly three things with
+//! its frontend through a `TurnLink` (the mode, the queue of typed-ahead input,
+//! and cancellation), and asks questions by sending an `Ask` carrying the reply
+//! channel. It never draws, never reads a key, and never chooses a word a person
+//! reads — the flavor text on the activity bar and in the turn summary is picked
+//! by the frontend from a `Waiting` kind and an elapsed time.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::config::{resolve_settings, Config, Reasoning, ResolvedSettings};
+use crate::config::{
+    autocompact_threshold, resolve_settings, Config, Reasoning, ResolvedSettings,
+    AUTOCOMPACT_FRACTION,
+};
 use crate::llm::LMStudioClient;
 use crate::modes::{Mode, ReviewCache};
 use crate::permissions::PermissionManager;
@@ -31,7 +37,21 @@ use crate::session::{
     set_system_message,
     load_session, session_file_path, ReasoningStats,
 };
-use crate::tools::{mcp_tools_to_openai_format, MyMcpServer};
+use crate::ask::{self, ASK_USER};
+use crate::llm::Chunk;
+use crate::modes::{
+    gate_for_mode, judge_tool_call, tools_for_mode, with_mode_note, PlanDecision, Verdict,
+    PRESENT_PLAN, START_PLAN,
+};
+use crate::permissions::{Gate, PermissionResponse};
+use crate::session::{
+    apply_reasoning, compact_history, estimate_tokens, reasoning_needs_a_request,
+    save_session, ReasoningOutcome,
+};
+use crate::render::{file_change_diff, indented_command};
+use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer};
+use crate::turn::*;
+use crate::util::truncate_at_boundary;
 use crate::workspace::Workspace;
 
 /// What a successful [`Agent::resume`] restored, for the caller to report.
@@ -278,4 +298,869 @@ impl Agent {
     pub(crate) fn plan(&self) -> Vec<crate::tools::TodoItem> {
         self.server.todos.lock().unwrap().clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// One turn
+// ---------------------------------------------------------------------------
+
+/// One turn: the user's message in, and everything that follows from it — rounds
+/// of tool calls, the prompts they need answering, the reply as it streams.
+///
+/// It says what happened through `tx` and shares three things through `link`; it
+/// holds no terminal, no keyboard and no renderer, and it must stay that way.
+/// See the module header.
+pub(crate) async fn run_turn(
+    agent: &mut Agent,
+    input: &str,
+    // True when this turn is `/init` writing the project instruction file, so the
+    // file it produces can be picked up at the end of it.
+    initializing: bool,
+    tx: &EventSink,
+    link: &TurnLink,
+) {
+        // Wall clock, started here rather than at the first request: what the summary at
+        // the end of the turn reports is how long the user waited, which includes the tool
+        // runs, the permission prompts they answered and every round of the loop below —
+        // not just the time the model spent generating.
+        let turn_started = std::time::Instant::now();
+
+        // Add user message
+        agent.messages.push(json!({
+            "role": "user",
+            "content": input
+        }));
+
+        // Get LLM response and handle tool call chains. The cap stops a model that keeps
+        // calling tools forever from spinning until the user kills the process. It does
+        // not apply in auto mode: a fixed number of rounds is a poor stand-in for "this is
+        // going nowhere", and a long job that hits it unattended has nobody to say
+        // "continue". Repetition is the better signal, and it is what guards auto mode.
+        const MAX_TOOL_ROUNDS: usize = 50;
+        // A stuck model gives itself away by calling the same tool with the same arguments
+        // over and over with nothing in between, which can happen on the tenth round or
+        // the fiftieth. The first threshold says so in the conversation; the second gives
+        // up on the turn.
+        const LOOP_NUDGE: usize = 3;
+        const LOOP_BREAK: usize = 5;
+        let mut round = 0usize;
+
+        // The (tool, arguments) pair called last, and how long the unbroken run of it is.
+        // Consecutive rather than counted across the turn: a model working through a list
+        // of compiler errors legitimately runs the same build command a dozen times in one
+        // turn, and every one of those is progress because there were edits in between. A
+        // loop is the same call with nothing else happening between the tries. Any
+        // different call resets the run, `nudged_at` with it, so a later loop still gets
+        // its warning.
+        let mut last_call: Option<(String, String)> = None;
+        let mut run = (0usize, String::new());
+        let mut nudged_at = 0usize;
+
+        // Cleared when compacting fails to get the history back under the line, which
+        // means the window is too small to hold even a summary of it. Trying again the
+        // next round would summarize the summary and throw the round away with it, so
+        // the turn runs on instead and lets the server error be the honest end of it.
+        let mut autocompact = true;
+
+        loop {
+            round += 1;
+            // Once a round, because that is when the history has changed and the
+            // status bar is what reports it. The numbers, not the line: how wide
+            // the bar is and what goes where is the frontend's business.
+            let _ = tx.send(AgentEvent::Status {
+                model: agent.client.model.clone(),
+                used_tokens: estimate_tokens(&agent.messages),
+                context_tokens: agent.context_tokens,
+            });
+            // Re-read every round rather than captured once: approving a plan can switch
+            // into auto mode mid-turn, and the cap should stop applying from that point.
+            if link.mode() != Mode::Auto && round > MAX_TOOL_ROUNDS {
+                let _ = tx.send(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
+                break;
+            }
+
+            // Auto mode is meant to run unattended, so the one thing it must not do at the
+            // edge of the window is stop and ask for /compact: there is nobody there to
+            // type it, and a job left running overnight would be found dead at the prompt.
+            // Checked here rather than at the end of a turn, where the old hint printed,
+            // because a long job lives inside this loop for hours and may never reach the
+            // end of a turn at all. The history is balanced at this point — every tool call
+            // from the round before already has its reply — so replacing it wholesale
+            // cannot orphan a tool_call_id, which is not true further down.
+            if link.mode() == Mode::Auto
+                && autocompact
+                && estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens)
+            {
+                let compacted = interruptible(
+                    tx,
+                    link,
+                    Waiting::Compacting,
+                    compact_history(&agent.client, &mut agent.messages),
+                )
+                .await;
+
+                match compacted {
+                    Some(Ok(report)) => {
+                        // The same reclaim /compact does, for the same reason: the cache is
+                        // keyed to a history that no longer exists.
+                        agent.review_cache.clear();
+                        let _ = tx.send(Notice::Compacted(report).into());
+                        // The compacted history ends on the assistant agreeing that it has
+                        // the notes, and asking for a reply straight after that is asking
+                        // the model to talk past itself. This says the one thing the notes
+                        // cannot: the task was mid-flight when the summarizer ran, and it
+                        // is the same task that continues.
+                        agent.messages.push(json!({
+                            "role": "user",
+                            "content": "Your context was compacted mid-task. Continue the \
+                                        work described in the notes above from where it left \
+                                        off; do not start over."
+                        }));
+
+                        if estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens) {
+                            autocompact = false;
+                            let _ = tx.send(
+                                Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize)
+                                    .into(),
+                            );
+                        }
+                    }
+                    // Not fatal by itself: the request below may still fit, and if it does
+                    // not, the server's own error ends the turn — exactly what would have
+                    // happened with none of this here.
+                    Some(Err(e)) => {
+                        let _ = tx.send(Notice::CompactionFailed(format!("{:#}", e)).into());
+                    }
+                    // Esc during the summarization is Esc during the turn, as everywhere
+                    // else in this loop.
+                    None => {
+                        let _ = tx.send(Notice::Interrupted.into());
+                        break;
+                    }
+                }
+            }
+
+
+            // Whether anything has reached the screen for this reply, and the
+            // half-rendered markdown line, both belong to the presenter — see
+            // `Presenter::start_reply`. Per round, not per turn: a turn is many
+            // rounds and each one streams its own reply.
+            let _ = tx.send(AgentEvent::ReplyStart);
+            // The count of characters streamed so far, which the activity bar
+            // shows so a model that reasons for minutes before its first content
+            // token is distinguishable from one that has hung, is now the pump's:
+            // it sees every chunk go past and can count them itself.
+            //
+            // Rebuilt every round rather than once per turn: approving a plan switches the
+            // mode mid-turn, and the very next request has to carry the full tool list.
+            let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
+            let request_tools = tools_for_mode(link.mode(), &agent.tools);
+
+            // Esc abandons the turn instead of killing the process. It arrives at
+            // the pump as a keystroke rather than as a signal, because raw mode is
+            // on for the whole session — which is also what lets the next message
+            // be typed while this one is still running — and reaches here as the
+            // link's cancellation.
+            let result = interruptible(
+                tx,
+                link,
+                Waiting::Model,
+                agent.client.chat_completion_streaming(
+                    request_messages,
+                    request_tools,
+                    // Both kinds of text are handed on the moment they arrive, so
+                    // none of the branches below re-print anything from the
+                    // finished message. What either one *looks* like — dim,
+                    // italic, folded, markdown-wrapped — is the presenter's, and
+                    // this no longer knows.
+                    |chunk| {
+                        let _ = tx.send(match chunk {
+                            Chunk::Reasoning(text) => AgentEvent::ReasoningChunk(text),
+                            Chunk::Content(text) => AgentEvent::ReplyChunk(text),
+                        });
+                    },
+                ),
+            )
+            .await;
+
+            let Some(result) = result else {
+                // The partial reply is dropped rather than stored: half a tool call in the
+                // history is worse than no reply at all. Everything before this turn stays
+                // consistent, so the conversation is still usable.
+                let _ = tx.send(AgentEvent::ReplyEnd);
+                let _ = tx.send(Notice::Interrupted.into());
+                break;
+            };
+
+            let mut message = match result {
+                Ok(message) => message,
+                Err(e) => {
+                    // A dropped connection, a server-side error, or an unparseable body
+                    // must not end the session. Every tool call made so far already has its
+                    // reply, so the history is consistent: drop back to the prompt.
+                    let _ = tx.send(AgentEvent::ReplyEnd);
+                    let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
+                    break;
+                }
+            };
+
+            // Both kinds of text were handed on as they arrived — including the case of a
+            // model whose entire reply is chain of thought with no content at all, which
+            // is why nothing is re-emitted from `message` here. All that is left is to say
+            // the reply is over, and let the presenter close whatever it has open.
+            let _ = tx.send(AgentEvent::ReplyEnd);
+
+            // The one place the reasoning policy is applied, deliberately ahead of every
+            // `agent.messages.push(message.clone())` below rather than at each of them: all three
+            // push this same value, and a policy enforced at two of the three sites would
+            // leave whole traces in the history depending on how the turn happened to end.
+            //
+            // Only the compression of a long enough trace costs a request, and only that
+            // goes through `work_with_input` — several seconds with a frozen input box
+            // every turn would be worse than the tokens are worth. Esc during it means
+            // `None`, which lands in the same place a failure does: the original chain of
+            // thought is kept and the turn carries on. Dropping a field, and declining a
+            // trace under the threshold, are both over before a frame could be painted, so
+            // they are awaited directly rather than announced as work in progress.
+            if agent.reasoning != Reasoning::Keep {
+                let note = if reasoning_needs_a_request(&message, agent.reasoning, agent.reasoning_threshold) {
+                    interruptible(
+                        tx,
+                        link,
+                        Waiting::CompressingReasoning,
+                        apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold),
+                    )
+                    .await
+                    .flatten()
+                } else {
+                    apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold).await
+                };
+
+                match note {
+                    // Shown rather than folded, and wearing the chrome's light blue: the
+                    // whole point of compressing is to find out whether it is paying for
+                    // itself, which cannot be judged from a line that is hidden by
+                    // default. Tinted, not painted — the bars are the only thing on
+                    // screen that gets a background, and that is what makes them read as
+                    // furniture rather than as output.
+                    Some(ReasoningOutcome::Compressed { before, after }) => {
+                        agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
+                        let _ = tx.send(Notice::ReasoningCompressed { before, after }.into());
+                    }
+                    // Dropping says nothing the policy did not already say: it removes
+                    // every trace, every turn, so a line per reply would be a line per
+                    // reply saying the same thing.
+                    Some(ReasoningOutcome::Dropped { tokens }) => {
+                        let _ = tx.send(Notice::ReasoningDropped { tokens }.into());
+                    }
+                    None => {}
+                }
+            }
+
+            // Check if model wants to call a tool
+            if let Some(tool_calls) = message.get("tool_calls").filter(|c| !c.is_null()) {
+                let tool_calls_array = match tool_calls.as_array() {
+                    Some(arr) => arr,
+                    None => {
+                        let _ = tx.send(Notice::ToolCallsMalformed(format!("{:?}", tool_calls)).into());
+                        break;
+                    }
+                };
+
+                // Check if array is empty
+                if tool_calls_array.is_empty() {
+                    // No actual tool calls, this is the final response — already streamed.
+                    agent.messages.push(message.clone());
+                    break;
+                }
+
+                // Add assistant message with tool call first
+                agent.messages.push(message.clone());
+
+                // Set when Ctrl+C lands during a tool call, so the turn ends rather than
+                // only the tool loop.
+                let mut interrupted = false;
+
+                for tool_call in tool_calls_array {
+
+                    // Captured up front: every path out of this iteration owes the model a
+                    // `role:"tool"` message under this id. Leaving one unanswered makes the
+                    // next request fail server-side, which is far harder to recover from
+                    // than telling the model its call was malformed.
+                    let tool_call_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
+                    let function = &tool_call["function"];
+
+                    let tool_name = match function["name"].as_str() {
+                        Some(name) => name,
+                        None => {
+                            let detail = format!(
+                                "Malformed tool call: no function name in {}",
+                                truncate_at_boundary(&function.to_string(), 500)
+                            );
+                            let _ = tx.send(Notice::ToolCallUnnamed(detail.clone()).into());
+                            agent.messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": detail
+                            }));
+                            continue;
+                        }
+                    };
+
+                    let parsed = parse_tool_arguments(function);
+
+                    // Counted here, before any of the branches below, so a call that is
+                    // refused, denied *or malformed* counts too — retrying a call the
+                    // workspace or the user has already turned down, unchanged and
+                    // immediately, is a loop like any other. What it returned is
+                    // deliberately not part of the key: a build that fails three times in a
+                    // row with nothing done between the tries is stuck whatever the errors
+                    // say.
+                    //
+                    // The malformed case has to be counted *before* the parse, not after,
+                    // and that is not tidiness. The error arm below `continue`s, so
+                    // counting after it meant a model repeating a call whose arguments are
+                    // not JSON never advanced the run at all. In normal mode the round cap
+                    // still stopped it; in auto mode, which skips that cap on purpose
+                    // because there is nobody there to type "continue", nothing stopped it
+                    // and the turn span forever unattended. Keyed on the canonical form
+                    // when it parses (serde_json sorts object keys, so the same call always
+                    // renders to the same string) and on the raw argument text when it does
+                    // not, which is the only form a malformed call has.
+                    let args_key = match &parsed {
+                        Ok(arguments) => arguments.to_string(),
+                        Err(_) => function.get("arguments").map(|a| a.to_string()).unwrap_or_default(),
+                    };
+                    let call = (tool_name.to_string(), args_key);
+                    if last_call.as_ref() == Some(&call) {
+                        run.0 += 1;
+                    } else {
+                        last_call = Some(call);
+                        run = (1, tool_name.to_string());
+                        nudged_at = 0;
+                    }
+
+                    let arguments = match parsed {
+                        Ok(arguments) => arguments,
+                        Err(detail) => {
+                            let _ = tx.send(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
+                            agent.messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": format!(
+                                    "Could not run '{}': {}. Call it again with valid JSON arguments.",
+                                    tool_name, detail
+                                )
+                            }));
+                            continue;
+                        }
+                    };
+
+                    // The model can put itself into plan mode, for when the user asked for
+                    // a plan rather than for the work. Nothing to approve: this only ever
+                    // takes capability away, and present_plan is where consent is needed.
+                    if tool_name == START_PLAN {
+                        let content = if link.mode() == Mode::Plan {
+                            "Already in plan mode. Investigate with the reading tools, then \
+                             call present_plan."
+                        } else {
+                            link.set_mode(Mode::Plan);
+                            let _ = tx.send(Notice::PlanModeEntered.into());
+                            "Plan mode is active. The tools that change this machine are no \
+                             longer available to you. Investigate the real code with read, \
+                             grep, ls and glob_search, then call present_plan with what you \
+                             propose. Do not start work until the user approves it."
+                        };
+                        agent.messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": content
+                        }));
+                        continue;
+                    }
+
+                    // A finished plan is not a tool call so much as the end of plan mode,
+                    // and the mode it ends lives out here rather than inside the tool.
+                    if tool_name == PRESENT_PLAN {
+                        let plan = arguments["plan"].as_str().unwrap_or("").trim().to_string();
+                        if plan.is_empty() {
+                            agent.messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": "The plan was empty. Put the plan itself in the \
+                                            'plan' field and call present_plan again."
+                            }));
+                            continue;
+                        }
+
+                        // A terminal that cannot be read from must not be taken as
+                        // approval — the same rule the permission prompt follows.
+                        let decision =
+                            ask_frontend(tx, |reply| Ask::Plan { plan: plan.clone(), reply }).await;
+                        let content = match decision {
+                            Some(PlanDecision::Approve) => {
+                                link.set_mode(Mode::Normal);
+                                let _ = tx.send(Notice::PlanApproved { auto: false }.into());
+                                "The user approved the plan. Plan mode is over and the full \
+                                 tool set is available again. Begin work now, following the \
+                                 plan you just had approved."
+                                    .to_string()
+                            }
+                            Some(PlanDecision::ApproveWithAuto) => {
+                                link.set_mode(Mode::Auto);
+                                let _ = tx.send(Notice::PlanApproved { auto: true }.into());
+                                // The model is told nothing about the review. It should
+                                // propose the same call either way, and knowing it is being
+                                // checked is an invitation to write for the checker.
+                                "The user approved the plan. Plan mode is over and the full \
+                                 tool set is available again. Begin work now, following the \
+                                 plan you just had approved."
+                                    .to_string()
+                            }
+                            Some(PlanDecision::Revise(feedback)) => {
+                                let _ = tx.send(Notice::PlanRejected.into());
+                                format!(
+                                    "The user did not approve the plan. Their corrections: {}\n\n\
+                                     You are still in plan mode and must not change anything. \
+                                     Fold this in — investigating further if you need to — and \
+                                     call present_plan again.",
+                                    feedback
+                                )
+                            }
+                            None => {
+                                let _ = tx.send(
+                                    Notice::AskFailed {
+                                        what: "about the plan",
+                                        detail: "no interactive terminal".to_string(),
+                                    }
+                                    .into(),
+                                );
+                                "The plan could not be shown for approval (no interactive \
+                                 terminal), so it is not approved. Do not start work."
+                                    .to_string()
+                            }
+                        };
+
+                        agent.messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": content
+                        }));
+                        continue;
+                    }
+
+                    // A question for the user is answered out here for the same reason a
+                    // plan is: the keyboard belongs to the REPL, and the tool body runs in
+                    // the MCP server too, where there is nobody to ask.
+                    if tool_name == ASK_USER {
+                        let question = arguments["question"].as_str().unwrap_or_default();
+                        // Anything that is not a string is dropped rather than rendered as
+                        // JSON: a model that sent objects here is better told the list was
+                        // too short than shown its own braces back on screen.
+                        let options: Vec<String> = arguments["options"]
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|item| item.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let content = match ask::normalize(question, &options) {
+                            Err(reason) => reason,
+                            Ok((question, options)) => {
+                                let answered = ask_frontend(tx, |reply| Ask::User {
+                                    question: question.clone(),
+                                    options: options.clone(),
+                                    reply,
+                                })
+                                .await;
+                                match answered {
+                                    Some(answer) => ask::reply_for(&answer, &options),
+                                    // Nobody to ask is not the same as an answer, and it
+                                    // must not stall the turn either: the model is told to
+                                    // carry the decision itself.
+                                    None => {
+                                        let _ = tx.send(
+                                            Notice::AskFailed {
+                                                what: "the user",
+                                                detail: "no interactive terminal".to_string(),
+                                            }
+                                            .into(),
+                                        );
+                                        "The question could not be put to the user (no \
+                                         interactive terminal). Decide it yourself, say in \
+                                         one line which way you went and why, and carry on."
+                                            .to_string()
+                                    }
+                                }
+                            }
+                        };
+
+                        agent.messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": content
+                        }));
+                        continue;
+                    }
+
+                    // Decide what this specific call needs: nothing (read-only), the user's
+                    // consent under a narrowly scoped key, or an outright refusal. The mode
+                    // has the first word — plan mode refuses anything that changes the
+                    // machine, whatever the call would normally be entitled to.
+                    let gate = gate_for_mode(link.mode(), &agent.workspace, tool_name, &arguments);
+
+                    if let Gate::Deny(reason) = &gate {
+                        let _ = tx.send(Notice::Refused(reason.clone()).into());
+                        agent.messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": reason
+                        }));
+                        continue;
+                    }
+
+                    let mut ask = match &gate {
+                        Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
+                            Some((keys.clone(), label.clone()))
+                        }
+                        _ => None,
+                    };
+
+                    // Auto mode: the reviewer answers the routine yeses so the user does
+                    // not have to. Only a call that was going to interrupt is reviewed —
+                    // an already-approved one costs nothing and should stay free.
+                    //
+                    // An allow ends it here. Anything else — a refusal, an unreadable
+                    // reply, a review the user interrupted — falls through to the prompt
+                    // with the reason attached, so the reviewer can decline to act but
+                    // never decides against the user on its own.
+                    // Why the call is running unasked, and what to add to the prompt when
+                    // it still has to be asked. Only one is ever set.
+                    let mut auto_note: Option<String> = None;
+                    let mut review_line: Option<String> = None;
+                    if link.mode() == Mode::Auto && ask.is_some() {
+                        // Transient: a review takes seconds, and a silent pause reads as a
+                        // hang. Erased once it lands, because the outcome belongs on the
+                        // call line below — left standing, every single call would cost two
+                        // lines of log to say one thing.
+                        let verdict = interruptible(
+                            tx,
+                            link,
+                            Waiting::ReviewingCall,
+                            judge_tool_call(&agent.client, &mut agent.review_cache, tool_name, &arguments),
+                        )
+                        .await;
+
+                        match verdict {
+                            Some(Ok(Verdict { allow: true, reason, cached })) => {
+                                // Marked, so reading back through a run still tells apart
+                                // a call the reviewer weighed from one it merely
+                                // recognized.
+                                auto_note = Some(match cached {
+                                    true => format!("cached — {}", reason),
+                                    false => reason,
+                                });
+                                ask = None;
+                            }
+                            Some(Ok(Verdict { allow: false, reason, .. })) => {
+                                review_line = Some(format!("🤖 Review: DENY — {}", reason));
+                            }
+                            Some(Err(e)) => {
+                                review_line = Some(format!("🤖 Review failed: {:#}", e));
+                            }
+                            None => {
+                                review_line = Some("🤖 Review interrupted.".to_string());
+                            }
+                        }
+                    }
+
+                    // Captured before the prompt consumes it: the diff below is skipped only
+                    // when the prompt has already shown it.
+                    let prompted = ask.is_some();
+
+                    if let Some((gate_keys, allow_all_label)) = ask {
+                        // Generate diff if needed
+                        let diff_content: Option<String> = file_change_diff(tool_name, &arguments);
+
+                        // Create human-readable description
+                        let mut description = match tool_name {
+                            "web_search" => {
+                                let query = arguments["query"].as_str().unwrap_or("unknown");
+                                format!("Search the web for: '{}'", query)
+                            }
+                            "web_fetch" | "web_get" => {
+                                let url = arguments["url"].as_str().unwrap_or("unknown");
+                                format!("Fetch content from URL: {}", url)
+                            }
+                            "write_file" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                let size = arguments["content"].as_str().map(|s| s.len()).unwrap_or(0);
+                                format!("Write {} bytes to file: {}", size, file_path)
+                            }
+                            "edit" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                let from = arguments["old_string"].as_str().unwrap_or("unknown");
+                                let to = arguments["new_string"].as_str().unwrap_or("unknown");
+                                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
+                                if replace_all {
+                                    format!("Edit file (replace all '{from}'->'{to}') in {}", file_path)
+                                } else {
+                                    format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
+                                }
+                            }
+                            "multi_edit" => {
+                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
+                                let count = arguments["edits"].as_array().map(|e| e.len()).unwrap_or(0);
+                                format!("Apply {} edit(s) to file: {}", count, file_path)
+                            }
+                            "run_background" => {
+                                let command = arguments["command"].as_str().unwrap_or("unknown");
+                                format!(
+                                    "Start in the background:\n{}",
+                                    indented_command(command)
+                                )
+                            }
+                            "run_command" => {
+                                let command = arguments["command"].as_str().unwrap_or("unknown");
+                                format!("Execute command:\n{}", indented_command(command))
+                            }
+                            _ => format!("Execute '{}' tool", tool_name)
+                        };
+
+                        // The reviewer declined to wave this through. Its reason goes in the
+                        // prompt rather than on its own line: shown twice it reads as two
+                        // separate verdicts, and a refusal here is advice, not a decision.
+                        if let Some(line) = &review_line {
+                            description.push_str(&format!("\n\n{}", line));
+                        }
+
+                        // Ask for permission with diff if available. A terminal we cannot
+                        // read from (piped stdin, no TTY) must not end the session, and must
+                        // never be taken as consent: refuse the call and tell the model.
+                        let answered = ask_frontend(tx, |reply| Ask::Permission {
+                            allow_all_label: allow_all_label.clone(),
+                            description: description.clone(),
+                            diff: diff_content.clone(),
+                            reply,
+                        })
+                        .await;
+                        let response = match answered {
+                            Some(response) => response,
+                            None => {
+                                let _ = tx.send(
+                                    Notice::AskFailed {
+                                        what: "for permission",
+                                        detail: "no interactive terminal".to_string(),
+                                    }
+                                    .into(),
+                                );
+                                agent.messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": format!(
+                                        "Permission for '{}' could not be requested (no \
+                                         interactive terminal), so it was not run.",
+                                        tool_name
+                                    )
+                                }));
+                                continue;
+                            }
+                        };
+
+                        match response {
+                            PermissionResponse::Allow => {
+                                // Allow once, proceed with execution
+                                let _ = tx.send(Notice::PermissionAllowed.into());
+                            }
+                            PermissionResponse::AllowAll => {
+                                // Remembered under the narrow keys this call resolved to,
+                                // not under the tool name.
+                                agent.permissions.allow(&gate_keys);
+                                let _ = tx.send(Notice::PermissionAllowedAll(allow_all_label.clone()).into());
+                            }
+                            PermissionResponse::Reject(alternative) => {
+                                // User rejected, send alternative to LLM
+                                let _ = tx.send(Notice::PermissionDenied { alternative: alternative.clone() }.into());
+
+                                agent.messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": format!("Permission denied by user. User suggests: {}", alternative)
+                                }));
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Execute the tool
+                    // A slow tool (a big fetch, a long build) is interruptible too. The
+                    // tool_call_id is still answered before breaking out — an unanswered one
+                    // is what the next request gets rejected for.
+                    let _ = tx.send(AgentEvent::ToolStarted { name: tool_name.to_string(), arguments: arguments.clone(), auto_note: auto_note.clone() });
+
+                    // The diff belongs under the call line, not before it, and it has to
+                    // appear on every path that skipped the prompt — a pre-approved write
+                    // and now an auto-approved one both used to arrive as a path and a byte
+                    // count, with no way to see what went into the file. Convenience should
+                    // cost the prompt, not the oversight. Suppressed only when the prompt
+                    // itself already showed the same diff a moment ago.
+                    if !prompted {
+                        if let Some(diff) = file_change_diff(tool_name, &arguments) {
+                            let _ = tx.send(AgentEvent::ToolDiff(diff));
+                        }
+                    }
+
+
+                    // Captured before the arguments move into the call. For a shell tool
+                    // the command is the thing that ran, so naming the tool as well would
+                    // only say "run_command" twice.
+                    // Cloned before the arguments move into the call, because what
+                    // ran has to be nameable after it has run. Cheap next to the
+                    // call itself, and the alternative is the frontend inventing
+                    // a description from the tool name alone.
+                    let activity_arguments = arguments.clone();
+                    let executed = interruptible(
+                        tx,
+                        link,
+                        Waiting::Tool(tool_name.to_string()),
+                        agent.server.execute_tool(tool_name, arguments),
+                    )
+                    .await;
+
+                    let Some(result) = executed else {
+                        let _ = tx.send(Notice::Interrupted.into());
+                        agent.messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": "Interrupted by the user before this tool finished."
+                        }));
+                        interrupted = true;
+                        break;
+                    };
+
+                    // It ran, whatever it returned: a failed build is still the last
+                    // thing that happened, and the bar saying so is the point.
+                    let _ = tx.send(AgentEvent::DidTool {
+                        name: tool_name.to_string(),
+                        arguments: activity_arguments,
+                    });
+
+                    let tool_result = result.unwrap_or_else(|e| {
+                        let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
+                        format!("Error: {}", e)
+                    });
+
+                    // The summary is the row that used to be all there was: the first
+                    // line of the result, cut to fit. The result itself is kept behind it
+                    // now rather than thrown away, and Ctrl+O opens it.
+                    //
+                    // research is the exception: it has already printed its progress and
+                    // its whole answer while it ran, so a summary here would repeat the
+                    // answer's first line immediately underneath the answer.
+                    if tool_name != "research" {
+                        let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
+                    }
+
+                    // Add tool result
+                    agent.messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_result
+                    }));
+                }
+
+                // The break above only leaves the tool loop; this leaves the turn.
+                if interrupted {
+                    break;
+                }
+
+                // The tool log makes a loop obvious to whoever is watching it scroll past,
+                // but the model reads none of that — every round looks to it like a fresh
+                // decision, which is why it can repeat one call fifty times. Saying the
+                // repetition out loud in the conversation is what breaks it, and it breaks
+                // it far earlier than the round cap. That matters most in auto mode, where
+                // the cap is the only backstop and nobody is watching it climb.
+                if run.0 >= LOOP_BREAK {
+                    let _ =
+                        tx.send(Notice::LoopBroken { tool: run.1.clone(), count: run.0 }.into());
+                    // Whatever was typed while this ran is deliberately left queued: it
+                    // becomes the next prompt, which is where the user takes over.
+                    break;
+                }
+                if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
+                    nudged_at = run.0;
+                    let _ = tx.send(Notice::LoopNudge { tool: run.1.clone(), count: run.0 }.into());
+                    // A user message rather than a system one: mid-conversation system
+                    // messages are ignored by some local models and rejected outright by
+                    // some servers, and this one has to land. The order is legal here for
+                    // the same reason the queued text below is — every tool call in this
+                    // round already has its result.
+                    agent.messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "You have called '{}' with the same arguments {} times in a \
+                             row. Get out of the loop — calling it again will not tell you \
+                             anything you have not already been told. Take a different \
+                             approach, or stop and say what you are stuck on.",
+                            run.1, run.0
+                        )
+                    }));
+                }
+
+                // Anything typed while this round ran joins the conversation here, where
+                // every tool call already has its result. Any sooner would put a user
+                // message between an assistant turn and the tool results it is waiting
+                // for, which is a message order servers reject outright.
+                for text in link.take_queued() {
+                    let _ = tx.send(Notice::QueuedSent(text.clone()).into());
+                    agent.messages.push(json!({"role": "user", "content": text}));
+                }
+
+                // Continue the loop to get next response (might be more tool calls or final answer)
+                continue;
+            } else {
+                // No tool call, this is the final response — already streamed above.
+                agent.messages.push(message.clone());
+                break;
+            }
+        }
+
+        // Every way out of the loop above lands here, an interrupt and a server error
+        // included: the line says how long the turn ran for, not whether it got anywhere,
+        // and a turn that ended badly after four minutes is exactly the one worth timing.
+        // Dimmed for the same reason the chain of thought is — it is not the answer.
+        let _ = tx.send(AgentEvent::Finished { elapsed: turn_started.elapsed() });
+
+        // The file /init just wrote is the one that belongs in the system message, and what
+        // was loaded at startup — usually nothing, since /init is what you run when the
+        // project has no instructions yet — is now out of date. Re-read it here rather than
+        // leaving it to the next startup, so the new rules are in force for the rest of this
+        // session and survive /clear, which re-pushes this same content.
+        if initializing {
+            let reloaded = load_project_context();
+            if reloaded != agent.project_context {
+                agent.project_context = reloaded;
+                if let Some((name, _)) = &agent.project_context {
+                    let _ = tx.send(Notice::ProjectContextReloaded(name.clone()).into());
+                }
+                agent.system_prompt = compose_system_prompt(
+                    agent.config.system_prompt.as_deref(),
+                    &agent.client.model,
+                    agent.settings.use_system_prompt,
+                    agent.user_context.as_deref(),
+                    agent.project_context.as_ref(),
+                );
+                set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
+            }
+        }
+
+        // Persisted every turn, so a crash does not cost the session's history.
+        // The input history is the frontend's and is saved by the pump.
+        if let Some(path) = &agent.session_path {
+            let todos = agent.plan();
+            save_session(path, &agent.messages, &agent.client.model, &todos);
+        }
 }

@@ -27,6 +27,10 @@ pub(crate) struct Presenter {
     /// markdown, does not go through the stream, and can be the *whole* reply —
     /// a model that only ever thought leaves a fold open with no content behind it.
     streamed_thinking: bool,
+    /// What the row above the input box says once the turn is over: the last
+    /// thing that actually happened, rather than an empty row. Chrome, so the
+    /// pump reads it rather than the presenter drawing it.
+    last_activity: Option<String>,
 }
 
 impl Presenter {
@@ -35,12 +39,18 @@ impl Presenter {
             markdown: MarkdownStream::new(),
             streamed_any: false,
             streamed_thinking: false,
+            last_activity: None,
         }
+    }
+
+    /// The row above the input box: the last thing that happened.
+    pub(crate) fn last_activity(&self) -> Option<&str> {
+        self.last_activity.as_deref()
     }
 
     /// Ready for the next reply. Per reply, not per turn: a turn is many rounds
     /// and each round streams one.
-    pub(crate) fn start_reply(&mut self) {
+    fn start_reply(&mut self) {
         self.markdown = MarkdownStream::new();
         self.streamed_any = false;
         self.streamed_thinking = false;
@@ -53,6 +63,7 @@ impl Presenter {
 
     pub(crate) fn show(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::ReplyStart => self.start_reply(),
             AgentEvent::ReasoningChunk(text) => {
                 if !self.streamed_thinking {
                     self.streamed_thinking = true;
@@ -139,17 +150,43 @@ impl Presenter {
                     crate::out::foldable(&line, &result);
                 }
             }
-            AgentEvent::Finished { verb, elapsed } => {
+            AgentEvent::Finished { elapsed } => {
                 // Dimmed for the same reason the chain of thought is: it is not
-                // the answer.
+                // the answer. The verb is chosen here because it is flavor text —
+                // one of a long list, picked fresh each turn — and choosing words
+                // is the display's job, not the turn's.
                 outln!(
                     "\n{}{}{}\n",
                     SetForegroundColor(Color::DarkGrey),
-                    crate::turn_summary(verb, elapsed, chrono::Local::now()),
+                    crate::turn_summary(crate::get_done_verb(), elapsed, chrono::Local::now()),
                     ResetColor
                 );
             }
+            // Chrome, not transcript: the row above the input box. Phrased here
+            // because "ran cargo build" is wording, and the turn only knows that
+            // `run_command` finished with those arguments.
+            AgentEvent::DidTool { name, arguments } => {
+                self.last_activity = Some(
+                    match crate::render::tool_call_summary(&name, &arguments) {
+                        summary if summary.is_empty() => format!("ran {}", name),
+                        // For a shell tool the command *is* the thing that ran,
+                        // so naming the tool as well would say "run_command" twice.
+                        summary if matches!(name.as_str(), "run_command" | "run_background") => {
+                            format!("ran {}", summary)
+                        }
+                        summary => format!("ran {} {}", name, summary),
+                    },
+                );
+            }
             AgentEvent::Notice(notice) => self.notice(notice),
+            // The pump's, not the presenter's: the activity bar and the status
+            // bar are chrome drawn around the transcript rather than lines in
+            // it, and a question needs answering rather than showing. Listed
+            // explicitly instead of caught by `_` so that a new variant still
+            // fails to compile here until someone has decided which side it is.
+            AgentEvent::Busy(_)
+            | AgentEvent::Status { .. }
+            | AgentEvent::Ask(_) => {}
         }
     }
 

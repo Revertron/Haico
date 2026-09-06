@@ -15,7 +15,6 @@ use crossterm::tty::IsTty;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 // The one thing that reads the keyboard.
@@ -716,12 +715,11 @@ fn bar(content: &str, width: usize) -> String {
 // figures on screen cannot disagree about what a token is. Nothing is bracketed until the
 // first token lands — through the silence before it, "(↓ 0)" says less than no bracket at
 // all, and the silence before it is exactly what this exists for.
-pub(crate) fn busy_label(busy: &str, streamed: Option<&AtomicUsize>) -> String {
-    let characters = match streamed {
-        Some(counter) => counter.load(Ordering::Relaxed),
-        None => 0,
-    };
-
+// Takes a count rather than a shared counter: it used to be read while the future
+// filling it was still running, so it had to be an `AtomicUsize` behind a
+// reference. Now every chunk passes through the pump, which counts them and calls
+// this on the same thread — there is nothing left to share.
+pub(crate) fn busy_label(busy: &str, characters: usize) -> String {
     match characters / 4 {
         0 => busy.to_string(),
         tokens if tokens < 1000 => format!("{} (↓ {})", busy, tokens),
@@ -1662,28 +1660,19 @@ mod tests {
 
     #[test]
     fn the_activity_bar_counts_up_only_once_there_is_something_to_count() {
-        let streamed = AtomicUsize::new(0);
-
-        // Work that produces no stream of its own says only what it is doing.
-        assert_eq!(busy_label("Thinking…", None), "Thinking…");
-
-        // And so does a stream that has not delivered a token yet: the whole point is the
-        // silence before the first one, and "(↓ 0)" would fill it with nothing.
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking…");
-        streamed.store(3, Ordering::Relaxed);
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking…");
+        // Work that produces no stream of its own says only what it is doing, and
+        // so does a stream that has not delivered a token yet: the whole point is
+        // the silence before the first one, and "(↓ 0)" would fill it with nothing.
+        assert_eq!(busy_label("Thinking…", 0), "Thinking…");
+        assert_eq!(busy_label("Thinking…", 3), "Thinking…");
 
         // Four characters to the token, the same rule `estimate_tokens` uses.
-        streamed.store(4, Ordering::Relaxed);
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 1)");
-        streamed.store(2596, Ordering::Relaxed);
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 649)");
+        assert_eq!(busy_label("Thinking…", 4), "Thinking… (↓ 1)");
+        assert_eq!(busy_label("Thinking…", 2596), "Thinking… (↓ 649)");
 
         // Thousands become the short form rather than a five-digit number nobody reads.
-        streamed.store(4000, Ordering::Relaxed);
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 1.0k)");
-        streamed.store(94_000, Ordering::Relaxed);
-        assert_eq!(busy_label("Thinking…", Some(&streamed)), "Thinking… (↓ 23.5k)");
+        assert_eq!(busy_label("Thinking…", 4000), "Thinking… (↓ 1.0k)");
+        assert_eq!(busy_label("Thinking…", 94_000), "Thinking… (↓ 23.5k)");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Terminal rendering: markdown, diffs, and the model picker.
 
+use crate::util::truncate_at_boundary;
 use crate::input::Keys;
 use anyhow::Result;
 use crossterm::{
@@ -1782,4 +1783,45 @@ mod markdown_tests {
         assert!(!rendered.contains("_another_"), "got {:?}", rendered);
         assert!(rendered.contains("italic") && rendered.contains("another"));
     }
+}
+
+// MCP Server with tools
+// Lay a command out so it can actually be read before being approved.
+//
+// It used to be cut at 50 characters, which for a generated one-liner meant approving a
+// script sight unseen. Wrapped to the terminal width and indented, with a generous ceiling
+// so a pathological command cannot flood the screen either.
+pub(crate) fn indented_command(command: &str) -> String {
+    const MAX: usize = 4000;
+    let shown = truncate_at_boundary(command.trim(), MAX);
+    let width = crossterm::terminal::size()
+        .map(|(cols, _)| (cols as usize).saturating_sub(6).max(40))
+        .unwrap_or(100);
+
+    let mut out = String::new();
+    for line in shown.lines() {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let mut take = truncate_at_boundary(rest, width);
+            if take.is_empty() {
+                take = rest;
+            }
+            // Break at a space when there is one near the end of the line. Splitting through
+            // the middle of a token is legible but jarring, and the whole point here is that
+            // the command can be read. Never break early enough to hide anything.
+            if take.len() < rest.len() {
+                if let Some(space) = take.rfind(' ').filter(|at| *at > width * 3 / 4) {
+                    take = &take[..space + 1];
+                }
+            }
+            out.push_str("    ");
+            out.push_str(take.trim_end());
+            out.push('\n');
+            rest = rest[take.len()..].trim_start_matches(' ');
+        }
+    }
+    if shown.len() < command.trim().len() {
+        out.push_str("    ... [truncated]\n");
+    }
+    out.trim_end().to_string()
 }

@@ -2,10 +2,8 @@ use anyhow::{Context, Result};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
-use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Declared first, and with #[macro_use], so out!/outln! are in scope for every
 // module below it.
@@ -48,46 +46,6 @@ use turn::*;
 use util::*;
 
 
-// MCP Server with tools
-// Lay a command out so it can actually be read before being approved.
-//
-// It used to be cut at 50 characters, which for a generated one-liner meant approving a
-// script sight unseen. Wrapped to the terminal width and indented, with a generous ceiling
-// so a pathological command cannot flood the screen either.
-fn indented_command(command: &str) -> String {
-    const MAX: usize = 4000;
-    let shown = truncate_at_boundary(command.trim(), MAX);
-    let width = crossterm::terminal::size()
-        .map(|(cols, _)| (cols as usize).saturating_sub(6).max(40))
-        .unwrap_or(100);
-
-    let mut out = String::new();
-    for line in shown.lines() {
-        let mut rest = line;
-        while !rest.is_empty() {
-            let mut take = truncate_at_boundary(rest, width);
-            if take.is_empty() {
-                take = rest;
-            }
-            // Break at a space when there is one near the end of the line. Splitting through
-            // the middle of a token is legible but jarring, and the whole point here is that
-            // the command can be read. Never break early enough to hide anything.
-            if take.len() < rest.len() {
-                if let Some(space) = take.rfind(' ').filter(|at| *at > width * 3 / 4) {
-                    take = &take[..space + 1];
-                }
-            }
-            out.push_str("    ");
-            out.push_str(take.trim_end());
-            out.push('\n');
-            rest = rest[take.len()..].trim_start_matches(' ');
-        }
-    }
-    if shown.len() < command.trim().len() {
-        out.push_str("    ... [truncated]\n");
-    }
-    out.trim_end().to_string()
-}
 
 fn print_repl_help() {
     outln!("Commands:");
@@ -198,124 +156,268 @@ async fn ask_about_call(
 }
 
 // The right-hand end of the status bar.
-fn status_line(model: &str, messages: &[Value], context_tokens: usize) -> String {
-    let used = estimate_tokens(messages);
+// Takes the count rather than the history: during a turn the frontend draws this
+// while the turn owns the messages, so the number has to arrive as a number.
+fn status_line(model: &str, used: usize, context_tokens: usize) -> String {
     let percent = (used as f64 / context_tokens.max(1) as f64) * 100.0;
     format!("{}  ctx {:.0}%", model, percent)
 }
-
-// Run something with the input box still live underneath it.
+// Run one turn with the input box still live underneath it.
 //
 // This is what the whole rework is for: while the model is thinking, or a tool is
 // running, the user can still type. What they submit is queued for the end of the
 // round rather than interrupting it — a message injected between an assistant turn
 // that called tools and the results of those calls is a message order the server
-// rejects. Esc, on the other hand, does interrupt: None comes back and the turn ends.
-async fn work_with_input<T>(
-    keys: &mut Option<Keys>,
-    editor: &mut Editor,
-    mode: &mut Mode,
-    queued: &mut Vec<String>,
-    status: &str,
-    // The plan, read fresh on every redraw rather than snapshotted once: todo_write runs
-    // inside the very work this is waiting on, and a panel that only caught up at the end
-    // of the turn would be worth nothing.
-    todos: &std::sync::Mutex<Vec<TodoItem>>,
-    plan_view: &mut PlanView,
-    busy: &str,
-    // Characters of reply seen so far, for the work that produces one. Shared rather than
-    // returned because it has to be readable while the future filling it is still running.
-    streamed: Option<&AtomicUsize>,
-    work: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    let Some(keys) = keys.as_mut() else {
-        // Piped input has nothing to type with, so the only way to stop is the signal
-        // that raw mode would otherwise have swallowed.
-        outln!("
-○ {}", busy);
-        return tokio::select! {
-            output = work => Some(output),
-            _ = tokio::signal::ctrl_c() => None,
-        };
-    };
+// rejects. Esc, on the other hand, does interrupt.
+//
+// There is exactly one of these per turn. There used to be five, one wrapped
+// around each piece of the turn that could block, and that is what made the loop
+// unmovable: each wrap handed the turn the keyboard, the editor and the queue for
+// the duration. Now the turn narrates itself through a channel and shares three
+// things through a `TurnLink`, and everything below the seam is this function's.
+async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initializing: bool) {
+    let link = TurnLink::new(agent.mode);
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut presenter = Presenter::new();
 
-    tokio::pin!(work);
+    // Chrome the pump draws around the transcript. Seeded from the agent before
+    // the turn borrows it, and kept current afterwards by the turn's own Status
+    // and Busy events — the pump cannot look at the agent again until the turn has
+    // given it back. The mode needs no event: the link is shared, so both sides
+    // already see the same one.
+    let mut status =
+        status_line(agent.model(), estimate_tokens(&agent.messages), agent.context_tokens);
+    let mut busy = get_thinking_message().to_string();
+    // Whether the label is one a character count belongs on — see `Waiting::Model`.
+    let mut counting = true;
+    // The plan panel is read fresh on every redraw rather than snapshotted:
+    // todo_write runs inside the very work this is waiting on, and a panel that
+    // only caught up at the end of the turn would be worth nothing. An Arc clone,
+    // so it can be read while the turn holds the agent.
+    let todos = agent.server.todos.clone();
+    // Characters streamed so far, thinking included, for the activity bar. A big
+    // model can reason for many minutes before its first content token, and a bar
+    // that only says "Thinking…" for all of it is indistinguishable from one that
+    // has hung. Counted here now: every chunk goes past this function anyway.
+    let mut streamed = 0usize;
 
-    // The bar is redrawn on a timer as well as on keystrokes. Without a tick it only
-    // changes when a key is pressed, which would leave the counter frozen through exactly
-    // the long silence it exists to fill.
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    {
+        let turn = run_turn(agent, input, initializing, &tx, &link);
+        tokio::pin!(turn);
 
-    // What the bar last said, and whether anything else needs redrawing. A tick that would
-    // draw the same label again is skipped: work with no counter to move — a tool running,
-    // a call being judged — never changes it, and repainting the region four times a second
-    // for the length of a long build is traffic and flicker bought for nothing.
-    let mut shown: Option<String> = None;
-    let mut shown_plan: Vec<TodoItem> = Vec::new();
-    let mut dirty = true;
-
-    loop {
-        let label = crate::input::busy_label(busy, streamed);
-        let plan = todos.lock().unwrap().clone();
-        if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
-            // Ctrl+T comes through `while_working` below, which sets `dirty` like any
-            // other key, so the view does not need watching separately here.
-            crate::input::draw(
-                editor,
-                &crate::input::Chrome {
-                    mode: *mode,
-                    busy: Some(&label),
-                    // Something is running, so the bar has better than history to show.
-                    last: None,
-                    status,
-                    todos: &plan,
-                    queued,
-                    plan: *plan_view,
-                },
-            );
-            shown = Some(label);
-            shown_plan = plan;
-            dirty = false;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        // What the bar last said, and whether anything else needs redrawing. A tick
+        // that would draw the same thing again is skipped: work with no counter to
+        // move — a tool running, a call being judged — never changes it, and
+        // repainting the region four times a second for the length of a long build
+        // is traffic and flicker bought for nothing.
+        let mut shown: Option<String> = None;
+        let mut shown_plan: Vec<TodoItem> = Vec::new();
+        let mut dirty = true;
+        // The turn's last act is to narrate its own ending, so every exit drains
+        // what is still queued before leaving. The channel cannot close while the
+        // pump holds a sender, which is why emptiness rather than closure is the
+        // signal.
+        macro_rules! drain {
+            () => {
+                while let Ok(event) = events.try_recv() {
+                    answer_or_show(&mut presenter, &mut io.keys, event, &link).await;
+                }
+            };
         }
 
-        tokio::select! {
-            // Nothing to do with the tick itself: the loop redraws at the top if the
-            // counter has moved since it last did.
-            _ = tick.tick() => {}
-            output = &mut work => {
-                out::clear_region();
-                return Some(output);
-            }
-            event = keys.next() => {
-                // Whatever it was — a character typed, a mode cycled, a resize — the box
-                // below the bar has to be drawn again even when the label has not moved.
-                dirty = true;
-                let Some(event) = event else {
-                    // The keyboard is gone. Finishing the work is still better than
-                    // dropping it on the floor.
-                    out::clear_region();
-                    return Some(work.await);
-                };
-                match crate::input::while_working(editor, mode, plan_view, event) {
-                    crate::input::WhileWorking::Interrupt => {
-                        out::clear_region();
-                        // What was waiting above the bar was never sent, and the user has
-                        // just said they did not want this turn. It goes back into the box
-                        // rather than on to the model as the next prompt.
-                        if !queued.is_empty() {
-                            let held: Vec<String> = queued.drain(..).collect();
-                            editor.restore(&held.join("\n"));
-                        }
-                        return None;
+        loop {
+            // Piped input has nothing to type with, so there is no box to draw and
+            // the only way to stop is the signal raw mode would have swallowed.
+            let Some(keys) = io.keys.as_mut() else {
+                outln!("\n○ {}", busy);
+                tokio::select! {
+                    _ = &mut turn => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        link.cancel();
+                        (&mut turn).await;
                     }
-                    // Not echoed into the transcript here: it has not been sent yet,
-                    // and the row above the bar is where it waits until it has.
-                    crate::input::WhileWorking::Queued(text) => queued.push(text),
-                    crate::input::WhileWorking::Nothing => {}
+                }
+                drain!();
+                break;
+            };
+
+            let label = crate::input::busy_label(&busy, if counting { streamed } else { 0 });
+            let plan = todos.lock().unwrap().clone();
+            if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
+                let queued = link.queued();
+                crate::input::draw(
+                    &mut io.editor,
+                    &crate::input::Chrome {
+                        mode: link.mode(),
+                        busy: Some(label.as_str()),
+                        // Something is running, so the bar has better than history
+                        // to show. The last thing that happened goes there at the
+                        // next prompt instead, which is drawn once this returns.
+                        last: None,
+                        status: &status,
+                        todos: &plan,
+                        queued: &queued,
+                        plan: io.plan_view,
+                    },
+                );
+                shown = Some(label);
+                shown_plan = plan;
+                dirty = false;
+            }
+
+            tokio::select! {
+                // Nothing to do with the tick itself: the loop redraws at the top
+                // if the counter has moved since it last did.
+                _ = tick.tick() => {}
+                _ = &mut turn => {
+                    drain!();
+                    break;
+                }
+                event = events.recv() => {
+                    match event {
+                        Some(event) => {
+                            match &event {
+                                AgentEvent::Busy(waiting) => {
+                                    busy = describe_waiting(waiting);
+                                    // Only the model's own generation has a
+                                    // stream behind it, so only that label means
+                                    // anything by a character count.
+                                    counting = matches!(waiting, Waiting::Model);
+                                }
+                                AgentEvent::Status { model, used_tokens, context_tokens } => {
+                                    status = status_line(model, *used_tokens, *context_tokens);
+                                }
+                                AgentEvent::ReplyStart => streamed = 0,
+                                AgentEvent::ReasoningChunk(text)
+                                | AgentEvent::ReplyChunk(text) => {
+                                    streamed += text.chars().count();
+                                }
+                                _ => {}
+                            }
+                            answer_or_show(&mut presenter, &mut io.keys, event, &link).await;
+                            dirty = true;
+                        }
+                        // Every sender is gone, which only happens once the turn has
+                        // been dropped: nothing more is coming.
+                        None => break,
+                    }
+                }
+                event = keys.next() => {
+                    // Whatever it was — a character typed, a mode cycled, a resize —
+                    // the box below the bar has to be drawn again even when the
+                    // label has not moved.
+                    dirty = true;
+                    let Some(event) = event else {
+                        // The keyboard is gone. Finishing the turn is still better
+                        // than dropping it on the floor.
+                        (&mut turn).await;
+                        drain!();
+                        break;
+                    };
+                    let mut mode = link.mode();
+                    let action =
+                        crate::input::while_working(&mut io.editor, &mut mode, &mut io.plan_view, event);
+                    if mode != link.mode() {
+                        link.set_mode(mode);
+                    }
+                    match action {
+                        crate::input::WhileWorking::Interrupt => {
+                            // What was waiting above the bar was never sent, and the
+                            // user has just said they did not want this turn. It goes
+                            // back into the box rather than on to the model as the
+                            // next prompt.
+                            let held = link.take_queued();
+                            if !held.is_empty() {
+                                io.editor.restore(&held.join("\n"));
+                            }
+                            // Not a drop: the turn is told, and stops somewhere it
+                            // chose, with every tool_call_id already answered. See
+                            // `TurnLink::until_cancelled`.
+                            link.cancel();
+                        }
+                        // Not echoed into the transcript here: it has not been sent
+                        // yet, and the row above the bar is where it waits until it has.
+                        crate::input::WhileWorking::Queued(text) => link.queue(text),
+                        crate::input::WhileWorking::Nothing => {}
+                    }
                 }
             }
         }
     }
+
+    out::clear_region();
+    // The turn owned the mode while it ran; hand it back.
+    agent.mode = link.mode();
+    // And the row above the box keeps whatever the turn last did, across the
+    // prompt and into the next turn. Only overwritten when this turn ran a tool:
+    // a turn that answered without touching anything leaves the previous answer
+    // standing rather than blanking the row.
+    if let Some(activity) = presenter.last_activity() {
+        io.last_activity = Some(activity.to_string());
+    }
+    // Anything still queued when the turn ended becomes the next prompt, which is
+    // where the user takes over.
+    io.queued = link.take_queued();
+    if let Some(path) = &io.history_path {
+        crate::input::save_history(path, io.editor.history());
+    }
+}
+
+// The words for a kind of waiting. Here rather than in the turn because the
+// model-thinking one is flavor text — one of a long list, picked fresh each
+// time — and choosing words is the display's job.
+fn describe_waiting(waiting: &Waiting) -> String {
+    match waiting {
+        Waiting::Model => get_thinking_message().to_string(),
+        Waiting::Compacting => "Compacting context…".to_string(),
+        Waiting::CompressingReasoning => "Compressing reasoning…".to_string(),
+        Waiting::ReviewingCall => "🤖 Reviewing tool call…".to_string(),
+        Waiting::Tool(name) => format!("{}…", name),
+    }
+}
+// Either answer the turn's question or put its output on screen.
+//
+// Answering happens here rather than in the pump's select arm because a prompt
+// runs its own read loop on the keyboard: it has to be awaited outside the
+// select that is also borrowing it. The turn is waiting on a reply channel
+// meanwhile, so nothing is racing.
+async fn answer_or_show(
+    presenter: &mut Presenter,
+    keys: &mut Option<Keys>,
+    event: AgentEvent,
+    link: &TurnLink,
+) {
+    let AgentEvent::Ask(ask) = event else {
+        presenter.show(event);
+        return;
+    };
+    // A dropped reply channel is a refusal, which is what a terminal that cannot
+    // be read from has to mean: never consent. Every `let _ =` below is that —
+    // the turn hears the drop and treats it as "could not ask".
+    match ask {
+        Ask::Plan { plan, reply } => {
+            if let Ok(decision) = ask_about_plan(keys.as_mut(), &plan).await {
+                let _ = reply.send(decision);
+            }
+        }
+        Ask::User { question, options, reply } => {
+            if let Ok(answer) = ask_the_user(keys.as_mut(), &question, &options).await {
+                let _ = reply.send(answer);
+            }
+        }
+        Ask::Permission { allow_all_label, description, diff, reply } => {
+            let response =
+                ask_about_call(keys.as_mut(), &allow_all_label, &description, diff.as_deref()).await;
+            if let Ok(response) = response {
+                let _ = reply.send(response);
+            }
+        }
+    }
+    // A prompt draws over the input region and leaves the cursor wherever it
+    // finished; the pump redraws on the next pass, and this keeps the scroll
+    // following the end while it does.
+    let _ = link;
 }
 
 // Rough size of the conversation, in tokens.
@@ -524,7 +626,7 @@ async fn main() -> Result<()> {
         } else {
             match io.keys.as_mut() {
                 Some(keys) => {
-                    let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
+                    let status = status_line(agent.model(), estimate_tokens(&agent.messages), agent.context_tokens);
                     let plan = agent.plan();
                     match read_command(
                         keys,
@@ -1071,7 +1173,7 @@ Usage: /set <name> <value>, or /set <name> unset
             input
         };
 
-        run_turn(&mut agent, &mut io, input, initializing).await;
+        drive_turn(&mut agent, &mut io, input, initializing).await;
     }
 
     if let Some(path) = &io.history_path {
@@ -1329,880 +1431,6 @@ struct TerminalIo {
 /// That is the precondition for the next step rather than the end of one: it
 /// still prints, and still owns the keyboard, but there is now a single seam to
 /// invert when the core starts emitting events instead of drawing (11.2).
-async fn run_turn(
-    agent: &mut Agent,
-    io: &mut TerminalIo,
-    input: &str,
-    // True when this turn is `/init` writing the project instruction file, so the
-    // file it produces can be picked up at the end of it.
-    initializing: bool,
-) {
-        // Everything this turn has to say goes through here. The turn decides what
-    // happened; the presenter decides what that looks like.
-    let mut presenter = Presenter::new();
-
-    // Wall clock, started here rather than at the first request: what the summary at
-        // the end of the turn reports is how long the user waited, which includes the tool
-        // runs, the permission prompts they answered and every round of the loop below —
-        // not just the time the model spent generating.
-        let turn_started = std::time::Instant::now();
-
-        // Add user message
-        agent.messages.push(json!({
-            "role": "user",
-            "content": input
-        }));
-
-        // Get LLM response and handle tool call chains. The cap stops a model that keeps
-        // calling tools forever from spinning until the user kills the process. It does
-        // not apply in auto mode: a fixed number of rounds is a poor stand-in for "this is
-        // going nowhere", and a long job that hits it unattended has nobody to say
-        // "continue". Repetition is the better signal, and it is what guards auto mode.
-        const MAX_TOOL_ROUNDS: usize = 50;
-        // A stuck model gives itself away by calling the same tool with the same arguments
-        // over and over with nothing in between, which can happen on the tenth round or
-        // the fiftieth. The first threshold says so in the conversation; the second gives
-        // up on the turn.
-        const LOOP_NUDGE: usize = 3;
-        const LOOP_BREAK: usize = 5;
-        let mut round = 0usize;
-
-        // The (tool, arguments) pair called last, and how long the unbroken run of it is.
-        // Consecutive rather than counted across the turn: a model working through a list
-        // of compiler errors legitimately runs the same build command a dozen times in one
-        // turn, and every one of those is progress because there were edits in between. A
-        // loop is the same call with nothing else happening between the tries. Any
-        // different call resets the run, `nudged_at` with it, so a later loop still gets
-        // its warning.
-        let mut last_call: Option<(String, String)> = None;
-        let mut run = (0usize, String::new());
-        let mut nudged_at = 0usize;
-
-        // Cleared when compacting fails to get the history back under the line, which
-        // means the window is too small to hold even a summary of it. Trying again the
-        // next round would summarize the summary and throw the round away with it, so
-        // the turn runs on instead and lets the server error be the honest end of it.
-        let mut autocompact = true;
-
-        loop {
-            round += 1;
-            // Re-read every round rather than captured once: approving a plan can switch
-            // into auto mode mid-turn, and the cap should stop applying from that point.
-            if agent.mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
-                presenter.show(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
-                break;
-            }
-
-            // Auto mode is meant to run unattended, so the one thing it must not do at the
-            // edge of the window is stop and ask for /compact: there is nobody there to
-            // type it, and a job left running overnight would be found dead at the prompt.
-            // Checked here rather than at the end of a turn, where the old hint printed,
-            // because a long job lives inside this loop for hours and may never reach the
-            // end of a turn at all. The history is balanced at this point — every tool call
-            // from the round before already has its reply — so replacing it wholesale
-            // cannot orphan a tool_call_id, which is not true further down.
-            if agent.mode == Mode::Auto
-                && autocompact
-                && estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens)
-            {
-                let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
-                let compacted = work_with_input(
-                    &mut io.keys,
-                    &mut io.editor,
-                    &mut agent.mode,
-                    &mut io.queued,
-                    &status,
-                    &agent.server.todos,
-                    &mut io.plan_view,
-                    "Compacting context…",
-                    None,
-                    compact_history(&agent.client, &mut agent.messages),
-                )
-                .await;
-
-                match compacted {
-                    Some(Ok(report)) => {
-                        // The same reclaim /compact does, for the same reason: the cache is
-                        // keyed to a history that no longer exists.
-                        agent.review_cache.clear();
-                        presenter.show(Notice::Compacted(report).into());
-                        // The compacted history ends on the assistant agreeing that it has
-                        // the notes, and asking for a reply straight after that is asking
-                        // the model to talk past itself. This says the one thing the notes
-                        // cannot: the task was mid-flight when the summarizer ran, and it
-                        // is the same task that continues.
-                        agent.messages.push(json!({
-                            "role": "user",
-                            "content": "Your context was compacted mid-task. Continue the \
-                                        work described in the notes above from where it left \
-                                        off; do not start over."
-                        }));
-
-                        if estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens) {
-                            autocompact = false;
-                            presenter.show(
-                                Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize)
-                                    .into(),
-                            );
-                        }
-                    }
-                    // Not fatal by itself: the request below may still fit, and if it does
-                    // not, the server's own error ends the turn — exactly what would have
-                    // happened with none of this here.
-                    Some(Err(e)) => presenter.show(Notice::CompactionFailed(format!("{:#}", e)).into()),
-                    // Esc during the summarization is Esc during the turn, as everywhere
-                    // else in this loop.
-                    None => {
-                        presenter.show(Notice::Interrupted.into());
-                        break;
-                    }
-                }
-            }
-
-            let thinking = get_thinking_message().to_string();
-
-            // Whether anything has reached the screen for this reply, and the
-            // half-rendered markdown line, both belong to the presenter — see
-            // `Presenter::start_reply`. Per round, not per turn: a turn is many
-            // rounds and each one streams its own reply.
-            presenter.start_reply();
-            // Characters of reply seen so far, thinking included, for the activity bar. A
-            // big model can reason for many minutes before its first content token, and a
-            // bar that only says "Thinking…" for all of it is indistinguishable from one
-            // that has hung. An atomic rather than a Cell so the future stays Send, and a
-            // local rather than a presenter field because `work_with_input` reads it while
-            // the callback below is writing through `&mut presenter`.
-            let streamed_chars = AtomicUsize::new(0);
-            // Rebuilt every round rather than once per turn: approving a plan switches the
-            // mode mid-turn, and the very next request has to carry the full tool list.
-            let request_messages = with_mode_note(agent.mode, &agent.workspace, &agent.messages);
-            let request_tools = tools_for_mode(agent.mode, &agent.tools);
-            let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
-
-            // Esc abandons the turn instead of killing the process. It arrives here as a
-            // keystroke rather than as a signal because raw mode is on for the whole
-            // session — which is also what lets the next message be typed while this one
-            // is still running.
-            let result = work_with_input(
-                &mut io.keys,
-                &mut io.editor,
-                &mut agent.mode,
-                &mut io.queued,
-                &status,
-                &agent.server.todos,
-                &mut io.plan_view,
-                &thinking,
-                Some(&streamed_chars),
-                agent.client.chat_completion_streaming(
-                    request_messages,
-                    request_tools,
-                    // Both kinds of text are handed on the moment they arrive, so
-                    // none of the branches below re-print anything from the
-                    // finished message. What either one *looks* like — dim,
-                    // italic, folded, markdown-wrapped — is the presenter's, and
-                    // this no longer knows.
-                    |chunk| {
-                        let event = match chunk {
-                            Chunk::Reasoning(text) => {
-                                streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
-                                AgentEvent::ReasoningChunk(text)
-                            }
-                            Chunk::Content(text) => {
-                                streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
-                                AgentEvent::ReplyChunk(text)
-                            }
-                        };
-                        presenter.show(event);
-                    },
-                ),
-            )
-            .await;
-
-            let Some(result) = result else {
-                // The partial reply is dropped rather than stored: half a tool call in the
-                // history is worse than no reply at all. Everything before this turn stays
-                // consistent, so the conversation is still usable.
-                presenter.show(AgentEvent::ReplyEnd);
-                presenter.show(Notice::Interrupted.into());
-                break;
-            };
-
-            let mut message = match result {
-                Ok(message) => message,
-                Err(e) => {
-                    // A dropped connection, a server-side error, or an unparseable body
-                    // must not end the session. Every tool call made so far already has its
-                    // reply, so the history is consistent: drop back to the prompt.
-                    presenter.show(AgentEvent::ReplyEnd);
-                    presenter.show(Notice::RequestFailed(format!("{:#}", e)).into());
-                    break;
-                }
-            };
-
-            // Both kinds of text were handed on as they arrived — including the case of a
-            // model whose entire reply is chain of thought with no content at all, which
-            // is why nothing is re-emitted from `message` here. All that is left is to say
-            // the reply is over, and let the presenter close whatever it has open.
-            presenter.show(AgentEvent::ReplyEnd);
-
-            // The one place the reasoning policy is applied, deliberately ahead of every
-            // `agent.messages.push(message.clone())` below rather than at each of them: all three
-            // push this same value, and a policy enforced at two of the three sites would
-            // leave whole traces in the history depending on how the turn happened to end.
-            //
-            // Only the compression of a long enough trace costs a request, and only that
-            // goes through `work_with_input` — several seconds with a frozen input box
-            // every turn would be worse than the tokens are worth. Esc during it means
-            // `None`, which lands in the same place a failure does: the original chain of
-            // thought is kept and the turn carries on. Dropping a field, and declining a
-            // trace under the threshold, are both over before a frame could be painted, so
-            // they are awaited directly rather than announced as work in progress.
-            if agent.reasoning != Reasoning::Keep {
-                let note = if reasoning_needs_a_request(&message, agent.reasoning, agent.reasoning_threshold) {
-                    work_with_input(
-                        &mut io.keys,
-                        &mut io.editor,
-                        &mut agent.mode,
-                        &mut io.queued,
-                        &status,
-                        &agent.server.todos,
-                        &mut io.plan_view,
-                        "Compressing reasoning…",
-                        None,
-                        apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold),
-                    )
-                    .await
-                    .flatten()
-                } else {
-                    apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold).await
-                };
-
-                match note {
-                    // Shown rather than folded, and wearing the chrome's light blue: the
-                    // whole point of compressing is to find out whether it is paying for
-                    // itself, which cannot be judged from a line that is hidden by
-                    // default. Tinted, not painted — the bars are the only thing on
-                    // screen that gets a background, and that is what makes them read as
-                    // furniture rather than as output.
-                    Some(ReasoningOutcome::Compressed { before, after }) => {
-                        agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
-                        presenter.show(Notice::ReasoningCompressed { before, after }.into());
-                    }
-                    // Dropping says nothing the policy did not already say: it removes
-                    // every trace, every turn, so a line per reply would be a line per
-                    // reply saying the same thing.
-                    Some(ReasoningOutcome::Dropped { tokens }) => {
-                        presenter.show(Notice::ReasoningDropped { tokens }.into());
-                    }
-                    None => {}
-                }
-            }
-
-            // Check if model wants to call a tool
-            if let Some(tool_calls) = message.get("tool_calls").filter(|c| !c.is_null()) {
-                let tool_calls_array = match tool_calls.as_array() {
-                    Some(arr) => arr,
-                    None => {
-                        presenter.show(Notice::ToolCallsMalformed(format!("{:?}", tool_calls)).into());
-                        break;
-                    }
-                };
-
-                // Check if array is empty
-                if tool_calls_array.is_empty() {
-                    // No actual tool calls, this is the final response — already streamed.
-                    agent.messages.push(message.clone());
-                    break;
-                }
-
-                // Add assistant message with tool call first
-                agent.messages.push(message.clone());
-
-                // Set when Ctrl+C lands during a tool call, so the turn ends rather than
-                // only the tool loop.
-                let mut interrupted = false;
-
-                for tool_call in tool_calls_array {
-                    //outln!("[DEBUG] Processing tool call: {}", serde_json::to_string_pretty(&tool_call).unwrap_or_default());
-
-                    // Captured up front: every path out of this iteration owes the model a
-                    // `role:"tool"` message under this id. Leaving one unanswered makes the
-                    // next request fail server-side, which is far harder to recover from
-                    // than telling the model its call was malformed.
-                    let tool_call_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
-                    let function = &tool_call["function"];
-
-                    let tool_name = match function["name"].as_str() {
-                        Some(name) => name,
-                        None => {
-                            let detail = format!(
-                                "Malformed tool call: no function name in {}",
-                                truncate_at_boundary(&function.to_string(), 500)
-                            );
-                            presenter.show(Notice::ToolCallUnnamed(detail.clone()).into());
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": detail
-                            }));
-                            continue;
-                        }
-                    };
-
-                    let parsed = parse_tool_arguments(function);
-
-                    // Counted here, before any of the branches below, so a call that is
-                    // refused, denied *or malformed* counts too — retrying a call the
-                    // workspace or the user has already turned down, unchanged and
-                    // immediately, is a loop like any other. What it returned is
-                    // deliberately not part of the key: a build that fails three times in a
-                    // row with nothing done between the tries is stuck whatever the errors
-                    // say.
-                    //
-                    // The malformed case has to be counted *before* the parse, not after,
-                    // and that is not tidiness. The error arm below `continue`s, so
-                    // counting after it meant a model repeating a call whose arguments are
-                    // not JSON never advanced the run at all. In normal mode the round cap
-                    // still stopped it; in auto mode, which skips that cap on purpose
-                    // because there is nobody there to type "continue", nothing stopped it
-                    // and the turn span forever unattended. Keyed on the canonical form
-                    // when it parses (serde_json sorts object keys, so the same call always
-                    // renders to the same string) and on the raw argument text when it does
-                    // not, which is the only form a malformed call has.
-                    let args_key = match &parsed {
-                        Ok(arguments) => arguments.to_string(),
-                        Err(_) => function.get("arguments").map(|a| a.to_string()).unwrap_or_default(),
-                    };
-                    let call = (tool_name.to_string(), args_key);
-                    if last_call.as_ref() == Some(&call) {
-                        run.0 += 1;
-                    } else {
-                        last_call = Some(call);
-                        run = (1, tool_name.to_string());
-                        nudged_at = 0;
-                    }
-
-                    let arguments = match parsed {
-                        Ok(arguments) => arguments,
-                        Err(detail) => {
-                            presenter.show(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": format!(
-                                    "Could not run '{}': {}. Call it again with valid JSON arguments.",
-                                    tool_name, detail
-                                )
-                            }));
-                            continue;
-                        }
-                    };
-
-                    // The model can put itself into plan mode, for when the user asked for
-                    // a plan rather than for the work. Nothing to approve: this only ever
-                    // takes capability away, and present_plan is where consent is needed.
-                    if tool_name == START_PLAN {
-                        let content = if agent.mode == Mode::Plan {
-                            "Already in plan mode. Investigate with the reading tools, then \
-                             call present_plan."
-                        } else {
-                            agent.mode = Mode::Plan;
-                            presenter.show(Notice::PlanModeEntered.into());
-                            "Plan mode is active. The tools that change this machine are no \
-                             longer available to you. Investigate the real code with read, \
-                             grep, ls and glob_search, then call present_plan with what you \
-                             propose. Do not start work until the user approves it."
-                        };
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // A finished plan is not a tool call so much as the end of plan mode,
-                    // and the mode it ends lives out here rather than inside the tool.
-                    if tool_name == PRESENT_PLAN {
-                        let plan = arguments["plan"].as_str().unwrap_or("").trim().to_string();
-                        if plan.is_empty() {
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": "The plan was empty. Put the plan itself in the \
-                                            'plan' field and call present_plan again."
-                            }));
-                            continue;
-                        }
-
-                        // A terminal that cannot be read from must not be taken as
-                        // approval — the same rule the permission prompt follows.
-                        let content = match ask_about_plan(io.keys.as_mut(), &plan).await {
-                            Ok(PlanDecision::Approve) => {
-                                agent.mode = Mode::Normal;
-                                presenter.show(Notice::PlanApproved { auto: false }.into());
-                                "The user approved the plan. Plan mode is over and the full \
-                                 tool set is available again. Begin work now, following the \
-                                 plan you just had approved."
-                                    .to_string()
-                            }
-                            Ok(PlanDecision::ApproveWithAuto) => {
-                                agent.mode = Mode::Auto;
-                                presenter.show(Notice::PlanApproved { auto: true }.into());
-                                // The model is told nothing about the review. It should
-                                // propose the same call either way, and knowing it is being
-                                // checked is an invitation to write for the checker.
-                                "The user approved the plan. Plan mode is over and the full \
-                                 tool set is available again. Begin work now, following the \
-                                 plan you just had approved."
-                                    .to_string()
-                            }
-                            Ok(PlanDecision::Revise(feedback)) => {
-                                presenter.show(Notice::PlanRejected.into());
-                                format!(
-                                    "The user did not approve the plan. Their corrections: {}\n\n\
-                                     You are still in plan mode and must not change anything. \
-                                     Fold this in — investigating further if you need to — and \
-                                     call present_plan again.",
-                                    feedback
-                                )
-                            }
-                            Err(e) => {
-                                presenter.show(Notice::AskFailed { what: "about the plan", detail: e.to_string() }.into());
-                                "The plan could not be shown for approval (no interactive \
-                                 terminal), so it is not approved. Do not start work."
-                                    .to_string()
-                            }
-                        };
-
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // A question for the user is answered out here for the same reason a
-                    // plan is: the keyboard belongs to the REPL, and the tool body runs in
-                    // the MCP server too, where there is nobody to ask.
-                    if tool_name == ASK_USER {
-                        let question = arguments["question"].as_str().unwrap_or_default();
-                        // Anything that is not a string is dropped rather than rendered as
-                        // JSON: a model that sent objects here is better told the list was
-                        // too short than shown its own braces back on screen.
-                        let options: Vec<String> = arguments["options"]
-                            .as_array()
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(|item| item.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        let content = match ask::normalize(question, &options) {
-                            Err(reason) => reason,
-                            Ok((question, options)) => {
-                                match ask_the_user(io.keys.as_mut(), &question, &options).await {
-                                    Ok(answer) => ask::reply_for(&answer, &options),
-                                    // Nobody to ask is not the same as an answer, and it
-                                    // must not stall the turn either: the model is told to
-                                    // carry the decision itself.
-                                    Err(e) => {
-                                        presenter.show(Notice::AskFailed { what: "the user", detail: e.to_string() }.into());
-                                        "The question could not be put to the user (no \
-                                         interactive terminal). Decide it yourself, say in \
-                                         one line which way you went and why, and carry on."
-                                            .to_string()
-                                    }
-                                }
-                            }
-                        };
-
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // Decide what this specific call needs: nothing (read-only), the user's
-                    // consent under a narrowly scoped key, or an outright refusal. The mode
-                    // has the first word — plan mode refuses anything that changes the
-                    // machine, whatever the call would normally be entitled to.
-                    let gate = gate_for_mode(agent.mode, &agent.workspace, tool_name, &arguments);
-
-                    if let Gate::Deny(reason) = &gate {
-                        presenter.show(Notice::Refused(reason.clone()).into());
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": reason
-                        }));
-                        continue;
-                    }
-
-                    let mut ask = match &gate {
-                        Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
-                            Some((keys.clone(), label.clone()))
-                        }
-                        _ => None,
-                    };
-
-                    // Auto mode: the reviewer answers the routine yeses so the user does
-                    // not have to. Only a call that was going to interrupt is reviewed —
-                    // an already-approved one costs nothing and should stay free.
-                    //
-                    // An allow ends it here. Anything else — a refusal, an unreadable
-                    // reply, a review the user interrupted — falls through to the prompt
-                    // with the reason attached, so the reviewer can decline to act but
-                    // never decides against the user on its own.
-                    // Why the call is running unasked, and what to add to the prompt when
-                    // it still has to be asked. Only one is ever set.
-                    let mut auto_note: Option<String> = None;
-                    let mut review_line: Option<String> = None;
-                    if agent.mode == Mode::Auto && ask.is_some() {
-                        // Transient: a review takes seconds, and a silent pause reads as a
-                        // hang. Erased once it lands, because the outcome belongs on the
-                        // call line below — left standing, every single call would cost two
-                        // lines of log to say one thing.
-                        let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
-                        let verdict = work_with_input(
-                            &mut io.keys,
-                            &mut io.editor,
-                            &mut agent.mode,
-                            &mut io.queued,
-                            &status,
-                            &agent.server.todos,
-                            &mut io.plan_view,
-                            "🤖 Reviewing tool call…",
-                            // The reviewer's own reply is not streamed, so there is
-                            // nothing to count.
-                            None,
-                            judge_tool_call(&agent.client, &mut agent.review_cache, tool_name, &arguments),
-                        )
-                        .await;
-
-                        match verdict {
-                            Some(Ok(Verdict { allow: true, reason, cached })) => {
-                                // Marked, so reading back through a run still tells apart
-                                // a call the reviewer weighed from one it merely
-                                // recognized.
-                                auto_note = Some(match cached {
-                                    true => format!("cached — {}", reason),
-                                    false => reason,
-                                });
-                                ask = None;
-                            }
-                            Some(Ok(Verdict { allow: false, reason, .. })) => {
-                                review_line = Some(format!("🤖 Review: DENY — {}", reason));
-                            }
-                            Some(Err(e)) => {
-                                review_line = Some(format!("🤖 Review failed: {:#}", e));
-                            }
-                            None => {
-                                review_line = Some("🤖 Review interrupted.".to_string());
-                            }
-                        }
-                    }
-
-                    // Captured before the prompt consumes it: the diff below is skipped only
-                    // when the prompt has already shown it.
-                    let prompted = ask.is_some();
-
-                    if let Some((gate_keys, allow_all_label)) = ask {
-                        // Generate diff if needed
-                        let diff_content: Option<String> = file_change_diff(tool_name, &arguments);
-
-                        // Create human-readable description
-                        let mut description = match tool_name {
-                            "web_search" => {
-                                let query = arguments["query"].as_str().unwrap_or("unknown");
-                                format!("Search the web for: '{}'", query)
-                            }
-                            "web_fetch" | "web_get" => {
-                                let url = arguments["url"].as_str().unwrap_or("unknown");
-                                format!("Fetch content from URL: {}", url)
-                            }
-                            "write_file" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let size = arguments["content"].as_str().map(|s| s.len()).unwrap_or(0);
-                                format!("Write {} bytes to file: {}", size, file_path)
-                            }
-                            "edit" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let from = arguments["old_string"].as_str().unwrap_or("unknown");
-                                let to = arguments["new_string"].as_str().unwrap_or("unknown");
-                                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
-                                if replace_all {
-                                    format!("Edit file (replace all '{from}'->'{to}') in {}", file_path)
-                                } else {
-                                    format!("Edit file (replace once '{from}'->'{to}') in {}", file_path)
-                                }
-                            }
-                            "multi_edit" => {
-                                let file_path = arguments["file_path"].as_str().unwrap_or("unknown");
-                                let count = arguments["edits"].as_array().map(|e| e.len()).unwrap_or(0);
-                                format!("Apply {} edit(s) to file: {}", count, file_path)
-                            }
-                            "run_background" => {
-                                let command = arguments["command"].as_str().unwrap_or("unknown");
-                                format!(
-                                    "Start in the background:\n{}",
-                                    indented_command(command)
-                                )
-                            }
-                            "run_command" => {
-                                let command = arguments["command"].as_str().unwrap_or("unknown");
-                                format!("Execute command:\n{}", indented_command(command))
-                            }
-                            _ => format!("Execute '{}' tool", tool_name)
-                        };
-
-                        // The reviewer declined to wave this through. Its reason goes in the
-                        // prompt rather than on its own line: shown twice it reads as two
-                        // separate verdicts, and a refusal here is advice, not a decision.
-                        if let Some(line) = &review_line {
-                            description.push_str(&format!("\n\n{}", line));
-                        }
-
-                        // Ask for permission with diff if available. A terminal we cannot
-                        // read from (piped stdin, no TTY) must not end the session, and must
-                        // never be taken as consent: refuse the call and tell the model.
-                        let response = match ask_about_call(
-                            io.keys.as_mut(),
-                            &allow_all_label,
-                            &description,
-                            diff_content.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(response) => response,
-                            Err(e) => {
-                                presenter.show(Notice::AskFailed { what: "for permission", detail: e.to_string() }.into());
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": format!(
-                                        "Permission for '{}' could not be requested (no \
-                                         interactive terminal), so it was not run.",
-                                        tool_name
-                                    )
-                                }));
-                                continue;
-                            }
-                        };
-
-                        match response {
-                            PermissionResponse::Allow => {
-                                // Allow once, proceed with execution
-                                presenter.show(Notice::PermissionAllowed.into());
-                            }
-                            PermissionResponse::AllowAll => {
-                                // Remembered under the narrow keys this call resolved to,
-                                // not under the tool name.
-                                agent.permissions.allow(&gate_keys);
-                                presenter.show(Notice::PermissionAllowedAll(allow_all_label.clone()).into());
-                            }
-                            PermissionResponse::Reject(alternative) => {
-                                // User rejected, send alternative to LLM
-                                presenter.show(Notice::PermissionDenied { alternative: alternative.clone() }.into());
-
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": format!("Permission denied by user. User suggests: {}", alternative)
-                                }));
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Execute the tool
-                    // A slow tool (a big fetch, a long build) is interruptible too. The
-                    // tool_call_id is still answered before breaking out — an unanswered one
-                    // is what the next request gets rejected for.
-                    presenter.show(AgentEvent::ToolStarted { name: tool_name.to_string(), arguments: arguments.clone(), auto_note: auto_note.clone() });
-
-                    // The diff belongs under the call line, not before it, and it has to
-                    // appear on every path that skipped the prompt — a pre-approved write
-                    // and now an auto-approved one both used to arrive as a path and a byte
-                    // count, with no way to see what went into the file. Convenience should
-                    // cost the prompt, not the oversight. Suppressed only when the prompt
-                    // itself already showed the same diff a moment ago.
-                    if !prompted {
-                        if let Some(diff) = file_change_diff(tool_name, &arguments) {
-                            presenter.show(AgentEvent::ToolDiff(diff));
-                        }
-                    }
-
-                    let status = status_line(agent.model(), &agent.messages, agent.context_tokens);
-                    let busy = format!("{}…", tool_name);
-
-                    // Captured before the arguments move into the call. For a shell tool
-                    // the command is the thing that ran, so naming the tool as well would
-                    // only say "run_command" twice.
-                    let did = match crate::render::tool_call_summary(tool_name, &arguments) {
-                        summary if summary.is_empty() => format!("ran {}", tool_name),
-                        summary if matches!(tool_name, "run_command" | "run_background") => {
-                            format!("ran {}", summary)
-                        }
-                        summary => format!("ran {} {}", tool_name, summary),
-                    };
-                    let executed = work_with_input(
-                        &mut io.keys,
-                        &mut io.editor,
-                        &mut agent.mode,
-                        &mut io.queued,
-                        &status,
-                        &agent.server.todos,
-                        &mut io.plan_view,
-                        &busy,
-                        // A tool produces its output all at once, so there is no partial
-                        // size to report while it runs.
-                        None,
-                        agent.server.execute_tool(tool_name, arguments),
-                    )
-                    .await;
-
-                    let Some(result) = executed else {
-                        presenter.show(Notice::Interrupted.into());
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": "Interrupted by the user before this tool finished."
-                        }));
-                        interrupted = true;
-                        break;
-                    };
-
-                    // It ran, whatever it returned: a failed build is still the last
-                    // thing that happened, and the bar saying so is the point.
-                    io.last_activity = Some(did);
-
-                    let tool_result = result.unwrap_or_else(|e| {
-                        presenter.show(Notice::ToolFailed(format!("{:?}", e)).into());
-                        format!("Error: {}", e)
-                    });
-
-                    // The summary is the row that used to be all there was: the first
-                    // line of the result, cut to fit. The result itself is kept behind it
-                    // now rather than thrown away, and Ctrl+O opens it.
-                    //
-                    // research is the exception: it has already printed its progress and
-                    // its whole answer while it ran, so a summary here would repeat the
-                    // answer's first line immediately underneath the answer.
-                    if tool_name != "research" {
-                        presenter.show(AgentEvent::ToolResult(tool_result.clone()));
-                    }
-
-                    // Add tool result
-                    agent.messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": tool_result
-                    }));
-                }
-
-                // The break above only leaves the tool loop; this leaves the turn.
-                if interrupted {
-                    break;
-                }
-
-                // The tool log makes a loop obvious to whoever is watching it scroll past,
-                // but the model reads none of that — every round looks to it like a fresh
-                // decision, which is why it can repeat one call fifty times. Saying the
-                // repetition out loud in the conversation is what breaks it, and it breaks
-                // it far earlier than the round cap. That matters most in auto mode, where
-                // the cap is the only backstop and nobody is watching it climb.
-                if run.0 >= LOOP_BREAK {
-                    presenter
-                        .show(Notice::LoopBroken { tool: run.1.clone(), count: run.0 }.into());
-                    // Whatever was typed while this ran is deliberately left queued: it
-                    // becomes the next prompt, which is where the user takes over.
-                    break;
-                }
-                if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
-                    nudged_at = run.0;
-                    presenter.show(Notice::LoopNudge { tool: run.1.clone(), count: run.0 }.into());
-                    // A user message rather than a system one: mid-conversation system
-                    // messages are ignored by some local models and rejected outright by
-                    // some servers, and this one has to land. The order is legal here for
-                    // the same reason the queued text below is — every tool call in this
-                    // round already has its result.
-                    agent.messages.push(json!({
-                        "role": "user",
-                        "content": format!(
-                            "You have called '{}' with the same arguments {} times in a \
-                             row. Get out of the loop — calling it again will not tell you \
-                             anything you have not already been told. Take a different \
-                             approach, or stop and say what you are stuck on.",
-                            run.1, run.0
-                        )
-                    }));
-                }
-
-                // Anything typed while this round ran joins the conversation here, where
-                // every tool call already has its result. Any sooner would put a user
-                // message between an assistant turn and the tool results it is waiting
-                // for, which is a message order servers reject outright.
-                for text in io.queued.drain(..) {
-                    presenter.show(Notice::QueuedSent(text.clone()).into());
-                    agent.messages.push(json!({"role": "user", "content": text}));
-                }
-
-                // Continue the loop to get next response (might be more tool calls or final answer)
-                continue;
-            } else {
-                // No tool call, this is the final response — already streamed above.
-                agent.messages.push(message.clone());
-                break;
-            }
-        }
-
-        // Every way out of the loop above lands here, an interrupt and a server error
-        // included: the line says how long the turn ran for, not whether it got anywhere,
-        // and a turn that ended badly after four minutes is exactly the one worth timing.
-        // Dimmed for the same reason the chain of thought is — it is not the answer.
-        presenter.show(AgentEvent::Finished {
-            verb: get_done_verb(),
-            elapsed: turn_started.elapsed(),
-        });
-
-        // The file /init just wrote is the one that belongs in the system message, and what
-        // was loaded at startup — usually nothing, since /init is what you run when the
-        // project has no instructions yet — is now out of date. Re-read it here rather than
-        // leaving it to the next startup, so the new rules are in force for the rest of this
-        // session and survive /clear, which re-pushes this same content.
-        if initializing {
-            let reloaded = load_project_context();
-            if reloaded != agent.project_context {
-                agent.project_context = reloaded;
-                if let Some((name, _)) = &agent.project_context {
-                    presenter.show(Notice::ProjectContextReloaded(name.clone()).into());
-                }
-                agent.system_prompt = compose_system_prompt(
-                    agent.config.system_prompt.as_deref(),
-                    &agent.client.model,
-                    agent.settings.use_system_prompt,
-                    agent.user_context.as_deref(),
-                    agent.project_context.as_ref(),
-                );
-                set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
-            }
-        }
-
-        // Persisted every turn, so a crash does not cost the session's history.
-        if let Some(path) = &io.history_path {
-            crate::input::save_history(path, io.editor.history());
-        }
-        if let Some(path) = &agent.session_path {
-            let todos = agent.plan();
-            save_session(path, &agent.messages, &agent.client.model, &todos);
-        }
-}
 
 /// Tests that drive a whole turn against a fake LLM server. Separate from the
 /// module above because they need a Tokio runtime and the output capture, and
@@ -2212,6 +1440,7 @@ async fn run_turn(
 #[cfg(test)]
 mod turn_tests {
     use super::*;
+    use serde_json::Value;
     use crate::testutil::{serve_sequence, test_config};
 
     /// One turn against `bodies`, returning the agent so the history can be
@@ -2228,23 +1457,50 @@ mod turn_tests {
         input: &str,
         mode: Mode,
     ) -> (Agent, usize) {
+        run_and_watch(bodies, input, mode).await.0
+    }
+
+    /// As `run_one_in`, but also every event the turn emitted.
+    ///
+    /// This is what the event stream bought the tests: the turn is driven with no
+    /// frontend at all — no terminal, no keyboard, no presenter — and what it
+    /// *said* can be asserted on directly instead of inferred from output. An
+    /// `Ask` arriving here is answered by nobody, so its reply channel drops and
+    /// the turn hears a refusal, which is exactly what a test wants: no prompt
+    /// can hang the suite.
+    async fn run_and_watch(
+        bodies: &'static [&'static str],
+        input: &str,
+        mode: Mode,
+    ) -> ((Agent, usize), Vec<AgentEvent>) {
         let (url, served) = serve_sequence(bodies).await;
         let cwd = std::env::current_dir().unwrap();
         let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
         agent.mode = mode;
-        // No keyboard: the piped path, which is also the only one a test can
-        // drive. Anything that would prompt fails closed rather than hanging.
-        let mut io = TerminalIo {
-            keys: None,
-            editor: Editor::new(Vec::new()),
-            queued: Vec::new(),
-            plan_view: PlanView::default(),
-            last_activity: None,
-            history_path: None,
-        };
-        run_turn(&mut agent, &mut io, input, false).await;
+
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, input, false, &tx, &link).await;
+        agent.mode = link.mode();
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
         let count = *served.lock().unwrap();
-        (agent, count)
+        ((agent, count), seen)
+    }
+
+    /// Every `Notice` the turn emitted, in order. The notices are the part of the
+    /// vocabulary that derives `PartialEq`, which is why assertions use them.
+    fn notices(events: &[AgentEvent]) -> Vec<Notice> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every `role: "tool"` reply in the history, as `(tool_call_id, content)`.
@@ -2389,5 +1645,76 @@ mod turn_tests {
             0,
             "a round left its tool call unanswered"
         );
+    }
+
+    /// The turn narrates itself, and this is the assertion that could not be
+    /// written before: driven with no frontend at all, what it *said* is checked
+    /// directly rather than inferred from terminal output.
+    #[tokio::test]
+    async fn a_malformed_call_is_narrated_as_well_as_answered() {
+        let _capture = crate::out::capture_guard();
+        const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"bad","type":"function","function":{"name":"read","arguments":"nope"}}]}}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+
+        let (_, events) = run_and_watch(&[MALFORMED, FINAL], "go", Mode::Normal).await;
+        let said = notices(&events);
+        assert!(
+            said.iter().any(|n| matches!(
+                n,
+                Notice::ToolArgumentsInvalid { tool, .. } if tool == "read"
+            )),
+            "the turn did not say which tool had bad arguments: {said:?}"
+        );
+
+        // A reply is opened and closed exactly once per round, on every path.
+        // The presenter's fold and half-rendered markdown line depend on that
+        // pairing, and a missing ReplyEnd leaks a fold into the next round.
+        let starts = events.iter().filter(|e| matches!(e, AgentEvent::ReplyStart)).count();
+        let ends = events.iter().filter(|e| matches!(e, AgentEvent::ReplyEnd)).count();
+        assert_eq!(starts, 2, "two rounds should open two replies");
+        assert_eq!(starts, ends, "every reply must be closed: {starts} opened, {ends} closed");
+
+        // And the turn reported its own end, which is the line the summary is
+        // drawn from.
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Finished { .. })));
+    }
+
+    /// Cancellation is a message, not a dropped future — see
+    /// `TurnLink::until_cancelled`. Cancelling before the turn starts means it
+    /// stops at its first interruptible point, and the invariant still holds: the
+    /// user message is in the history and nothing is left half-written.
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_without_orphaning_anything() {
+        let _capture = crate::out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+
+        let (url, served) = serve_sequence(&[ANSWER]).await;
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        let link = TurnLink::new(agent.mode);
+        // Cancelled up front: `until_cancelled` has to see a flag that was already
+        // set, not only a transition after it subscribed.
+        link.cancel();
+
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "hello", false, &tx, &link).await;
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            notices(&seen).contains(&Notice::Interrupted),
+            "a cancelled turn should say so: {:?}",
+            notices(&seen)
+        );
+        assert_eq!(*served.lock().unwrap(), 0, "cancelled before the first request, so none went");
+        // The user's message is there and nothing else is: no assistant message
+        // was pushed, so no tool call can be unanswered.
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m.get("role").and_then(Value::as_str)).collect();
+        assert_eq!(roles.last(), Some(&"user"));
+        assert!(tool_replies(&agent.messages).is_empty());
     }
 }
