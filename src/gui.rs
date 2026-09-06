@@ -39,9 +39,11 @@ use anyhow::Result;
 use lumio::prelude::*;
 use lumio::types::rect;
 
-use crate::agent::{run_turn, Agent};
+use crate::agent::{run_turn, Agent, Knob};
+use crate::config::Reasoning;
+use crate::llm::fetch_available_models;
 use crate::ask::Answer;
-use crate::modes::PlanDecision;
+use crate::modes::{Mode, PlanDecision};
 use crate::permissions::PermissionResponse;
 use crate::turn::{AgentEvent, Ask, Notice, TurnLink, Waiting};
 
@@ -62,8 +64,36 @@ const OPEN_REASONING: &str = "reasoning-open";
 const PROSE: f32 = 15.0;
 const CODE: f32 = 13.0;
 
+const MENUBAR: &str = "menubar";
+
+/// Menu item ids. Matched against `MenuBar::clicked_item`, so they are the one
+/// place the layout and the code have to agree twice.
+const MENU_SETTINGS: &str = "menu-settings";
+const MENU_CLEAR: &str = "menu-clear";
+const MENU_QUIT: &str = "menu-quit";
+const MENU_MODE_NORMAL: &str = "menu-mode-normal";
+const MENU_MODE_PLAN: &str = "menu-mode-plan";
+const MENU_MODE_AUTO: &str = "menu-mode-auto";
+/// The Model menu is built from the server's list once it arrives, so its item
+/// ids are this prefix plus the model name.
+const MENU_MODEL_PREFIX: &str = "menu-model:";
+
 const LAYOUT: &str = r#"
 <Frame id="root" width="max" height="max" direction="vertical" padding="0">
+    <MenuBar id="menubar" width="max" height="min">
+        <Menu title="haico">
+            <MenuItem id="menu-settings" text="Model settings…"/>
+            <Separator/>
+            <MenuItem id="menu-clear" text="Clear conversation"/>
+            <Separator/>
+            <MenuItem id="menu-quit" text="Quit"/>
+        </Menu>
+        <Menu title="Mode">
+            <MenuItem id="menu-mode-normal" text="Normal — ask about every gated call"/>
+            <MenuItem id="menu-mode-plan" text="Plan — investigate, change nothing"/>
+            <MenuItem id="menu-mode-auto" text="Auto — review each call first"/>
+        </Menu>
+    </MenuBar>
     <ScrollView id="scroll" width="max" height="max" direction="vertical">
         <Frame id="transcript" width="max" height="min" direction="vertical" padding="12"/>
     </ScrollView>
@@ -81,10 +111,10 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
     let mut ui = UI::from_xml(LAYOUT, 1040, 760, default_typeface(), 1.0)
         .ok_or_else(|| anyhow::anyhow!("the GUI layout failed to parse"))?;
 
-    // Submitted input, UI thread to worker. A plain std channel: the worker
-    // blocks on it between turns, which is exactly what is wanted, and nothing
-    // on the UI side ever waits for it.
-    let (input_tx, input_rx) = mpsc::channel::<String>();
+    // Commands, UI thread to worker. A plain std channel: the worker blocks on
+    // it between turns, which is exactly what is wanted, and nothing on the UI
+    // side ever waits for it.
+    let (input_tx, input_rx) = mpsc::channel::<Command>();
 
     // A Memo is multi-line, so Enter belongs to the text. Submitting is the
     // button, and Ctrl+Enter for anyone who would rather not reach for it.
@@ -98,6 +128,34 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
     let tx = input_tx.clone();
     ui.add_shortcut("Ctrl+Enter", Box::new(move |ui| submit(ui, &tx)));
 
+    // The menubar fires one Click for whichever leaf was chosen; which one it
+    // was comes from `clicked_item`. Quit is handled here because closing the
+    // window is the frontend's own business; everything else needs the agent.
+    if let Some(bar) = ui.get_view(MENUBAR) {
+        let tx = input_tx.clone();
+        bar.borrow_mut().on_event(
+            EventType::Click,
+            Box::new(move |ui, view, _data| {
+                let Some(item) =
+                    view.as_any().downcast_ref::<MenuBar>().and_then(|bar| bar.clicked_item())
+                else {
+                    return false;
+                };
+                if item == MENU_QUIT {
+                    ui.request_quit();
+                    return true;
+                }
+                match command_for(&item) {
+                    Some(command) => {
+                        let _ = tx.send(command);
+                        true
+                    }
+                    None => false,
+                }
+            }),
+        );
+    }
+
     // The link of the turn in flight, if any, so closing the window can stop it.
     // Without this, shutting down waits for whatever the model is in the middle
     // of — a long build, a slow request — and the process outlives the window it
@@ -106,37 +164,51 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
 
     let handle = ui.handle();
     let worker_running = Arc::clone(&running);
+    // The worker's own sender, so it can hand one to a dialog: the settings form
+    // answers on the same channel every other command arrives on.
+    let worker_tx = input_tx.clone();
     let worker = std::thread::Builder::new()
         .name("haico-agent".to_string())
         .spawn(move || {
             // `block_on` rather than `spawn`, so nothing here has to be
             // `'static + Send` beyond the agent itself.
             match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime.block_on(converse(agent, input_rx, handle, worker_running)),
+                Ok(runtime) => {
+                    runtime.block_on(converse(agent, input_rx, worker_tx, handle, worker_running))
+                }
                 Err(e) => eprintln!("could not start the agent runtime: {e}"),
             }
         })?;
 
-    // Dropped before the loop starts, and this is load-bearing. The handlers hold
-    // their own clones, so the channel closes when the window drops them — but
-    // only if this one is gone too. While it lives, the worker's `recv` can never
-    // return and the join below never finishes.
-    drop(input_tx);
+    // Shutdown is signalled from a drop guard rather than a line after the loop,
+    // and that is the whole point of it. The worker holds a sender of its own now
+    // (to hand to dialogs), so the channel closing can no longer end its loop —
+    // and if `lumio::run` unwinds, a plain statement after it never runs. Either
+    // way the process would outlive the window, which is exactly what made it
+    // look unclosable the first time.
+    struct Shutdown(mpsc::Sender<Command>, Arc<Mutex<Option<TurnLink>>>);
+    impl Drop for Shutdown {
+        fn drop(&mut self) {
+            // Stop the turn in flight rather than waiting it out; cancellation
+            // lands somewhere the turn chose, with its history balanced.
+            if let Some(link) = self.1.lock().unwrap().take() {
+                link.cancel();
+            }
+            let _ = self.0.send(Command::Shutdown);
+        }
+    }
+    let signal = Shutdown(input_tx, Arc::clone(&running));
 
     lumio::run(ui, WindowConfig::new("haico", 1040, 760).center().skin("dark"));
 
-    // The window is gone. Stop the turn in flight rather than waiting it out;
-    // cancellation lands somewhere the turn chose, with its history balanced.
-    if let Some(link) = running.lock().unwrap().take() {
-        link.cancel();
-    }
+    drop(signal);
     let _ = worker.join();
     Ok(())
 }
 
 /// Take whatever is in the input box and send it to the worker. Returns whether
 /// a redraw is needed, which is Lumio's convention for an event handler.
-fn submit(ui: &mut UI, tx: &mpsc::Sender<String>) -> bool {
+fn submit(ui: &mut UI, tx: &mpsc::Sender<Command>) -> bool {
     let Some(element) = ui.get_view(INPUT) else { return false };
     let text = {
         let view = element.borrow();
@@ -148,20 +220,41 @@ fn submit(ui: &mut UI, tx: &mpsc::Sender<String>) -> bool {
         memo.set_text("");
         text
     };
-    let _ = tx.send(text);
+    let _ = tx.send(Command::Send(text));
     true
 }
 
 /// One turn per submitted line, until the window closes and the channel with it.
 async fn converse(
     mut agent: Agent,
-    input_rx: mpsc::Receiver<String>,
+    input_rx: mpsc::Receiver<Command>,
+    tx: mpsc::Sender<Command>,
     handle: UiHandle,
     running: Arc<Mutex<Option<TurnLink>>>,
 ) {
     show(&handle, |ui| line(ui, "Ready. Type below, then Send or Ctrl+Enter.", Tone::Muted));
 
-    while let Ok(input) = input_rx.recv() {
+    // The model list, fetched once so the Model menu can offer it. Best-effort:
+    // a server that cannot be reached simply leaves the menu absent, which says
+    // more than an empty menu would.
+    let models = fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
+        .await
+        .unwrap_or_default();
+    if !models.is_empty() {
+        let current = agent.model().to_string();
+        show(&handle, move |ui| add_model_menu(ui, models, &current));
+    }
+
+    while let Ok(command) = input_rx.recv() {
+        let input = match command {
+            Command::Send(input) => input,
+            other => {
+                if !obey(&mut agent, &handle, &tx, other) {
+                    break;
+                }
+                continue;
+            }
+        };
         let echoed = input.clone();
         show(&handle, move |ui| user(ui, &echoed));
 
@@ -645,6 +738,314 @@ fn set_label(ui: &mut UI, id: &str, text: &str) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Menus and the settings dialog
+// ---------------------------------------------------------------------------
+
+/// What the window asks the conversation to do.
+///
+/// The channel between the two threads used to carry a submitted line and
+/// nothing else. Menus make it a command channel, because everything a menu does
+/// needs the agent and the agent lives on the worker — including *reading* it:
+/// the settings dialog is opened by the worker with a snapshot, rather than by
+/// the UI reaching across for the current values.
+pub(crate) enum Command {
+    Send(String),
+    /// The window has closed. An explicit signal rather than relying on every
+    /// sender being dropped: the worker holds one itself now, to hand to
+    /// dialogs, so closure alone can no longer end the loop.
+    Shutdown,
+    /// Read the settings and open the dialog on them.
+    OpenSettings,
+    /// Field values from the dialog, by canonical knob name. An empty string
+    /// clears that knob, which is what an emptied field should mean.
+    ApplySettings { knobs: Vec<(String, String)>, reasoning: String },
+    SetMode(Mode),
+    SwitchModel(String),
+    Clear,
+}
+
+/// The settings as they stand, for filling the form.
+struct Snapshot {
+    model: String,
+    /// Canonical name, label, and current value — empty when the knob is unset.
+    knobs: Vec<(&'static str, String)>,
+    reasoning: Reasoning,
+}
+
+/// Field id for a knob in the settings form.
+fn field_id(name: &str) -> String {
+    format!("set-{name}")
+}
+
+const REASONING_FIELD: &str = "set-reasoning";
+const SETTINGS_APPLY: &str = "settings-apply";
+const SETTINGS_CANCEL: &str = "settings-cancel";
+
+/// Build the settings form and show it.
+///
+/// The form is its own `UI` handed to `Dialog::content`, which means the buttons
+/// have to live in this layout too and the size has to be given: custom content
+/// is not auto-measured. Reading it back happens in `on_result`, where the
+/// dialog's own ids resolve.
+fn show_settings(ui: &mut UI, snapshot: Snapshot, tx: mpsc::Sender<Command>) {
+    let names: Vec<&'static str> = snapshot.knobs.iter().map(|(name, _)| *name).collect();
+    let Some(form) = settings_form(&snapshot) else {
+        line(ui, "the settings form failed to build", Tone::Error);
+        return;
+    };
+
+    Dialog::new("Model settings")
+        .content(form)
+        .size(FORM_WIDTH, FORM_HEIGHT)
+        .button_id(SETTINGS_APPLY, "Apply", ButtonSide::Right)
+        .button_id(SETTINGS_CANCEL, "Cancel", ButtonSide::Right)
+        .default_button(SETTINGS_APPLY)
+        .cancel_button(SETTINGS_CANCEL)
+        .on_result(move |ui, pressed| {
+            if pressed != SETTINGS_APPLY {
+                return;
+            }
+            // The dialog's own ids resolve here, which is how the form is read
+            // back — the same way `UI::show_input` reads its one field.
+            let knobs = names
+                .iter()
+                .map(|name| {
+                    let text = ui
+                        .get_view(&field_id(name))
+                        .and_then(|e| {
+                            let view = e.borrow();
+                            view.as_any().downcast_ref::<Edit>().map(|edit| edit.get_text())
+                        })
+                        .unwrap_or_default();
+                    (name.to_string(), text)
+                })
+                .collect();
+            let reasoning = ui
+                .get_view(REASONING_FIELD)
+                .and_then(|e| {
+                    let view = e.borrow();
+                    view.as_any().downcast_ref::<ComboBox>().and_then(|c| c.get_selected_text())
+                })
+                .unwrap_or_default();
+            let _ = tx.send(Command::ApplySettings { knobs, reasoning });
+        })
+        .show(ui);
+}
+
+const FORM_WIDTH: u32 = 560;
+const FORM_HEIGHT: u32 = 470;
+
+/// Build the form's own `UI`, filled from `snapshot`.
+///
+/// Separate from showing it because a Lumio dialog is an app-modal *window*
+/// rather than an overlay, so the only way to render the form for inspection is
+/// to build it and render it on its own. Which is also the only way to test it.
+fn settings_form(snapshot: &Snapshot) -> Option<UI> {
+    let mut rows = String::new();
+    for (name, value) in &snapshot.knobs {
+        rows.push_str(&format!(
+            r#"<Frame width="max" height="min" direction="horizontal" margin_bottom="6">
+                 <Label width="170" text="{name}"/>
+                 <Edit id="{id}" width="max" text="{value}"/>
+               </Frame>"#,
+            name = name,
+            id = field_id(name),
+            value = value,
+        ));
+    }
+
+    let layout = format!(
+        r#"
+<Frame id="settings-root" width="max" height="max" direction="vertical" padding="14">
+    <Label width="max" text="Model: {model}" margin_bottom="10"/>
+    <Label width="max" text="Empty means unset — the server decides." margin_bottom="10"/>
+    {rows}
+    <Frame width="max" height="min" direction="horizontal" margin_bottom="6">
+        <Label width="170" text="reasoning"/>
+        <ComboBox id="{reasoning_field}" width="max"/>
+    </Frame>
+    <Frame width="max" height="min" direction="horizontal" gravity="right" margin_top="10">
+        <Button id="{apply}" text="Apply" width="110"/>
+        <Button id="{cancel}" text="Cancel" width="110" margin_left="8"/>
+    </Frame>
+</Frame>
+"#,
+        model = snapshot.model,
+        rows = rows,
+        reasoning_field = REASONING_FIELD,
+        apply = SETTINGS_APPLY,
+        cancel = SETTINGS_CANCEL,
+    );
+
+    let form = UI::from_xml(&layout, FORM_WIDTH, FORM_HEIGHT, default_typeface(), 1.0)?;
+    // Filled after parsing, because a ComboBox's items are added from code
+    // rather than from the layout.
+    if let Some(element) = form.get_view(REASONING_FIELD) {
+        let view = element.borrow();
+        if let Some(combo) = view.as_any().downcast_ref::<ComboBox>() {
+            for (index, policy) in REASONING_CHOICES.iter().enumerate() {
+                combo.add_item(&policy.to_string());
+                if *policy == snapshot.reasoning {
+                    combo.set_selected(index);
+                }
+            }
+        }
+    }
+    Some(form)
+}
+
+
+/// The reasoning policies, in the order the dropdown offers them.
+const REASONING_CHOICES: &[Reasoning] = &[Reasoning::Keep, Reasoning::Compress, Reasoning::Drop];
+
+/// Turn a menu click into a command. `None` for an item that needs no worker.
+fn command_for(item: &str) -> Option<Command> {
+    match item {
+        MENU_SETTINGS => Some(Command::OpenSettings),
+        MENU_CLEAR => Some(Command::Clear),
+        MENU_MODE_NORMAL => Some(Command::SetMode(Mode::Normal)),
+        MENU_MODE_PLAN => Some(Command::SetMode(Mode::Plan)),
+        MENU_MODE_AUTO => Some(Command::SetMode(Mode::Auto)),
+        model if model.starts_with(MENU_MODEL_PREFIX) => {
+            Some(Command::SwitchModel(model[MENU_MODEL_PREFIX.len()..].to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Add the Model menu once the server's list has arrived.
+///
+/// Appended rather than filled in place, because `MenuBar` can add a menu but
+/// not replace one — so the menu simply is not there until the list is, which is
+/// also the honest thing to show when the server cannot be reached.
+fn add_model_menu(ui: &mut UI, models: Vec<String>, current: &str) {
+    let Some(element) = ui.get_view(MENUBAR) else { return };
+    let items = models
+        .into_iter()
+        .map(|model| {
+            let mark = if model == current { "• " } else { "   " };
+            MenuItem {
+                id: format!("{MENU_MODEL_PREFIX}{model}"),
+                icon_path: String::new(),
+                text: format!("{mark}{model}"),
+                separator: false,
+                children: Vec::new(),
+            }
+        })
+        .collect();
+    if let Some(bar) = element.borrow_mut().as_any_mut().downcast_mut::<MenuBar>() {
+        bar.add_menu("Model", items);
+    }
+    ui.relayout();
+}
+
+/// Empty the transcript, for `Clear`.
+fn clear_transcript(ui: &mut UI) {
+    let Some(element) = ui.get_view(TRANSCRIPT) else { return };
+    let ids: Vec<String> = {
+        let view = element.borrow();
+        match view.as_container() {
+            Some(container) => container.get_views().iter().map(|v| v.borrow().get_id()).collect(),
+            None => Vec::new(),
+        }
+    };
+    if let Some(container) = element.borrow_mut().as_container_mut() {
+        for id in ids {
+            container.remove_view(&id);
+        }
+    }
+    // Anything mid-stream is gone with the views it was writing into.
+    REPLY_MARKDOWN.with(|md| *md.borrow_mut() = None);
+    ui.relayout();
+}
+
+/// Carry out everything that is not a message. Returns false when the window is
+/// gone and the loop should end.
+///
+/// On the worker, because all of it needs the agent — including *reading* it:
+/// the settings dialog is opened from here with a snapshot, rather than by the
+/// UI reaching across for the current values.
+fn obey(
+    agent: &mut Agent,
+    handle: &UiHandle,
+    tx: &mpsc::Sender<Command>,
+    command: Command,
+) -> bool {
+    match command {
+        // Handled by the caller.
+        Command::Send(_) => {}
+        Command::Shutdown => return false,
+        Command::OpenSettings => {
+            let snapshot = Snapshot {
+                model: agent.model().to_string(),
+                knobs: Knob::ALL
+                    .iter()
+                    .map(|knob| (knob.name(), agent.knob_value(*knob).unwrap_or_default()))
+                    .collect(),
+                reasoning: agent.reasoning,
+            };
+            // The dialog answers on the same channel every other command comes
+            // in on, so Apply is just another command and needs no second path.
+            let tx = tx.clone();
+            show(handle, move |ui| show_settings(ui, snapshot, tx));
+        }
+        Command::ApplySettings { knobs, reasoning } => {
+            let mut complaints = Vec::new();
+            for (name, value) in knobs {
+                let Some(knob) = Knob::parse(&name) else { continue };
+                // An emptied field means "stop overriding it", which is exactly
+                // what `set_knob` does with an empty string.
+                if let Err(complaint) = agent.set_knob(knob, Some(&value)) {
+                    complaints.push(format!("{complaint}, got '{value}'"));
+                }
+            }
+            if let Some(policy) = REASONING_CHOICES.iter().find(|p| p.to_string() == reasoning) {
+                agent.set_reasoning(*policy);
+            }
+            // Every field is attempted, and the ones that failed are named. A
+            // rejected field changes nothing, so the rest still apply — better
+            // than refusing the whole form over one typo.
+            let summary = match complaints.is_empty() {
+                true => "settings applied".to_string(),
+                false => complaints.join("; "),
+            };
+            let tone = if complaints.is_empty() { Tone::Muted } else { Tone::Error };
+            show(handle, move |ui| line(ui, &summary, tone));
+        }
+        Command::SetMode(mode) => {
+            agent.mode = mode;
+            let said = format!("mode: {}", mode.describe());
+            show(handle, move |ui| line(ui, &said, Tone::Normal));
+        }
+        Command::SwitchModel(model) => {
+            agent.switch_model(model.clone());
+            let said = format!("now using {model}");
+            show(handle, move |ui| line(ui, &said, Tone::Normal));
+        }
+        Command::Clear => {
+            // What survives a clear and what does not is the agent's business,
+            // documented on `Agent::clear`. The transcript going with it is this
+            // frontend's, because a window has no scrollback to leave it in.
+            let reload = agent.clear();
+            show(handle, move |ui| {
+                clear_transcript(ui);
+                match reload {
+                    crate::agent::ContextReload::Reloaded(name) => {
+                        line(ui, &format!("reloaded project context from {name}"), Tone::Muted)
+                    }
+                    crate::agent::ContextReload::Gone => {
+                        line(ui, "project context file is gone", Tone::Warning)
+                    }
+                    crate::agent::ContextReload::Unchanged => {}
+                }
+                line(ui, "conversation cleared", Tone::Muted);
+            });
+        }
+    }
+    true
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,17 +1210,15 @@ mod tests {
     /// Every `Notice` has to survive being phrased by this frontend. A variant
     /// added to the vocabulary without a GUI wording fails to compile in
     /// `describe`; this checks the wordings are non-empty and do not panic.
-    /// The regression that made the window look unclosable: `run` held the
-    /// original input sender for its whole body, so when the window closed and
-    /// dropped the handlers' clones the channel still had a live sender, the
-    /// worker stayed blocked in `recv`, and `join` never returned. The window
-    /// went away and the process did not.
+    /// The regression that made the window look unclosable: the worker stayed
+    /// blocked in `recv` after the window closed, so `join` never returned —
+    /// the window went away and the process did not.
     ///
     /// With every sender gone `converse` has to fall out at its first read. The
     /// test would hang rather than fail if that broke, which is why it is worth
     /// having: the failure mode is a hang, and a hang is invisible in review.
     #[tokio::test]
-    async fn a_closed_input_channel_ends_the_conversation() {
+    async fn a_shutdown_message_ends_the_conversation() {
         let (w, h) = (400u32, 300u32);
         let ui = UI::from_xml(LAYOUT, w, h, default_typeface(), 1.0).expect("layout");
         let handle = ui.handle();
@@ -827,11 +1226,18 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let agent = Agent::new(crate::testutil::test_config("http://127.0.0.1:1"), "m".into(), &cwd);
 
-        let (tx, rx) = mpsc::channel::<String>();
-        drop(tx);
+        let (tx, rx) = mpsc::channel::<Command>();
         let running = Arc::new(Mutex::new(None));
-        // Returns, rather than blocking forever on a channel nobody can send to.
-        converse(agent, rx, handle, running).await;
+        // Sent before the loop starts, so it is waiting: `converse` has to see
+        // it and return rather than blocking on the next read.
+        //
+        // Shutdown is a message now rather than the channel closing, because the
+        // worker holds a sender of its own to hand to dialogs. Closure alone can
+        // therefore no longer end the loop, which is why `run` signals from a
+        // drop guard — a plain statement after `lumio::run` would be skipped if
+        // it unwound, and the process would once again outlive its window.
+        tx.send(Command::Shutdown).unwrap();
+        converse(agent, rx, tx, handle, running).await;
     }
 
     /// Reasoning is flowed, and the reason is the case in the middle: a model
@@ -851,6 +1257,104 @@ mod tests {
         assert_eq!(flow(""), "");
     }
 
+
+    /// The settings form has to build, fill from the snapshot, and carry every
+    /// knob — a field that silently goes missing is a setting that silently
+    /// cannot be changed. Rendered too, because a form that parses can still lay
+    /// out to nothing.
+    #[test]
+    fn the_settings_form_builds_and_fills() {
+        use lumio::drawing::{set_current_palette, DrawableRegistry, Palette};
+        use lumio::render::render_to_pixmap;
+
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let palette = Palette::dark();
+        set_current_palette(palette.clone());
+        let registry = DrawableRegistry::new();
+
+        let snapshot = Snapshot {
+            model: "test-model".into(),
+            knobs: Knob::ALL
+                .iter()
+                .map(|knob| {
+                    let value = match knob {
+                        Knob::Temperature => "0.7".to_string(),
+                        Knob::ReasoningThreshold => "800".to_string(),
+                        // The rest unset, which a field shows as empty.
+                        _ => String::new(),
+                    };
+                    (knob.name(), value)
+                })
+                .collect(),
+            reasoning: Reasoning::Compress,
+        };
+
+        // A Lumio dialog is an app-modal window rather than an overlay, so the
+        // form is built and rendered on its own; rendering the main UI would
+        // never show it.
+        let mut ui = settings_form(&snapshot).expect("the settings form must build");
+        ui.layout(FORM_WIDTH, FORM_HEIGHT, 1.0);
+
+        // Every knob has a field, found by the id the read-back uses.
+        for knob in Knob::ALL {
+            assert!(
+                ui.get_view(&field_id(knob.name())).is_some(),
+                "no field for {}",
+                knob.name()
+            );
+        }
+        // Filled from the snapshot, not left blank.
+        let temperature = ui
+            .get_view(&field_id("temperature"))
+            .and_then(|e| {
+                let view = e.borrow();
+                view.as_any().downcast_ref::<Edit>().map(|edit| edit.get_text())
+            })
+            .unwrap_or_default();
+        assert_eq!(temperature, "0.7");
+
+        // The dropdown offers every policy and starts on the current one.
+        let selected = ui
+            .get_view(REASONING_FIELD)
+            .and_then(|e| {
+                let view = e.borrow();
+                view.as_any()
+                    .downcast_ref::<ComboBox>()
+                    .map(|c| (c.item_count(), c.get_selected_text()))
+            })
+            .expect("no reasoning dropdown");
+        assert_eq!(selected.0, REASONING_CHOICES.len());
+        assert_eq!(selected.1.as_deref(), Some("compress"));
+
+        let pixmap =
+            render_to_pixmap(&ui, FORM_WIDTH, FORM_HEIGHT, 1.0, &palette, &registry).unwrap();
+        let data = pixmap.data();
+        let first = [data[0], data[1], data[2], data[3]];
+        assert!(
+            data.chunks_exact(4).any(|px| px != first),
+            "the settings form rendered blank"
+        );
+        pixmap.save_png(std::env::temp_dir().join("haico-gui-settings.png")).unwrap();
+    }
+
+    /// Menu ids resolve to the commands they name, including the model items
+    /// whose ids carry the model name in them.
+    #[test]
+    fn menu_items_map_to_commands() {
+        assert!(matches!(command_for(MENU_SETTINGS), Some(Command::OpenSettings)));
+        assert!(matches!(command_for(MENU_CLEAR), Some(Command::Clear)));
+        assert!(matches!(command_for(MENU_MODE_PLAN), Some(Command::SetMode(Mode::Plan))));
+        assert!(matches!(command_for(MENU_MODE_AUTO), Some(Command::SetMode(Mode::Auto))));
+        // The model name survives the round trip through the id, colons and all.
+        let id = format!("{MENU_MODEL_PREFIX}vendor/model:q4_k_m");
+        match command_for(&id) {
+            Some(Command::SwitchModel(model)) => assert_eq!(model, "vendor/model:q4_k_m"),
+            other => panic!("expected a model switch, got {}", other.is_some()),
+        }
+        // Quit is the frontend's own and never becomes a command.
+        assert!(command_for(MENU_QUIT).is_none());
+        assert!(command_for("nonsense").is_none());
+    }
     #[test]
     fn every_notice_has_gui_wording() {
         let all = vec![
