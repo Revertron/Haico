@@ -43,6 +43,7 @@ use crate::ask::Answer;
 use crate::modes::{Mode, PlanDecision};
 use crate::permissions::PermissionResponse;
 use crate::turn::{AgentEvent, Ask, Notice, TurnLink, Waiting};
+use crate::util::strip_ansi;
 use tokio::sync::oneshot;
 
 const TRANSCRIPT: &str = "transcript";
@@ -409,7 +410,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             };
             show(handle, move |ui| code_line(ui, text.trim()));
         }
-        AgentEvent::ToolDiff(diff) => show(handle, move |ui| block(ui, &diff)),
+        AgentEvent::ToolDiff(diff) => show(handle, move |ui| diff_block(ui, &diff)),
         AgentEvent::ToolResult(result) => show(handle, move |ui| block(ui, &result)),
         // The row above the terminal's input box has no counterpart here; the
         // busy label already says what is running.
@@ -482,7 +483,7 @@ fn ask_in_window(handle: &UiHandle, ask: Ask) {
                 line(ui, "Allow this tool usage?", Tone::Warning);
                 line(ui, &description, Tone::Normal);
                 if let Some(diff) = &diff {
-                    block(ui, diff);
+                    diff_block(ui, diff);
                 }
                 open_gate(ui, &allow_all_label, reply);
             });
@@ -866,9 +867,63 @@ fn block(ui: &mut UI, text: &str) {
     let element = rich("", CODE);
     if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
         view.start_block(BlockStyle::pre().background(0xFF232323).padding(8.0).hanging(20.0));
-        view.push(text.trim_end(), SpanStyle::default().code());
+        // Stripped, because a code block shows whatever a tool produced and some
+        // of that was written for a terminal: any command that believes it has a
+        // TTY colors its output with SGR sequences. Lumio draws what it is
+        // given, so an escape left in arrives as a box for ESC followed by the
+        // letters of the sequence, which is what a diff used to look like here.
+        view.push(strip_ansi(text).trim_end(), SpanStyle::default().code());
     }
     append(ui, element);
+}
+
+/// A diff, colored by what each line does to the file.
+///
+/// `generate_diff` colors its own lines with SGR, black on a red or green band,
+/// and those escapes reach here as text. Rather than interpret them — which
+/// would tie the window to the terminal's encoding, the coupling the whole seam
+/// exists to avoid — they are stripped like any other, and the color is taken
+/// from the marker the diff already writes in front of every line.
+fn diff_block(ui: &mut UI, diff: &str) {
+    let element = rich("", CODE);
+    if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
+        view.start_block(BlockStyle::pre().background(0xFF232323).padding(8.0).hanging(20.0));
+        let plain = strip_ansi(diff);
+        for (index, text) in plain.trim_end().lines().enumerate() {
+            if index > 0 {
+                view.push("\n", SpanStyle::default().code());
+            }
+            let mut style = SpanStyle::default().code();
+            style.color = match marker(text) {
+                Some('+') => Some(0xFF7FB77F),
+                Some('-') => Some(0xFFD86A6A),
+                _ => None,
+            };
+            view.push(text, style);
+        }
+    }
+    append(ui, element);
+}
+
+/// The `+`/`-`/space a diff line carries after its line number, if it has one.
+///
+/// `generate_diff` writes the number in a six-wide field and then a space, so
+/// the marker is the eighth character — and demanding that exact shape is what
+/// keeps a line of *content* beginning with a minus from being read as a
+/// deletion. Everything else (the `File:` header, the `...` between regions)
+/// simply has no marker.
+fn marker(line: &str) -> Option<char> {
+    let mut chars = line.chars();
+    for _ in 0..6 {
+        let digit = chars.next()?;
+        if !digit.is_ascii_digit() && digit != ' ' {
+            return None;
+        }
+    }
+    if chars.next()? != ' ' {
+        return None;
+    }
+    chars.next()
 }
 
 // The markdown being streamed into the open reply.
@@ -1434,7 +1489,7 @@ mod tests {
                 let summary = crate::render::tool_call_summary(&name, &arguments);
                 code_line(ui, format!("{name} {summary}").trim());
             }
-            AgentEvent::ToolDiff(diff) => block(ui, &diff),
+            AgentEvent::ToolDiff(diff) => diff_block(ui, &diff),
             AgentEvent::ToolResult(result) => block(ui, &result),
             AgentEvent::Notice(notice) => {
                 let (text, tone) = describe(notice);
@@ -1732,6 +1787,95 @@ mod tests {
         let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
         wire_gate(&mut ui);
         ui
+    }
+
+    /// The text of the last thing appended to the transcript.
+    fn last_block(ui: &UI) -> String {
+        let transcript = ui.get_view(TRANSCRIPT).expect("transcript");
+        let element = {
+            let view = transcript.borrow();
+            view.as_container().expect("a container").get_views().last().cloned()
+        };
+        let element = element.expect("nothing was appended");
+        let view = element.borrow();
+        view.as_any()
+            .downcast_ref::<RichText>()
+            .expect("a RichText")
+            .block_text(0)
+            .unwrap_or_default()
+    }
+
+    /// A diff is written for a terminal: `generate_diff` colors its lines with
+    /// SGR, black on a red or green band. The window draws what it is given, so
+    /// an escape left in one arrives as a box for ESC followed by the letters of
+    /// the sequence — which is what the diff in a permission prompt looked like.
+    ///
+    /// Checked against a diff the real function produced, because the point is
+    /// what actually arrives, and because the marker column this reads is one
+    /// that function chooses.
+    #[test]
+    fn a_diff_loses_its_escapes_and_keeps_its_markers() {
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let diff = crate::render::generate_diff("f.rs", "one\ntwo\n", "one\nTWO\n").expect("a diff");
+        assert!(diff.contains('\u{1b}'), "an uncolored diff would prove nothing here");
+
+        let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
+        diff_block(&mut ui, &diff);
+        ui.layout(800, 600, 1.0);
+
+        let shown = last_block(&ui);
+        assert!(!shown.contains('\u{1b}'), "an escape reached the window: {shown:?}");
+        assert!(shown.contains("- two"), "the removal survived: {shown:?}");
+        assert!(shown.contains("+ TWO"), "the addition survived: {shown:?}");
+        assert!(shown.contains("f.rs"), "the header survived: {shown:?}");
+
+        // And the color the escapes used to carry is actually applied, which the
+        // text alone cannot show: an added line has to come out green and a
+        // removed one red, or the strip has thrown information away instead of
+        // moving it.
+        let palette = Palette::dark();
+        set_current_palette(palette.clone());
+        let pixmap = render_to_pixmap(&ui, 800, 600, 1.0, &palette, &DrawableRegistry::new())
+            .expect("pixmap");
+        let (mut greens, mut reds) = (0, 0);
+        for pixel in pixmap.pixels() {
+            let (r, g) = (pixel.red() as i32, pixel.green() as i32);
+            if g > r + 20 {
+                greens += 1;
+            }
+            if r > g + 20 {
+                reds += 1;
+            }
+        }
+        assert!(greens > 0, "nothing was drawn green for the added line");
+        assert!(reds > 0, "nothing was drawn red for the removed line");
+    }
+
+    /// Tool output goes through the same block, and a command that believes it
+    /// has a terminal colors its own output the same way.
+    #[test]
+    fn tool_output_loses_its_escapes_too() {
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
+        block(&mut ui, "\u{1b}[32mok\u{1b}[0m 3 passed");
+        ui.layout(800, 600, 1.0);
+        assert_eq!(last_block(&ui), "ok 3 passed");
+    }
+
+    /// The color comes from the column `generate_diff` writes its marker in, and
+    /// nothing else may claim it — a line of *content* starting with a minus is
+    /// not a deletion, and neither is the header.
+    #[test]
+    fn only_the_diffs_own_marker_column_counts() {
+        assert_eq!(marker("     1 + added"), Some('+'));
+        assert_eq!(marker("     2 - removed"), Some('-'));
+        assert_eq!(marker("     3   unchanged"), Some(' '));
+        assert_eq!(marker("File: src/main.rs"), None);
+        assert_eq!(marker("- not a diff line"), None);
+        assert_eq!(marker("short"), None);
+        // A line that opens with a multibyte character must not be sliced
+        // through the middle of it.
+        assert_eq!(marker("\u{2014} a dash"), None);
     }
 
     /// The panel takes the composer's place for exactly as long as a gated call
