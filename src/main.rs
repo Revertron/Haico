@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
@@ -21,6 +20,7 @@ mod input;
 mod llm;
 mod modes;
 mod permissions;
+mod present;
 mod prompt;
 mod readable;
 mod render;
@@ -28,6 +28,7 @@ mod session;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod turn;
 mod util;
 mod workspace;
 
@@ -38,10 +39,12 @@ use input::*;
 use llm::*;
 use modes::*;
 use permissions::*;
+use present::*;
 use prompt::*;
 use render::*;
 use session::*;
 use tools::*;
+use turn::*;
 use util::*;
 
 
@@ -1334,7 +1337,11 @@ async fn run_turn(
     // file it produces can be picked up at the end of it.
     initializing: bool,
 ) {
-        // Wall clock, started here rather than at the first request: what the summary at
+        // Everything this turn has to say goes through here. The turn decides what
+    // happened; the presenter decides what that looks like.
+    let mut presenter = Presenter::new();
+
+    // Wall clock, started here rather than at the first request: what the summary at
         // the end of the turn reports is how long the user waited, which includes the tool
         // runs, the permission prompts they answered and every round of the loop below —
         // not just the time the model spent generating.
@@ -1382,7 +1389,7 @@ async fn run_turn(
             // Re-read every round rather than captured once: approving a plan can switch
             // into auto mode mid-turn, and the cap should stop applying from that point.
             if agent.mode != Mode::Auto && round > MAX_TOOL_ROUNDS {
-                outln!("\n[stopped after {} tool-call rounds without a final answer]", MAX_TOOL_ROUNDS);
+                presenter.show(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
                 break;
             }
 
@@ -1418,12 +1425,7 @@ async fn run_turn(
                         // The same reclaim /compact does, for the same reason: the cache is
                         // keyed to a history that no longer exists.
                         agent.review_cache.clear();
-                        outln!(
-                            "{}{}{}",
-                            SetForegroundColor(crate::input::BAR_BACKGROUND),
-                            report,
-                            ResetColor
-                        );
+                        presenter.show(Notice::Compacted(report).into());
                         // The compacted history ends on the assistant agreeing that it has
                         // the notes, and asking for a reply straight after that is asking
                         // the model to talk past itself. This says the one thing the notes
@@ -1438,20 +1440,20 @@ async fn run_turn(
 
                         if estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens) {
                             autocompact = false;
-                            outln!(
-                                "[the summary is still over {}% of the window; carrying on without compacting again]",
-                                (AUTOCOMPACT_FRACTION * 100.0) as usize
+                            presenter.show(
+                                Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize)
+                                    .into(),
                             );
                         }
                     }
                     // Not fatal by itself: the request below may still fit, and if it does
                     // not, the server's own error ends the turn — exactly what would have
                     // happened with none of this here.
-                    Some(Err(e)) => outln!("\n[error] could not compact: {:#}\n", e),
+                    Some(Err(e)) => presenter.show(Notice::CompactionFailed(format!("{:#}", e)).into()),
                     // Esc during the summarization is Esc during the turn, as everywhere
                     // else in this loop.
                     None => {
-                        outln!("\n[interrupted]\n");
+                        presenter.show(Notice::Interrupted.into());
                         break;
                     }
                 }
@@ -1459,22 +1461,18 @@ async fn run_turn(
 
             let thinking = get_thinking_message().to_string();
 
-            // Assistant text is printed the moment it arrives, so none of the branches
-            // below re-print it.
-            let mut streamed_any = false;
-            // The same for the chain of thought, which is shown dimmed as it lands. Tracked
-            // separately because it is not markdown and does not go through the stream
-            // above, and because the branches below have to know that something was already
-            // put on screen even when no content ever followed.
-            let mut streamed_thinking = false;
+            // Whether anything has reached the screen for this reply, and the
+            // half-rendered markdown line, both belong to the presenter — see
+            // `Presenter::start_reply`. Per round, not per turn: a turn is many
+            // rounds and each one streams its own reply.
+            presenter.start_reply();
             // Characters of reply seen so far, thinking included, for the activity bar. A
             // big model can reason for many minutes before its first content token, and a
             // bar that only says "Thinking…" for all of it is indistinguishable from one
-            // that has hung. An atomic rather than a Cell so the future stays Send.
+            // that has hung. An atomic rather than a Cell so the future stays Send, and a
+            // local rather than a presenter field because `work_with_input` reads it while
+            // the callback below is writing through `&mut presenter`.
             let streamed_chars = AtomicUsize::new(0);
-            // Rendered as it arrives rather than at the end, so the answer still
-            // appears a piece at a time and still comes out as markdown.
-            let mut markdown = MarkdownStream::new();
             // Rebuilt every round rather than once per turn: approving a plan switches the
             // mode mid-turn, and the very next request has to carry the full tool list.
             let request_messages = with_mode_note(agent.mode, &agent.workspace, &agent.messages);
@@ -1498,67 +1496,23 @@ async fn run_turn(
                 agent.client.chat_completion_streaming(
                     request_messages,
                     request_tools,
+                    // Both kinds of text are handed on the moment they arrive, so
+                    // none of the branches below re-print anything from the
+                    // finished message. What either one *looks* like — dim,
+                    // italic, folded, markdown-wrapped — is the presenter's, and
+                    // this no longer knows.
                     |chunk| {
-                        match chunk {
-                            // Dimmed, and painted per piece rather than left switched on
-                            // across the stream: an unfinished line is redrawn above the
-                            // input box every time the box moves, and a color left open at
-                            // the end of it would bleed into the box itself.
+                        let event = match chunk {
                             Chunk::Reasoning(text) => {
                                 streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
-                                if !streamed_thinking {
-                                    streamed_thinking = true;
-                                    // Folded from the start rather than after the fact: the
-                                    // reasoning can run for pages, and the activity bar is
-                                    // already counting the characters as they arrive, so
-                                    // nothing about the wait goes unreported while it is
-                                    // closed. Ctrl+O opens it, and it stays open.
-                                    crate::out::begin_fold(&format!(
-                                        "{}{}○ (thinking){}",
-                                        SetAttribute(Attribute::Italic),
-                                        SetForegroundColor(Color::DarkGrey),
-                                        ResetColor
-                                    ));
-                                    out!(
-                                        "{}{}○ {}",
-                                        SetAttribute(Attribute::Italic),
-                                        SetForegroundColor(Color::DarkGrey),
-                                        ResetColor
-                                    );
-                                }
-                                // Italic as well as dim: a tool call and its result are
-                                // dim too, and until this the three were the same grey.
-                                // A terminal that cannot do italic is no worse off than
-                                // before — conhost drops the attribute and prints the
-                                // dim text it printed already.
-                                out!(
-                                    "{}{}{}{}",
-                                    SetAttribute(Attribute::Italic),
-                                    SetForegroundColor(Color::DarkGrey),
-                                    text,
-                                    ResetColor
-                                );
+                                AgentEvent::ReasoningChunk(text)
                             }
                             Chunk::Content(text) => {
                                 streamed_chars.fetch_add(text.chars().count(), Ordering::Relaxed);
-                                if !streamed_any {
-                                    streamed_any = true;
-                                    // The answer starts on a row of its own, so it is not
-                                    // mistaken for the tail of the thinking above it. The
-                                    // reasoning is over the moment the answer begins, so
-                                    // its fold closes here and the answer is not swept into
-                                    // it.
-                                    if streamed_thinking {
-                                        crate::out::end_fold();
-                                        crate::out::ensure_line_start();
-                                        outln!();
-                                    }
-                                    out!("● ");
-                                }
-                                out!("{}", markdown.push(&text));
+                                AgentEvent::ReplyChunk(text)
                             }
-                        }
-                        crate::out::flush();
+                        };
+                        presenter.show(event);
                     },
                 ),
             )
@@ -1568,14 +1522,8 @@ async fn run_turn(
                 // The partial reply is dropped rather than stored: half a tool call in the
                 // history is worse than no reply at all. Everything before this turn stays
                 // consistent, so the conversation is still usable.
-                crate::out::end_fold();
-                if streamed_any {
-                    out!("{}", markdown.finish(false));
-                }
-                if streamed_any || streamed_thinking {
-                    crate::out::ensure_line_start();
-                }
-                outln!("\n[interrupted]\n");
+                presenter.show(AgentEvent::ReplyEnd);
+                presenter.show(Notice::Interrupted.into());
                 break;
             };
 
@@ -1585,28 +1533,17 @@ async fn run_turn(
                     // A dropped connection, a server-side error, or an unparseable body
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
-                    crate::out::end_fold();
-                    if streamed_any || streamed_thinking {
-                        outln!();
-                    }
-                    outln!("\n[error] {:#}", e);
-                    outln!("Conversation kept. Type a message to retry.");
+                    presenter.show(AgentEvent::ReplyEnd);
+                    presenter.show(Notice::RequestFailed(format!("{:#}", e)).into());
                     break;
                 }
             };
 
-            // Both kinds of text were printed as they arrived — including the case of a
+            // Both kinds of text were handed on as they arrived — including the case of a
             // model whose entire reply is chain of thought with no content at all, which
-            // is why nothing is re-printed from `message` here. All that is left is to
-            // close whichever of the two was last on screen.
-            // A reply that was nothing but reasoning ends with its fold still open.
-            crate::out::end_fold();
-            if streamed_any {
-                out!("{}", markdown.finish(false));
-            }
-            if streamed_any || streamed_thinking {
-                crate::out::ensure_line_start();
-            }
+            // is why nothing is re-emitted from `message` here. All that is left is to say
+            // the reply is over, and let the presenter close whatever it has open.
+            presenter.show(AgentEvent::ReplyEnd);
 
             // The one place the reasoning policy is applied, deliberately ahead of every
             // `agent.messages.push(message.clone())` below rather than at each of them: all three
@@ -1649,20 +1586,13 @@ async fn run_turn(
                     // furniture rather than as output.
                     Some(ReasoningOutcome::Compressed { before, after }) => {
                         agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
-                        outln!(
-                            "{}Compressed reasoning from {} to {} tokens.{}",
-                            SetForegroundColor(crate::input::BAR_BACKGROUND),
-                            before,
-                            after,
-                            ResetColor
-                        );
+                        presenter.show(Notice::ReasoningCompressed { before, after }.into());
                     }
                     // Dropping says nothing the policy did not already say: it removes
                     // every trace, every turn, so a line per reply would be a line per
                     // reply saying the same thing.
                     Some(ReasoningOutcome::Dropped { tokens }) => {
-                        let line = format!("[reasoning dropped (~{} tokens)]", tokens);
-                        crate::out::foldable(&line, &line);
+                        presenter.show(Notice::ReasoningDropped { tokens }.into());
                     }
                     None => {}
                 }
@@ -1673,7 +1603,7 @@ async fn run_turn(
                 let tool_calls_array = match tool_calls.as_array() {
                     Some(arr) => arr,
                     None => {
-                        outln!("[ERROR] tool_calls is not an array: {:?}", tool_calls);
+                        presenter.show(Notice::ToolCallsMalformed(format!("{:?}", tool_calls)).into());
                         break;
                     }
                 };
@@ -1709,7 +1639,7 @@ async fn run_turn(
                                 "Malformed tool call: no function name in {}",
                                 truncate_at_boundary(&function.to_string(), 500)
                             );
-                            outln!("[ERROR] {}", detail);
+                            presenter.show(Notice::ToolCallUnnamed(detail.clone()).into());
                             agent.messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
@@ -1755,7 +1685,7 @@ async fn run_turn(
                     let arguments = match parsed {
                         Ok(arguments) => arguments,
                         Err(detail) => {
-                            outln!("[ERROR] {}: {}", tool_name, detail);
+                            presenter.show(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
                             agent.messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
@@ -1777,7 +1707,7 @@ async fn run_turn(
                              call present_plan."
                         } else {
                             agent.mode = Mode::Plan;
-                            outln!("\n📋 Plan mode — investigating before changing anything.\n");
+                            presenter.show(Notice::PlanModeEntered.into());
                             "Plan mode is active. The tools that change this machine are no \
                              longer available to you. Investigate the real code with read, \
                              grep, ls and glob_search, then call present_plan with what you \
@@ -1810,7 +1740,7 @@ async fn run_turn(
                         let content = match ask_about_plan(io.keys.as_mut(), &plan).await {
                             Ok(PlanDecision::Approve) => {
                                 agent.mode = Mode::Normal;
-                                outln!("\n✓ Plan approved — starting work.\n");
+                                presenter.show(Notice::PlanApproved { auto: false }.into());
                                 "The user approved the plan. Plan mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
@@ -1818,13 +1748,7 @@ async fn run_turn(
                             }
                             Ok(PlanDecision::ApproveWithAuto) => {
                                 agent.mode = Mode::Auto;
-                                outln!("\n✓ Plan approved — starting work in auto mode.");
-                                // Said plainly, because "auto" sounds like it will stop
-                                // asking and right now it does not.
-                                outln!(
-                                    "  Each gated call is reviewed first; you still answer \
-                                     the prompt.\n"
-                                );
+                                presenter.show(Notice::PlanApproved { auto: true }.into());
                                 // The model is told nothing about the review. It should
                                 // propose the same call either way, and knowing it is being
                                 // checked is an invitation to write for the checker.
@@ -1834,7 +1758,7 @@ async fn run_turn(
                                     .to_string()
                             }
                             Ok(PlanDecision::Revise(feedback)) => {
-                                outln!("\n✗ Plan sent back for revision.\n");
+                                presenter.show(Notice::PlanRejected.into());
                                 format!(
                                     "The user did not approve the plan. Their corrections: {}\n\n\
                                      You are still in plan mode and must not change anything. \
@@ -1844,7 +1768,7 @@ async fn run_turn(
                                 )
                             }
                             Err(e) => {
-                                outln!("\n[error] could not ask about the plan: {}", e);
+                                presenter.show(Notice::AskFailed { what: "about the plan", detail: e.to_string() }.into());
                                 "The plan could not be shown for approval (no interactive \
                                  terminal), so it is not approved. Do not start work."
                                     .to_string()
@@ -1886,7 +1810,7 @@ async fn run_turn(
                                     // must not stall the turn either: the model is told to
                                     // carry the decision itself.
                                     Err(e) => {
-                                        outln!("\n[error] could not ask the user: {}", e);
+                                        presenter.show(Notice::AskFailed { what: "the user", detail: e.to_string() }.into());
                                         "The question could not be put to the user (no \
                                          interactive terminal). Decide it yourself, say in \
                                          one line which way you went and why, and carry on."
@@ -1911,7 +1835,7 @@ async fn run_turn(
                     let gate = gate_for_mode(agent.mode, &agent.workspace, tool_name, &arguments);
 
                     if let Gate::Deny(reason) = &gate {
-                        outln!("\n⛔ {}\n", reason);
+                        presenter.show(Notice::Refused(reason.clone()).into());
                         agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
@@ -2057,7 +1981,7 @@ async fn run_turn(
                         {
                             Ok(response) => response,
                             Err(e) => {
-                                outln!("\n[error] could not ask for permission: {}", e);
+                                presenter.show(Notice::AskFailed { what: "for permission", detail: e.to_string() }.into());
                                 agent.messages.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
@@ -2074,17 +1998,17 @@ async fn run_turn(
                         match response {
                             PermissionResponse::Allow => {
                                 // Allow once, proceed with execution
-                                outln!("✓ Permission granted for this request\n");
+                                presenter.show(Notice::PermissionAllowed.into());
                             }
                             PermissionResponse::AllowAll => {
                                 // Remembered under the narrow keys this call resolved to,
                                 // not under the tool name.
                                 agent.permissions.allow(&gate_keys);
-                                outln!("✓ {}\n", allow_all_label);
+                                presenter.show(Notice::PermissionAllowedAll(allow_all_label.clone()).into());
                             }
                             PermissionResponse::Reject(alternative) => {
                                 // User rejected, send alternative to LLM
-                                outln!("✗ Permission denied. User suggestion: {}\n", alternative);
+                                presenter.show(Notice::PermissionDenied { alternative: alternative.clone() }.into());
 
                                 agent.messages.push(json!({
                                     "role": "tool",
@@ -2100,7 +2024,7 @@ async fn run_turn(
                     // A slow tool (a big fetch, a long build) is interruptible too. The
                     // tool_call_id is still answered before breaking out — an unanswered one
                     // is what the next request gets rejected for.
-                    outln!("{}", tool_call_line(tool_name, &arguments, auto_note.as_deref()));
+                    presenter.show(AgentEvent::ToolStarted { name: tool_name.to_string(), arguments: arguments.clone(), auto_note: auto_note.clone() });
 
                     // The diff belongs under the call line, not before it, and it has to
                     // appear on every path that skipped the prompt — a pre-approved write
@@ -2110,11 +2034,7 @@ async fn run_turn(
                     // itself already showed the same diff a moment ago.
                     if !prompted {
                         if let Some(diff) = file_change_diff(tool_name, &arguments) {
-                            if let Some(preview) = change_preview(&diff) {
-                                // The preview is a few lines of the change; the whole diff
-                                // waits behind it.
-                                crate::out::foldable(preview.trim_end_matches('\n'), &diff);
-                            }
+                            presenter.show(AgentEvent::ToolDiff(diff));
                         }
                     }
 
@@ -2148,7 +2068,7 @@ async fn run_turn(
                     .await;
 
                     let Some(result) = executed else {
-                        outln!("\n[interrupted]\n");
+                        presenter.show(Notice::Interrupted.into());
                         agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
@@ -2163,7 +2083,7 @@ async fn run_turn(
                     io.last_activity = Some(did);
 
                     let tool_result = result.unwrap_or_else(|e| {
-                        outln!("[ERROR] Tool execution failed: {:?}", e);
+                        presenter.show(Notice::ToolFailed(format!("{:?}", e)).into());
                         format!("Error: {}", e)
                     });
 
@@ -2175,9 +2095,7 @@ async fn run_turn(
                     // its whole answer while it ran, so a summary here would repeat the
                     // answer's first line immediately underneath the answer.
                     if tool_name != "research" {
-                        if let Some(line) = tool_result_line(&tool_result) {
-                            crate::out::foldable(&line, &tool_result);
-                        }
+                        presenter.show(AgentEvent::ToolResult(tool_result.clone()));
                     }
 
                     // Add tool result
@@ -2200,20 +2118,15 @@ async fn run_turn(
                 // it far earlier than the round cap. That matters most in auto mode, where
                 // the cap is the only backstop and nobody is watching it climb.
                 if run.0 >= LOOP_BREAK {
-                    outln!(
-                        "\n[stopped: '{}' was called {} times in a row with the same arguments]\n",
-                        run.1, run.0
-                    );
+                    presenter
+                        .show(Notice::LoopBroken { tool: run.1.clone(), count: run.0 }.into());
                     // Whatever was typed while this ran is deliberately left queued: it
                     // becomes the next prompt, which is where the user takes over.
                     break;
                 }
                 if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
                     nudged_at = run.0;
-                    outln!(
-                        "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
-                        run.1, run.0
-                    );
+                    presenter.show(Notice::LoopNudge { tool: run.1.clone(), count: run.0 }.into());
                     // A user message rather than a system one: mid-conversation system
                     // messages are ignored by some local models and rejected outright by
                     // some servers, and this one has to land. The order is legal here for
@@ -2236,7 +2149,7 @@ async fn run_turn(
                 // message between an assistant turn and the tool results it is waiting
                 // for, which is a message order servers reject outright.
                 for text in io.queued.drain(..) {
-                    outln!("{}", echo(PROMPT, &text));
+                    presenter.show(Notice::QueuedSent(text.clone()).into());
                     agent.messages.push(json!({"role": "user", "content": text}));
                 }
 
@@ -2253,12 +2166,10 @@ async fn run_turn(
         // included: the line says how long the turn ran for, not whether it got anywhere,
         // and a turn that ended badly after four minutes is exactly the one worth timing.
         // Dimmed for the same reason the chain of thought is — it is not the answer.
-        outln!(
-            "\n{}{}{}\n",
-            SetForegroundColor(Color::DarkGrey),
-            turn_summary(get_done_verb(), turn_started.elapsed(), chrono::Local::now()),
-            ResetColor
-        );
+        presenter.show(AgentEvent::Finished {
+            verb: get_done_verb(),
+            elapsed: turn_started.elapsed(),
+        });
 
         // The file /init just wrote is the one that belongs in the system message, and what
         // was loaded at startup — usually nothing, since /init is what you run when the
@@ -2270,7 +2181,7 @@ async fn run_turn(
             if reloaded != agent.project_context {
                 agent.project_context = reloaded;
                 if let Some((name, _)) = &agent.project_context {
-                    outln!("\nLoaded project context from {}", name);
+                    presenter.show(Notice::ProjectContextReloaded(name.clone()).into());
                 }
                 agent.system_prompt = compose_system_prompt(
                     agent.config.system_prompt.as_deref(),
