@@ -44,7 +44,6 @@ use crate::modes::{Mode, PlanDecision};
 use crate::permissions::PermissionResponse;
 use crate::turn::{AgentEvent, Ask, Notice, TurnLink, Waiting};
 use crate::util::strip_ansi;
-use tokio::sync::oneshot;
 
 const TRANSCRIPT: &str = "transcript";
 const SCROLL: &str = "scroll";
@@ -64,15 +63,20 @@ const OPEN_REASONING: &str = "reasoning-open";
 const PROSE: f32 = 15.0;
 const CODE: f32 = 13.0;
 
-/// The permission panel and its parts. It takes the composer's place while a
-/// gated call waits for an answer, so the two are never on screen together.
+/// The question panel and its parts. It takes the composer's place while a turn
+/// waits on an answer — a gated call, a plan to approve — so the two are never
+/// on screen together and there is one thing to do at a time.
 const GATE: &str = "gate";
-const GATE_ALLOW: &str = "gate-allow";
-const GATE_ALL: &str = "gate-all";
-const GATE_REJECT: &str = "gate-reject";
+const GATE_ONE: &str = "gate-1";
+const GATE_TWO: &str = "gate-2";
+const GATE_THREE: &str = "gate-3";
 const GATE_REPLY: &str = "gate-reply";
 const GATE_TEXT: &str = "gate-text";
 const GATE_SEND: &str = "gate-send";
+
+/// What the model is told when a plan is sent back with the field left empty.
+const REVISE_WITHOUT_WORDS: &str =
+    "The user sent the plan back without saying what to change. Ask what is wrong with it.";
 
 const MENUBAR: &str = "menubar";
 
@@ -146,9 +150,9 @@ const LAYOUT: &str = r#"
     </ScrollView>
     <Label id="busy" width="max" height="min" text="" margin_left="12" margin_top="2"/>
     <Frame id="gate" width="max" height="min" direction="vertical" padding="8" visibility="gone">
-        <Button id="gate-allow" width="max" height="32" text="1. Allow once"/>
-        <Button id="gate-all" width="max" height="32" text="2. Allow all" margin_top="4"/>
-        <Button id="gate-reject" width="max" height="32" text="3. Reject and provide alternative" margin_top="4"/>
+        <Button id="gate-1" width="max" height="32" text="1."/>
+        <Button id="gate-2" width="max" height="32" text="2." margin_top="4"/>
+        <Button id="gate-3" width="max" height="32" text="3." margin_top="4"/>
         <Frame id="gate-reply" width="max" height="min" direction="horizontal" margin_top="4" visibility="gone">
             <Edit id="gate-text" width="max" height="32"/>
             <Button id="gate-send" text="Send" width="90" height="32" margin_left="8"/>
@@ -438,17 +442,40 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
 fn ask_in_window(handle: &UiHandle, ask: Ask) {
     match ask {
         Ask::Plan { plan, reply } => {
-            let message = format!("{plan}\n\nStart work on this plan?");
-            confirm(handle, "Plan ready", message, move |approved| match approved {
-                true => PlanDecision::Approve,
-                // No feedback box yet, so the model is told plainly that there is
-                // none rather than handed an empty string it would read as assent.
-                false => PlanDecision::Revise(
-                    "The user declined the plan in the GUI without written feedback. \
-                     Ask what to change."
-                        .to_string(),
-                ),
-            }, reply);
+            show(handle, move |ui| {
+                line(ui, "Proposed plan", Tone::Warning);
+                // As markdown, for the reason the terminal renders it too: a plan
+                // comes back as markdown, and unrendered it is a wall of asterisks
+                // exactly when it most needs reading.
+                markdown_block(ui, &plan);
+                open_gate(
+                    ui,
+                    [
+                        "Approve and start work".to_string(),
+                        "Approve and enable auto mode (routine calls run without asking)"
+                            .to_string(),
+                        "Send back corrections".to_string(),
+                    ],
+                    move |choice, written| {
+                        let _ = reply.send(match choice {
+                            0 => PlanDecision::Approve,
+                            // Approving a plan is the moment the user knows what
+                            // is coming, which is when loosening the grip on the
+                            // individual steps is a reasonable thing to do. A
+                            // yes/no box had no way to offer it.
+                            1 => PlanDecision::ApproveWithAuto,
+                            // An empty field is not a correction, and here that
+                            // matters: the model is being sent back to revise, so
+                            // it is told there is nothing to revise toward rather
+                            // than handed "Their corrections:" and a full stop.
+                            _ if written.is_empty() => PlanDecision::Revise(
+                                REVISE_WITHOUT_WORDS.to_string(),
+                            ),
+                            _ => PlanDecision::Revise(written),
+                        });
+                    },
+                );
+            });
         }
         Ask::User { question, options, reply } => {
             let prompt = match options.is_empty() {
@@ -485,16 +512,39 @@ fn ask_in_window(handle: &UiHandle, ask: Ask) {
                 if let Some(diff) = &diff {
                     diff_block(ui, diff);
                 }
-                open_gate(ui, &allow_all_label, reply);
+                open_gate(
+                    ui,
+                    [
+                        "Allow once".to_string(),
+                        // The label names the scope the approval would have, which
+                        // is the whole reason this answer can be offered at all: a
+                        // yes/no box had nowhere to put it, so it used to be lost.
+                        allow_all_label,
+                        "Reject and provide alternative".to_string(),
+                    ],
+                    move |choice, written| {
+                        let _ = reply.send(match choice {
+                            0 => PermissionResponse::Allow,
+                            1 => PermissionResponse::AllowAll,
+                            // Empty is allowed, as it is in the terminal: the model
+                            // is told the call was refused either way.
+                            _ => PermissionResponse::Reject(written),
+                        });
+                    },
+                );
             });
         }
     }
 }
 
 thread_local! {
-    /// The permission question the panel is putting, and the channel it answers
-    /// on. `None` whenever the panel is closed, which is what makes the number
-    /// keys inert the rest of the time.
+    /// How to answer the question the panel is putting: called with the row that
+    /// was chosen and whatever was typed, and `None` whenever the panel is
+    /// closed, which is what makes the number keys inert the rest of the time.
+    ///
+    /// A closure rather than one ask's reply channel, so the panel knows nothing
+    /// about what it is asking. Each [`Ask`] supplies the mapping next to its own
+    /// vocabulary — the row numbers mean something only there.
     ///
     /// UI-thread state, like the asset provider, because the panel's controls
     /// are wired once at startup and have to find the current question from
@@ -502,7 +552,8 @@ thread_local! {
     /// not work for the accelerators: `fire_shortcut` puts a handler back into
     /// the registry after running it, so one that unregistered itself while
     /// answering would survive anyway and go on eating the key afterwards.
-    static PENDING: RefCell<Option<oneshot::Sender<PermissionResponse>>> =
+    #[allow(clippy::type_complexity)]
+    static PENDING: RefCell<Option<Box<dyn FnOnce(usize, String)>>> =
         const { RefCell::new(None) };
 }
 
@@ -511,12 +562,12 @@ fn gate_open() -> bool {
     PENDING.with(|pending| pending.borrow().is_some())
 }
 
-/// Wire the permission panel's controls. Once, at startup — see [`PENDING`].
+/// Wire the question panel's controls. Once, at startup — see [`PENDING`].
 fn wire_gate(ui: &mut UI) {
-    on_click(ui, GATE_ALLOW, |ui| answer_gate(ui, PermissionResponse::Allow));
-    on_click(ui, GATE_ALL, |ui| answer_gate(ui, PermissionResponse::AllowAll));
-    on_click(ui, GATE_REJECT, open_reject);
-    on_click(ui, GATE_SEND, send_reject);
+    on_click(ui, GATE_ONE, |ui| answer_gate(ui, 0, String::new()));
+    on_click(ui, GATE_TWO, |ui| answer_gate(ui, 1, String::new()));
+    on_click(ui, GATE_THREE, open_field);
+    on_click(ui, GATE_SEND, send_field);
 
     // Enter sends the alternative. A KeyDown listener on the focused view runs
     // before the view's own handling, so this needs no accelerator — which is
@@ -527,7 +578,7 @@ fn wire_gate(ui: &mut UI) {
             EventType::KeyDown,
             Box::new(|ui, _view, data| match data {
                 EventData::Key { code: Some(VirtualKeyCode::Return), .. } => {
-                    send_reject(ui);
+                    send_field(ui);
                     true
                 }
                 _ => false,
@@ -540,55 +591,61 @@ fn wire_gate(ui: &mut UI) {
     // and because Lumio fires an accelerator only when the focused view did not
     // take the key first — so typing "1" into the composer, or into the
     // alternative field, types a 1 rather than answering.
-    ui.add_shortcut("1", Box::new(|ui| gate_answer(ui, PermissionResponse::Allow)));
-    ui.add_shortcut("2", Box::new(|ui| gate_answer(ui, PermissionResponse::AllowAll)));
+    ui.add_shortcut("1", Box::new(|ui| gate_answer(ui, 0)));
+    ui.add_shortcut("2", Box::new(|ui| gate_answer(ui, 1)));
     ui.add_shortcut(
         "3",
         Box::new(|ui| {
             if !gate_open() {
                 return false;
             }
-            open_reject(ui);
+            open_field(ui);
             true
         }),
     );
 }
 
 /// An accelerator that answers the panel, or declines the key if nothing asked.
-fn gate_answer(ui: &mut UI, response: PermissionResponse) -> bool {
+fn gate_answer(ui: &mut UI, choice: usize) -> bool {
     if !gate_open() {
         return false;
     }
-    answer_gate(ui, response);
+    answer_gate(ui, choice, String::new());
     true
 }
 
-/// Put a gated call to the user, in the composer's place.
-fn open_gate(ui: &mut UI, allow_all_label: &str, reply: oneshot::Sender<PermissionResponse>) {
-    // Replacing a pending question drops its sender, which the turn hears as a
-    // refusal. It cannot happen — a turn waits for its answer before going on —
-    // but if that assumption ever breaks, denying is the direction to break in.
-    PENDING.with(|pending| *pending.borrow_mut() = Some(reply));
-    // The label names the scope the approval would have, which is the whole
-    // reason this answer can be offered at all: a yes/no box had nowhere to
-    // put it, so it used to be dropped.
-    set_button(ui, GATE_ALL, &format!("2. {allow_all_label}"));
+/// Put a question to the user, in the composer's place.
+///
+/// The rows are labelled per question and numbered here, so the number a label
+/// claims and the key that picks it cannot drift apart. The third row is the one
+/// that takes words, in both questions asked so far and by construction: it is
+/// the row [`open_field`] replaces.
+fn open_gate(ui: &mut UI, labels: [String; 3], answer: impl FnOnce(usize, String) + 'static) {
+    // Replacing a pending question drops its answerer, and every ask treats a
+    // dropped reply channel as a refusal. It cannot happen — a turn waits for
+    // its answer before going on — but if that assumption ever breaks, refusing
+    // is the direction to break in.
+    PENDING.with(|pending| *pending.borrow_mut() = Some(Box::new(answer)));
+    let rows = [(GATE_ONE, &labels[0]), (GATE_TWO, &labels[1]), (GATE_THREE, &labels[2])];
+    for (index, (id, label)) in rows.into_iter().enumerate() {
+        set_button(ui, id, &format!("{}. {label}", index + 1));
+    }
     show_view(ui, GATE, true);
     show_view(ui, COMPOSER, false);
     ui.relayout();
 }
 
 /// Answer the pending question, once, and put the composer back.
-fn answer_gate(ui: &mut UI, response: PermissionResponse) {
-    let Some(reply) = PENDING.with(|pending| pending.borrow_mut().take()) else { return };
-    let _ = reply.send(response);
+fn answer_gate(ui: &mut UI, choice: usize, text: String) {
+    let Some(answer) = PENDING.with(|pending| pending.borrow_mut().take()) else { return };
+    answer(choice, text);
     later(ui, close_gate);
 }
 
-/// Swap the third option for the field that says what to do instead.
-fn open_reject(ui: &mut UI) {
+/// Swap the third option for the field that takes the answer in words.
+fn open_field(ui: &mut UI) {
     later(ui, |ui| {
-        show_view(ui, GATE_REJECT, false);
+        show_view(ui, GATE_THREE, false);
         show_view(ui, GATE_REPLY, true);
         ui.relayout();
         // Focusing the field is also what disarms the number keys: an
@@ -600,11 +657,11 @@ fn open_reject(ui: &mut UI) {
     });
 }
 
-/// Reject with whatever the field says, empty included — the terminal's third
-/// answer allows an empty alternative too, and the model is told either way.
-fn send_reject(ui: &mut UI) {
-    let alternative = edit_text(ui, GATE_TEXT).trim().to_string();
-    answer_gate(ui, PermissionResponse::Reject(alternative));
+/// Take the third answer with whatever was written for it. What an empty field
+/// means is the question's business, not the panel's.
+fn send_field(ui: &mut UI) {
+    let written = edit_text(ui, GATE_TEXT).trim().to_string();
+    answer_gate(ui, 2, written);
 }
 
 /// Hide the panel, restore the composer, and leave the panel ready for the next
@@ -612,7 +669,7 @@ fn send_reject(ui: &mut UI) {
 fn close_gate(ui: &mut UI) {
     show_view(ui, GATE, false);
     show_view(ui, GATE_REPLY, false);
-    show_view(ui, GATE_REJECT, true);
+    show_view(ui, GATE_THREE, true);
     set_edit(ui, GATE_TEXT, "");
     show_view(ui, COMPOSER, true);
     if let Some(element) = ui.get_view(INPUT) {
@@ -680,23 +737,6 @@ fn edit_text(ui: &mut UI, id: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A yes/no dialog whose answer is mapped by `decide` and sent on `reply` once.
-fn confirm<T: Send + 'static>(
-    handle: &UiHandle,
-    title: &'static str,
-    message: String,
-    decide: impl FnOnce(bool) -> T + Send + 'static,
-    reply: tokio::sync::oneshot::Sender<T>,
-) {
-    let mut once = Some((decide, reply));
-    handle.run_on_ui_thread(move |ui| {
-        ui.show_confirm(title, &message, move |_ui, yes| {
-            if let Some((decide, reply)) = once.take() {
-                let _ = reply.send(decide(yes));
-            }
-        });
-    });
-}
 
 /// Queue a closure to run on the UI thread. Every write to the window goes
 /// through here, which is what keeps the worker from ever touching a Lumio type.
@@ -964,6 +1004,21 @@ fn stream_reply(ui: &mut UI, text: &str) {
                 md.push(view, text);
             }
         });
+    }
+    append(ui, element);
+}
+
+/// Render a finished markdown document into the transcript as one view.
+///
+/// Its own `MarkdownView` rather than the reply's: this is a whole document
+/// arriving at once, and borrowing the streaming renderer would leave the next
+/// reply carrying on from this one's markdown.
+fn markdown_block(ui: &mut UI, text: &str) {
+    let element = rich("", PROSE);
+    if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
+        let mut markdown = crate::markdown::MarkdownView::new(PROSE);
+        markdown.push(view, text);
+        markdown.finish(view);
     }
     append(ui, element);
 }
@@ -1771,6 +1826,31 @@ mod tests {
             );
         }
     }
+    /// Open the panel on a permission question, as `ask_in_window` does, and hand
+    /// back the channel its answer arrives on.
+    fn permission_gate(
+        ui: &mut UI,
+        allow_all_label: &str,
+    ) -> ((), tokio::sync::oneshot::Receiver<PermissionResponse>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        open_gate(
+            ui,
+            [
+                "Allow once".to_string(),
+                allow_all_label.to_string(),
+                "Reject and provide alternative".to_string(),
+            ],
+            move |choice, written| {
+                let _ = tx.send(match choice {
+                    0 => PermissionResponse::Allow,
+                    1 => PermissionResponse::AllowAll,
+                    _ => PermissionResponse::Reject(written),
+                });
+            },
+        );
+        ((), rx)
+    }
+
     /// Whether a view is on screen, as the panel's swap is expressed.
     fn visible(ui: &UI, id: &str) -> bool {
         ui.get_view(id)
@@ -1878,6 +1958,85 @@ mod tests {
         assert_eq!(marker("\u{2014} a dash"), None);
     }
 
+    fn button_text(ui: &UI, id: &str) -> String {
+        ui.get_view(id)
+            .map(|element| {
+                let view = element.borrow();
+                view.as_any().downcast_ref::<Button>().expect("a Button").get_text()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Put a plan to the panel exactly as the turn does, through `ask_in_window`
+    /// rather than by calling `open_gate` directly — the labels and the mapping
+    /// are what this is checking, and they live in that arm.
+    fn plan_gate(ui: &mut UI, plan: &str) -> tokio::sync::oneshot::Receiver<PlanDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = ui.handle();
+        ask_in_window(&handle, Ask::Plan { plan: plan.to_string(), reply: tx });
+        // Queued like every other write to the window.
+        ui.update();
+        rx
+    }
+
+    /// A plan gets the same three-answer panel a gated call gets, and the middle
+    /// answer is the one a yes/no box could not carry: approve *and* stop being
+    /// asked about routine calls. It used to be unreachable from the window.
+    #[test]
+    fn a_plan_can_be_approved_into_auto_mode() {
+        let mut ui = gate_ui();
+        let mut rx = plan_gate(&mut ui, "# Steps\n\n1. Read the loop\n2. Fix the counter\n");
+
+        assert_eq!(button_text(&ui, GATE_ONE), "1. Approve and start work");
+        assert!(button_text(&ui, GATE_TWO).starts_with("2. Approve and enable auto mode"));
+        assert_eq!(button_text(&ui, GATE_THREE), "3. Send back corrections");
+
+        // The plan is markdown and is rendered as such: the heading is a heading,
+        // not a line beginning with a hash.
+        let shown = last_block(&ui);
+        assert!(!shown.contains('#'), "the plan was not rendered as markdown: {shown:?}");
+        assert!(shown.contains("Steps"), "the plan is missing: {shown:?}");
+
+        press(&mut ui, VirtualKeyCode::Key2);
+        assert!(matches!(rx.try_recv(), Ok(PlanDecision::ApproveWithAuto)));
+    }
+
+    /// Sending a plan back carries the user's corrections. The window used to
+    /// answer with a fixed sentence saying there were none, which is the worst
+    /// thing to tell a model being asked to revise.
+    #[test]
+    fn corrections_reach_the_model_in_the_users_own_words() {
+        let mut ui = gate_ui();
+        let mut rx = plan_gate(&mut ui, "Do the thing");
+
+        press(&mut ui, VirtualKeyCode::Key3);
+        ui.update();
+        set_edit(&mut ui, GATE_TEXT, "start with the tests");
+        press(&mut ui, VirtualKeyCode::Return);
+
+        match rx.try_recv() {
+            Ok(PlanDecision::Revise(feedback)) => assert_eq!(feedback, "start with the tests"),
+            _ => panic!("the corrections did not reach the model"),
+        }
+    }
+
+    /// An empty field is not a correction. Told nothing, a model sent back to
+    /// revise has nothing to revise toward, so it is told that instead.
+    #[test]
+    fn an_empty_correction_says_so_rather_than_saying_nothing() {
+        let mut ui = gate_ui();
+        let mut rx = plan_gate(&mut ui, "Do the thing");
+
+        press(&mut ui, VirtualKeyCode::Key3);
+        ui.update();
+        press(&mut ui, VirtualKeyCode::Return);
+
+        match rx.try_recv() {
+            Ok(PlanDecision::Revise(feedback)) => assert_eq!(feedback, REVISE_WITHOUT_WORDS),
+            _ => panic!("an empty field did not send the plan back"),
+        }
+    }
+
     /// The panel takes the composer's place for exactly as long as a gated call
     /// is waiting, and the number keys answer it the way the terminal's prompt
     /// does. The scope of "allow all" is on the button, which is the thing a
@@ -1887,13 +2046,12 @@ mod tests {
         let mut ui = gate_ui();
         assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE), "closed until asked");
 
-        let (tx, mut rx) = oneshot::channel();
-        open_gate(&mut ui, "Allow all 'edit' calls under src", tx);
+        let (_tx, mut rx) = permission_gate(&mut ui, "Allow all 'edit' calls under src");
         assert!(visible(&ui, GATE) && !visible(&ui, COMPOSER));
         assert!(gate_open());
 
         let label = ui
-            .get_view(GATE_ALL)
+            .get_view(GATE_TWO)
             .map(|element| {
                 let view = element.borrow();
                 view.as_any().downcast_ref::<Button>().expect("a Button").get_text()
@@ -1918,16 +2076,15 @@ mod tests {
     #[test]
     fn rejecting_swaps_the_third_option_for_a_field() {
         let mut ui = gate_ui();
-        let (tx, mut rx) = oneshot::channel();
-        open_gate(&mut ui, "Allow all", tx);
+        let (_tx, mut rx) = permission_gate(&mut ui, "Allow all");
 
         press(&mut ui, VirtualKeyCode::Key3);
         ui.update();
-        assert!(!visible(&ui, GATE_REJECT), "the option gave up its place");
+        assert!(!visible(&ui, GATE_THREE), "the option gave up its place");
         assert!(visible(&ui, GATE_REPLY));
         // The first two answers stay reachable, so choosing to say something is
         // not a one-way door.
-        assert!(visible(&ui, GATE_ALLOW) && visible(&ui, GATE_ALL));
+        assert!(visible(&ui, GATE_ONE) && visible(&ui, GATE_TWO));
 
         set_edit(&mut ui, GATE_TEXT, "  read it first  ");
         // Enter reaches the field because it has the focus, which the swap gave
@@ -1943,7 +2100,7 @@ mod tests {
         ui.update();
         assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
         // And the panel is ready for the next question rather than mid-answer.
-        assert!(visible(&ui, GATE_REJECT) && !visible(&ui, GATE_REPLY));
+        assert!(visible(&ui, GATE_THREE) && !visible(&ui, GATE_REPLY));
         assert_eq!(edit_text(&mut ui, GATE_TEXT), "");
     }
 
@@ -1956,8 +2113,7 @@ mod tests {
     #[test]
     fn clicking_an_option_answers_without_panicking() {
         let mut ui = gate_ui();
-        let (tx, mut rx) = oneshot::channel();
-        open_gate(&mut ui, "Allow all", tx);
+        let (_tx, mut rx) = permission_gate(&mut ui, "Allow all");
         ui.force_layout();
 
         // In window coordinates, which is what dispatch is given: a view's own
@@ -1965,7 +2121,7 @@ mod tests {
         // origin before offering the point to its children.
         let rect_of = |id: &str| ui.get_view(id).expect("laid out").borrow().get_rect();
         let panel = rect_of(GATE);
-        let option = rect_of(GATE_ALLOW);
+        let option = rect_of(GATE_ONE);
         let middle = Point::new(
             panel.min.x + (option.min.x + option.max.x) / 2,
             panel.min.y + (option.min.y + option.max.y) / 2,
@@ -1989,7 +2145,7 @@ mod tests {
         }
         ui.update();
         assert!(visible(&ui, COMPOSER) && !visible(&ui, GATE));
-        assert!(visible(&ui, GATE_REJECT) && !visible(&ui, GATE_REPLY));
+        assert!(visible(&ui, GATE_THREE) && !visible(&ui, GATE_REPLY));
     }
 
     /// The check is derived from the current model, never stored — which is
