@@ -18,6 +18,8 @@ mod debug;
 mod gui;
 mod input;
 mod llm;
+#[cfg(feature = "gui")]
+mod markdown;
 mod modes;
 mod permissions;
 mod present;

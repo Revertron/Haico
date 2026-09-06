@@ -22,13 +22,13 @@
 //!
 //! ## What is deliberately unfinished
 //!
-//! Replies are plain text, not markdown — that is section 11.4, and it is the
-//! next thing. The transcript is a `Frame` of `RichText` children inside a
-//! `ScrollView` rather than a virtualized `RecyclerView`, which is fine for a
-//! session and wrong for a long one. And the permission dialog offers two
-//! answers where the terminal offers three: "allow for the rest of the session"
-//! is a scope decision a yes/no box cannot express, so it is not offered rather
-//! than being quietly folded into "yes".
+//! The transcript is a `Frame` of `RichText` children inside a `ScrollView`
+//! rather than a virtualized `RecyclerView`, which is fine for a session and
+//! wrong for a long one. Code blocks are not syntax-highlighted; that wants
+//! `syntect` emitting spans. And the permission dialog offers two answers where
+//! the terminal offers three: "allow for the rest of the session" is a scope
+//! decision a yes/no box cannot express, so it is not offered rather than being
+//! quietly folded into "yes".
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -219,8 +219,13 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             show(handle, move |ui| set_label(ui, STATUS, &text));
         }
         AgentEvent::ReplyStart => show(handle, |ui| close_open(ui)),
-        AgentEvent::ReplyEnd => show(handle, |ui| close_open(ui)),
-        AgentEvent::ReplyChunk(text) => show(handle, move |ui| stream(ui, OPEN_REPLY, &text, false)),
+        // Settled before the id is taken away, so the reply's last block is laid
+        // out as finished markdown rather than left provisional.
+        AgentEvent::ReplyEnd => show(handle, |ui| {
+            finish_reply(ui);
+            close_open(ui);
+        }),
+        AgentEvent::ReplyChunk(text) => show(handle, move |ui| stream_reply(ui, &text)),
         AgentEvent::ReasoningChunk(text) => {
             show(handle, move |ui| stream(ui, OPEN_REASONING, &text, true))
         }
@@ -506,7 +511,66 @@ fn block(ui: &mut UI, text: &str) {
     append(ui, element);
 }
 
-/// Append to the open reply, creating it on the first chunk.
+// The markdown being streamed into the open reply.
+//
+// A thread-local rather than a field, because every write to the window happens
+// in a one-shot closure on the UI thread: there is no long-lived object here to
+// hang it on, and the view itself is found by id. It is only ever touched from
+// the UI thread, which is what makes this safe rather than merely convenient.
+#[cfg(feature = "gui")]
+thread_local! {
+    static REPLY_MARKDOWN: RefCell<Option<crate::markdown::MarkdownView>> =
+        const { RefCell::new(None) };
+}
+
+/// Append a chunk of the model's answer, rendering it as markdown.
+///
+/// The reply is one `RichText` for the whole message, so it can be selected in
+/// one drag; the markdown renderer replaces only the block still being written.
+fn stream_reply(ui: &mut UI, text: &str) {
+    let existed = with_rich(ui, OPEN_REPLY, |view| {
+        REPLY_MARKDOWN.with(|md| {
+            let mut md = md.borrow_mut();
+            md.get_or_insert_with(|| crate::markdown::MarkdownView::new(PROSE)).push(view, text);
+        });
+    })
+    .is_some();
+    if existed {
+        ui.relayout();
+        follow_end(ui);
+        return;
+    }
+    let element = rich(OPEN_REPLY, PROSE);
+    if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
+        REPLY_MARKDOWN.with(|md| {
+            let mut md = md.borrow_mut();
+            *md = Some(crate::markdown::MarkdownView::new(PROSE));
+            if let Some(md) = md.as_mut() {
+                md.push(view, text);
+            }
+        });
+    }
+    append(ui, element);
+}
+
+/// The reply is over: settle the last block and forget the renderer, so the next
+/// reply starts from nothing rather than continuing this one's markdown.
+fn finish_reply(ui: &mut UI) {
+    with_rich(ui, OPEN_REPLY, |view| {
+        REPLY_MARKDOWN.with(|md| {
+            if let Some(md) = md.borrow_mut().as_mut() {
+                md.finish(view);
+            }
+        });
+    });
+    REPLY_MARKDOWN.with(|md| *md.borrow_mut() = None);
+    ui.relayout();
+}
+
+/// Append to the open view, creating it on the first chunk. Used for the chain
+/// of thought, which is not markdown — it is the model talking to itself, and
+/// running it through a renderer would put headings and lists in a stream of
+/// half-finished sentences.
 ///
 /// Uses `RichText::push`, so only the block being written into is reshaped —
 /// which is what makes streaming into one long message affordable.
@@ -610,8 +674,12 @@ mod tests {
     /// exported so the production path stays a single match.
     fn apply(ui: &mut UI, event: AgentEvent) {
         match event {
-            AgentEvent::ReplyStart | AgentEvent::ReplyEnd => close_open(ui),
-            AgentEvent::ReplyChunk(text) => stream(ui, OPEN_REPLY, &text, false),
+            AgentEvent::ReplyStart => close_open(ui),
+            AgentEvent::ReplyEnd => {
+                finish_reply(ui);
+                close_open(ui);
+            }
+            AgentEvent::ReplyChunk(text) => stream_reply(ui, &text),
             AgentEvent::ReasoningChunk(text) => stream(ui, OPEN_REASONING, &text, true),
             AgentEvent::ToolStarted { name, arguments, .. } => {
                 let summary = crate::render::tool_call_summary(&name, &arguments);
@@ -628,6 +696,44 @@ mod tests {
             AgentEvent::Finished { .. } => line(ui, "done in 2s", Tone::Muted),
             AgentEvent::DidTool { .. } | AgentEvent::Ask(_) => {}
         }
+    }
+
+    /// A markdown reply arriving in chunks, which is how it actually arrives.
+    /// Rendered small enough to read, and written out so the formatting can be
+    /// looked at rather than only asserted about.
+    #[test]
+    fn a_markdown_reply_renders() {
+        const REPLY: &str = "## What I found\n\nThe loop counts **after** the parse, so a call \
+             with bad `arguments` never advances it. Two things follow:\n\n\
+             - normal mode still stops at the round cap\n\
+             - auto mode skips that cap, so nothing stopped it\n\n\
+             Here is the fix:\n\n\
+             ```rust\nlet parsed = parse_tool_arguments(function);\n\
+             // Counted before the branches below.\nlet key = match &parsed {\n\
+             \x20   Ok(a) => a.to_string(),\n\x20   Err(_) => raw(function),\n};\n```\n\n\
+             > Measured: fifty rounds before, five after.\n\n\
+             See [the plan](plan.md) for the rest.";
+
+        let mut events = vec![AgentEvent::ReplyStart];
+        // Chunked the way a model streams: a few characters at a time, so every
+        // partial construct — an unclosed fence, a half-typed list marker — is
+        // seen and replaced.
+        let mut at = 0;
+        while at < REPLY.len() {
+            let mut next = (at + 7).min(REPLY.len());
+            while next < REPLY.len() && !REPLY.is_char_boundary(next) {
+                next += 1;
+            }
+            events.push(AgentEvent::ReplyChunk(REPLY[at..next].to_string()));
+            at = next;
+        }
+        events.push(AgentEvent::ReplyEnd);
+
+        let (children, drew) = render_events(events, "markdown");
+        assert!(drew, "the window rendered blank");
+        // One view for the whole reply, whatever its internal structure: that is
+        // what lets a person select the answer in a single drag.
+        assert_eq!(children, 1, "the reply should be one selectable view");
     }
 
     #[test]
