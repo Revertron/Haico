@@ -236,24 +236,23 @@ async fn converse(
 
     // The model list, fetched once so the Model menu can offer it.
     //
-    // Loaded models first, and only those when there are any: the rest of what a
-    // server reports are downloads rather than anything that is running, and on
-    // a machine with a library that is a menu of dozens. The full list is the
-    // fallback for when nothing is loaded at all, which is the same choice the
-    // REPL's picker makes and for the same reason.
+    // Every model the server knows, not only the loaded ones. The REPL's picker
+    // prefers loaded models, but that is a different question — "which one do we
+    // start with" — and this is switching mid-session, where an unloaded model is
+    // a perfectly good answer that the server will load on demand. Narrowing the
+    // menu to what is already in memory would take that away, so the loaded ones
+    // are *marked* instead and the list stays whole however long it is.
     //
-    // Best-effort either way: a server that cannot be reached leaves the menu
-    // absent, which says more than an empty menu would.
-    let loaded = fetch_loaded_models(&agent.config.llm_url, agent.config.token.as_deref()).await;
-    let models = match loaded.is_empty() {
-        false => loaded,
-        true => fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
-            .await
-            .unwrap_or_default(),
-    };
+    // Best-effort: a server that cannot be reached leaves the menu absent, which
+    // says more than an empty menu would.
+    let models = fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
+        .await
+        .unwrap_or_default();
     if !models.is_empty() {
+        let loaded =
+            fetch_loaded_models(&agent.config.llm_url, agent.config.token.as_deref()).await;
         let current = agent.model().to_string();
-        show(&handle, move |ui| add_model_menu(ui, models, &current));
+        show(&handle, move |ui| add_model_menu(ui, models, loaded, &current));
     }
 
     while let Ok(command) = input_rx.recv() {
@@ -931,12 +930,19 @@ fn command_for(item: &str) -> Option<Command> {
 /// Appended rather than filled in place, because `MenuBar` can add a menu but
 /// not replace one — so the menu simply is not there until the list is, which is
 /// also the honest thing to show when the server cannot be reached.
-fn add_model_menu(ui: &mut UI, models: Vec<String>, current: &str) {
+fn add_model_menu(ui: &mut UI, models: Vec<String>, loaded: Vec<String>, current: &str) {
     let Some(element) = ui.get_view(MENUBAR) else { return };
     let items = models
         .into_iter()
         .map(|model| {
-            let mark = if model == current { "• " } else { "   " };
+            // Which one is in use, and which are already in memory — the second
+            // matters because picking an unloaded one means waiting for it to
+            // load. Marked rather than filtered: everything stays reachable.
+            let mark = match (&model == current, loaded.contains(&model)) {
+                (true, _) => "● ",
+                (false, true) => "○ ",
+                (false, false) => "   ",
+            };
             MenuItem {
                 id: format!("{MENU_MODEL_PREFIX}{model}"),
                 icon_path: String::new(),
