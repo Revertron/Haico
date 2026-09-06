@@ -342,3 +342,35 @@ pub(crate) fn settings_of(
     }
     }
 
+
+/// A `Config` aimed at `url`, with everything else at its quietest: no config
+/// file, no search backend, no resume, and the inline renderer — a test owns no
+/// terminal to take the alternate screen of.
+///
+/// Spelled out field by field rather than derived from `Default`: the real
+/// defaults are decided by `parse_config`, and a `Default` impl on `Config`
+/// would be a second answer to that question, findable from production code and
+/// wrong there.
+pub(crate) fn test_config(url: &str) -> crate::Config {
+    crate::Config {
+        llm_url: url.to_string(),
+        token: None,
+        system_prompt: None,
+        model: None,
+        server: false,
+        url_supplied: true,
+        searxng: None,
+        context_arg: None,
+        temperature_arg: None,
+        max_tokens_arg: None,
+        top_p_arg: None,
+        top_k_arg: None,
+        min_p_arg: None,
+        repeat_penalty_arg: None,
+        file: Default::default(),
+        config_path: None,
+        resume: false,
+        tui: crate::Tui::Inline,
+        mouse: Default::default(),
+    }
+}

@@ -1719,7 +1719,40 @@ async fn run_turn(
                         }
                     };
 
-                    let arguments = match parse_tool_arguments(function) {
+                    let parsed = parse_tool_arguments(function);
+
+                    // Counted here, before any of the branches below, so a call that is
+                    // refused, denied *or malformed* counts too — retrying a call the
+                    // workspace or the user has already turned down, unchanged and
+                    // immediately, is a loop like any other. What it returned is
+                    // deliberately not part of the key: a build that fails three times in a
+                    // row with nothing done between the tries is stuck whatever the errors
+                    // say.
+                    //
+                    // The malformed case has to be counted *before* the parse, not after,
+                    // and that is not tidiness. The error arm below `continue`s, so
+                    // counting after it meant a model repeating a call whose arguments are
+                    // not JSON never advanced the run at all. In normal mode the round cap
+                    // still stopped it; in auto mode, which skips that cap on purpose
+                    // because there is nobody there to type "continue", nothing stopped it
+                    // and the turn span forever unattended. Keyed on the canonical form
+                    // when it parses (serde_json sorts object keys, so the same call always
+                    // renders to the same string) and on the raw argument text when it does
+                    // not, which is the only form a malformed call has.
+                    let args_key = match &parsed {
+                        Ok(arguments) => arguments.to_string(),
+                        Err(_) => function.get("arguments").map(|a| a.to_string()).unwrap_or_default(),
+                    };
+                    let call = (tool_name.to_string(), args_key);
+                    if last_call.as_ref() == Some(&call) {
+                        run.0 += 1;
+                    } else {
+                        last_call = Some(call);
+                        run = (1, tool_name.to_string());
+                        nudged_at = 0;
+                    }
+
+                    let arguments = match parsed {
                         Ok(arguments) => arguments,
                         Err(detail) => {
                             outln!("[ERROR] {}: {}", tool_name, detail);
@@ -1734,22 +1767,6 @@ async fn run_turn(
                             continue;
                         }
                     };
-
-                    // Counted here, before any of the branches below, so a call that is
-                    // refused or denied counts too — retrying a call the workspace or the
-                    // user has already turned down, unchanged and immediately, is a loop
-                    // like any other. What it returned is deliberately not part of the key:
-                    // a build that fails three times in a row with nothing done between the
-                    // tries is stuck whatever the errors say. serde_json sorts object keys,
-                    // so the same call always renders to the same string.
-                    let call = (tool_name.to_string(), arguments.to_string());
-                    if last_call.as_ref() == Some(&call) {
-                        run.0 += 1;
-                    } else {
-                        last_call = Some(call);
-                        run = (1, tool_name.to_string());
-                        nudged_at = 0;
-                    }
 
                     // The model can put itself into plan mode, for when the user asked for
                     // a plan rather than for the work. Nothing to approve: this only ever
@@ -2274,4 +2291,192 @@ async fn run_turn(
             let todos = agent.plan();
             save_session(path, &agent.messages, &agent.client.model, &todos);
         }
+}
+
+/// Tests that drive a whole turn against a fake LLM server. Separate from the
+/// module above because they need a Tokio runtime and the output capture, and
+/// because what they are pinning is different in kind: not a helper's output but
+/// the loop's invariants — the ones whose failure mode is the *next* request
+/// being rejected rather than anything visible in this one.
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    use crate::testutil::{serve_sequence, test_config};
+
+    /// One turn against `bodies`, returning the agent so the history can be
+    /// inspected, plus how many requests the server actually served.
+    async fn run_one(bodies: &'static [&'static str], input: &str) -> (Agent, usize) {
+        run_one_in(bodies, input, Mode::Normal).await
+    }
+
+    /// As `run_one`, in a chosen mode. Auto mode matters here because it is the
+    /// only one that skips `MAX_TOOL_ROUNDS`, so it is the only one where a
+    /// runaway turn has nothing but the repetition guard to stop it.
+    async fn run_one_in(
+        bodies: &'static [&'static str],
+        input: &str,
+        mode: Mode,
+    ) -> (Agent, usize) {
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = mode;
+        // No keyboard: the piped path, which is also the only one a test can
+        // drive. Anything that would prompt fails closed rather than hanging.
+        let mut io = TerminalIo {
+            keys: None,
+            editor: Editor::new(Vec::new()),
+            queued: Vec::new(),
+            plan_view: PlanView::default(),
+            last_activity: None,
+            history_path: None,
+        };
+        run_turn(&mut agent, &mut io, input, false).await;
+        let count = *served.lock().unwrap();
+        (agent, count)
+    }
+
+    /// Every `role: "tool"` reply in the history, as `(tool_call_id, content)`.
+    fn tool_replies(messages: &[Value]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .map(|m| {
+                (
+                    m.get("tool_call_id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    m.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The invariant that costs the most when it breaks, and shows nothing when
+    /// it does: **every `tool_call_id` must get a `role: "tool"` reply**, on
+    /// every path. An unanswered id is accepted by this request and rejected by
+    /// the *next* one, server-side, which is why it took a release to find and
+    /// why it is worth a test that asserts on the history rather than the screen.
+    ///
+    /// Both malformed shapes are covered at once because both used to `continue`
+    /// past the reply: a call with no function name, and one whose arguments are
+    /// not JSON. Local models emit the second often enough that it was the
+    /// original bug report.
+    #[tokio::test]
+    async fn every_tool_call_id_is_answered_even_when_malformed() {
+        let _capture = crate::out::capture_guard();
+        const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[
+                {"id":"call_no_name","type":"function","function":{"arguments":"{}"}},
+                {"id":"call_bad_args","type":"function","function":{"name":"read","arguments":"not json at all"}}
+            ]}}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"all done"}}]}"#;
+
+        let (agent, served) = run_one(&[MALFORMED, FINAL], "do something").await;
+        let replies = tool_replies(&agent.messages);
+        let ids: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"call_no_name") && ids.contains(&"call_bad_args"),
+            "an id went unanswered — the next request would be rejected. Replies: {replies:?}"
+        );
+
+        // Answered *with something the model can act on*, not merely answered:
+        // the point of replying to a malformed call is to say what was wrong.
+        let bad_args = replies.iter().find(|(id, _)| id == "call_bad_args").unwrap();
+        assert!(
+            bad_args.1.contains("read"),
+            "the reply does not name the tool that failed: {:?}",
+            bad_args.1
+        );
+
+        // And the turn went on to a second request and finished on the answer,
+        // rather than stopping at the malformed round.
+        assert_eq!(served, 2, "the turn did not come back for a final answer");
+        assert_eq!(
+            agent.messages.last().and_then(|m| m.get("content")).and_then(Value::as_str),
+            Some("all done")
+        );
+    }
+
+    /// A reply with no tool calls ends the turn on the answer, and the user's
+    /// message and the assistant's both land in the history — the ordinary case,
+    /// asserted so that the interesting ones above have a baseline.
+    #[tokio::test]
+    async fn a_plain_answer_ends_the_turn() {
+        let _capture = crate::out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello back"}}]}"#;
+
+        let (agent, served) = run_one(&[ANSWER], "hello").await;
+        assert_eq!(served, 1, "a turn with no tool calls should take one request");
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m.get("role").and_then(Value::as_str)).collect();
+        assert_eq!(roles.last(), Some(&"assistant"));
+        assert!(roles.contains(&"user"));
+        assert!(tool_replies(&agent.messages).is_empty());
+    }
+
+    /// `MAX_TOOL_ROUNDS` is not the only thing stopping a runaway turn, and in
+    /// auto mode it is not applied at all — the guard there is the identical call
+    /// repeated with nothing in between. A server that answers with the same
+    /// tool call forever must therefore still terminate.
+    #[tokio::test]
+    async fn an_identical_call_repeated_forever_still_terminates() {
+        let _capture = crate::out::capture_guard();
+        // `serve_sequence` repeats its last body forever, so this is a model that
+        // never stops asking for the same thing.
+        const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"same","type":"function","function":{"name":"read","arguments":"also not json"}}]}}]}"#;
+
+        let (agent, served) = run_one(&[SAME], "loop forever").await;
+        // The bound is what matters, not its exact value: without one this test
+        // would hang rather than fail.
+        assert!(served > 1, "the loop never came back for a second round");
+        // The claim is specifically that the *repetition* guard stopped it and
+        // not the round cap: `LOOP_BREAK` is 5 against a cap of 50, so a count
+        // in single figures is the identical-call run firing. A range rather
+        // than an exact number, because the nudge rounds are free to move.
+        assert!(
+            served <= 8,
+            "a repeated identical call ran for {served} rounds — that is the round cap \
+             stopping it, not the loop guard"
+        );
+        // However it stopped, every id it made is still answered.
+        let unanswered = agent
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_calls").is_some_and(|c| !c.is_null()))
+            .count()
+            - tool_replies(&agent.messages).len();
+        assert_eq!(unanswered, 0, "a round left its tool call unanswered");
+    }
+
+    /// The same runaway turn in **auto mode**, which is where it actually
+    /// mattered. Auto mode skips `MAX_TOOL_ROUNDS` deliberately — a fixed number
+    /// of rounds is a poor stand-in for "this is going nowhere", and a long job
+    /// that hits it unattended has nobody to say "continue" — so the repetition
+    /// guard is the *only* thing bounding it.
+    ///
+    /// This is the test that found the bug it now guards: the run counter used to
+    /// be incremented after `parse_tool_arguments`, whose error arm `continue`s,
+    /// so a model repeating a call whose arguments are not JSON never advanced
+    /// the run. In normal mode the cap still caught it. In auto mode nothing did,
+    /// and the turn span forever with no user present to stop it. Written second,
+    /// because writing it first would have hung the suite rather than failed.
+    #[tokio::test]
+    async fn auto_mode_still_bounds_a_repeated_malformed_call() {
+        let _capture = crate::out::capture_guard();
+        const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"same","type":"function","function":{"name":"read","arguments":"still not json"}}]}}]}"#;
+
+        let (agent, served) = run_one_in(&[SAME], "loop forever", Mode::Auto).await;
+        assert!(
+            served <= 8,
+            "auto mode ran {served} rounds of an identical malformed call: with no round 
+             cap there, the repetition guard is all there is and it did not fire"
+        );
+        assert_eq!(
+            agent.messages.iter().filter(|m| m.get("tool_calls").is_some_and(|c| !c.is_null())).count()
+                - tool_replies(&agent.messages).len(),
+            0,
+            "a round left its tool call unanswered"
+        );
+    }
 }
