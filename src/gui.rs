@@ -41,7 +41,7 @@ use lumio::types::rect;
 
 use crate::agent::{run_turn, Agent, Knob};
 use crate::config::Reasoning;
-use crate::llm::fetch_available_models;
+use crate::llm::{fetch_available_models, fetch_loaded_models};
 use crate::ask::Answer;
 use crate::modes::{Mode, PlanDecision};
 use crate::permissions::PermissionResponse;
@@ -234,12 +234,23 @@ async fn converse(
 ) {
     show(&handle, |ui| line(ui, "Ready. Type below, then Send or Ctrl+Enter.", Tone::Muted));
 
-    // The model list, fetched once so the Model menu can offer it. Best-effort:
-    // a server that cannot be reached simply leaves the menu absent, which says
-    // more than an empty menu would.
-    let models = fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
-        .await
-        .unwrap_or_default();
+    // The model list, fetched once so the Model menu can offer it.
+    //
+    // Loaded models first, and only those when there are any: the rest of what a
+    // server reports are downloads rather than anything that is running, and on
+    // a machine with a library that is a menu of dozens. The full list is the
+    // fallback for when nothing is loaded at all, which is the same choice the
+    // REPL's picker makes and for the same reason.
+    //
+    // Best-effort either way: a server that cannot be reached leaves the menu
+    // absent, which says more than an empty menu would.
+    let loaded = fetch_loaded_models(&agent.config.llm_url, agent.config.token.as_deref()).await;
+    let models = match loaded.is_empty() {
+        false => loaded,
+        true => fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
+            .await
+            .unwrap_or_default(),
+    };
     if !models.is_empty() {
         let current = agent.model().to_string();
         show(&handle, move |ui| add_model_menu(ui, models, &current));
