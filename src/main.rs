@@ -885,158 +885,48 @@ In force for '{}':", agent.client.model);
         // One command for every sampling knob rather than one command each. "/temp" is kept
         // as a shorthand for the one that gets touched most.
         if input == "/set" || input.starts_with("/set ") || input.starts_with("/temp") {
+            // `/temp 0.7` is the shorthand that predates `/set`, kept because it
+            // is what fingers already know.
             let rest = if let Some(rest) = input.strip_prefix("/temp") {
                 format!("temperature {}", rest.trim())
             } else {
                 input.strip_prefix("/set").unwrap_or("").trim().to_string()
             };
             let mut parts = rest.split_whitespace();
-            let name = parts.next().unwrap_or("").to_lowercase();
-            let value = parts.next().unwrap_or("").to_string();
+            let name = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
 
+            // No name: show everything. What each one *is* comes from the agent;
+            // the layout of the listing is this frontend's.
             if name.is_empty() {
-                outln!("  temperature     {}", agent.settings.temperature.describe());
-                outln!("  top_p           {}", agent.settings.top_p.describe());
-                outln!("  top_k           {}", agent.settings.top_k.describe());
-                outln!("  min_p           {}", agent.settings.min_p.describe());
-                outln!("  repeat_penalty  {}", agent.settings.repeat_penalty.describe());
-                outln!("  max_tokens      {}", agent.settings.max_tokens.describe());
-                outln!("  reasoning_threshold  {} tokens", agent.reasoning_threshold);
-                outln!("
-Usage: /set <name> <value>, or /set <name> unset
-");
+                for knob in Knob::ALL {
+                    outln!("  {:<20}{}", knob.name(), agent.knob(*knob));
+                }
+                outln!("\nUsage: /set <name> <value>, or /set <name> unset\n");
                 continue;
             }
 
-            // Canonical wire names, plus the abbreviations people actually type.
-            let canonical = match name.as_str() {
-                "temp" | "temperature" => "temperature",
-                "top_p" | "top-p" | "topp" => "top_p",
-                "top_k" | "top-k" | "topk" => "top_k",
-                "min_p" | "min-p" | "minp" => "min_p",
-                "repeat_penalty" | "repeat-penalty" | "repeat" | "penalty" => "repeat_penalty",
-                "max_tokens" | "max-tokens" | "max" => "max_tokens",
-                "reasoning_threshold" | "reasoning-threshold" | "threshold" => {
-                    "reasoning_threshold"
-                }
-                other => {
-                    outln!(
-                        "Unknown setting '{}'. Try: temperature, top_p, top_k, min_p, \
-                         repeat_penalty, max_tokens, reasoning_threshold.\n",
-                        other
-                    );
-                    continue;
-                }
+            let Some(knob) = Knob::parse(name) else {
+                outln!(
+                    "Unknown setting '{}'. Try: {}.\n",
+                    name,
+                    Knob::ALL.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
+                );
+                continue;
             };
 
-            // Handled here rather than through the machinery below, because this one is
-            // haico's own and not the server's: it never goes into a request, so there is
-            // nothing to apply to the two clients afterwards, and "unset" has to mean
-            // falling back to the config file rather than leaving a field out for the
-            // server to decide. Everything below this line is about the sampling knobs.
-            if canonical == "reasoning_threshold" {
-                if value.is_empty() {
-                    outln!("  reasoning_threshold  {} tokens
-", agent.reasoning_threshold);
-                } else if value == "unset" || value == "default" || value == "-" {
-                    agent.reasoning_threshold = agent.settings.reasoning_threshold();
-                    outln!(
-                        "reasoning_threshold back to {} tokens, as configured.
-",
-                        agent.reasoning_threshold
-                    );
-                } else if let Ok(parsed) = value.parse::<usize>() {
-                    agent.reasoning_threshold = parsed;
-                    outln!("reasoning_threshold = {} tokens for this session.
-", parsed);
-                } else {
-                    outln!(
-                        "reasoning_threshold needs a whole number of tokens, got '{}'.
-",
-                        value
-                    );
-                }
-                continue;
-            }
-
+            // A name with no value asks rather than sets.
             if value.is_empty() {
-                let shown = match canonical {
-                    "temperature" => agent.settings.temperature.describe(),
-                    "top_p" => agent.settings.top_p.describe(),
-                    "top_k" => agent.settings.top_k.describe(),
-                    "min_p" => agent.settings.min_p.describe(),
-                    "repeat_penalty" => agent.settings.repeat_penalty.describe(),
-                    _ => agent.settings.max_tokens.describe(),
-                };
-                outln!("  {}  {}
-", canonical, shown);
+                outln!("  {:<20}{}\n", knob.name(), agent.knob(knob));
                 continue;
             }
 
-            let clearing = value == "unset" || value == "default" || value == "-";
-            const SET_HERE: &str = "set with /set";
-
-            let applied = if clearing {
-                match canonical {
-                    "temperature" => agent.settings.temperature = Setting::unset(FROM_UNSET),
-                    "top_p" => agent.settings.top_p = Setting::unset(FROM_UNSET),
-                    "top_k" => agent.settings.top_k = Setting::unset(FROM_UNSET),
-                    "min_p" => agent.settings.min_p = Setting::unset(FROM_UNSET),
-                    "repeat_penalty" => agent.settings.repeat_penalty = Setting::unset(FROM_UNSET),
-                    _ => agent.settings.max_tokens = Setting::unset(FROM_UNSET),
-                }
-                true
-            } else {
-                // top_k and max_tokens are counts; sending 40.0 where a server wants an
-                // integer is a needless way to get a 400 back.
-                match canonical {
-                    "top_k" | "max_tokens" => match value.parse::<u64>() {
-                        Ok(parsed) => {
-                            let setting = Setting { value: Some(parsed), source: SET_HERE };
-                            if canonical == "top_k" {
-                                agent.settings.top_k = setting;
-                            } else {
-                                agent.settings.max_tokens = setting;
-                            }
-                            true
-                        }
-                        Err(_) => {
-                            outln!("{} needs a whole number, got '{}'.
-", canonical, value);
-                            false
-                        }
-                    },
-                    _ => match value.parse::<f64>() {
-                        Ok(parsed) => {
-                            let setting = Setting { value: Some(parsed), source: SET_HERE };
-                            match canonical {
-                                "temperature" => agent.settings.temperature = setting,
-                                "top_p" => agent.settings.top_p = setting,
-                                "min_p" => agent.settings.min_p = setting,
-                                _ => agent.settings.repeat_penalty = setting,
-                            }
-                            true
-                        }
-                        Err(_) => {
-                            outln!("{} needs a number, got '{}'.
-", canonical, value);
-                            false
-                        }
-                    },
-                }
-            };
-
-            if applied {
-                // Both clients, same as /model: web_fetch summarizes through the server's.
-                agent.client.apply_settings(&agent.settings);
-                agent.server.llm_client.apply_settings(&agent.settings);
-                if clearing {
-                    outln!("{} unset — the server decides again.
-", canonical);
-                } else {
-                    outln!("{} = {} for this session.
-", canonical, value);
-                }
+            match agent.set_knob(knob, Some(value)) {
+                Ok(()) => match agent.knob_value(knob) {
+                    Some(now) => outln!("{} = {} for this session.\n", knob.name(), now),
+                    None => outln!("{} unset — the server decides again.\n", knob.name()),
+                },
+                Err(complaint) => outln!("{}, got '{}'.\n", complaint, value),
             }
             continue;
         }

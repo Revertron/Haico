@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    autocompact_threshold, resolve_settings, Config, Reasoning, ResolvedSettings,
-    AUTOCOMPACT_FRACTION,
+    autocompact_threshold, resolve_settings, Config, Reasoning, ResolvedSettings, Setting,
+    AUTOCOMPACT_FRACTION, FROM_UNSET,
 };
 use crate::ask::{self, ASK_USER};
 use crate::llm::{Chunk, LMStudioClient};
@@ -1124,4 +1124,269 @@ mod send_check {
     const fn assert_send<T: Send>() {}
     #[allow(dead_code)]
     const _: () = assert_send::<super::Agent>();
+}
+
+// ---------------------------------------------------------------------------
+// Model settings
+// ---------------------------------------------------------------------------
+
+/// A model setting a frontend can read and change.
+///
+/// These were only ever reachable through `/set`, which meant the parsing, the
+/// canonical names and the "apply to both clients" step all lived inside one
+/// slash command. They are settings rather than commands — a window puts them in
+/// a dialog and never types a name at all — so the policy belongs here, and only
+/// the wording stays with each frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Knob {
+    Temperature,
+    TopP,
+    TopK,
+    MinP,
+    RepeatPenalty,
+    MaxTokens,
+    /// haico's own rather than the server's: it never goes into a request, so
+    /// there is nothing to apply to the clients afterwards, and clearing it means
+    /// falling back to the config file rather than letting the server decide.
+    ReasoningThreshold,
+}
+
+impl Knob {
+    /// Every knob, in the order a frontend should show them.
+    pub(crate) const ALL: &'static [Knob] = &[
+        Knob::Temperature,
+        Knob::TopP,
+        Knob::TopK,
+        Knob::MinP,
+        Knob::RepeatPenalty,
+        Knob::MaxTokens,
+        Knob::ReasoningThreshold,
+    ];
+
+    /// The canonical wire name — what the config file and the request field use.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Knob::Temperature => "temperature",
+            Knob::TopP => "top_p",
+            Knob::TopK => "top_k",
+            Knob::MinP => "min_p",
+            Knob::RepeatPenalty => "repeat_penalty",
+            Knob::MaxTokens => "max_tokens",
+            Knob::ReasoningThreshold => "reasoning_threshold",
+        }
+    }
+
+    /// Resolve a name a person typed, including the abbreviations they use.
+    pub(crate) fn parse(name: &str) -> Option<Knob> {
+        match name.to_lowercase().as_str() {
+            "temp" | "temperature" => Some(Knob::Temperature),
+            "top_p" | "top-p" | "topp" => Some(Knob::TopP),
+            "top_k" | "top-k" | "topk" => Some(Knob::TopK),
+            "min_p" | "min-p" | "minp" => Some(Knob::MinP),
+            "repeat_penalty" | "repeat-penalty" | "repeat" | "penalty" => {
+                Some(Knob::RepeatPenalty)
+            }
+            "max_tokens" | "max-tokens" | "max" => Some(Knob::MaxTokens),
+            "reasoning_threshold" | "reasoning-threshold" | "threshold" => {
+                Some(Knob::ReasoningThreshold)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this one is a count. `top_k` and `max_tokens` are: sending 40.0
+    /// where a server wants an integer is a needless way to get a 400 back.
+    fn is_count(self) -> bool {
+        matches!(self, Knob::TopK | Knob::MaxTokens | Knob::ReasoningThreshold)
+    }
+}
+
+impl Agent {
+    /// The knob's current value and where it came from, ready to show.
+    pub(crate) fn knob(&self, knob: Knob) -> String {
+        match knob {
+            Knob::Temperature => self.settings.temperature.describe(),
+            Knob::TopP => self.settings.top_p.describe(),
+            Knob::TopK => self.settings.top_k.describe(),
+            Knob::MinP => self.settings.min_p.describe(),
+            Knob::RepeatPenalty => self.settings.repeat_penalty.describe(),
+            Knob::MaxTokens => self.settings.max_tokens.describe(),
+            // Never absent: unset means the configured default, not "no value".
+            Knob::ReasoningThreshold => format!("{} tokens", self.reasoning_threshold),
+        }
+    }
+
+    /// The value alone, with no provenance — what a form field is filled with.
+    /// `None` for a knob that is not set, which a field shows as empty.
+    pub(crate) fn knob_value(&self, knob: Knob) -> Option<String> {
+        match knob {
+            Knob::Temperature => self.settings.temperature.value.map(|v| v.to_string()),
+            Knob::TopP => self.settings.top_p.value.map(|v| v.to_string()),
+            Knob::TopK => self.settings.top_k.value.map(|v| v.to_string()),
+            Knob::MinP => self.settings.min_p.value.map(|v| v.to_string()),
+            Knob::RepeatPenalty => self.settings.repeat_penalty.value.map(|v| v.to_string()),
+            Knob::MaxTokens => self.settings.max_tokens.value.map(|v| v.to_string()),
+            Knob::ReasoningThreshold => Some(self.reasoning_threshold.to_string()),
+        }
+    }
+
+    /// Set a knob for this session, or clear it back to what is configured.
+    ///
+    /// `None`, an empty string, or one of the words a person types to mean
+    /// "stop overriding it" all clear. `Err` carries what was wrong with the
+    /// text, for the frontend to say in its own words; nothing changes when it
+    /// does, so a rejected field leaves the session exactly as it was.
+    pub(crate) fn set_knob(&mut self, knob: Knob, value: Option<&str>) -> Result<(), String> {
+        const SET_HERE: &str = "set here";
+        let text = value.map(str::trim).filter(|v| !v.is_empty());
+        let clearing = text.is_none() || matches!(text, Some("unset" | "default" | "-"));
+
+        if knob == Knob::ReasoningThreshold {
+            // Its own path, because it is not a request field: clearing means the
+            // configured value rather than an absent one, and there is nothing to
+            // push to the clients.
+            self.reasoning_threshold = match text {
+                _ if clearing => self.settings.reasoning_threshold(),
+                Some(text) => text
+                    .parse::<usize>()
+                    .map_err(|_| format!("{} needs a whole number of tokens", knob.name()))?,
+                None => unreachable!("not clearing implies text"),
+            };
+            return Ok(());
+        }
+
+        if clearing {
+            match knob {
+                Knob::Temperature => self.settings.temperature = Setting::unset(FROM_UNSET),
+                Knob::TopP => self.settings.top_p = Setting::unset(FROM_UNSET),
+                Knob::TopK => self.settings.top_k = Setting::unset(FROM_UNSET),
+                Knob::MinP => self.settings.min_p = Setting::unset(FROM_UNSET),
+                Knob::RepeatPenalty => self.settings.repeat_penalty = Setting::unset(FROM_UNSET),
+                Knob::MaxTokens => self.settings.max_tokens = Setting::unset(FROM_UNSET),
+                Knob::ReasoningThreshold => unreachable!("handled above"),
+            }
+        } else {
+            let text = text.expect("not clearing implies text");
+            if knob.is_count() {
+                let parsed = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("{} needs a whole number", knob.name()))?;
+                let setting = Setting { value: Some(parsed), source: SET_HERE };
+                match knob {
+                    Knob::TopK => self.settings.top_k = setting,
+                    Knob::MaxTokens => self.settings.max_tokens = setting,
+                    _ => unreachable!("the only counts that reach here"),
+                }
+            } else {
+                let parsed = text
+                    .parse::<f64>()
+                    .map_err(|_| format!("{} needs a number", knob.name()))?;
+                let setting = Setting { value: Some(parsed), source: SET_HERE };
+                match knob {
+                    Knob::Temperature => self.settings.temperature = setting,
+                    Knob::TopP => self.settings.top_p = setting,
+                    Knob::MinP => self.settings.min_p = setting,
+                    Knob::RepeatPenalty => self.settings.repeat_penalty = setting,
+                    _ => unreachable!("the only reals that reach here"),
+                }
+            }
+        }
+
+        // Both clients, same as `switch_model`: the REPL drives one and
+        // `web_fetch` summarizes through the server's, so leaving one behind
+        // would silently keep the old sampling for half the work.
+        self.client.apply_settings(&self.settings);
+        self.server.llm_client.apply_settings(&self.settings);
+        Ok(())
+    }
+
+    /// Change what happens to a reply's chain of thought once the turn moves on.
+    pub(crate) fn set_reasoning(&mut self, reasoning: Reasoning) {
+        self.reasoning = reasoning;
+    }
+}
+
+#[cfg(test)]
+mod knob_tests {
+    use super::*;
+    use crate::testutil::test_config;
+
+    fn agent() -> Agent {
+        let cwd = std::env::current_dir().unwrap();
+        Agent::new(test_config("http://127.0.0.1:1"), "m".to_string(), &cwd)
+    }
+
+    #[test]
+    fn names_and_abbreviations_resolve() {
+        for knob in Knob::ALL {
+            assert_eq!(Knob::parse(knob.name()), Some(*knob), "{} should parse", knob.name());
+        }
+        // The short forms people actually type.
+        assert_eq!(Knob::parse("temp"), Some(Knob::Temperature));
+        assert_eq!(Knob::parse("TOP-P"), Some(Knob::TopP));
+        assert_eq!(Knob::parse("penalty"), Some(Knob::RepeatPenalty));
+        assert_eq!(Knob::parse("threshold"), Some(Knob::ReasoningThreshold));
+        assert_eq!(Knob::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn setting_and_clearing_round_trip() {
+        let mut agent = agent();
+        assert_eq!(agent.knob_value(Knob::Temperature), None, "starts unset");
+
+        agent.set_knob(Knob::Temperature, Some("0.7")).unwrap();
+        assert_eq!(agent.knob_value(Knob::Temperature), Some("0.7".to_string()));
+
+        // Every spelling of "stop overriding it" clears.
+        for clearing in ["unset", "default", "-", ""] {
+            agent.set_knob(Knob::Temperature, Some("0.7")).unwrap();
+            agent.set_knob(Knob::Temperature, Some(clearing)).unwrap();
+            assert_eq!(
+                agent.knob_value(Knob::Temperature),
+                None,
+                "{clearing:?} should clear it"
+            );
+        }
+        agent.set_knob(Knob::Temperature, Some("0.7")).unwrap();
+        agent.set_knob(Knob::Temperature, None).unwrap();
+        assert_eq!(agent.knob_value(Knob::Temperature), None);
+    }
+
+    /// A count must not accept a decimal: sending 40.0 where the server wants an
+    /// integer is a needless way to get a 400 back.
+    #[test]
+    fn counts_refuse_decimals_and_nothing_changes() {
+        let mut agent = agent();
+        agent.set_knob(Knob::TopK, Some("40")).unwrap();
+        let complaint = agent.set_knob(Knob::TopK, Some("40.5")).unwrap_err();
+        assert!(complaint.contains("whole number"), "unhelpful complaint: {complaint}");
+        // Rejected means unchanged, not half-applied.
+        assert_eq!(agent.knob_value(Knob::TopK), Some("40".to_string()));
+
+        let complaint = agent.set_knob(Knob::Temperature, Some("hot")).unwrap_err();
+        assert!(complaint.contains("number"), "unhelpful complaint: {complaint}");
+    }
+
+    /// The threshold is haico's own, not a request field: clearing it means the
+    /// configured value rather than an absent one, so it is never `None`.
+    #[test]
+    fn the_reasoning_threshold_falls_back_rather_than_unsetting() {
+        let mut agent = agent();
+        let configured = agent.knob_value(Knob::ReasoningThreshold).unwrap();
+        agent.set_knob(Knob::ReasoningThreshold, Some("1234")).unwrap();
+        assert_eq!(agent.knob_value(Knob::ReasoningThreshold), Some("1234".to_string()));
+        agent.set_knob(Knob::ReasoningThreshold, Some("unset")).unwrap();
+        assert_eq!(agent.knob_value(Knob::ReasoningThreshold), Some(configured));
+    }
+
+    /// Both clients get the sampling, because `web_fetch` summarizes through the
+    /// server's copy and half-applied sampling is the kind of thing nobody
+    /// notices until two identical prompts behave differently.
+    #[test]
+    fn sampling_reaches_both_clients() {
+        let mut agent = agent();
+        agent.set_knob(Knob::Temperature, Some("0.25")).unwrap();
+        assert_eq!(agent.client.temperature, Some(0.25));
+        assert_eq!(agent.server.llm_client.temperature, Some(0.25));
+    }
 }
