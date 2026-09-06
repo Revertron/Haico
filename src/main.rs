@@ -756,7 +756,7 @@ In force for '{}':", agent.client.model);
                 }
             );
             outln!(
-                "\nA '-' means the field is left out of the request, so the agent.server's own \
+                "\nA '-' means the field is left out of the request, so the server's own \
                  setting for that model applies."
             );
             outln!("Change one for this session with /set <name> <value>.\n");
@@ -803,7 +803,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 other => {
                     outln!(
                         "Unknown setting '{}'. Try: temperature, top_p, top_k, min_p, \
-                         repeat_penalty, max_tokens, agent.reasoning_threshold.\n",
+                         repeat_penalty, max_tokens, reasoning_threshold.\n",
                         other
                     );
                     continue;
@@ -817,22 +817,22 @@ Usage: /set <name> <value>, or /set <name> unset
             // server to decide. Everything below this line is about the sampling knobs.
             if canonical == "reasoning_threshold" {
                 if value.is_empty() {
-                    outln!("  agent.reasoning_threshold  {} tokens
+                    outln!("  reasoning_threshold  {} tokens
 ", agent.reasoning_threshold);
                 } else if value == "unset" || value == "default" || value == "-" {
                     agent.reasoning_threshold = agent.settings.reasoning_threshold();
                     outln!(
-                        "agent.reasoning_threshold back to {} tokens, as configured.
+                        "reasoning_threshold back to {} tokens, as configured.
 ",
                         agent.reasoning_threshold
                     );
                 } else if let Ok(parsed) = value.parse::<usize>() {
                     agent.reasoning_threshold = parsed;
-                    outln!("agent.reasoning_threshold = {} tokens for this session.
+                    outln!("reasoning_threshold = {} tokens for this session.
 ", parsed);
                 } else {
                     outln!(
-                        "agent.reasoning_threshold needs a whole number of tokens, got '{}'.
+                        "reasoning_threshold needs a whole number of tokens, got '{}'.
 ",
                         value
                     );
@@ -912,7 +912,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 agent.client.apply_settings(&agent.settings);
                 agent.server.llm_client.apply_settings(&agent.settings);
                 if clearing {
-                    outln!("{} unset — the agent.server decides again.
+                    outln!("{} unset — the server decides again.
 ", canonical);
                 } else {
                     outln!("{} = {} for this session.
@@ -1017,7 +1017,7 @@ Usage: /set <name> <value>, or /set <name> unset
                 outln!("  drop      strip it the moment the turn is over");
                 outln!(
                     "\nCompressing costs one extra request per reply and only runs on a \
-                     trace over ~{} tokens (/set agent.reasoning_threshold).\n",
+                     trace over ~{} tokens (/set reasoning_threshold).\n",
                     agent.reasoning_threshold
                 );
             } else if let Some(chosen) = Reasoning::parse(&rest) {
@@ -1773,12 +1773,12 @@ async fn run_turn(
                     // takes capability away, and present_plan is where consent is needed.
                     if tool_name == START_PLAN {
                         let content = if agent.mode == Mode::Plan {
-                            "Already in plan agent.mode. Investigate with the reading tools, then \
+                            "Already in plan mode. Investigate with the reading tools, then \
                              call present_plan."
                         } else {
                             agent.mode = Mode::Plan;
                             outln!("\n📋 Plan mode — investigating before changing anything.\n");
-                            "Plan agent.mode is active. The tools that change this machine are no \
+                            "Plan mode is active. The tools that change this machine are no \
                              longer available to you. Investigate the real code with read, \
                              grep, ls and glob_search, then call present_plan with what you \
                              propose. Do not start work until the user approves it."
@@ -1811,7 +1811,7 @@ async fn run_turn(
                             Ok(PlanDecision::Approve) => {
                                 agent.mode = Mode::Normal;
                                 outln!("\n✓ Plan approved — starting work.\n");
-                                "The user approved the plan. Plan agent.mode is over and the full \
+                                "The user approved the plan. Plan mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
                                     .to_string()
@@ -1828,7 +1828,7 @@ async fn run_turn(
                                 // The model is told nothing about the review. It should
                                 // propose the same call either way, and knowing it is being
                                 // checked is an invitation to write for the checker.
-                                "The user approved the plan. Plan agent.mode is over and the full \
+                                "The user approved the plan. Plan mode is over and the full \
                                  tool set is available again. Begin work now, following the \
                                  plan you just had approved."
                                     .to_string()
@@ -1837,7 +1837,7 @@ async fn run_turn(
                                 outln!("\n✗ Plan sent back for revision.\n");
                                 format!(
                                     "The user did not approve the plan. Their corrections: {}\n\n\
-                                     You are still in plan agent.mode and must not change anything. \
+                                     You are still in plan mode and must not change anything. \
                                      Fold this in — investigating further if you need to — and \
                                      call present_plan again.",
                                     feedback
