@@ -78,6 +78,29 @@ const MENU_MODE_AUTO: &str = "menu-mode-auto";
 /// ids are this prefix plus the model name.
 const MENU_MODEL_PREFIX: &str = "menu-model:";
 
+/// Menu icons, by the path [`Icons`] serves them under.
+const ICON_CURRENT: &str = "icons/check.svg";
+const ICON_LOADED: &str = "icons/memory.svg";
+
+/// The handful of icons the window needs, compiled in.
+///
+/// haico is one binary and stays one: an icon that has to be found on disk is an
+/// icon that is missing on somebody's machine. SVG rather than PNG because Lumio
+/// rasterizes SVG at the size it draws, so the same file is right on a HiDPI
+/// screen — see `assets/icons/README.md` for where they came from and why they
+/// carry an explicit fill.
+struct Icons;
+
+impl AssetsProvider for Icons {
+    fn get_file(&self, path: &str) -> Option<&[u8]> {
+        match path {
+            ICON_CURRENT => Some(include_bytes!("../assets/icons/check.svg")),
+            ICON_LOADED => Some(include_bytes!("../assets/icons/memory.svg")),
+            _ => None,
+        }
+    }
+}
+
 const LAYOUT: &str = r#"
 <Frame id="root" width="max" height="max" direction="vertical" padding="0">
     <MenuBar id="menubar" width="max" height="min">
@@ -108,6 +131,11 @@ const LAYOUT: &str = r#"
 
 /// Open a window and run `agent` behind it until the window closes.
 pub(crate) fn run(agent: Agent) -> Result<()> {
+    // Before anything is built, and on this thread: Lumio keeps the provider in
+    // thread-local storage and looks it up while drawing, so it has to be set on
+    // the thread that owns the window.
+    set_provider(Box::new(Icons));
+
     let mut ui = UI::from_xml(LAYOUT, 1040, 760, default_typeface(), 1.0)
         .ok_or_else(|| anyhow::anyhow!("the GUI layout failed to parse"))?;
 
@@ -938,15 +966,20 @@ fn add_model_menu(ui: &mut UI, models: Vec<String>, loaded: Vec<String>, current
             // Which one is in use, and which are already in memory — the second
             // matters because picking an unloaded one means waiting for it to
             // load. Marked rather than filtered: everything stays reachable.
-            let mark = match (&model == current, loaded.contains(&model)) {
-                (true, _) => "● ",
-                (false, true) => "○ ",
-                (false, false) => "   ",
+            //
+            // In the icon column a menu already has, rather than as a character
+            // in front of the text: a bullet glyph has to be paid for out of the
+            // label, so unmarked rows need matching padding to stay aligned and
+            // the model name starts in a different place depending on its state.
+            let icon = match (&model == current, loaded.contains(&model)) {
+                (true, _) => ICON_CURRENT,
+                (false, true) => ICON_LOADED,
+                (false, false) => "",
             };
             MenuItem {
                 id: format!("{MENU_MODEL_PREFIX}{model}"),
-                icon_path: String::new(),
-                text: format!("{mark}{model}"),
+                icon_path: icon.to_string(),
+                text: model,
                 separator: false,
                 children: Vec::new(),
             }
@@ -1356,6 +1389,70 @@ mod tests {
 
     /// Menu ids resolve to the commands they name, including the model items
     /// whose ids carry the model name in them.
+
+    /// The icons have to be served, parse as SVG, and be *visible* on the dark
+    /// skin the window opens with.
+    ///
+    /// The last part is the one worth a test. An MDI icon ships with no `fill`,
+    /// so it rasterizes black and vanishes against a dark menu — the file looks
+    /// fine, the provider finds it, and nothing appears. Rendering one on the
+    /// window's own background and demanding a pixel that is neither the
+    /// background nor black is what catches that.
+    #[test]
+    fn the_menu_icons_are_served_and_visible_on_the_dark_skin() {
+        use lumio::drawing::{set_current_palette, DrawableRegistry, Palette};
+        use lumio::render::render_to_pixmap;
+
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        // Thread-local, so a test thread needs its own.
+        set_provider(Box::new(Icons));
+        for path in [ICON_CURRENT, ICON_LOADED] {
+            let bytes = Icons.get_file(path).unwrap_or_else(|| panic!("{path} is not served"));
+            assert!(bytes.starts_with(b"<svg"), "{path} is not an SVG");
+            assert!(
+                String::from_utf8_lossy(bytes).contains("fill="),
+                "{path} has no explicit fill, so it will rasterize black and vanish"
+            );
+        }
+
+        let palette = Palette::dark();
+        set_current_palette(palette.clone());
+        let registry = DrawableRegistry::new();
+        let (w, h) = (64u32, 64u32);
+
+        for path in [ICON_CURRENT, ICON_LOADED] {
+            let xml = format!(
+                r#"<Frame width="max" height="max" padding="8">
+                     <ImageView id="icon" width="max" height="max" image="{path}"/>
+                   </Frame>"#
+            );
+            let mut ui = UI::from_xml(&xml, w, h, default_typeface(), 1.0).expect("layout");
+            ui.layout(w, h, 1.0);
+            let pixmap = render_to_pixmap(&ui, w, h, 1.0, &palette, &registry).expect("pixmap");
+
+            // The corner is background; anything the icon drew differs from it.
+            let px = pixmap.pixels();
+            let background = px[0];
+            let drew = px.iter().any(|p| {
+                (p.red(), p.green(), p.blue()) != (background.red(), background.green(), background.blue())
+            });
+            assert!(drew, "{path} rendered nothing at all");
+
+            // And what it drew is lighter than the dark ground, rather than the
+            // black an unfilled MDI path would give.
+            let brightest = px
+                .iter()
+                .map(|p| p.red() as u32 + p.green() as u32 + p.blue() as u32)
+                .max()
+                .unwrap_or(0);
+            let ground = background.red() as u32 + background.green() as u32 + background.blue() as u32;
+            assert!(
+                brightest > ground + 60,
+                "{path} is not lighter than the dark background it sits on \
+                 (brightest {brightest}, ground {ground}) — it would be invisible"
+            );
+        }
+    }
     #[test]
     fn menu_items_map_to_commands() {
         assert!(matches!(command_for(MENU_SETTINGS), Some(Command::OpenSettings)));
