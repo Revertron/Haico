@@ -75,8 +75,22 @@ const MENU_MODE_NORMAL: &str = "menu-mode-normal";
 const MENU_MODE_PLAN: &str = "menu-mode-plan";
 const MENU_MODE_AUTO: &str = "menu-mode-auto";
 /// The Model menu is built from the server's list once it arrives, so its item
-/// ids are this prefix plus the model name.
+/// ids are this prefix plus the model name, and its title is how the menu is
+/// found again when the check has to move.
 const MENU_MODEL_PREFIX: &str = "menu-model:";
+const MENU_MODEL: &str = "Model";
+
+/// What the server said it had, when it was asked.
+///
+/// Held for as long as the window is open because the Model menu is rebuilt
+/// from it whenever the current model changes. Not re-fetched at that point:
+/// switching is not a good moment to wait on the server, and a list that grew
+/// stale in one direction (a model loaded since) is a better menu than no menu
+/// while a request is in flight.
+struct Models {
+    all: Vec<String>,
+    loaded: Vec<String>,
+}
 
 /// Menu icons, by the path [`Icons`] serves them under.
 const ICON_CURRENT: &str = "icons/check.svg";
@@ -273,21 +287,28 @@ async fn converse(
     //
     // Best-effort: a server that cannot be reached leaves the menu absent, which
     // says more than an empty menu would.
-    let models = fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
+    let all = fetch_available_models(&agent.config.llm_url, agent.config.token.as_deref())
         .await
         .unwrap_or_default();
-    if !models.is_empty() {
-        let loaded =
-            fetch_loaded_models(&agent.config.llm_url, agent.config.token.as_deref()).await;
+    let models = Arc::new(match all.is_empty() {
+        true => Models { all, loaded: Vec::new() },
+        false => Models {
+            all,
+            loaded: fetch_loaded_models(&agent.config.llm_url, agent.config.token.as_deref())
+                .await,
+        },
+    });
+    if !models.all.is_empty() {
         let current = agent.model().to_string();
-        show(&handle, move |ui| add_model_menu(ui, models, loaded, &current));
+        let models = Arc::clone(&models);
+        show(&handle, move |ui| add_model_menu(ui, &models, &current));
     }
 
     while let Ok(command) = input_rx.recv() {
         let input = match command {
             Command::Send(input) => input,
             other => {
-                if !obey(&mut agent, &handle, &tx, other) {
+                if !obey(&mut agent, &handle, &tx, &models, other) {
                     break;
                 }
                 continue;
@@ -958,10 +979,42 @@ fn command_for(item: &str) -> Option<Command> {
 /// Appended rather than filled in place, because `MenuBar` can add a menu but
 /// not replace one — so the menu simply is not there until the list is, which is
 /// also the honest thing to show when the server cannot be reached.
-fn add_model_menu(ui: &mut UI, models: Vec<String>, loaded: Vec<String>, current: &str) {
+fn add_model_menu(ui: &mut UI, models: &Models, current: &str) {
     let Some(element) = ui.get_view(MENUBAR) else { return };
-    let items = models
-        .into_iter()
+    let items = model_items(models, current);
+    if let Some(bar) = element.borrow_mut().as_any_mut().downcast_mut::<MenuBar>() {
+        bar.add_menu(MENU_MODEL, items);
+    }
+    ui.relayout();
+}
+
+/// Move the check to `current`, by rebuilding the Model menu's items.
+///
+/// The whole menu rather than the two rows that changed, because "which row
+/// holds the check" is not state this keeps — it is derived from the current
+/// model each time, so there is nothing to get out of step. The dropdown is
+/// built from these items as it opens, so the change is there the next time it
+/// is opened, which is the first time anyone can see it.
+///
+/// False when there is no Model menu to remark, which is the ordinary state of
+/// a session whose server never answered with a list.
+fn remark_model_menu(ui: &mut UI, models: &Models, current: &str) -> bool {
+    let Some(element) = ui.get_view(MENUBAR) else { return false };
+    let items = model_items(models, current);
+    // Bound rather than chained: the borrow guard would otherwise outlive
+    // `element` itself, there being no statement after it to end it.
+    let mut view = element.borrow_mut();
+    match view.as_any_mut().downcast_mut::<MenuBar>() {
+        Some(bar) => bar.set_menu_items(MENU_MODEL, items),
+        None => false,
+    }
+}
+
+/// One row per model the server knows, marked with what haico knows about it.
+fn model_items(models: &Models, current: &str) -> Vec<MenuItem> {
+    models
+        .all
+        .iter()
         .map(|model| {
             // Which one is in use, and which are already in memory — the second
             // matters because picking an unloaded one means waiting for it to
@@ -971,7 +1024,7 @@ fn add_model_menu(ui: &mut UI, models: Vec<String>, loaded: Vec<String>, current
             // in front of the text: a bullet glyph has to be paid for out of the
             // label, so unmarked rows need matching padding to stay aligned and
             // the model name starts in a different place depending on its state.
-            let icon = match (&model == current, loaded.contains(&model)) {
+            let icon = match (model == current, models.loaded.contains(model)) {
                 (true, _) => ICON_CURRENT,
                 (false, true) => ICON_LOADED,
                 (false, false) => "",
@@ -979,16 +1032,12 @@ fn add_model_menu(ui: &mut UI, models: Vec<String>, loaded: Vec<String>, current
             MenuItem {
                 id: format!("{MENU_MODEL_PREFIX}{model}"),
                 icon_path: icon.to_string(),
-                text: model,
+                text: model.clone(),
                 separator: false,
                 children: Vec::new(),
             }
         })
-        .collect();
-    if let Some(bar) = element.borrow_mut().as_any_mut().downcast_mut::<MenuBar>() {
-        bar.add_menu("Model", items);
-    }
-    ui.relayout();
+        .collect()
 }
 
 /// Empty the transcript, for `Clear`.
@@ -1021,6 +1070,7 @@ fn obey(
     agent: &mut Agent,
     handle: &UiHandle,
     tx: &mpsc::Sender<Command>,
+    models: &Arc<Models>,
     command: Command,
 ) -> bool {
     match command {
@@ -1072,7 +1122,11 @@ fn obey(
         Command::SwitchModel(model) => {
             agent.switch_model(model.clone());
             let said = format!("now using {model}");
-            show(handle, move |ui| line(ui, &said, Tone::Normal));
+            let models = Arc::clone(models);
+            show(handle, move |ui| {
+                remark_model_menu(ui, &models, &model);
+                line(ui, &said, Tone::Normal);
+            });
         }
         Command::Clear => {
             // What survives a clear and what does not is the agent's business,
@@ -1438,6 +1492,7 @@ mod tests {
             });
             assert!(drew, "{path} rendered nothing at all");
 
+
             // And what it drew is lighter than the dark ground, rather than the
             // black an unfilled MDI path would give.
             let brightest = px
@@ -1453,6 +1508,100 @@ mod tests {
             );
         }
     }
+    /// The check is derived from the current model, never stored — which is
+    /// the whole fix. It used to be written once when the list arrived, so
+    /// switching left it sitting on the model that was current at startup.
+    #[test]
+    fn the_check_follows_the_current_model() {
+        let models = Models {
+            all: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            loaded: vec!["alpha".into(), "beta".into()],
+        };
+        let icons = |current: &str| -> Vec<String> {
+            model_items(&models, current).into_iter().map(|item| item.icon_path).collect()
+        };
+
+        // Loaded and in use, loaded, and neither.
+        assert_eq!(icons("alpha"), [ICON_CURRENT, ICON_LOADED, ""]);
+
+        // Switching moves the check, and hands the model it left behind back
+        // the marker its loaded state earns it.
+        assert_eq!(icons("beta"), [ICON_LOADED, ICON_CURRENT, ""]);
+
+        // Including onto one the server has not loaded, which is a legitimate
+        // choice: the server loads it on demand.
+        assert_eq!(icons("gamma"), [ICON_LOADED, ICON_LOADED, ICON_CURRENT]);
+
+        // A model the list never mentioned marks nothing rather than guessing.
+        assert_eq!(icons("delta"), [ICON_LOADED, ICON_LOADED, ""]);
+    }
+
+    /// The bug this is for: picking a model moved nothing. The icon logic was
+    /// right and the menu could be rebuilt — what was missing was the call
+    /// between them, so the check has to be followed the whole way, from the
+    /// command a click produces to the item the menu ends up holding.
+    #[test]
+    fn switching_moves_the_check_all_the_way_to_the_menu() {
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
+        let handle = ui.handle();
+
+        let models = Arc::new(Models {
+            all: vec!["alpha".into(), "beta".into()],
+            loaded: vec!["alpha".into()],
+        });
+        add_model_menu(&mut ui, &models, "alpha");
+
+        let icons = |ui: &UI| -> Vec<String> {
+            let bar = ui.get_view(MENUBAR).expect("menubar");
+            let bar = bar.borrow();
+            bar.as_any()
+                .downcast_ref::<MenuBar>()
+                .expect("a MenuBar")
+                .menu_items(MENU_MODEL)
+                .expect("the Model menu")
+                .into_iter()
+                .map(|item| item.icon_path)
+                .collect()
+        };
+        assert_eq!(icons(&ui), [ICON_CURRENT, ""]);
+
+        // Exactly what a click on the second row produces.
+        let command = command_for(&format!("{MENU_MODEL_PREFIX}beta")).expect("a command");
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent =
+            Agent::new(crate::testutil::test_config("http://127.0.0.1:1"), "alpha".into(), &cwd);
+        let (tx, _rx) = mpsc::channel::<Command>();
+        assert!(obey(&mut agent, &handle, &tx, &models, command));
+        assert_eq!(agent.model(), "beta");
+
+        // Queued, not run: it takes a tick on the UI thread, which is what the
+        // window does for itself and a test has to do for it.
+        assert_eq!(icons(&ui), [ICON_CURRENT, ""], "not until the UI ticks");
+        ui.update();
+        assert_eq!(icons(&ui), [ICON_LOADED, ICON_CURRENT]);
+    }
+
+    /// The two halves have to name the same menu: `set_menu_items` finds it by
+    /// title, and a title that did not match would fail silently, leaving
+    /// exactly the stale check this replaced.
+    #[test]
+    fn remarking_finds_the_menu_that_was_added() {
+        lumio::backend::set_render_backend(RenderBackend::Software);
+        let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
+        let models = Models { all: vec!["alpha".into()], loaded: Vec::new() };
+
+        assert!(!remark_model_menu(&mut ui, &models, "alpha"), "no Model menu yet");
+        add_model_menu(&mut ui, &models, "alpha");
+        assert!(remark_model_menu(&mut ui, &models, "alpha"));
+
+        // And it replaced the menu rather than adding a second one beside it.
+        let bar = ui.get_view(MENUBAR).expect("menubar");
+        let bar = bar.borrow();
+        let titles = bar.as_any().downcast_ref::<MenuBar>().expect("a MenuBar").menu_titles();
+        assert_eq!(titles.iter().filter(|t| *t == MENU_MODEL).count(), 1);
+    }
+
     #[test]
     fn menu_items_map_to_commands() {
         assert!(matches!(command_for(MENU_SETTINGS), Some(Command::OpenSettings)));
