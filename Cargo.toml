@@ -4,7 +4,20 @@ version = "0.2.13"
 edition = "2021"
 description = "Interactive CLI coding assistant for local LLMs (via LM Studio) with a custom “MCP” tool router."
 
+# The GUI frontend is opt-in: it pulls winit, glutin, image and resvg, which is a
+# lot of dependency for a tool whose first job is a terminal. `cargo build
+# --features gui` gets a binary that answers `--gui`; without it that flag says so
+# and exits.
+[features]
+default = []
+gui = ["dep:lumio-gui"]
+
 [dependencies]
+# Both backends, which gives GL with an automatic software fallback: haico gets
+# run in VMs and over forwarded displays, and the cost of the second backend is
+# tree size rather than runtime. The software one is also what makes the GUI
+# testable — it renders to a pixmap with no window at all.
+lumio-gui = { path = "../Lumio", optional = true, features = ["backend-software"] }
 rmcp = { version = "3.1.0", features = ["transport-io"] }
 reqwest = { version = "0.13.4", features = ["json", "gzip", "deflate", "brotli", "zstd", "cookies"] }
 serde_json = "1.0"

@@ -14,6 +14,8 @@ mod agent;
 mod ask;
 mod config;
 mod debug;
+#[cfg(feature = "gui")]
+mod gui;
 mod input;
 mod llm;
 mod modes;
@@ -474,6 +476,14 @@ async fn main() -> Result<()> {
     // Server mode: hand off to the MCP stdio server and return (no banner, no REPL).
     if config.server {
         return run_mcp_server(config).await;
+    }
+
+    // The window, as a third entry beside the REPL and the MCP server. It needs
+    // the model chosen first — picking one is a conversation, and the GUI has no
+    // picker yet — so `--gui` without `--model` says so rather than opening an
+    // empty window.
+    if config.gui {
+        return run_gui(config);
     }
 
     // From here on the keyboard is read a key at a time rather than a line at a time,
@@ -1719,4 +1729,42 @@ mod turn_tests {
         assert_eq!(roles.last(), Some(&"user"));
         assert!(tool_replies(&agent.messages).is_empty());
     }
+}
+
+/// The window frontend, when this binary was built with it.
+///
+/// Not `async`: winit owns the main thread and `lumio::run` blocks on it, so the
+/// Tokio runtime the conversation needs is created on the worker inside
+/// `gui::run` instead. That is also why this is reached before `main` takes the
+/// terminal — there is no terminal to take.
+#[cfg(feature = "gui")]
+fn run_gui(config: Config) -> Result<()> {
+    let Some(model) = config.model.clone().filter(|m| !m.is_empty()) else {
+        eprintln!(
+            "--gui needs --model for now: choosing a model is a conversation, and the window \
+             has no picker yet."
+        );
+        return Ok(());
+    };
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut agent = Agent::new(config, model, &cwd);
+    // Same as the REPL: resume only when asked, and report nothing if there is
+    // nothing to report — the window shows its own greeting.
+    if agent.config.resume {
+        if let Err(e) = agent.resume() {
+            eprintln!("could not resume: {e:#}");
+        }
+    }
+    gui::run(agent)
+}
+
+/// The same flag in a build without the feature. Says so and exits, rather than
+/// falling back to the REPL — a silent fallback looks like the flag worked.
+#[cfg(not(feature = "gui"))]
+fn run_gui(_config: Config) -> Result<()> {
+    eprintln!(
+        "this haico was built without the GUI. Rebuild with `cargo build --release \
+         --features gui` to use --gui."
+    );
+    Ok(())
 }

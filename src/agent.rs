@@ -1115,3 +1115,13 @@ pub(crate) async fn run_turn(
             save_session(path, &agent.messages, &agent.client.model, &todos);
         }
 }
+
+#[cfg(test)]
+mod send_check {
+    /// The GUI runs winit on the main thread and the conversation on a worker,
+    /// so the agent has to be movable between them. Asserted at compile time
+    /// rather than discovered when the frontend is half-written.
+    const fn assert_send<T: Send>() {}
+    #[allow(dead_code)]
+    const _: () = assert_send::<super::Agent>();
+}

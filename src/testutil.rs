@@ -358,6 +358,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         system_prompt: None,
         model: None,
         server: false,
+        gui: false,
         url_supplied: true,
         searxng: None,
         context_arg: None,

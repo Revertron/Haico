@@ -95,6 +95,10 @@ pub(crate) struct Config {
     pub(crate) system_prompt: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) server: bool,
+    // Open a window rather than driving the terminal. Only meaningful in a build
+    // with the `gui` feature; without it `main` says so and exits rather than
+    // silently falling back to the REPL, which would look like the flag worked.
+    pub(crate) gui: bool,
     pub(crate) url_supplied: bool,
     pub(crate) searxng: Option<String>,
     // The model's context window, in tokens. Only used to tell the user how close the
@@ -141,6 +145,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("", "repeat-penalty", "Repetition penalty (default: leave it to the server)", "VALUE");
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
+    opts.optflag("", "gui", "Open a window instead of using the terminal");
     opts.optflag("h", "help", "Print this help message");
 
     let matches = match opts.parse(&args[1..]) {
@@ -218,6 +223,7 @@ pub(crate) fn parse_config() -> Result<Config> {
 
     // Run as an stdio MCP server instead of the interactive REPL
     let server = matches.opt_present("server");
+    let gui = matches.opt_present("gui");
 
     // SearxNG instance for web_search, replacing DuckDuckGo when set.
     // Priority: command-line arg > environment variable > none (DuckDuckGo).
@@ -269,6 +275,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         system_prompt,
         model,
         server,
+        gui,
         url_supplied,
         searxng,
         context_arg,
@@ -649,6 +656,7 @@ mod tests {
             system_prompt: None,
             model: None,
             server: false,
+            gui: false,
             url_supplied: false,
             searxng: None,
             context_arg: None,
