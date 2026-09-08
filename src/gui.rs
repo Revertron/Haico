@@ -63,6 +63,11 @@ const OPEN_REASONING: &str = "reasoning-open";
 const PROSE: f32 = 15.0;
 const CODE: f32 = 13.0;
 
+/// Default window width
+const WIN_WIDTH: u32 = 1280;
+/// Default window height
+const WIN_HEIGHT: u32 = 800;
+
 /// The question panel and its parts. It takes the composer's place while a turn
 /// waits on an answer — a gated call, a plan to approve — so the two are never
 /// on screen together and there is one thing to do at a time.
@@ -173,7 +178,7 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
     // the thread that owns the window.
     set_provider(Box::new(Icons));
 
-    let mut ui = UI::from_xml(LAYOUT, 1040, 760, default_typeface(), 1.0)
+    let mut ui = UI::from_xml(LAYOUT, WIN_WIDTH, WIN_HEIGHT, default_typeface(), 1.0)
         .ok_or_else(|| anyhow::anyhow!("the GUI layout failed to parse"))?;
 
     // Commands, UI thread to worker. A plain std channel: the worker blocks on
@@ -266,7 +271,7 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
     }
     let signal = Shutdown(input_tx, Arc::clone(&running));
 
-    lumio::run(ui, WindowConfig::new("haico", 1040, 760).center().skin("dark"));
+    lumio::run(ui, WindowConfig::new("haico", WIN_WIDTH, WIN_HEIGHT).center().skin("dark"));
 
     drop(signal);
     let _ = worker.join();
@@ -1494,7 +1499,7 @@ mod tests {
         // nothing here; this is the harness, not the frontend.
         lumio::backend::set_render_backend(RenderBackend::Software);
 
-        let (w, h) = (1040u32, 760u32);
+        let (w, h) = (WIN_WIDTH, WIN_HEIGHT);
         let palette = Palette::dark();
         set_current_palette(palette.clone());
         let registry = DrawableRegistry::new();

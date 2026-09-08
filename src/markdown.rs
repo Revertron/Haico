@@ -45,7 +45,7 @@ const HANGING: f32 = 14.0;
 /// not a preference.
 const INLINE_CODE_SCALE: f32 = 0.86;
 
-/// Streams markdown into one `RichText`.
+/// Streams Markdown into one `RichText`.
 ///
 /// Holds no reference to the view: the caller owns it, and hands it in on each
 /// chunk. That keeps this usable from anywhere the view can be reached, which in
