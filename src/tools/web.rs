@@ -22,12 +22,16 @@ pub(crate) struct WebGetParams {
     pub(crate) url: String,
 }
 
-// Outcome of fetching and cleaning a web page: either a cross-host redirect notice to
-// surface to the caller, or the cleaned, size-limited page text.
+// Outcome of fetching and cleaning a web page: the cleaned, size-limited page text, or
+// one of the two reasons there is no page text to hand back. Both of those carry the
+// sentence to give the caller rather than an error, because a model that is told a URL
+// redirected elsewhere or was blocked by a challenge can act on it, and an error struct
+// printed at it cannot be acted on at all.
 
 #[derive(Clone)]
 pub(crate) enum FetchResult {
     Redirect(String),
+    Blocked(String),
     Text { final_url: String, text: String },
 }
 
@@ -94,6 +98,42 @@ pub(crate) fn browser_client() -> Result<reqwest::Client, McpError> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
+}
+
+// Why a fetched page's status is read before its body.
+//
+// A blocked request still answers with a body, and that body is still valid HTML, so the
+// readability pass downstream turns one into a page like any other. Stack Overflow behind
+// Cloudflare came back to `web_get` as the single line "Enable JavaScript and cookies to
+// continue", reported as a successful read — the model was told it had read the question.
+//
+// Two signals, because they do not always agree. The status catches an ordinary failure
+// (404, 500, a plain 403). `cf-mitigated: challenge` is what Cloudflare labels its own
+// interstitials with, and it does not only send them with a 4xx, so a challenge served
+// with a 200 is only visible in the header.
+
+pub(crate) fn blocked_reason(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<String> {
+    let challenged = headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("challenge"));
+
+    if challenged {
+        return Some(format!(
+            "blocked by a bot-detection challenge (HTTP {}). The page was not served; \
+             its content is not available to fetch",
+            status.as_u16()
+        ));
+    }
+
+    if !status.is_success() {
+        return Some(format!("the server answered HTTP {}", status));
+    }
+
+    None
 }
 
 // Resolve a search result's URL into an absolute, scheme-carrying one.
@@ -391,6 +431,17 @@ impl MyMcpServer {
             return Ok(result);
         }
 
+        // Nothing is cached on this path, deliberately: a challenge is a statement about
+        // this request, not about the URL, so storing it would hand the same stub back to
+        // every later fetch in the session — including the research sub-agent's, which
+        // shares this cache — without ever asking the site again.
+        if let Some(reason) = blocked_reason(response.status(), response.headers()) {
+            return Ok(FetchResult::Blocked(format!(
+                "Failed to fetch {}: {}",
+                final_url, reason
+            )));
+        }
+
         // Get the response body
         let html = response
             .text()
@@ -426,6 +477,9 @@ impl MyMcpServer {
             FetchResult::Redirect(message) => {
                 return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
             }
+            FetchResult::Blocked(message) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
             FetchResult::Text { final_url, text } => (final_url, text),
         };
 
@@ -459,6 +513,9 @@ impl MyMcpServer {
         let (final_url, text) = match self.fetch_clean_text(&params.0.url).await? {
             FetchResult::Redirect(message) => {
                 return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
+            }
+            FetchResult::Blocked(message) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
             }
             FetchResult::Text { final_url, text } => (final_url, text),
         };
@@ -628,6 +685,42 @@ mod tests {
             "https://example.com/page"
         );
         assert_eq!(resolve_result_url(None, ""), "");
+    }
+
+
+    #[test]
+    fn reports_an_unsuccessful_status() {
+        use reqwest::header::HeaderMap;
+        use reqwest::StatusCode;
+
+        assert!(blocked_reason(StatusCode::OK, &HeaderMap::new()).is_none());
+
+        let reason = blocked_reason(StatusCode::NOT_FOUND, &HeaderMap::new()).unwrap();
+        assert!(reason.contains("404"), "{}", reason);
+    }
+
+
+    #[test]
+    fn names_a_cloudflare_challenge_even_on_a_200() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        use reqwest::StatusCode;
+
+        // The header Stack Overflow's 403 interstitial carries, verbatim.
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-mitigated", HeaderValue::from_static("challenge"));
+
+        let reason = blocked_reason(StatusCode::FORBIDDEN, &headers).unwrap();
+        assert!(reason.contains("bot-detection challenge"), "{}", reason);
+
+        // A challenge does not have to arrive with a failing status, which is the whole
+        // reason the header is consulted as well.
+        let reason = blocked_reason(StatusCode::OK, &headers).unwrap();
+        assert!(reason.contains("bot-detection challenge"), "{}", reason);
+
+        // Some other value in that header is not a challenge.
+        let mut other = HeaderMap::new();
+        other.insert("cf-mitigated", HeaderValue::from_static("rewrite"));
+        assert!(blocked_reason(StatusCode::OK, &other).is_none());
     }
 
 
