@@ -231,18 +231,77 @@ pub(crate) fn test_server() -> crate::MyMcpServer {
     )
     }
 
-    // A scratch file with a unique name, cleaned up by the caller.
+// A directory under the OS temp folder that takes itself away again.
+//
+// The fixtures used to leave theirs behind. Each one is named for the process and the
+// thread, so nothing collided and every run looked clean — while the temp folder
+// collected one directory per test per run, thousands of them before anyone noticed.
+//
+// Removed on the way in as well as out: a run killed halfway through (Ctrl+C, a
+// harness panic) leaves the directory, and the next run to land on the same name would
+// otherwise find a fixture it did not plant.
+pub(crate) struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    // `label` only has to tell the fixtures apart — the process and thread are already
+    // in the name, which is what keeps two tests running at once out of each other's way.
+    pub(crate) fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "haico-{}-{}-{:?}",
+            label,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn join(&self, tail: &str) -> std::path::PathBuf {
+        self.path.join(tail)
+    }
+
+    // A subdirectory, created, for a fixture that needs several.
+    pub(crate) fn subdir(&self, name: &str) -> std::path::PathBuf {
+        let path = self.path.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+thread_local! {
+    // The scratch directory belongs to the running test, and a thread-local is the only
+    // place a guard for it can live: `scratch` hands back a plain path to thirty-odd
+    // call sites, none of which is holding anything, and a test binary has no exit hook
+    // to sweep up at the end. libtest gives each test its own thread, so the directory
+    // is made when the first scratch file is asked for and removed when that thread
+    // ends — including when the test panicked, which is the one case where the files
+    // would have been worth keeping. Measured with `--test-threads=1` as well, where the
+    // tests are serialized but still each get a thread; a harness that ever stopped doing
+    // that would leave the directory behind, which is what every run did before this.
+    static SCRATCH_DIR: TempDir = TempDir::new("test");
+}
+
+    // A scratch file with a unique name, in a directory that goes with the test.
 
 pub(crate) fn scratch(name: &str, contents: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "haico-test-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
+    SCRATCH_DIR.with(|dir| {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    })
     }
 
 

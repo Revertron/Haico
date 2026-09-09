@@ -41,6 +41,10 @@ pub(crate) struct Workspace {
     // the whole reason to list it is that it is somewhere the model has business reading
     // and no business changing.
     readable: Vec<PathBuf>,
+    // This session's scratch directory, which is also in `writable` — it is remembered
+    // separately because it is the one writable root that is not the user's work, and
+    // both the system prompt and the auto-mode reviewer have to say so.
+    scratch: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -51,7 +55,29 @@ impl Workspace {
                 .iter()
                 .map(|p| absolute_path(&expand_home(p)))
                 .collect(),
+            scratch: None,
         }
+    }
+
+    // Point the workspace at this session's scratch directory, replacing whatever was
+    // there before.
+    //
+    // Replacing rather than adding: `/clear` deletes the old directory and makes a new
+    // one, and a writable root that no longer exists would stay in the list, be shown by
+    // `/workspace`, and let a write recreate a directory nothing is going to clean up.
+    pub(crate) fn set_scratch(&mut self, path: Option<&Path>) {
+        if let Some(old) = self.scratch.take() {
+            self.writable.retain(|root| root != &old);
+        }
+        if let Some(path) = path {
+            let resolved = absolute_path(path);
+            self.writable.push(resolved.clone());
+            self.scratch = Some(resolved);
+        }
+    }
+
+    pub(crate) fn scratch(&self) -> Option<&Path> {
+        self.scratch.as_deref()
     }
 
     // Add a directory to the session's writable set.
@@ -140,6 +166,55 @@ impl Workspace {
         note
     }
 
+    // What the auto-mode reviewer is told about the boundary.
+    //
+    // Separate wording from `note()` because the reviewer is told to deny anything that
+    // touches files "outside the project directory", and it is shown one call with no
+    // conversation behind it. Without this it reads a write into a directory under the
+    // system temp folder as exactly that — while the temp directory in question is the
+    // one haico created for the session and told the agent to use.
+    pub(crate) fn review_note(&self) -> String {
+        let list = |roots: &[PathBuf]| {
+            roots
+                .iter()
+                .map(|r| {
+                    let scratch = self.scratch.as_deref() == Some(r.as_path());
+                    if scratch {
+                        format!(
+                            "- {} — this session's scratch directory, created by the tool \
+                             itself under the system temp folder. Writing, overwriting and \
+                             deleting throwaway files here is ordinary work.",
+                            display_path(r)
+                        )
+                    } else {
+                        format!("- {}", display_path(r))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut note = format!(
+            "\n\nThe agent is working under these directories. For the rules above they all \
+             count as its project:\n{}",
+            list(&self.writable)
+        );
+
+        if !self.readable.is_empty() {
+            note.push_str(&format!(
+                "\n\nThese it may read but never write:\n{}",
+                list(&self.readable)
+            ));
+        }
+
+        note.push_str(
+            "\n\nThe file tools already refuse every other path before it reaches you. A \
+             shell command is not bounded that way — it can reach anything the user can, \
+             which is the case you are here to judge.",
+        );
+        note
+    }
+
     // Why this call cannot proceed, if it cannot.
     //
     // The message is written for the model as much as the user: it says which boundary was
@@ -206,22 +281,24 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
     use serde_json::json;
 
-    fn scratch_dirs() -> (PathBuf, PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("haico-ws-{}", std::process::id()));
-        let project = base.join("project");
-        let client = base.join("client");
-        let elsewhere = base.join("elsewhere");
-        for dir in [&project, &client, &elsewhere] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        (project, client, elsewhere)
+    // Real directories, not invented paths: every comparison here goes through
+    // `absolute_path`, which canonicalizes, and canonicalizing only resolves a path that
+    // exists. The guard comes back with them and has to be *bound* — `let (_, project,
+    // ..)` drops the directory before the first assertion runs.
+    fn scratch_dirs() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let base = TempDir::new("ws");
+        let project = base.subdir("project");
+        let client = base.subdir("client");
+        let elsewhere = base.subdir("elsewhere");
+        (base, project, client, elsewhere)
     }
 
     #[test]
     fn the_working_directory_is_writable_and_everywhere_else_is_not() {
-        let (project, _, elsewhere) = scratch_dirs();
+        let (_base, project, _, elsewhere) = scratch_dirs();
         let workspace = Workspace::new(&project, &[]);
 
         assert!(workspace.may_write(&project.join("src/main.rs")));
@@ -235,7 +312,7 @@ mod tests {
 
     #[test]
     fn adding_a_directory_makes_it_a_first_class_part_of_the_workspace() {
-        let (project, client, elsewhere) = scratch_dirs();
+        let (_base, project, client, elsewhere) = scratch_dirs();
         let mut workspace = Workspace::new(&project, &[]);
 
         assert!(!workspace.may_write(&client.join("app.ts")));
@@ -261,9 +338,62 @@ mod tests {
         assert_eq!(workspace.writable_roots().len(), 2);
     }
 
+    // The scratch directory is a writable root like any other, or the model is told to
+    // put its throwaway files somewhere the file tools then refuse to write.
+    #[test]
+    fn the_scratch_directory_is_writable_and_is_replaced_rather_than_piled_up() {
+        let (_base, project, first, second) = scratch_dirs();
+        let mut workspace = Workspace::new(&project, &[]);
+
+        assert!(!workspace.may_write(&first.join("draft.py")));
+        assert!(workspace.scratch().is_none());
+
+        workspace.set_scratch(Some(&first));
+        assert!(workspace.may_write(&first.join("draft.py")));
+        assert_eq!(workspace.writable_roots().len(), 2);
+        assert_eq!(workspace.scratch(), workspace.writable_roots().last().map(|p| p.as_path()));
+
+        // /clear deletes the old directory and makes another. The root has to move with
+        // it — left behind, a write would recreate a directory nothing will clean up.
+        workspace.set_scratch(Some(&second));
+        assert!(workspace.may_write(&second.join("draft.py")));
+        assert!(!workspace.may_write(&first.join("draft.py")));
+        assert_eq!(workspace.writable_roots().len(), 2);
+
+        // And a session that could not make one is not left with a phantom root.
+        workspace.set_scratch(None);
+        assert!(!workspace.may_read(&second.join("draft.py")));
+        assert_eq!(workspace.writable_roots().len(), 1);
+        assert!(workspace.may_write(&project.join("src/main.rs")));
+    }
+
+    // The reviewer denies writes "outside the project directory" and is shown one call
+    // with no history, so the scratch directory has to arrive labelled — otherwise the
+    // one place haico told the agent to write is the one it gets refused for.
+    #[test]
+    fn the_reviewer_is_told_which_directory_is_scratch() {
+        let (_base, project, scratch, library) = scratch_dirs();
+        let mut workspace = Workspace::new(&project, &[library.display().to_string()]);
+        workspace.set_scratch(Some(&scratch));
+
+        let note = workspace.review_note();
+        assert!(note.contains(&display_path(&project)));
+        assert!(note.contains(&display_path(&scratch)));
+        assert!(note.contains("scratch directory"), "got: {}", note);
+        assert!(note.contains("read but never write"), "got: {}", note);
+        assert!(note.contains(&display_path(&library)));
+
+        // The project's own root must not be described as scratch.
+        let line = note
+            .lines()
+            .find(|l| l.contains(&display_path(&project)))
+            .unwrap();
+        assert!(!line.contains("scratch"), "got: {}", line);
+    }
+
     #[test]
     fn configured_read_paths_can_be_read_but_never_written() {
-        let (project, library, _) = scratch_dirs();
+        let (_base, project, library, _) = scratch_dirs();
         let workspace = Workspace::new(&project, &[library.display().to_string()]);
 
         assert!(workspace.may_read(&library.join("src/lib.rs")));
@@ -275,7 +405,7 @@ mod tests {
 
     #[test]
     fn refusals_name_the_boundary_that_was_hit() {
-        let (project, library, elsewhere) = scratch_dirs();
+        let (_base, project, library, elsewhere) = scratch_dirs();
         let workspace = Workspace::new(&project, &[library.display().to_string()]);
 
         // In-bounds work says nothing at all.
@@ -385,7 +515,7 @@ mod tests {
 
     #[test]
     fn a_relative_path_cannot_climb_out_of_the_workspace() {
-        let (project, _, elsewhere) = scratch_dirs();
+        let (_base, project, _, elsewhere) = scratch_dirs();
         let workspace = Workspace::new(&project, &[]);
 
         // The escape that matters: dots are resolved before the comparison, so this lands

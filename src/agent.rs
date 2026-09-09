@@ -41,6 +41,7 @@ use crate::prompt::{compose_system_prompt, load_project_context, load_user_conte
 // pending change, which the turn has to compute because only it has the old file.
 // How much of it to show is the frontend's, and that half lives there.
 use crate::render::file_change_diff;
+use crate::scratch::Scratch;
 use crate::session::{
     apply_reasoning, compact_history, estimate_tokens, load_session,
     reasoning_needs_a_request, save_session, session_file_path, set_system_message,
@@ -109,6 +110,10 @@ pub(crate) struct Agent {
     /// end in auto mode should not quietly resume deciding things for the user.
     pub(crate) mode: Mode,
     pub(crate) workspace: Workspace,
+    /// This session's scratch directory. Held here because it is the
+    /// conversation's, not the machine's: `clear` renews it, and dropping the
+    /// agent takes it away.
+    scratch: Scratch,
 }
 
 impl Agent {
@@ -125,15 +130,22 @@ impl Agent {
 
         let project_context = load_project_context();
         let user_context = load_user_context();
+
+        // Before the prompt, not after: the prompt names the scratch directory, and the
+        // file tools can only write there because the workspace was told about it.
+        let scratch = Scratch::new();
+        let mut workspace = Workspace::new(cwd, &config.file.read_paths);
+        workspace.set_scratch(scratch.path());
+
         let system_prompt = compose_system_prompt(
             config.system_prompt.as_deref(),
             &client.model,
             settings.use_system_prompt,
             user_context.as_deref(),
             project_context.as_ref(),
+            &workspace,
         );
 
-        let workspace = Workspace::new(cwd, &config.file.read_paths);
         let context_tokens = settings.context_tokens;
         let reasoning = settings.reasoning();
         let reasoning_threshold = settings.reasoning_threshold();
@@ -157,6 +169,7 @@ impl Agent {
             review_cache: ReviewCache::new(),
             mode: Mode::Normal,
             workspace,
+            scratch,
         };
         agent.seed_system_message();
         agent
@@ -205,21 +218,29 @@ impl Agent {
     /// them, and no verdict is invalidated by this — the reviewer never saw the
     /// conversation); the plan (pinned above the input box, a plan for work that
     /// was just discarded would sit there for the rest of the session); and the
-    /// reasoning savings, which were savings on the history that just went.
+    /// scratch directory, whose contents are working notes for the conversation
+    /// that is going. The reasoning savings go too — they were savings on the
+    /// history that just went.
     pub(crate) fn clear(&mut self) -> ContextReload {
         let reloaded = load_project_context();
         let outcome = if reloaded == self.project_context {
             ContextReload::Unchanged
         } else {
             self.project_context = reloaded;
-            // Only the prompt: the history is about to be cleared anyway, so
-            // replacing the system message in it would be work thrown away.
-            self.recompose_system_prompt();
             match &self.project_context {
                 Some((name, _)) => ContextReload::Reloaded(name.clone()),
                 None => ContextReload::Gone,
             }
         };
+
+        // The new directory has a new name, so the prompt is rebuilt whether the
+        // project's instructions changed or not — otherwise the fresh
+        // conversation would be handed the path of a directory that was just
+        // deleted. Only the prompt: the history is about to be cleared anyway,
+        // so replacing the system message in it would be work thrown away.
+        self.scratch.renew();
+        self.workspace.set_scratch(self.scratch.path());
+        self.recompose_system_prompt();
 
         self.messages.clear();
         self.seed_system_message();
@@ -239,6 +260,7 @@ impl Agent {
             self.settings.use_system_prompt,
             self.user_context.as_deref(),
             self.project_context.as_ref(),
+            &self.workspace,
         );
         let changed = rebuilt != self.system_prompt;
         self.system_prompt = rebuilt;
@@ -847,7 +869,13 @@ pub(crate) async fn run_turn(
                             tx,
                             link,
                             Waiting::ReviewingCall,
-                            judge_tool_call(&agent.client, &mut agent.review_cache, tool_name, &arguments),
+                            judge_tool_call(
+                                &agent.client,
+                                &mut agent.review_cache,
+                                &agent.workspace,
+                                tool_name,
+                                &arguments,
+                            ),
                         )
                         .await;
 
@@ -1103,6 +1131,7 @@ pub(crate) async fn run_turn(
                     agent.settings.use_system_prompt,
                     agent.user_context.as_deref(),
                     agent.project_context.as_ref(),
+                    &agent.workspace,
                 );
                 set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
             }
@@ -1388,5 +1417,46 @@ mod knob_tests {
         agent.set_knob(Knob::Temperature, Some("0.25")).unwrap();
         assert_eq!(agent.client.temperature, Some(0.25));
         assert_eq!(agent.server.llm_client.temperature, Some(0.25));
+    }
+}
+
+/// The session's scratch directory, from the conversation's side: it has to be
+/// somewhere the file tools may write, the model has to be told where it is, and
+/// clearing the conversation has to take it away.
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use crate::testutil::test_config;
+
+    fn system_message(agent: &Agent) -> String {
+        agent.messages[0]["content"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn a_session_gets_a_writable_scratch_directory_and_clear_replaces_it() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config("http://127.0.0.1:1"), "m".to_string(), &cwd);
+
+        let first = agent.workspace.scratch().expect("a session has one").to_path_buf();
+        assert!(first.is_dir());
+        // Writable, or the model is being pointed at a directory the file tools refuse.
+        assert!(agent.workspace.may_write(&first.join("draft.py")));
+        // And named, or it is unguessable and the model invents "C:\Temp" instead.
+        assert!(system_message(&agent).contains(&crate::util::display_path(&first)));
+
+        std::fs::write(first.join("draft.py"), "print(1)").unwrap();
+        agent.clear();
+
+        let second = agent.workspace.scratch().expect("cleared, not removed").to_path_buf();
+        assert_ne!(first, second);
+        assert!(!first.exists(), "the cleared conversation's files survived");
+        assert!(agent.workspace.may_write(&second.join("draft.py")));
+        assert!(!agent.workspace.may_write(&first.join("draft.py")));
+
+        // The prompt is rebuilt whether or not the project's instructions changed —
+        // otherwise the fresh conversation is handed a path that was just deleted.
+        let system = system_message(&agent);
+        assert!(system.contains(&crate::util::display_path(&second)), "got: {}", system);
+        assert!(!system.contains(&crate::util::display_path(&first)));
     }
 }

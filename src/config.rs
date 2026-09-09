@@ -783,6 +783,9 @@ mod tests {
     #[test]
     fn a_model_can_be_configured_without_haico_s_own_prompt() {
         use crate::{compose_system_prompt, resolve_settings};
+        use crate::workspace::Workspace;
+
+        let workspace = Workspace::new(&std::env::current_dir().unwrap(), &[]);
 
         let config = config_with(
             r#"
@@ -810,6 +813,7 @@ mod tests {
             false,
             Some("USER RULES"),
             Some(&project),
+            &workspace,
         )
         .expect("project instructions still make a system message");
         assert!(bare.contains("USER RULES"));
@@ -818,17 +822,28 @@ mod tests {
         assert!(!bare.contains("# Tone and style"), "got: {}", bare);
 
         // ...and with nothing to say at all there is no system message to send.
-        assert!(compose_system_prompt(Some("CUSTOM"), "raw-model", false, None, None).is_none());
+        assert!(
+            compose_system_prompt(Some("CUSTOM"), "raw-model", false, None, None, &workspace)
+                .is_none()
+        );
 
         // On: unchanged from before — custom prompt if given, ours otherwise, project
         // instructions appended either way.
         let custom =
-            compose_system_prompt(Some("CUSTOM"), "guided-model", true, None, Some(&project))
-                .expect("a prompt is in force");
+            compose_system_prompt(
+                Some("CUSTOM"),
+                "guided-model",
+                true,
+                None,
+                Some(&project),
+                &workspace,
+            )
+            .expect("a prompt is in force");
         assert!(custom.starts_with("CUSTOM"));
         assert!(custom.contains("PROJECT RULES"));
         let ours =
-            compose_system_prompt(None, "guided-model", true, None, None).expect("built-in");
+            compose_system_prompt(None, "guided-model", true, None, None, &workspace)
+                .expect("built-in");
         assert!(ours.contains("guided-model"));
     }
 

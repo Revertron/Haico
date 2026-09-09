@@ -1,6 +1,7 @@
 //! The system prompt and the project's own instruction file.
 
-use crate::util::{run_git_command, truncate_at_boundary};
+use crate::util::{display_path, run_git_command, truncate_at_boundary};
+use crate::workspace::Workspace;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ pub(crate) fn get_main_branch() -> String {
 }
 
 
-pub(crate) fn build_system_prompt(model: &str) -> String {
+pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String {
     let pwd = env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
@@ -84,6 +85,27 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
 
     let main_branch = get_main_branch();
 
+    // Named because it is otherwise unguessable. A model told to write a throwaway script
+    // and given nowhere to put it picks "C:\Temp" or "/tmp" — a path the workspace then
+    // refuses, on a machine whose real temp directory it was never shown.
+    let scratch_dir = match workspace.scratch() {
+        Some(path) => display_path(path),
+        None => "none — this session has none, so keep temporary files in the working \
+                 directory"
+            .to_string(),
+    };
+
+    let read_paths = if workspace.readable_roots().is_empty() {
+        "none".to_string()
+    } else {
+        workspace
+            .readable_roots()
+            .iter()
+            .map(|r| display_path(r))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     SYSTEM_PROMPT
         .replace("$pwd", &pwd)
         .replace("$is_repo", &is_repo.to_string())
@@ -91,6 +113,8 @@ pub(crate) fn build_system_prompt(model: &str) -> String {
         .replace("$os_version", os_version)
         .replace("$shell", shell)
         .replace("$date", &date)
+        .replace("$scratch_dir", &scratch_dir)
+        .replace("$read_paths", &read_paths)
         .replace("$branch", &branch)
         .replace("$main_branch", &main_branch)
         .replace("$git_status", &git_status)
@@ -120,13 +144,14 @@ pub(crate) fn compose_system_prompt(
     use_system_prompt: bool,
     user_context: Option<&str>,
     project_context: Option<&(String, String)>,
+    workspace: &Workspace,
 ) -> Option<String> {
     let mut content = if !use_system_prompt {
         String::new()
     } else if let Some(custom) = custom {
         custom.to_string()
     } else {
-        build_system_prompt(model)
+        build_system_prompt(model, workspace)
     };
 
     // Appended to whichever prompt is in use, so a custom --system-prompt gets these too,
@@ -455,24 +480,21 @@ fn readme(root: &Path) -> Option<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
 
     // Its own directory rather than testutil::scratch, because build_init_prompt lists the
-    // whole directory and scratch is shared by every test on the thread.
-    fn init_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "haico-init-{}-{}-{:?}",
-            std::process::id(),
-            name,
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    // whole directory and one test's fixture would show up in another's listing.
+    fn init_dir(name: &str) -> TempDir {
+        TempDir::new(&format!("init-{}", name))
     }
 
     // The order is the whole point: the project's file has to come after the user's, or
     // "takes precedence over the guidance above" in each section says the wrong thing and
     // the more specific file is the one that loses.
+    fn ws() -> Workspace {
+        Workspace::new(&env::current_dir().unwrap(), &[])
+    }
+
     #[test]
     fn user_instructions_sit_between_ours_and_the_project_s() {
         let project = ("HAICO.md".to_string(), "PROJECT RULES".to_string());
@@ -483,6 +505,7 @@ mod tests {
             true,
             Some("USER RULES"),
             Some(&project),
+            &ws(),
         )
         .expect("everything is present");
 
@@ -494,10 +517,38 @@ mod tests {
 
         // Alone it is still a system message, and without anything above it the sentence
         // about taking precedence is left out.
-        let alone = compose_system_prompt(None, "some-model", false, Some("USER RULES"), None)
-            .expect("the user's own file is enough on its own");
+        let alone =
+            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, &ws())
+                .expect("the user's own file is enough on its own");
         assert!(alone.starts_with("# User instructions"), "got: {}", alone);
         assert!(!alone.contains("takes precedence"), "got: {}", alone);
+    }
+
+    // The two lines this whole thing exists for: a model that is not told the real temp
+    // directory writes to "C:\Temp" and has the write refused, and one that is not told
+    // what it may read discovers the read-only roots by being refused too.
+    #[test]
+    fn the_env_block_names_the_scratch_directory_and_the_read_only_roots() {
+        let base = init_dir("env-block");
+        let scratch = base.subdir("scratch");
+        let library = base.subdir("library");
+
+        let mut workspace = Workspace::new(base.path(), &[library.display().to_string()]);
+        workspace.set_scratch(Some(&scratch));
+
+        let prompt = build_system_prompt("some-model", &workspace);
+
+        let shown = crate::util::display_path(workspace.scratch().unwrap());
+        assert!(prompt.contains(&format!("Scratch directory: {}", shown)), "got: {}", prompt);
+        assert!(prompt.contains("Read-only directories:"), "got: {}", prompt);
+        assert!(prompt.contains(&crate::util::display_path(&library)), "got: {}", prompt);
+        assert!(!prompt.contains("$scratch_dir") && !prompt.contains("$read_paths"));
+
+        // Nothing configured is "none" rather than an empty line, which reads as a
+        // substitution that failed.
+        let bare = build_system_prompt("some-model", &Workspace::new(base.path(), &[]));
+        assert!(bare.contains("Read-only directories: none"), "got: {}", bare);
+        assert!(bare.contains("Scratch directory: none —"), "got: {}", bare);
     }
 
     #[test]
@@ -508,7 +559,7 @@ mod tests {
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("target")).unwrap();
 
-        let prompt = build_init_prompt(&dir);
+        let prompt = build_init_prompt(dir.path());
 
         assert!(prompt.contains("HAICO.md"), "no target file named:\n{}", prompt);
         assert!(prompt.contains("Cargo.toml"));
@@ -525,9 +576,9 @@ mod tests {
         let dir = init_dir("existing");
         fs::write(dir.join("CLAUDE.md"), "# Rules\n\nNever touch generated code.\n").unwrap();
 
-        assert_eq!(init_target_file(&dir), "CLAUDE.md");
+        assert_eq!(init_target_file(dir.path()), "CLAUDE.md");
 
-        let prompt = build_init_prompt(&dir);
+        let prompt = build_init_prompt(dir.path());
         assert!(prompt.contains("`CLAUDE.md`"), "wrong target:\n{}", prompt);
         assert!(!prompt.contains("`HAICO.md`"));
         assert!(prompt.contains("Never touch generated code."));
@@ -541,7 +592,7 @@ mod tests {
         let dir = init_dir("empty");
         fs::write(dir.join("AGENTS.md"), "\n  \n").unwrap();
 
-        assert_eq!(init_target_file(&dir), "HAICO.md");
+        assert_eq!(init_target_file(dir.path()), "HAICO.md");
     }
 }
 

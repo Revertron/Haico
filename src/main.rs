@@ -26,6 +26,7 @@ mod present;
 mod prompt;
 mod readable;
 mod render;
+mod scratch;
 mod session;
 #[cfg(test)]
 mod testutil;
@@ -712,7 +713,11 @@ async fn main() -> Result<()> {
         if input == "/workspace" {
             outln!("Readable and writable:");
             for root in agent.workspace.writable_roots() {
-                outln!("  {}", display_path(root));
+                // The scratch directory is in this list and looks like a stray temp path
+                // without the label — it is haico's own, not something the user added.
+                let scratch = agent.workspace.scratch() == Some(root.as_path());
+                let suffix = if scratch { "   (this session's scratch directory)" } else { "" };
+                outln!("  {}{}", display_path(root), suffix);
             }
             if agent.workspace.readable_roots().is_empty() {
                 outln!("Readable only: none configured (see 'read_paths' in the config file).");
