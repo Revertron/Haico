@@ -1366,7 +1366,7 @@ mod turn_tests {
         input: &str,
         mode: Mode,
     ) -> (Agent, usize) {
-        run_and_watch(bodies, input, mode).await.0
+        run_and_watch(bodies, input, mode, Reasoning::Keep).await.0
     }
 
     /// As `run_one_in`, but also every event the turn emitted.
@@ -1377,15 +1377,21 @@ mod turn_tests {
     /// `Ask` arriving here is answered by nobody, so its reply channel drops and
     /// the turn hears a refusal, which is exactly what a test wants: no prompt
     /// can hang the suite.
+    ///
+    /// The reasoning policy is a parameter for the same reason the mode is: it
+    /// changes what the turn does after a reply rather than what it says to the
+    /// server, so a fixture cannot express it.
     async fn run_and_watch(
         bodies: &'static [&'static str],
         input: &str,
         mode: Mode,
+        reasoning: Reasoning,
     ) -> ((Agent, usize), Vec<AgentEvent>) {
         let (url, served) = serve_sequence(bodies).await;
         let cwd = std::env::current_dir().unwrap();
         let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
         agent.mode = mode;
+        agent.reasoning = reasoning;
 
         let link = TurnLink::new(agent.mode);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -1566,7 +1572,8 @@ mod turn_tests {
             "tool_calls":[{"id":"bad","type":"function","function":{"name":"read","arguments":"nope"}}]}}]}"#;
         const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
 
-        let (_, events) = run_and_watch(&[MALFORMED, FINAL], "go", Mode::Normal).await;
+        let (_, events) =
+            run_and_watch(&[MALFORMED, FINAL], "go", Mode::Normal, Reasoning::Keep).await;
         let said = notices(&events);
         assert!(
             said.iter().any(|n| matches!(
@@ -1587,6 +1594,52 @@ mod turn_tests {
         // And the turn reported its own end, which is the line the summary is
         // drawn from.
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Finished { .. })));
+    }
+
+    /// Compression replaces the chain of thought in the history, so the
+    /// transcript is the only place the summary can still be read — which is why
+    /// the notice carries the text as well as the two figures. Reporting a saving
+    /// and nothing else leaves the reader no way to judge whether what survived
+    /// was worth keeping, and the original is gone by then.
+    #[tokio::test]
+    async fn a_compressed_trace_is_reported_with_the_text_that_replaced_it() {
+        let _capture = crate::out::capture_guard();
+        // Well over the 800-token threshold, so the turn spends a request on
+        // compressing it and the second body is the compressor's answer.
+        // `serve_sequence` wants `'static` bodies and a trace this long has to be
+        // built rather than written out, so it is leaked — a test process is the
+        // one place where that costs nothing.
+        let reply: &'static str = Box::leak(
+            format!(
+                "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"Done.\",\
+                 \"reasoning_content\":\"{}\"}}}}]}}",
+                "z".repeat(8_000)
+            )
+            .into_boxed_str(),
+        );
+        const SUMMARY: &str = r#"{"choices":[{"message":{"role":"assistant",
+            "content":"Tried the regex path, too slow."}}]}"#;
+        let bodies: &'static [&'static str] = Box::leak(Box::new([reply, SUMMARY]));
+
+        let ((agent, _), events) =
+            run_and_watch(bodies, "go", Mode::Normal, Reasoning::Compress).await;
+        let said = notices(&events);
+        let reported = said.iter().find_map(|n| match n {
+            Notice::ReasoningCompressed { summary, .. } => Some(summary.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            reported.as_deref(),
+            Some("Tried the regex path, too slow."),
+            "the compression was reported without the text it produced: {said:?}"
+        );
+        // And what was reported is what the history actually carries — the point
+        // of reading it back out of the message rather than passing it alongside
+        // the figures.
+        assert_eq!(
+            agent.messages.last().unwrap()["reasoning_content"].as_str(),
+            reported.as_deref()
+        );
     }
 
     /// Cancellation is a message, not a dropped future — see

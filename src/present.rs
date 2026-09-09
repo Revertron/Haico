@@ -224,16 +224,49 @@ impl Presenter {
                 percent
             ),
             Notice::CompactionFailed(e) => outln!("\n[error] could not compact: {}\n", e),
-            // Shown rather than folded: the whole point of compressing is to find
-            // out whether it is paying for itself, which cannot be judged from a
-            // line hidden by default.
-            Notice::ReasoningCompressed { before, after } => outln!(
-                "{}Compressed reasoning from {} to {} tokens.{}",
-                SetForegroundColor(crate::input::BAR_BACKGROUND),
-                before,
-                after,
-                ResetColor
-            ),
+            // The figures are shown rather than folded: the whole point of
+            // compressing is to find out whether it is paying for itself, which
+            // cannot be judged from a line hidden by default.
+            Notice::ReasoningCompressed { before, after, summary } => {
+                outln!(
+                    "{}Compressed reasoning from {} to {} tokens.{}",
+                    SetForegroundColor(crate::input::BAR_BACKGROUND),
+                    before,
+                    after,
+                    ResetColor
+                );
+                // The figures say the trace shrank; they do not say whether what
+                // came back is still worth having, and the original is gone from
+                // the history by now. So the summary goes behind a fold of its
+                // own, opened by the same Ctrl+O as the thinking it replaced —
+                // dim and italic for the same reason that is: it is not the
+                // answer. Written per line rather than left switched on, so a
+                // color cannot bleed past the block.
+                //
+                // `begin_fold` rather than `foldable` because of what the inline
+                // renderer does with each: `foldable` would print the summary row
+                // and nothing else, leaving a label there for a fold that cannot
+                // open. This way the text itself is simply printed under the line
+                // above, which already says what it is.
+                if !summary.is_empty() {
+                    crate::out::begin_fold(&format!(
+                        "{}{}○ (compressed reasoning){}",
+                        SetAttribute(Attribute::Italic),
+                        SetForegroundColor(Color::DarkGrey),
+                        ResetColor
+                    ));
+                    for line in summary.lines() {
+                        outln!(
+                            "{}{}      {}{}",
+                            SetAttribute(Attribute::Italic),
+                            SetForegroundColor(Color::DarkGrey),
+                            line,
+                            ResetColor
+                        );
+                    }
+                    crate::out::end_fold();
+                }
+            }
             // Folded, because dropping says nothing the policy did not already
             // say: it removes every trace, every turn, so a visible line per
             // reply would be a line per reply saying the same thing.

@@ -44,8 +44,8 @@ use crate::render::file_change_diff;
 use crate::scratch::Scratch;
 use crate::session::{
     apply_reasoning, compact_history, estimate_tokens, load_session,
-    reasoning_needs_a_request, save_session, session_file_path, set_system_message,
-    ReasoningOutcome, ReasoningStats,
+    reasoning_needs_a_request, reasoning_text, save_session, session_file_path,
+    set_system_message, ReasoningOutcome, ReasoningStats,
 };
 use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer};
 use crate::turn::*;
@@ -564,7 +564,13 @@ pub(crate) async fn run_turn(
                     // furniture rather than as output.
                     Some(ReasoningOutcome::Compressed { before, after }) => {
                         agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
-                        let _ = tx.send(Notice::ReasoningCompressed { before, after }.into());
+                        // Read back out of the message rather than handed over with the
+                        // figures: `apply_reasoning` has just written the summary into the
+                        // reasoning field, and that field is the version the history now
+                        // carries — reporting anything else would be reporting a text the
+                        // conversation does not actually contain.
+                        let summary = reasoning_text(&message).unwrap_or_default().to_string();
+                        let _ = tx.send(Notice::ReasoningCompressed { before, after, summary }.into());
                     }
                     // Dropping says nothing the policy did not already say: it removes
                     // every trace, every turn, so a line per reply would be a line per

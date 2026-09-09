@@ -787,7 +787,10 @@ fn describe(notice: Notice) -> (String, Tone) {
             (format!("still over {percent}% of the window; not compacting again"), Tone::Warning)
         }
         Notice::CompactionFailed(e) => (format!("could not compact: {e}"), Tone::Error),
-        Notice::ReasoningCompressed { before, after } => {
+        // The summary the terminal folds away is not shown here: there is nothing
+        // to fold it into, and the window shows a chain of thought in full or not
+        // at all.
+        Notice::ReasoningCompressed { before, after, .. } => {
             (format!("compressed reasoning {before} → {after} tokens"), Tone::Muted)
         }
         Notice::ReasoningDropped { tokens } => {
@@ -2272,7 +2275,7 @@ mod tests {
             Notice::Compacted("r".into()),
             Notice::CompactionStillLarge(90),
             Notice::CompactionFailed("e".into()),
-            Notice::ReasoningCompressed { before: 10, after: 2 },
+            Notice::ReasoningCompressed { before: 10, after: 2, summary: "s".into() },
             Notice::ReasoningDropped { tokens: 10 },
             Notice::ToolCallsMalformed("x".into()),
             Notice::ToolCallUnnamed("x".into()),

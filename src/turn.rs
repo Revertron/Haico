@@ -246,7 +246,11 @@ pub(crate) enum Notice {
     /// be tried again this turn. Carries the percentage of the window.
     CompactionStillLarge(usize),
     CompactionFailed(String),
-    ReasoningCompressed { before: usize, after: usize },
+    /// The policy replaced a chain of thought with a summary of it. The figures
+    /// say a compression happened; `summary` is what came back, and it travels
+    /// with them because by the time this is read the original is gone from the
+    /// history — there is nowhere else left to look at what the trace became.
+    ReasoningCompressed { before: usize, after: usize, summary: String },
     ReasoningDropped { tokens: usize },
     /// `tool_calls` was present but not an array.
     ToolCallsMalformed(String),
