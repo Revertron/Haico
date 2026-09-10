@@ -424,6 +424,9 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
         // The row above the terminal's input box has no counterpart here; the
         // busy label already says what is running.
         AgentEvent::DidTool { .. } => {}
+        // The window's busy label has no counter to move, and the call itself is
+        // drawn when it starts.
+        AgentEvent::ToolCallChunk(_) => {}
         AgentEvent::Finished { elapsed } => {
             let text = format!("done in {}", crate::format_elapsed(elapsed));
             show(handle, move |ui| {

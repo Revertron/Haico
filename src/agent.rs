@@ -491,11 +491,16 @@ pub(crate) async fn run_turn(
                     // none of the branches below re-print anything from the
                     // finished message. What either one *looks* like — dim,
                     // italic, folded, markdown-wrapped — is the presenter's, and
-                    // this no longer knows.
+                    // this no longer knows. The third carries no text at all,
+                    // only how much of a tool call has landed: the call is shown
+                    // whole when it is about to run, and once is enough.
                     |chunk| {
                         let _ = tx.send(match chunk {
                             Chunk::Reasoning(text) => AgentEvent::ReasoningChunk(text),
                             Chunk::Content(text) => AgentEvent::ReplyChunk(text),
+                            Chunk::ToolFragment(characters) => {
+                                AgentEvent::ToolCallChunk(characters)
+                            }
                         });
                     },
                 ),

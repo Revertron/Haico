@@ -195,6 +195,7 @@ impl Presenter {
             // fails to compile here until someone has decided which side it is.
             AgentEvent::Busy(_)
             | AgentEvent::Status { .. }
+            | AgentEvent::ToolCallChunk(_)
             | AgentEvent::Ask(_) => {}
         }
     }

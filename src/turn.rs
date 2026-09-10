@@ -309,6 +309,12 @@ pub(crate) enum AgentEvent {
     /// is the frontend's business, and a streaming renderer is the only thing
     /// that can decide when a line has settled enough to wrap.
     ReplyChunk(String),
+    /// How many characters of a tool call have just arrived. A count and not the
+    /// text, for the reason given on `llm::Chunk::ToolFragment`: the call itself
+    /// is shown whole by [`Self::ToolStarted`] once it is about to run. This is
+    /// only so a frontend with a progress counter can keep it moving through the
+    /// stretch of a reply that puts nothing else on the screen.
+    ToolCallChunk(usize),
     /// The reply is over, however it ended — finished, interrupted or failed.
     /// Sent on every one of those paths so a frontend holding open state (a
     /// markdown stream mid-line, a fold) has exactly one place to close it.

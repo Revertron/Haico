@@ -298,6 +298,12 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
                                 | AgentEvent::ReplyChunk(text) => {
                                     streamed += text.chars().count();
                                 }
+                                // The arguments of a call being written out are
+                                // generation like any other, and the longest
+                                // stretch of a turn that shows nothing at all.
+                                AgentEvent::ToolCallChunk(characters) => {
+                                    streamed += characters;
+                                }
                                 _ => {}
                             }
                             answer_or_show(&mut presenter, &mut io.keys, event, &link).await;

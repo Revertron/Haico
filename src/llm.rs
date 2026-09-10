@@ -497,6 +497,16 @@ pub(crate) struct StreamAssembler {
 pub(crate) enum Chunk {
     Content(String),
     Reasoning(String),
+    /// How many characters of a tool call just arrived: the name and the
+    /// arguments, not the id a server made up for it.
+    ///
+    /// A count and not the text, deliberately. The call is shown once, whole,
+    /// when it is about to run, and a file's worth of arguments has no business
+    /// being streamed onto the screen on the way there as well — a caller that
+    /// never receives the text cannot print it by accident. What it is for is the
+    /// activity bar: without it a model spending a minute writing one long
+    /// argument looks exactly like one that has hung.
+    ToolFragment(usize),
 }
 
 impl StreamAssembler {
@@ -526,6 +536,10 @@ impl StreamAssembler {
         }
 
         if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+            // What this delta actually added to the calls being assembled. Counted as it
+            // is stored rather than as it arrives: a server that repeats the name on every
+            // fragment would otherwise have the count run away from what the model wrote.
+            let mut fragment = 0usize;
             for call in calls {
                 let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if self.tool_calls.len() <= index {
@@ -542,12 +556,17 @@ impl StreamAssembler {
                     if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
                         if slot.name.is_empty() {
                             slot.name = name.to_string();
+                            fragment += name.chars().count();
                         }
                     }
                     if let Some(arguments) = function.get("arguments").and_then(|a| a.as_str()) {
                         slot.arguments.push_str(arguments);
+                        fragment += arguments.chars().count();
                     }
                 }
+            }
+            if fragment > 0 {
+                pieces.push(Chunk::ToolFragment(fragment));
             }
         }
 
@@ -746,6 +765,7 @@ mod tests {
                 match piece {
                     crate::Chunk::Content(text) => printed.push_str(&text),
                     crate::Chunk::Reasoning(text) => panic!("not thinking: {}", text),
+                    crate::Chunk::ToolFragment(n) => panic!("not a call: {} chars", n),
                 }
             }
         }
@@ -753,13 +773,16 @@ mod tests {
 
         // A tool call: id and name complete in the first fragment, arguments split across
         // several. The repeated id/name in the second fragment must not be appended twice.
-        assert!(assembler
-            .push(&json!({"choices": [{"delta": {"tool_calls": [{
-                "index": 0,
-                "id": "call_abc",
-                "function": {"name": "read", "arguments": "{\"file"}
-            }]}}]}))
-            .is_empty());
+        // Nothing to print — what comes back is the size of what was stored, for the bar.
+        let fragment = assembler.push(&json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_abc",
+            "function": {"name": "read", "arguments": "{\"file"}
+        }]}}]}));
+        assert!(
+            matches!(fragment[..], [crate::Chunk::ToolFragment(n)] if n == "read{\"file".len()),
+            "expected one counted fragment"
+        );
         assembler.push(&json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
             "id": "call_abc",
@@ -795,6 +818,43 @@ mod tests {
         );
     }
 
+
+    // The activity bar counts what has arrived, and a model writing out a long argument
+    // used to leave it sitting still for the length of the write — which looks exactly
+    // like a hang. What is counted is what was *stored*: a server repeating the id and
+    // the name on every fragment must not inflate it, and the id is the server's own
+    // bookkeeping rather than anything the model spent time generating.
+    #[test]
+    fn a_tool_call_being_written_out_is_counted_but_not_handed_over_as_text() {
+        use crate::StreamAssembler;
+
+        let mut assembler = StreamAssembler::default();
+        let mut counted = 0usize;
+        let mut push = |delta| {
+            for piece in assembler.push(&json!({"choices": [{"delta": delta}]})) {
+                match piece {
+                    crate::Chunk::ToolFragment(n) => counted += n,
+                    crate::Chunk::Content(text) | crate::Chunk::Reasoning(text) => {
+                        panic!("a call was handed over as text: {}", text)
+                    }
+                }
+            }
+        };
+
+        push(json!({"tool_calls": [{
+            "index": 0,
+            "id": "call_abc",
+            "function": {"name": "write_file", "arguments": "{\"path\":"}
+        }]}));
+        // The same id and the same name again, as several servers send them.
+        push(json!({"tool_calls": [{
+            "index": 0,
+            "id": "call_abc",
+            "function": {"name": "write_file", "arguments": "\"a.rs\"}"}
+        }]}));
+
+        assert_eq!(counted, "write_file".len() + "{\"path\":\"a.rs\"}".len());
+    }
 
     #[test]
     fn stream_without_tool_calls_or_content_stays_well_formed() {
@@ -964,6 +1024,7 @@ mod tests {
             .chat_completion_streaming(vec![], vec![], |chunk| match chunk {
                 crate::Chunk::Reasoning(text) => order.push(format!("think:{}", text)),
                 crate::Chunk::Content(text) => order.push(format!("say:{}", text)),
+                crate::Chunk::ToolFragment(n) => order.push(format!("call:{}", n)),
             })
             .await
             .unwrap();
