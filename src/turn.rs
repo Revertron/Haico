@@ -237,6 +237,11 @@ pub(crate) enum Notice {
     Interrupted,
     /// The request failed and the turn is over, but the conversation is intact.
     RequestFailed(String),
+    /// A request failed while the history carried a picture, so the pictures
+    /// were taken out and the request tried again. Carries the server's own
+    /// complaint: it is the evidence for the guess that the image was the
+    /// problem, and if the retry fails too it is the only clue left.
+    ImagesStripped(String),
     /// The round cap stopped a turn that never reached a final answer. Carries
     /// the cap, since the number is the whole point of saying so.
     RoundCapReached(usize),

@@ -321,7 +321,10 @@ impl MyMcpServer {
             ));
         }
 
-        match self.execute_tool(name, arguments).await {
+        // `.text` and not the whole output: the two tools reachable from here
+        // return prose, and an image part could not go into this sub-agent's
+        // message list anyway — it has no user message to put one in.
+        match self.execute_tool(name, arguments).await.map(|output| output.text) {
             Ok(text) if is_page && text.len() > MAX_PAGE_CHARS => {
                 format!(
                     "{}\n\n[Cut off at {} characters. If the answer was further down, say so \

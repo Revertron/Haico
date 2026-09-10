@@ -8,6 +8,7 @@ use crate::util::{file_key, modified_time, truncate_at_boundary};
 use anyhow::Result;
 use lru::LruCache;
 use rmcp::handler::server::{tool::ToolRouter, wrapper::Parameters};
+use rmcp::model::ContentBlock;
 use rmcp::{tool_handler, ServerHandler};
 use serde_json::{json, Value};
 use std::fs;
@@ -320,7 +321,7 @@ impl MyMcpServer {
     }
 
 
-    pub(crate) async fn execute_tool(&self, name: &str, arguments: Value) -> Result<String> {
+    pub(crate) async fn execute_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
         let result = match name {
             "calculator" => {
                 let params: CalculatorParams = serde_json::from_value(arguments)?;
@@ -422,18 +423,46 @@ impl MyMcpServer {
             _ => return Err(anyhow::anyhow!("Unknown tool: {}", name)),
         };
 
-        // Extract text from result
+        // Split the result by kind rather than flattening it to text. Flattening
+        // is what this did for as long as every tool returned prose, and it is
+        // why `read` on an image had nowhere to put the image.
         let text = result
             .content
             .iter()
-            .filter_map(|c| {
-                c.as_text().map(|t| t.text.as_str())
-            })
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(text)
+        let images = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ContentBlock::Image(image) => {
+                    Some((image.mime_type.clone(), image.data.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        Ok(ToolOutput { text, images })
     }
+}
+
+/// What a tool produced, split by what the conversation can do with each half.
+///
+/// The split is forced by the wire format, not chosen. A `role: "tool"` message
+/// may carry text parts and nothing else — servers reject an `image_url` there
+/// outright — so a picture cannot travel back inside the reply to the call that
+/// produced it. It comes back beside the text instead, and the turn puts it
+/// where an image is allowed: a user message, after the round's tool replies.
+///
+/// MCP server mode never builds one of these. There the `CallToolResult` goes to
+/// the host whole, image blocks and all, because MCP has a place for them.
+#[derive(Debug, Default)]
+pub(crate) struct ToolOutput {
+    pub(crate) text: String,
+    /// `(mime type, base64 data)`, in the order the tool produced them.
+    pub(crate) images: Vec<(String, String)>,
 }
 
 // MCP server handler: wires the existing tool_router to handle list_tools/call_tool.

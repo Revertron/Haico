@@ -1599,6 +1599,118 @@ mod turn_tests {
         );
     }
 
+    /// `read` on an image returns the picture, and the picture cannot ride in
+    /// the `role: "tool"` reply — that message may carry text and nothing else.
+    /// So it arrives as a user message, and only once every tool call in the
+    /// round has its reply.
+    #[tokio::test]
+    async fn reading_an_image_puts_it_in_a_user_message_after_the_tool_reply() {
+        let _capture = crate::out::capture_guard();
+
+        let dir = crate::testutil::TempDir::new("read-image");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+
+        // The model asks to read it, then answers. The path is escaped for JSON
+        // because a Windows path is full of backslashes.
+        let call = format!(
+            r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+            "tool_calls":[{{"id":"c1","type":"function","function":{{"name":"read","arguments":{}}}}}]}}}}]}}"#,
+            serde_json::to_string(
+                &serde_json::json!({"file_path": png.display().to_string()}).to_string()
+            )
+            .unwrap()
+        );
+        let (url, requests) = crate::testutil::serve_sequence(Box::leak(Box::new([
+            &*Box::leak(call.into_boxed_str()),
+            r#"{"choices":[{"message":{"role":"assistant","content":"a tiny png"}}]}"#,
+        ])))
+        .await;
+
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(crate::testutil::test_config(&url), "m".to_string(), &cwd);
+        // The temp directory is outside the project, so without this the read is
+        // refused by the workspace and never reaches the image path at all.
+        agent.workspace.attach(&png);
+
+        // `read` is on the auto-allowed list, so no prompt stands in the way.
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "look at the screenshot", false, &tx, &link).await;
+        assert_eq!(*requests.lock().unwrap(), 2);
+
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m["role"].as_str()).collect();
+        // system, user, assistant(tool_calls), tool, user(image), assistant
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user", "assistant"]);
+
+        // The tool reply is text and names the file. It must not have become an
+        // array: a server rejects an image part in a tool message outright.
+        let reply = &agent.messages[3];
+        let text = reply["content"].as_str().expect("a tool reply must be a string");
+        assert!(text.contains("PNG"), "the reply does not say what the file is: {text}");
+
+        // And the picture is in the user message that follows it.
+        let parts = agent.messages[4]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(parts[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    /// A model with no vision head rejects the request carrying a picture, and
+    /// every request after it, so the conversation is dead until the picture
+    /// leaves. The turn takes it out once and tries again rather than handing
+    /// back a history that can only fail.
+    #[tokio::test]
+    async fn a_refused_image_is_stripped_and_the_request_retried() {
+        let _capture = crate::out::capture_guard();
+
+        let dir = crate::testutil::TempDir::new("strip-image");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+
+        // The server refuses the first request outright, then answers. That is
+        // the shape of a text-only model being handed an image.
+        let (url, served) = crate::testutil::serve_sequence(&[
+            "not json, and not a 200 either",
+            r#"{"choices":[{"message":{"role":"assistant","content":"no picture here"}}]}"#,
+        ])
+        .await;
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(crate::testutil::test_config(&url), "m".to_string(), &cwd);
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, &format!("look at @{}", png.display()), false, &tx, &link).await;
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            notices(&seen).iter().any(|n| matches!(n, Notice::ImagesStripped(_))),
+            "the retry never happened: {:?}",
+            notices(&seen)
+        );
+        assert_eq!(*served.lock().unwrap(), 2, "the request was not tried a second time");
+
+        // No image left anywhere, and the message that carried one still says
+        // something rather than being emptied.
+        for message in &agent.messages {
+            if let Some(parts) = message["content"].as_array() {
+                assert!(
+                    !parts.iter().any(|p| p["type"] == "image_url"),
+                    "an image survived the strip"
+                );
+                assert!(!parts.is_empty(), "a message was left with no content at all");
+            }
+        }
+        let user = crate::session::message_text(&agent.messages[1]);
+        assert!(user.contains("removed"), "the model was not told why: {user}");
+    }
+
     /// A message carrying an image must still reach a text summarizer as
     /// something, or the turn it began summarizes as though nobody spoke.
     #[test]

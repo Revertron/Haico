@@ -2021,6 +2021,7 @@ dependencies = [
  "globset",
  "html2text",
  "ignore",
+ "image",
  "lru",
  "lumio-gui",
  "public-api",

@@ -1,5 +1,6 @@
 use super::MyMcpServer;
-use crate::util::{modified_time, truncate_at_boundary};
+use crate::util::{display_path, modified_time, truncate_at_boundary};
+use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -352,7 +353,7 @@ fn grep_blocking(
 
 #[tool_router(router = files_router, vis = "pub(crate)")]
 impl MyMcpServer {
-    #[tool(description = "Use whenever you need to see what a file actually contains rather than assume — inspecting source before changing it, checking config or data, or quoting exact text. Always Read a file before you Edit or Write it. Reads files from the filesystem. Requires absolute path. Reads up to 2000 lines (use offset/limit for large files). Lines >2000 chars truncated.")]
+    #[tool(description = "Use whenever you need to see what a file actually contains rather than assume — inspecting source before changing it, checking config or data, or quoting exact text. Always Read a file before you Edit or Write it. Reads files from the filesystem. Requires absolute path. Reads up to 2000 lines (use offset/limit for large files). Lines >2000 chars truncated. A PNG, JPEG, GIF or WEBP comes back as a picture instead of text, so this is how to look at a screenshot or a mockup — but only ask for one if you can actually see images; if you cannot, reading it wastes the whole conversation.")]
     pub(crate) async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -368,6 +369,53 @@ impl MyMcpServer {
                 "Path is not a file: {}",
                 params.0.file_path
             ))]));
+        }
+
+        // Before the text path, because an image is not a text file that failed
+        // to parse — it is a thing the model can look at, and the old answer
+        // ("not a text file") was a dead end for exactly the file a vision model
+        // is most often pointed at. Sniffed from the bytes, so a JPEG someone
+        // renamed to .png is still described as a JPEG.
+        if let Some(on_disk) = crate::mention::image_type_of(&file_path) {
+            // Whatever comes back here is what a server will take, which is not
+            // always what is on disk — see `sendable_image`.
+            let Some((mime, bytes)) = crate::mention::sendable_image(&file_path) else {
+                return Err(McpError::internal_error(
+                    format!("Failed to read image: {}", display_path(&file_path)),
+                    None,
+                ));
+            };
+            // Said as what the file is, not as what is being sent. Calling a
+            // .webp "a PNG image" because it was converted on the way out reads
+            // as haico having misidentified it, and the model repeats that
+            // wording back to the user.
+            let kind = |mime: &str| mime.trim_start_matches("image/").to_uppercase();
+            let format = if mime == on_disk {
+                kind(on_disk)
+            } else {
+                format!("{} (converted to {} to send)", kind(on_disk), kind(&mime))
+            };
+            // The text block goes with the image rather than instead of it. In
+            // the REPL it becomes the `role: "tool"` reply, which may carry text
+            // and nothing else, so it is the only place the *name* of the file
+            // can be said — the picture arrives in a separate message with no
+            // tool_call_id to tie it to this call.
+            let note = format!(
+                "{} is a {} image, {} KB. It is attached as an image.",
+                display_path(&file_path),
+                format,
+                bytes.len().div_ceil(1024)
+            );
+            // Not marked read: `mark_read` exists so an edit can be checked
+            // against the bytes the model saw, and the text tools cannot edit an
+            // image at all.
+            return Ok(CallToolResult::success(vec![
+                ContentBlock::text(note),
+                ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    mime,
+                ),
+            ]));
         }
 
         let file = fs::File::open(&file_path).map_err(|e| {
@@ -1166,7 +1214,8 @@ mod tests {
                 }),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(found.contains("files.rs"), "got: {}", found);
 
         // Joined at runtime: written out in one piece, the needle would be sitting in
@@ -1175,7 +1224,8 @@ mod tests {
         let missing = server
             .execute_tool("grep", serde_json::json!({"pattern": needle}))
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(missing.starts_with("No matches found"), "got: {}", missing);
 
         // An unparseable pattern still comes back as an error rather than reaching a thread.
@@ -1206,7 +1256,7 @@ mod tests {
         );
 
         // And it still finishes, with the counts it was asked for.
-        let counted = search.await.unwrap();
+        let counted = search.await.unwrap().text;
         assert!(counted.contains("files.rs:"), "got: {}", counted);
     }
 }

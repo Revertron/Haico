@@ -845,6 +845,12 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::FileNotAttached { path, reason } => {
             (format!("could not attach {path}: {reason}"), Tone::Warning)
         }
+        Notice::ImagesStripped(detail) => (
+            format!(
+                "the request was refused with an image in it — images removed and sent                  again; this model most likely cannot see them ({detail})"
+            ),
+            Tone::Warning,
+        ),
         Notice::QueuedSent(text) => (text, Tone::Normal),
         Notice::ProjectContextReloaded(name) => {
             (format!("reloaded project context from {name}"), Tone::Muted)
@@ -2319,6 +2325,7 @@ mod tests {
             Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: false },
             Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: true },
             Notice::FileNotAttached { path: "p".into(), reason: "r".into() },
+            Notice::ImagesStripped("400 bad request".into()),
             Notice::QueuedSent("q".into()),
             Notice::ProjectContextReloaded("CLAUDE.md".into()),
         ];

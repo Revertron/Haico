@@ -50,6 +50,12 @@ unicode-width = "0.2.2"
 # An image in a message goes out as a data: URL, which is what every OpenAI-compatible
 # server takes. Encoding one is the whole use.
 base64 = "0.22"
+# Decoding one format, and encoding one. WEBP is the format the servers disagree about:
+# LM Studio refuses the string "image/webp" in a data URL while decoding the bytes
+# happily, and llama.cpp is the mirror image — it takes the label and cannot decode the
+# bytes at all without an optional ffmpeg build. Re-encoding to PNG is the only answer
+# that is true on both. Default features off: this is a converter, not an image library.
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 
 # Windows only, and only for the full-screen renderer's mouse.
 #

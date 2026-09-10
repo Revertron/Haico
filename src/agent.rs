@@ -379,21 +379,25 @@ async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Valu
 
         // Sniffed from the bytes, so a JPEG that someone renamed to .png is
         // still sent as a JPEG. See `mention::image_type`.
-        if let Some(mime) = crate::mention::image_type_of(&mention.path) {
-            match std::fs::read(&mention.path) {
-                Ok(bytes) => {
+        if crate::mention::image_type_of(&mention.path).is_some() {
+            match crate::mention::sendable_image(&mention.path) {
+                Some((mime, bytes)) => {
                     let outside = agent.workspace.attach(&mention.path);
                     let _ = tx.send(
                         Notice::ImageAttached { path: shown, bytes: bytes.len(), outside }.into(),
                     );
                     images.push(json!({
                         "type": "image_url",
-                        "image_url": { "url": data_url(mime, &bytes) }
+                        "image_url": { "url": data_url(&mime, &bytes) }
                     }));
                 }
-                Err(e) => {
+                None => {
                     let _ = tx.send(
-                        Notice::FileNotAttached { path: shown, reason: e.to_string() }.into(),
+                        Notice::FileNotAttached {
+                            path: shown,
+                            reason: "the file could not be read".to_string(),
+                        }
+                        .into(),
                     );
                 }
             }
@@ -471,6 +475,48 @@ async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Valu
     json!(parts)
 }
 
+/// Take every picture out of the history, leaving a line of text where each one
+/// was. Returns how many went.
+///
+/// A message stripped down to nothing but images does not become an empty
+/// message — it becomes the note, because a `content` of `[]` is a message some
+/// servers reject and all of them find strange, and because the model should be
+/// told the picture is gone rather than left wondering why its own question no
+/// longer makes sense.
+///
+/// Not a general-purpose history edit. This runs at the top of a round, where
+/// every tool call already has its reply, and it never removes a message — so no
+/// `tool_call_id` can be orphaned by it.
+fn strip_images(messages: &mut [Value]) -> usize {
+    let mut removed = 0;
+
+    for message in messages.iter_mut() {
+        let Some(parts) = message["content"].as_array() else { continue };
+        let images = parts.iter().filter(|part| part["type"] == "image_url").count();
+        if images == 0 {
+            continue;
+        }
+        removed += images;
+
+        let mut kept: Vec<Value> = parts
+            .iter()
+            .filter(|part| part["type"] != "image_url")
+            .cloned()
+            .collect();
+        kept.push(json!({
+            "type": "text",
+            "text": format!(
+                "[{} image(s) were attached here and have been removed: the server would \
+                 not accept them, so this model cannot see images. Work from the text.]",
+                images
+            )
+        }));
+        message["content"] = json!(kept);
+    }
+
+    removed
+}
+
 /// One image as the `data:` URL an OpenAI-compatible server expects.
 ///
 /// A URL and not a file path, because the server is a separate process and may
@@ -543,6 +589,10 @@ pub(crate) async fn run_turn(
         // next round would summarize the summary and throw the round away with it, so
         // the turn runs on instead and lets the server error be the honest end of it.
         let mut autocompact = true;
+
+        // Set once the recovery below has run, so a failure that has nothing to do with
+        // images cannot make the turn retry forever.
+        let mut stripped_images = false;
 
         loop {
             round += 1;
@@ -682,10 +732,30 @@ pub(crate) async fn run_turn(
             let mut message = match result {
                 Ok(message) => message,
                 Err(e) => {
+                    let _ = tx.send(AgentEvent::ReplyEnd);
+
+                    // An image in the history is the one failure this can back
+                    // out of, and the only one worth trying to: a model without
+                    // a vision head rejects the request that carries a picture
+                    // and every request after it, so the conversation is dead
+                    // until the picture leaves. That is a real risk here and not
+                    // a theoretical one, because `read` lets the *model* choose
+                    // the file — it can point itself at a screenshot with no
+                    // way to know whether it can see one.
+                    //
+                    // Once per turn, so an unrelated failure that keeps failing
+                    // still ends at the prompt instead of looping. The images
+                    // are gone from the history for good, which is the point:
+                    // retrying with them in would fail the same way.
+                    if !stripped_images && strip_images(&mut agent.messages) > 0 {
+                        stripped_images = true;
+                        let _ = tx.send(Notice::ImagesStripped(format!("{:#}", e)).into());
+                        continue;
+                    }
+
                     // A dropped connection, a server-side error, or an unparseable body
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
-                    let _ = tx.send(AgentEvent::ReplyEnd);
                     let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
                     break;
                 }
@@ -773,6 +843,10 @@ pub(crate) async fn run_turn(
                 // Set when Ctrl+C lands during a tool call, so the turn ends rather than
                 // only the tool loop.
                 let mut interrupted = false;
+
+                // Pictures the round's tools returned, waiting for the one place
+                // an image is allowed to go. See where they are pushed below.
+                let mut seen_images: Vec<Value> = Vec::new();
 
                 for tool_call in tool_calls_array {
 
@@ -1175,6 +1249,14 @@ pub(crate) async fn run_turn(
                     // call itself, and the alternative is the frontend inventing
                     // a description from the tool name alone.
                     let activity_arguments = arguments.clone();
+                    // What a picture coming back from this call is called, asked
+                    // while the arguments are still here to ask. `read` is the
+                    // only tool that returns one, so its path is the only name
+                    // worth looking for.
+                    let image_label = arguments["file_path"]
+                        .as_str()
+                        .map(|path| display_path(std::path::Path::new(path)))
+                        .unwrap_or_else(|| tool_name.to_string());
                     let executed = interruptible(
                         tx,
                         link,
@@ -1203,8 +1285,36 @@ pub(crate) async fn run_turn(
 
                     let tool_result = result.unwrap_or_else(|e| {
                         let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
-                        format!("Error: {}", e)
+                        crate::tools::ToolOutput {
+                            text: format!("Error: {}", e),
+                            images: Vec::new(),
+                        }
                     });
+
+                    // Held for after the loop rather than pushed here. A picture
+                    // cannot go in the `role: "tool"` reply — that message may
+                    // carry text and nothing else, and a server rejects an image
+                    // part in one outright — so it has to arrive as a user
+                    // message, and a user message may not sit between an
+                    // assistant turn and the tool results it is waiting for.
+                    for (mime, data) in tool_result.images {
+                        let _ = tx.send(
+                            Notice::ImageAttached {
+                                path: image_label.clone(),
+                                // Back from base64 to the size of the thing it
+                                // encodes, which is the figure that means
+                                // something to whoever reads the line.
+                                bytes: data.len() / 4 * 3,
+                                outside: false,
+                            }
+                            .into(),
+                        );
+                        seen_images.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                        }));
+                    }
+                    let tool_result = tool_result.text;
 
                     // The summary is the row that used to be all there was: the first
                     // line of the result, cut to fit. The result itself is kept behind it
@@ -1228,6 +1338,31 @@ pub(crate) async fn run_turn(
                 // The break above only leaves the tool loop; this leaves the turn.
                 if interrupted {
                     break;
+                }
+
+                // The pictures the round's tools produced, in the one position
+                // they are legal: after every tool call in the round has its
+                // reply, as a user message. The wire format allows no image in a
+                // `role: "tool"` message, and no user message before those
+                // replies are complete — between them that leaves exactly here.
+                //
+                // A line of text goes with them because the images arrive with
+                // no `tool_call_id` and nothing else ties them to the call that
+                // fetched them. The tool's own reply named the file; this says
+                // which message the picture is in.
+                if !seen_images.is_empty() {
+                    let count = seen_images.len();
+                    let mut parts = seen_images;
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "{} named in the tool result{} above, attached here because an \
+                             image cannot be sent inside a tool result.",
+                            if count == 1 { "The image" } else { "The images" },
+                            if count == 1 { "" } else { "s" }
+                        )
+                    }));
+                    agent.messages.push(json!({"role": "user", "content": parts}));
                 }
 
                 // The tool log makes a loop obvious to whoever is watching it scroll past,

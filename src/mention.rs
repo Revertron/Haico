@@ -67,6 +67,50 @@ pub(crate) fn image_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// One image, in a form a model server will actually take: its bytes and the
+/// MIME type to declare for them.
+///
+/// **WEBP is re-encoded to PNG, and that is the whole reason this exists.** The
+/// two servers haico is pointed at disagree about webp in opposite directions,
+/// so there is no label that satisfies both:
+///
+/// - LM Studio validates the *string* in the data URL and rejects `image/webp`
+///   outright, with `'url' field must be a base64 encoded image` — which reads
+///   like a corrupt payload and is nothing of the kind. Its decoder sniffs the
+///   content, so the same bytes labelled `image/png` are decoded correctly.
+/// - llama.cpp is the mirror image. It takes any label and loads through
+///   `stb_image`, which has no webp support at all; there is a
+///   `decode_webp_with_ffmpeg` path, so a build without ffmpeg cannot read one
+///   however it is announced.
+///
+/// Mislabelling therefore fixes one server and not the other, and lies in the
+/// URL besides. Re-encoding is true on both, and the cost is paid once per
+/// image on a path that is already about to base64 a few hundred kilobytes.
+///
+/// PNG, JPEG and GIF are passed through untouched. All three are accepted by
+/// every server tested, and re-encoding a JPEG to PNG would multiply its size
+/// for nothing.
+pub(crate) fn sendable_image(path: &std::path::Path) -> Option<(String, Vec<u8>)> {
+    let mime = image_type_of(path)?;
+    let bytes = std::fs::read(path).ok()?;
+
+    if mime != "image/webp" {
+        return Some((mime.to_string(), bytes));
+    }
+
+    // A webp that will not decode is left as a webp rather than dropped: the
+    // request then fails the way it did before, which is a worse outcome than
+    // this function working but a better one than silently attaching nothing.
+    let Ok(decoded) = image::load_from_memory(&bytes) else {
+        return Some((mime.to_string(), bytes));
+    };
+    let mut png = std::io::Cursor::new(Vec::new());
+    match decoded.write_to(&mut png, image::ImageFormat::Png) {
+        Ok(()) => Some(("image/png".to_string(), png.into_inner())),
+        Err(_) => Some((mime.to_string(), bytes)),
+    }
+}
+
 /// As above, for a file on disk, reading only as much of it as the question
 /// needs.
 ///
@@ -242,6 +286,36 @@ mod tests {
         let text = dir.join("notes.png");
         std::fs::write(&text, "not an image at all").unwrap();
         assert_eq!(image_type_of(&text), None);
+    }
+
+    #[test]
+    fn a_webp_is_re_encoded_and_the_others_are_left_alone() {
+        let dir = TempDir::new("mention-webp");
+
+        // A real one-pixel WEBP, so this exercises the decoder rather than the
+        // signature check. Lossless VP8L, which is the smallest valid file.
+        let webp = dir.join("tiny.webp");
+        let bytes = [
+            b'R', b'I', b'F', b'F', 0x1a, 0, 0, 0, b'W', b'E', b'B', b'P', b'V', b'P', b'8', b'L',
+            0x0e, 0, 0, 0, 0x2f, 0, 0, 0, 0x10, 0x07, 0x10, 0x11, 0x11, 0x88, 0x88, 0xfe, 0x07,
+            0x00,
+        ];
+        std::fs::write(&webp, bytes).unwrap();
+
+        let (mime, converted) = sendable_image(&webp).expect("a webp should be sendable");
+        // The point of the whole function: what goes out is not what is on disk.
+        // LM Studio refuses the string "image/webp" and llama.cpp cannot decode
+        // the bytes, so neither the label nor the payload may survive.
+        assert_eq!(mime, "image/png");
+        assert_eq!(image_type(&converted), Some("image/png"));
+
+        // A PNG is passed through byte for byte. Re-encoding one would be work
+        // for nothing, and re-encoding a JPEG would multiply its size.
+        let png = dir.join("plain.png");
+        std::fs::write(&png, &converted).unwrap();
+        let (mime, again) = sendable_image(&png).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(again, converted, "a png was re-encoded when it did not need to be");
     }
 
     #[test]

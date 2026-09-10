@@ -339,6 +339,21 @@ impl Presenter {
             Notice::FileNotAttached { path, reason } => {
                 outln!("  ⊘ {} was not attached: {}", path, reason)
             }
+            // Two lines, because both halves are news: what happened to the
+            // conversation, and what the server said that prompted it. The
+            // second is folded — it is a server error, wanted only if the
+            // retry fails too.
+            Notice::ImagesStripped(detail) => {
+                outln!(
+                    "\n⊘ The request was refused with an image in it, so the images were \
+                     removed and it was sent again. This model most likely cannot see them."
+                );
+                let summary = detail.lines().next().unwrap_or_default();
+                crate::out::foldable(
+                    &format!("  the server said: {}", summary),
+                    &format!("  the server said: {}", detail),
+                );
+            }
             Notice::QueuedSent(text) => outln!("{}", echo(PROMPT, &text)),
             Notice::ProjectContextReloaded(name) => {
                 outln!("\nLoaded project context from {}", name)
