@@ -2036,6 +2036,7 @@ dependencies = [
  "terminput-crossterm",
  "tokio",
  "toml",
+ "unicode-width",
  "url",
  "urlencoding",
 ]

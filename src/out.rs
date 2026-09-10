@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use unicode_width::UnicodeWidthChar;
 
 struct Out {
     raw: bool,
@@ -1034,12 +1035,115 @@ fn terminal_height() -> usize {
 
 // How wide a string prints. Escape sequences take no space, and counting them would
 // make every colored line look several times longer than it is.
+// The pictographs a terminal draws two cells wide even though the Unicode tables call
+// them one, sorted so they can be searched. These are the characters with the Emoji
+// property whose *default* presentation is text rather than color: the standard gives
+// them an East Asian Width of Ambiguous or Neutral, meaning one cell, and every terminal
+// with a color emoji font draws them from it at two, because that is the glyph the font
+// has. `unicode-width` answers with the standard, correctly, and is one cell short.
+//
+// This is the gap that broke a table: the frame was measured with ☑ at one cell and each
+// row drawn a cell wider than the frame around it.
+//
+// It is deliberately the Emoji property *minus* the characters that are also ordinary
+// text. ©, ®, ™, ‼, ⁉, ℹ, Ⓜ, ▪ and ▫ carry the property too, and widening those would
+// break far more prose than it fixed. A pictograph found missing later is one line here.
+// Nothing needs removing for the emoji that are already two cells by the standard —
+// ✅, ❌, ⚡ and the astral ones — and an entry that overlaps them costs nothing.
+const WIDE_TEXT_EMOJI: &[(u32, u32)] = &[
+    (0x2194, 0x2199), // ↔ ↕ ↖ ↗ ↘ ↙
+    (0x21A9, 0x21AA), // ↩ ↪
+    (0x2328, 0x2328), // ⌨
+    (0x23CF, 0x23CF), // ⏏
+    (0x23ED, 0x23EF), // ⏭ ⏮ ⏯
+    (0x23F1, 0x23F2), // ⏱ ⏲
+    (0x23F8, 0x23FA), // ⏸ ⏹ ⏺
+    (0x25B6, 0x25B6), // ▶
+    (0x25C0, 0x25C0), // ◀
+    (0x2600, 0x2604), // ☀ ☁ ☂ ☃ ☄
+    (0x260E, 0x260E), // ☎
+    (0x2611, 0x2611), // ☑
+    (0x2618, 0x2618), // ☘
+    (0x261D, 0x261D), // ☝
+    (0x2620, 0x2620), // ☠
+    (0x2622, 0x2623), // ☢ ☣
+    (0x2626, 0x2626), // ☦
+    (0x262A, 0x262A), // ☪
+    (0x262E, 0x262F), // ☮ ☯
+    (0x2638, 0x263A), // ☸ ☹ ☺
+    (0x2640, 0x2640), // ♀
+    (0x2642, 0x2642), // ♂
+    (0x265F, 0x2660), // ♟ ♠
+    (0x2663, 0x2663), // ♣
+    (0x2665, 0x2666), // ♥ ♦
+    (0x2668, 0x2668), // ♨
+    (0x267B, 0x267B), // ♻
+    (0x267E, 0x267E), // ♾
+    (0x2692, 0x2697), // ⚒ ⚓ ⚔ ⚕ ⚖ ⚗
+    (0x2699, 0x2699), // ⚙
+    (0x269B, 0x269C), // ⚛ ⚜
+    (0x26A0, 0x26A0), // ⚠
+    (0x26A7, 0x26A7), // ⚧
+    (0x26B0, 0x26B1), // ⚰ ⚱
+    (0x26C8, 0x26C8), // ⛈
+    (0x26CF, 0x26CF), // ⛏
+    (0x26D1, 0x26D1), // ⛑
+    (0x26D3, 0x26D3), // ⛓
+    (0x26E9, 0x26E9), // ⛩
+    (0x26F0, 0x26F1), // ⛰ ⛱
+    (0x26F4, 0x26F4), // ⛴
+    (0x26F7, 0x26F9), // ⛷ ⛸ ⛹
+    (0x2702, 0x2702), // ✂
+    (0x2708, 0x2709), // ✈ ✉
+    (0x270C, 0x270D), // ✌ ✍
+    (0x270F, 0x270F), // ✏
+    (0x2712, 0x2712), // ✒
+    (0x2714, 0x2714), // ✔
+    (0x2716, 0x2716), // ✖
+    (0x271D, 0x271D), // ✝
+    (0x2721, 0x2721), // ✡
+    (0x2733, 0x2734), // ✳ ✴
+    (0x2744, 0x2744), // ❄
+    (0x2747, 0x2747), // ❇
+    (0x2763, 0x2764), // ❣ ❤
+    (0x27A1, 0x27A1), // ➡
+    (0x2934, 0x2935), // ⤴ ⤵
+    (0x2B05, 0x2B07), // ⬅ ⬆ ⬇
+];
+
+// How many cells one character takes. Two for CJK and the emoji, none for a combining
+// mark or a variation selector, one for nearly everything else.
+//
+// A control character is none: it prints nothing. The exception is a tab, which is kept
+// at one because that is what the wrapper counts it as when it treats it as a blank —
+// neither is the eight columns a terminal actually gives it, and disagreeing with
+// ourselves would be worse than being uniformly approximate.
+fn cell_width(ch: char) -> usize {
+    let code = ch as u32;
+    // Almost everything printed is ASCII, and the table starts far above it.
+    if code >= WIDE_TEXT_EMOJI[0].0 && code <= WIDE_TEXT_EMOJI[WIDE_TEXT_EMOJI.len() - 1].1 {
+        let found = WIDE_TEXT_EMOJI.binary_search_by(|&(first, last)| {
+            if code < first {
+                std::cmp::Ordering::Greater
+            } else if code > last {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        if found.is_ok() {
+            return 2;
+        }
+    }
+    UnicodeWidthChar::width(ch).unwrap_or(usize::from(ch == '\t'))
+}
+
 pub(crate) fn visible_width(text: &str) -> usize {
     let mut width = 0;
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
         if ch != '\u{1b}' {
-            width += 1;
+            width += cell_width(ch);
             continue;
         }
         // CSI sequences run until a byte in @..~; anything else is a two-character
@@ -1279,7 +1383,7 @@ impl Wrap {
                 }
                 _ => {
                     word.push(ch);
-                    word_width += 1;
+                    word_width += cell_width(ch);
                 }
             }
         }
@@ -1345,11 +1449,14 @@ impl Wrap {
                 out.push('\r');
                 continue;
             }
-            if self.column >= self.width && !self.row_empty {
+            // A two-cell character cannot straddle the edge, so the room for it is
+            // asked for before it is written rather than after.
+            let cells = cell_width(ch);
+            if self.column + cells > self.width && !self.row_empty {
                 self.break_row(out);
             }
             out.push(ch);
-            self.column += 1;
+            self.column += cells;
             self.row_empty = false;
         }
     }
@@ -1971,6 +2078,42 @@ mod tests {
                 row
             );
         }
+    }
+
+    // What broke a table: the screen is measured in cells, and a character is not one of
+    // them. U+2713 and U+2714 sit next to each other in the Unicode tables and are drawn
+    // differently — the second carries the emoji property and gets a color glyph two
+    // cells wide — which is why this cannot be a rule about blocks of characters.
+    #[test]
+    fn width_is_counted_in_cells_rather_than_characters() {
+        assert_eq!(super::visible_width("abc"), 3);
+        // Two cells: CJK by the standard, the emoji by the font every terminal falls back
+        // to for them.
+        assert_eq!(super::visible_width("\u{4e2d}\u{6587}"), 4);
+        assert_eq!(super::visible_width("\u{2611} Pass"), 7);
+        assert_eq!(super::visible_width("\u{1f680}"), 2);
+        // One cell, and it must stay that way: the frame of every table is drawn out of
+        // these, and a check mark that is not an emoji is drawn as text.
+        assert_eq!(super::visible_width("\u{2500}\u{2502}\u{250c}"), 3);
+        assert_eq!(super::visible_width("\u{2713}"), 1);
+        assert_eq!(super::visible_width("\u{2714}"), 2);
+        // None at all: a variation selector and a combining mark are drawn into the
+        // character in front of them, and an escape sequence is not drawn.
+        assert_eq!(super::visible_width("\u{2611}\u{fe0f}"), 2);
+        assert_eq!(super::visible_width("e\u{301}"), 1);
+        assert_eq!(super::visible_width("\u{1b}[31mred\u{1b}[0m"), 3);
+    }
+
+    // The wrapper counts the same way, so a row of wide characters stops at the edge
+    // rather than one character past it.
+    #[test]
+    fn a_run_of_wide_characters_wraps_on_the_cell_it_runs_out_on() {
+        let text = "\u{4e2d}".repeat(12) + "\n";
+        let wrapped = wrapped(&text, 10);
+        no_row_overflows(&wrapped, 10);
+        // Five characters to a ten-cell row, not ten.
+        assert_eq!(wrapped.lines().next().map(super::visible_width), Some(10));
+        assert_eq!(wrapped.lines().next().map(|row| row.chars().count()), Some(5));
     }
 
     #[test]

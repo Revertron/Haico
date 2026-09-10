@@ -46,6 +46,7 @@ ego-tree = "0.11.0"
 ignore = "0.4.33"
 globset = "0.4.20"
 toml = "1.1.4"
+unicode-width = "0.2.2"
 
 # Windows only, and only for the full-screen renderer's mouse.
 #

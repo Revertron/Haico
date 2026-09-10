@@ -1654,6 +1654,37 @@ mod markdown_tests {
         );
     }
 
+    // A cell holding a character the terminal draws two cells wide. Measured in
+    // characters the row is a character shorter than the frame; measured in cells, which
+    // is what the screen actually is, it has to be exactly as wide. Getting that wrong is
+    // what put the right-hand border of every row one column past the corner above it.
+    #[test]
+    fn a_wide_character_in_a_cell_does_not_push_the_border_past_the_frame() {
+        let table = rows(&[
+            "| Test | Status |",
+            "|---|---|",
+            "| Host-based routing | \u{2611} Pass |",
+            "| Missing file | \u{2611} Pass |",
+        ]);
+        let drawn = plain(&layout_table(&table, 60));
+
+        let widths: Vec<usize> = drawn.lines().map(crate::out::visible_width).collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "the rows are not all the same width on screen: {:?} in {:?}",
+            widths,
+            drawn
+        );
+        // And it really is the wide character doing it, rather than every row happening
+        // to hold the same number of characters.
+        let characters: Vec<usize> = drawn.lines().map(|line| line.chars().count()).collect();
+        assert!(
+            characters.iter().any(|count| *count != characters[0]),
+            "the test is not exercising a wide character: {:?}",
+            drawn
+        );
+    }
+
     #[test]
     fn a_table_too_wide_for_the_terminal_wraps_its_widest_column() {
         let table = rows(&[
