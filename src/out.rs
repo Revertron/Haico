@@ -672,6 +672,29 @@ impl Screen {
         }
     }
 
+    // Throw the transcript away.
+    //
+    // The lines are gone rather than scrolled past, because this is what `/clear` does to
+    // the conversation and a transcript of a conversation that no longer exists is not
+    // something to scroll back through. `dump` writes what is left on the way out, so a
+    // cleared session does not reappear in the terminal's own scrollback either.
+    //
+    // The sequence numbers carry on from where they were rather than starting again.
+    // `dropped` means "how many lines this buffer no longer has", and these are exactly
+    // that; handing their numbers to lines written after the clear is how an anchor left
+    // over from before it would come to point at one of them.
+    fn forget(&mut self) {
+        self.dropped += self.lines.len() as u64;
+        self.lines.clear();
+        self.open.clear();
+        self.carry.clear();
+        // A fold that was still open belonged to output that has just gone. Left on
+        // Detail, the next thing written would be hidden behind a summary that is no
+        // longer on the screen to expand.
+        self.writing = Kind::Normal;
+        self.scroll = None;
+    }
+
     fn shows(&self, kind: Kind) -> bool {
         match kind {
             Kind::Normal => true,
@@ -1447,6 +1470,48 @@ pub(crate) fn clear_region() {
     }
 }
 
+// Throw away everything that has been shown, along with the conversation it was showing.
+//
+// `/clear` starts over, and the transcript of what was just discarded is not something to
+// scroll back through — the window frontend has always dropped it with the history, and
+// this is the same thing for the two terminal renderers. Under the full-screen one the
+// transcript is haico's own, so it is simply forgotten. Under the inline one the lines
+// belong to the terminal, so the terminal is asked to purge them, its scrollback included:
+// clearing only the viewport would leave the whole cleared conversation one wheel-click
+// above it, which is not clearing it at all.
+//
+// Nothing happens when the output is a pipe rather than a terminal — there is no screen to
+// clear and the escapes would land in whatever is reading it. `raw` is what tells the two
+// apart, being switched on for exactly as long as there is a terminal to hold in raw mode.
+pub(crate) fn clear_screen() {
+    let mut state = lock();
+    if state.screen.is_some() {
+        if let Some(screen) = &mut state.screen {
+            screen.forget();
+        }
+        state.screen_paint();
+        return;
+    }
+    if !state.raw {
+        return;
+    }
+    // The region comes off first, so what is drawn next is drawn from the top of an empty
+    // screen rather than patched into rows the last frame still believes it knows the
+    // position of. The half-finished line waiting above it goes with the rest.
+    state.erase_region();
+    state.pending.clear();
+    state.wrap.reset_line();
+    let escapes = format!(
+        "{}{}{}",
+        Clear(ClearType::Purge),
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    );
+    state.write_out(&escapes);
+    state.at_line_start = true;
+    state.paint();
+}
+
 // Take the alternate screen and start owning the viewport.
 //
 // Everything printed from here on belongs to haico rather than to the terminal, which is
@@ -1985,6 +2050,43 @@ mod tests {
         // Blank lines keep their rows.
         assert_eq!(wrapped("one\n\ntwo\n", 40), "one\n\ntwo\n");
     }
+
+    // /clear takes the screen with the conversation. Under the inline renderer the lines
+    // are the terminal's, so the scrollback has to go too — a cleared conversation still
+    // sitting one wheel-click above the input box was never cleared.
+    #[test]
+    fn clearing_takes_the_scrollback_with_the_screen_and_puts_the_box_back() {
+        let _guard = super::capture_guard();
+
+        super::start_capture();
+        super::set_raw(true);
+        super::set_region(vec!["> hello".to_string()], 0, 7);
+        outln!("a result");
+        super::clear_screen();
+        let written = super::take_capture();
+
+        let purge = written.rfind("[3J").expect("the scrollback should be purged");
+        assert!(
+            written[purge..].find("a result").is_none(),
+            "the transcript survived the clear in {:?}",
+            written
+        );
+        let redraw = written.rfind("> hello").expect("the box should be drawn again");
+        assert!(purge < redraw, "wrong order in {:?}", written);
+    }
+
+    // Nothing is written at all when there is no screen to clear: the escapes would just
+    // be junk in whatever is reading the output.
+    #[test]
+    fn clearing_a_piped_session_writes_no_escapes_into_the_pipe() {
+        let _guard = super::capture_guard();
+
+        // `start_capture` leaves raw mode off, which is what a piped session leaves it.
+        super::start_capture();
+        outln!("a result");
+        super::clear_screen();
+        assert_eq!(super::take_capture(), "a result\n");
+    }
     // ---- the full-screen renderer ----
 
     fn screen_with(lines: &[&str]) -> super::Screen {
@@ -2350,5 +2452,28 @@ mod tests {
             "the unfinished line was dropped: {:?}",
             dumped
         );
+    }
+
+    // /clear throws the conversation away, and the transcript is a transcript of that
+    // conversation: it goes too, off the screen and out of the dump both, so giving up the
+    // alternate screen later does not hand the cleared session back.
+    #[test]
+    fn a_cleared_transcript_leaves_the_screen_and_the_dump_empty() {
+        let mut screen = screen_with(&["first", "second"]);
+        screen.write("a line that never ended");
+        frame(&mut screen, &["> "], (40, 6));
+
+        screen.forget();
+        let painted = frame(&mut screen, &["> "], (40, 6));
+
+        for gone in ["first", "second", "a line that never ended"] {
+            assert!(!painted.contains(gone), "{:?} survived in {:?}", gone, painted);
+        }
+        assert!(screen.rows(40, 6).is_empty(), "{:?}", screen.rows(40, 6));
+        assert_eq!(screen.dump(40), "");
+
+        // And the screen is a working one again rather than a dead end.
+        screen.write("after\n");
+        assert_eq!(screen.dump(40), "after\n");
     }
 }

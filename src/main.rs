@@ -761,7 +761,10 @@ async fn main() -> Result<()> {
 
         if input == "/clear" || input == "/new" || input == "/reset" {
             // What is discarded, what survives and why is `Agent::clear`'s
-            // business; all that is left here is saying what happened.
+            // business. The screen is this frontend's: a transcript of a
+            // conversation that no longer exists goes with it, the way it always
+            // has in the window. What is left here is saying what happened.
+            out::clear_screen();
             match agent.clear() {
                 ContextReload::Unchanged => {}
                 ContextReload::Reloaded(name) => outln!("Reloaded project context from {}", name),
