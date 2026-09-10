@@ -352,16 +352,54 @@ impl Agent {
 ///   instruction and the end of the message is a long way for a small model to
 ///   hold it. The `@name` is still in the text, and each block names itself by
 ///   that as well as by the full path, so the two ends tie together.
-async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> String {
+///
+/// A mentioned **image** takes the other path out of this function. It cannot go
+/// in the text, so the message stops being text: `content` becomes the
+/// OpenAI-compatible parts array, the image parts first and one text part
+/// carrying everything above. That shape is only used when there is an image in
+/// it — a plain string is what every server handles, and there is no reason to
+/// make one parse an array to be told a sentence.
+///
+/// Whether the model can *see* the image is deliberately not asked. There is no
+/// reliable way to know from here: the name says nothing dependable, and no
+/// OpenAI-compatible endpoint reports it. So the image is sent, and a text-only
+/// model's server says so in its own words — which is a clearer answer than a
+/// guess of haico's would be.
+async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Value {
     let mentions = crate::mention::find(input);
     if mentions.is_empty() {
-        return input.to_string();
+        return json!(input);
     }
 
     let mut blocks = String::new();
+    let mut images: Vec<Value> = Vec::new();
 
     for mention in mentions {
         let shown = display_path(&mention.path);
+
+        // Sniffed from the bytes, so a JPEG that someone renamed to .png is
+        // still sent as a JPEG. See `mention::image_type`.
+        if let Some(mime) = crate::mention::image_type_of(&mention.path) {
+            match std::fs::read(&mention.path) {
+                Ok(bytes) => {
+                    let outside = agent.workspace.attach(&mention.path);
+                    let _ = tx.send(
+                        Notice::ImageAttached { path: shown, bytes: bytes.len(), outside }.into(),
+                    );
+                    images.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": data_url(mime, &bytes) }
+                    }));
+                }
+                Err(e) => {
+                    let _ = tx.send(
+                        Notice::FileNotAttached { path: shown, reason: e.to_string() }.into(),
+                    );
+                }
+            }
+            continue;
+        }
+
         let read = agent
             .server
             .read(Parameters(ReadParams {
@@ -419,11 +457,28 @@ async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Stri
         ));
     }
 
-    if blocks.is_empty() {
-        input.to_string()
-    } else {
-        format!("{}{}", blocks, input)
+    let text = if blocks.is_empty() { input.to_string() } else { format!("{}{}", blocks, input) };
+
+    if images.is_empty() {
+        return json!(text);
     }
+
+    // Images first and the text last, for the same reason the text blocks go
+    // above the request: what the model is being asked to do should be the last
+    // thing it reads.
+    let mut parts = images;
+    parts.push(json!({"type": "text", "text": text}));
+    json!(parts)
+}
+
+/// One image as the `data:` URL an OpenAI-compatible server expects.
+///
+/// A URL and not a file path, because the server is a separate process and may
+/// be a separate machine — a path it could not open is the one thing this must
+/// never send.
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,10 +507,10 @@ pub(crate) async fn run_turn(
         let turn_started = std::time::Instant::now();
 
         // Add user message, with any `@path` in it already read into it.
-        let input = attach_mentions(agent, input, tx).await;
+        let content = attach_mentions(agent, input, tx).await;
         agent.messages.push(json!({
             "role": "user",
-            "content": input
+            "content": content
         }));
 
         // Get LLM response and handle tool call chains. The cap stops a model that keeps
@@ -1219,8 +1274,8 @@ pub(crate) async fn run_turn(
                 // the harder thing to explain.
                 for text in link.take_queued() {
                     let _ = tx.send(Notice::QueuedSent(text.clone()).into());
-                    let text = attach_mentions(agent, &text, tx).await;
-                    agent.messages.push(json!({"role": "user", "content": text}));
+                    let content = attach_mentions(agent, &text, tx).await;
+                    agent.messages.push(json!({"role": "user", "content": content}));
                 }
 
                 // Continue the loop to get next response (might be more tool calls or final answer)

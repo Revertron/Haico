@@ -834,6 +834,14 @@ fn describe(notice: Notice) -> (String, Tone) {
                 (line, Tone::Muted)
             }
         }
+        Notice::ImageAttached { path, bytes, outside } => {
+            let line = format!("attached {path} (image, {} KB)", bytes.div_ceil(1024));
+            if outside {
+                (format!("{line} — outside the workspace, added for this session"), Tone::Warning)
+            } else {
+                (line, Tone::Muted)
+            }
+        }
         Notice::FileNotAttached { path, reason } => {
             (format!("could not attach {path}: {reason}"), Tone::Warning)
         }
@@ -2308,6 +2316,8 @@ mod tests {
             Notice::LoopBroken { tool: "t".into(), count: 5 },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: false },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: true },
+            Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: false },
+            Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: true },
             Notice::FileNotAttached { path: "p".into(), reason: "r".into() },
             Notice::QueuedSent("q".into()),
             Notice::ProjectContextReloaded("CLAUDE.md".into()),

@@ -285,6 +285,10 @@ pub(crate) enum Notice {
     /// went out. `outside` marks the ones that were beyond the workspace and
     /// widened it, which is the half worth reading twice.
     FileAttached { path: String, lines: usize, outside: bool },
+    /// The same, for an image, which goes into the message as a data URL rather
+    /// than as text. Bytes and not lines: an image has none, and its size is the
+    /// figure worth showing because it is what the request will carry.
+    ImageAttached { path: String, bytes: usize, outside: bool },
     /// …and one that could not be read, so the message carries the name alone.
     /// Worth saying: silence here looks exactly like a file that was attached.
     FileNotAttached { path: String, reason: String },

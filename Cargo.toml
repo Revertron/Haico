@@ -47,6 +47,9 @@ ignore = "0.4.33"
 globset = "0.4.20"
 toml = "1.1.4"
 unicode-width = "0.2.2"
+# An image in a message goes out as a data: URL, which is what every OpenAI-compatible
+# server takes. Encoding one is the whole use.
+base64 = "0.22"
 
 # Windows only, and only for the full-screen renderer's mouse.
 #

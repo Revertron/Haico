@@ -327,6 +327,15 @@ impl Presenter {
                 if lines == 1 { "" } else { "s" },
                 if outside { " — outside the workspace, added for this session" } else { "" }
             ),
+            // Kilobytes rather than lines, and the icon differs, because what
+            // the request carries is what the reader wants to weigh up: an
+            // image is worth ten of the text file next to it in the list.
+            Notice::ImageAttached { path, bytes, outside } => outln!(
+                "  ⊕ {} (image, {} KB){}",
+                path,
+                bytes.div_ceil(1024),
+                if outside { " — outside the workspace, added for this session" } else { "" }
+            ),
             Notice::FileNotAttached { path, reason } => {
                 outln!("  ⊘ {} was not attached: {}", path, reason)
             }

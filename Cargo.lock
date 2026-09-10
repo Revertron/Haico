@@ -2010,6 +2010,7 @@ name = "haico"
 version = "0.2.14"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clipboard-win",
  "crossterm",

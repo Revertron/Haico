@@ -42,6 +42,44 @@ const TRAILING: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"
 // a word. The mirror of the set above, so "(@path)" works from both ends.
 const OPENERS: &[char] = &['(', '[', '{', '<', '"', '\'', '`'];
 
+/// The image formats a vision model is reachable with, as the MIME type that
+/// goes in the data URL.
+///
+/// **Recognized by the bytes on disk, never by the extension.** A `.png` that is
+/// really a JPEG is common enough — every screenshot tool that renames rather
+/// than converts makes one — and the MIME type in a data URL is not decoration:
+/// a server that believes it decodes the wrong thing and fails somewhere far
+/// from here. The four are what OpenAI-compatible servers agree on; anything
+/// else is left to the text path, which says "not a text file" and is right.
+pub(crate) fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    // Each of these is the format's own signature, taken from its specification
+    // rather than guessed from a sample.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// As above, for a file on disk, reading only as much of it as the question
+/// needs.
+///
+/// Twelve bytes rather than the whole file: an image is read whole a moment
+/// later anyway, but a text file must not be read twice over just to establish
+/// that it is one.
+pub(crate) fn image_type_of(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut header = Vec::with_capacity(12);
+    std::fs::File::open(path).ok()?.take(12).read_to_end(&mut header).ok()?;
+    image_type(&header)
+}
+
 /// Every file the text mentions, in the order they were typed, without repeats.
 ///
 /// Repeats are dropped by resolved path rather than by what was typed: naming
@@ -176,6 +214,34 @@ mod tests {
         let dir = TempDir::new("mention-dir");
         let text = format!("look in @{}", dir.path().display());
         assert!(find(&text).is_empty());
+    }
+
+    #[test]
+    fn an_image_is_recognized_by_its_bytes_and_not_its_name() {
+        // The smallest valid file of each kind is not needed — only the
+        // signature is read, and reading only the signature is the point.
+        assert_eq!(image_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]), Some("image/jpeg"));
+        assert_eq!(image_type(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(image_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+
+        // Text, an empty file, and a RIFF container that is a WAV rather than a
+        // WEBP — the one case a four-byte check would get wrong.
+        assert_eq!(image_type(b"fn main() {}"), None);
+        assert_eq!(image_type(b""), None);
+        assert_eq!(image_type(b"RIFF\0\0\0\0WAVEfmt "), None);
+
+        // And the name never enters into it: a JPEG called .png is a JPEG,
+        // which matters because the MIME type in the data URL is what the
+        // server decodes by.
+        let dir = TempDir::new("mention-image");
+        let lying = dir.join("screenshot.png");
+        std::fs::write(&lying, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(image_type_of(&lying), Some("image/jpeg"));
+
+        let text = dir.join("notes.png");
+        std::fs::write(&text, "not an image at all").unwrap();
+        assert_eq!(image_type_of(&text), None);
     }
 
     #[test]

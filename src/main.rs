@@ -81,6 +81,8 @@ fn print_repl_help() {
     outln!();
     outln!("In a message:  write @path to send the file with it — relative or absolute,");
     outln!("               and a file outside the workspace comes into reach with it.");
+    outln!("               A PNG, JPEG, GIF or WEBP goes as a picture, for a model that");
+    outln!("               can see one; a model that cannot will say so.");
     outln!("At the prompt: up/down for history, Shift+Enter for another line,");
     outln!("               Ctrl+V or Shift+Insert to paste,");
     outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
@@ -1533,6 +1535,85 @@ mod turn_tests {
             agent.server.check_may_modify(&file).is_none(),
             "the mentioned file was not marked read — the saved round is spent re-reading it"
         );
+    }
+
+    /// A mentioned image cannot go in the text, so the message stops being
+    /// text: `content` becomes the parts array, with the image as a data URL.
+    #[tokio::test]
+    async fn a_mentioned_image_becomes_a_content_part() {
+        let _capture = crate::out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        let dir = crate::testutil::TempDir::new("mention-image-turn");
+        let png = dir.join("shot.png");
+        // A signature and some bytes after it: nothing decodes this, and what
+        // is asserted is the shape of the message, not the picture.
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "some prose").unwrap();
+
+        let input = format!("what is in @{} — see also @{}", png.display(), notes.display());
+        let (agent, served) = run_one(&[ANSWER], &input).await;
+        assert_eq!(served, 1);
+
+        let message = agent
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .cloned()
+            .unwrap();
+        let parts = message["content"].as_array().expect("content should be a parts array");
+
+        // The image first, the text last — the request is what the model should
+        // read at the end.
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "not a png data URL: {}",
+            parts[0]["image_url"]["url"]
+        );
+        assert_eq!(parts[1]["type"], "text");
+
+        // The text part still carries the text file and the request itself, so
+        // mixing the two kinds in one message loses neither.
+        let text = parts[1]["text"].as_str().unwrap();
+        assert!(text.contains("some prose"), "the text mention is missing: {text}");
+        assert!(text.trim_end().ends_with(&input), "the request is not last in: {text}");
+
+        // And the base64 is costed as an image rather than as prose. Left alone,
+        // a screenshot reads as hundreds of thousands of tokens and auto mode
+        // starts compacting a history that compaction cannot shrink. Measured
+        // against the same message with a realistic payload in it, since the
+        // twelve-byte one above would pass either way.
+        let mut heavy = message.clone();
+        heavy["content"][0]["image_url"]["url"] =
+            Value::String(format!("data:image/png;base64,{}", "A".repeat(400_000)));
+        let estimate = crate::session::estimate_tokens(&[heavy]);
+        assert!(
+            estimate < 2000,
+            "a 300 KB image is being counted as {estimate} tokens of text"
+        );
+    }
+
+    /// A message carrying an image must still reach a text summarizer as
+    /// something, or the turn it began summarizes as though nobody spoke.
+    #[test]
+    fn an_image_message_still_has_text_for_the_summarizer() {
+        let message = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "why is this button grey?"}
+            ]
+        });
+        let text = crate::session::message_text(&message);
+        assert!(text.contains("why is this button grey?"));
+        assert!(text.contains("[an image]"), "the image left no mark: {text}");
+        assert!(!text.contains("AAAA"), "the base64 reached the summarizer: {text}");
     }
 
     /// A mentioned file outside every root comes into reach, and only that file
