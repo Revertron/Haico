@@ -70,6 +70,12 @@ impl Presenter {
             AgentEvent::ReasoningChunk(text) => {
                 if !self.streamed_thinking {
                     self.streamed_thinking = true;
+                    // A row of its own, with a blank one above it, for the
+                    // same reason the answer gets one: the thinking is not a
+                    // continuation of the prompt, or of the tool result it
+                    // follows.
+                    crate::out::ensure_line_start();
+                    outln!();
                     // Folded from the start rather than after the fact: the
                     // reasoning can run for pages, and the activity bar is
                     // already counting the characters as they arrive, so nothing
