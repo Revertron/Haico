@@ -317,6 +317,19 @@ impl Presenter {
                 "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
                 tool, count
             ),
+            // Under the echoed message, indented, because that is what it is
+            // about — and one line each however long the file was, since the
+            // contents went to the model and not to the screen.
+            Notice::FileAttached { path, lines, outside } => outln!(
+                "  ⊕ {} ({} line{}){}",
+                path,
+                lines,
+                if lines == 1 { "" } else { "s" },
+                if outside { " — outside the workspace, added for this session" } else { "" }
+            ),
+            Notice::FileNotAttached { path, reason } => {
+                outln!("  ⊘ {} was not attached: {}", path, reason)
+            }
             Notice::QueuedSent(text) => outln!("{}", echo(PROMPT, &text)),
             Notice::ProjectContextReloaded(name) => {
                 outln!("\nLoaded project context from {}", name)

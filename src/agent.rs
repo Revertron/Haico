@@ -22,6 +22,7 @@
 //! by the frontend from a `Waiting` kind and an elapsed time.
 
 use anyhow::{anyhow, Result};
+use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -47,9 +48,9 @@ use crate::session::{
     reasoning_needs_a_request, reasoning_text, save_session, session_file_path,
     set_system_message, ReasoningOutcome, ReasoningStats,
 };
-use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer};
+use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer, ReadParams};
 use crate::turn::*;
-use crate::util::truncate_at_boundary;
+use crate::util::{display_path, truncate_at_boundary};
 use crate::workspace::Workspace;
 
 /// What a successful [`Agent::resume`] restored, for the caller to report.
@@ -320,6 +321,112 @@ impl Agent {
 }
 
 // ---------------------------------------------------------------------------
+// @mentions
+// ---------------------------------------------------------------------------
+
+/// Put the files a message named with `@` into the message, before it is sent.
+///
+/// The saving is a whole round. Left to itself the model reads the name, emits a
+/// `read` call, waits for the server to prefill the reply and only then starts
+/// working; on a local model that is seconds to minutes spent fetching something
+/// the user already knew they wanted. Which file it is is not a judgment call
+/// here — the user typed the path.
+///
+/// Three things are worth knowing about what this does beyond concatenating:
+///
+/// - **It reads through the `read` tool rather than `fs::read_to_string`.** That
+///   is what gets the line-number prefixes the edit tool's callers expect, the
+///   2000-line cap, the "not a text file" message for a binary, and — the part
+///   that matters most — `mark_read`. Without that last one the model is handed
+///   the contents and then refused the edit, because `check_may_modify` has
+///   never seen the file this session. The turn saved by attaching would be
+///   spent re-reading it, which is the whole feature undone.
+/// - **A file outside the workspace widens it, to that one file.** Typing the
+///   path is the consent; see `Workspace::attach` for why it stays one file.
+///   Nothing has to be done to tell the model about it: `with_mode_note` builds
+///   the workspace note from the workspace itself on every request, so a file
+///   attached here is named in the one that follows. The system prompt does not
+///   carry the boundary and is deliberately left alone.
+/// - **The blocks go in front of the user's own words, not after.** The request
+///   is what the model should read last, and a 2000-line attachment between the
+///   instruction and the end of the message is a long way for a small model to
+///   hold it. The `@name` is still in the text, and each block names itself by
+///   that as well as by the full path, so the two ends tie together.
+async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> String {
+    let mentions = crate::mention::find(input);
+    if mentions.is_empty() {
+        return input.to_string();
+    }
+
+    let mut blocks = String::new();
+
+    for mention in mentions {
+        let shown = display_path(&mention.path);
+        let read = agent
+            .server
+            .read(Parameters(ReadParams {
+                file_path: mention.path.display().to_string(),
+                offset: None,
+                limit: None,
+            }))
+            .await;
+
+        let text = match read {
+            Ok(result) if result.is_error != Some(true) => result
+                .content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            // Binary, unreadable, or gone in the moment between the parse and
+            // now. Nothing is attached and the `@name` stays in the text as
+            // written, so the model can still call `read` on it and be told the
+            // same thing through the channel that knows how to say it.
+            Ok(result) => {
+                let reason = result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // The tool quotes back the path it was handed, which is the
+                // verbatim form because that is what the workspace compares
+                // against. `display_path` cannot reach it there — it strips a
+                // prefix, and this one is in the middle of a sentence.
+                let reason = reason.replace(r"\\?\", "");
+                let _ = tx.send(Notice::FileNotAttached { path: shown, reason }.into());
+                continue;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Notice::FileNotAttached { path: shown, reason: format!("{:?}", e) }.into());
+                continue;
+            }
+        };
+
+        // After the read, not before: a file that turned out to be unreadable has
+        // no business having widened the boundary on its way to failing.
+        let outside = agent.workspace.attach(&mention.path);
+
+        let _ = tx.send(
+            Notice::FileAttached { path: shown.clone(), lines: text.lines().count(), outside }
+                .into(),
+        );
+
+        blocks.push_str(&format!(
+            "Contents of {}, referenced as {} in the message below:\n{}\n\n",
+            shown, mention.written, text
+        ));
+    }
+
+    if blocks.is_empty() {
+        input.to_string()
+    } else {
+        format!("{}{}", blocks, input)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // One turn
 // ---------------------------------------------------------------------------
 
@@ -344,7 +451,8 @@ pub(crate) async fn run_turn(
         // not just the time the model spent generating.
         let turn_started = std::time::Instant::now();
 
-        // Add user message
+        // Add user message, with any `@path` in it already read into it.
+        let input = attach_mentions(agent, input, tx).await;
         agent.messages.push(json!({
             "role": "user",
             "content": input
@@ -1104,8 +1212,14 @@ pub(crate) async fn run_turn(
                 // every tool call already has its result. Any sooner would put a user
                 // message between an assistant turn and the tool results it is waiting
                 // for, which is a message order servers reject outright.
+                // The echo carries what was typed; the message carries the same
+                // text with its mentions read into it. Typing `@path` while the
+                // model works is as ordinary as typing it at the prompt, and a
+                // mention that expanded in one place and not the other would be
+                // the harder thing to explain.
                 for text in link.take_queued() {
                     let _ = tx.send(Notice::QueuedSent(text.clone()).into());
+                    let text = attach_mentions(agent, &text, tx).await;
                     agent.messages.push(json!({"role": "user", "content": text}));
                 }
 

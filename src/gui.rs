@@ -826,6 +826,17 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::LoopBroken { tool, count } => {
             (format!("stopped: '{tool}' called {count} times in a row"), Tone::Warning)
         }
+        Notice::FileAttached { path, lines, outside } => {
+            let line = format!("attached {path} ({lines} lines)");
+            if outside {
+                (format!("{line} — outside the workspace, added for this session"), Tone::Warning)
+            } else {
+                (line, Tone::Muted)
+            }
+        }
+        Notice::FileNotAttached { path, reason } => {
+            (format!("could not attach {path}: {reason}"), Tone::Warning)
+        }
         Notice::QueuedSent(text) => (text, Tone::Normal),
         Notice::ProjectContextReloaded(name) => {
             (format!("reloaded project context from {name}"), Tone::Muted)
@@ -2295,6 +2306,9 @@ mod tests {
             Notice::PermissionDenied { alternative: "a".into() },
             Notice::LoopNudge { tool: "t".into(), count: 3 },
             Notice::LoopBroken { tool: "t".into(), count: 5 },
+            Notice::FileAttached { path: "p".into(), lines: 3, outside: false },
+            Notice::FileAttached { path: "p".into(), lines: 3, outside: true },
+            Notice::FileNotAttached { path: "p".into(), reason: "r".into() },
             Notice::QueuedSent("q".into()),
             Notice::ProjectContextReloaded("CLAUDE.md".into()),
         ];

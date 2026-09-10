@@ -20,6 +20,7 @@ mod input;
 mod llm;
 #[cfg(feature = "gui")]
 mod markdown;
+mod mention;
 mod modes;
 mod permissions;
 mod present;
@@ -78,6 +79,8 @@ fn print_repl_help() {
     outln!("  /clear /new /reset Start over, keeping the system prompt");
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
     outln!();
+    outln!("In a message:  write @path to send the file with it — relative or absolute,");
+    outln!("               and a file outside the workspace comes into reach with it.");
     outln!("At the prompt: up/down for history, Shift+Enter for another line,");
     outln!("               Ctrl+V or Shift+Insert to paste,");
     outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
@@ -731,6 +734,14 @@ async fn main() -> Result<()> {
                 outln!("Readable only:");
                 for root in agent.workspace.readable_roots() {
                     outln!("  {}", display_path(root));
+                }
+            }
+            // Listed apart from the directories above, because that is what they
+            // are not: the file is in reach and nothing else in its directory is.
+            if !agent.workspace.attached_files().is_empty() {
+                outln!("Single files, named with @ in a message:");
+                for file in agent.workspace.attached_files() {
+                    outln!("  {}", display_path(file));
                 }
             }
             outln!("\nAnything else is refused outright, for reads as well as writes.\n");
@@ -1484,6 +1495,81 @@ mod turn_tests {
         assert_eq!(
             agent.messages.last().and_then(|m| m.get("content")).and_then(Value::as_str),
             Some("all done")
+        );
+    }
+
+    /// `@path` in a message puts the file in the message, which is the whole
+    /// point: the turn must reach the model with the contents already there,
+    /// rather than spending a round on a `read` the user has already asked for.
+    #[tokio::test]
+    async fn a_mentioned_file_arrives_in_the_message() {
+        let _capture = crate::out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        let dir = crate::testutil::TempDir::new("mention-turn");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "the quick brown fox").unwrap();
+
+        let input = format!("what is in @{}?", file.display());
+        let (agent, served) = run_one(&[ANSWER], &input).await;
+
+        // One request, not two: nothing was fetched by a tool call.
+        assert_eq!(served, 1);
+        let sent = agent
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(sent.contains("the quick brown fox"), "contents missing from: {sent}");
+        // The instruction is still the last thing the model reads, and the
+        // reference it was written as is still in it.
+        assert!(sent.trim_end().ends_with(&input), "the request is not last in: {sent}");
+
+        // Read through the `read` tool, so the file counts as seen and an edit
+        // is not refused for a file the model was just handed.
+        assert!(
+            agent.server.check_may_modify(&file).is_none(),
+            "the mentioned file was not marked read — the saved round is spent re-reading it"
+        );
+    }
+
+    /// A mentioned file outside every root comes into reach, and only that file
+    /// does. `/add` widens to a directory because that is what it is asked for;
+    /// a mention is asked about one file, and `@~/.ssh/config` must not hand
+    /// over the keys beside it.
+    #[tokio::test]
+    async fn a_mention_outside_the_workspace_reaches_that_file_alone() {
+        let _capture = crate::out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        // Outside the working directory the test agent is built in, which is the
+        // crate root.
+        let dir = crate::testutil::TempDir::new("mention-outside");
+        let named = dir.join("named.txt");
+        let sibling = dir.join("sibling.txt");
+        std::fs::write(&named, "in reach").unwrap();
+        std::fs::write(&sibling, "not in reach").unwrap();
+
+        let (agent, _) = run_one(&[ANSWER], &format!("read @{}", named.display())).await;
+
+        assert!(agent.workspace.may_write(&named), "the named file is still refused");
+        assert!(
+            !agent.workspace.may_read(&sibling),
+            "the mention opened the whole directory, not the one file"
+        );
+        // And the model is told, or it finds out through a refused call instead.
+        // The note is built per request from the workspace, so this is what the
+        // next request would carry rather than what the system prompt holds.
+        let note = agent.workspace.note();
+        assert!(
+            note.contains(&crate::util::display_path(&crate::util::absolute_path(&named))),
+            "the attached file is not in the workspace note: {note}"
+        );
+        assert!(
+            !note.contains(&crate::util::display_path(&crate::util::absolute_path(&sibling))),
+            "the note names a file that was never attached: {note}"
         );
     }
 

@@ -281,6 +281,13 @@ pub(crate) enum Notice {
     LoopNudge { tool: String, count: usize },
     /// …and this is where the turn gave up on it.
     LoopBroken { tool: String, count: usize },
+    /// A file the message named with `@` was read into it before the request
+    /// went out. `outside` marks the ones that were beyond the workspace and
+    /// widened it, which is the half worth reading twice.
+    FileAttached { path: String, lines: usize, outside: bool },
+    /// …and one that could not be read, so the message carries the name alone.
+    /// Worth saying: silence here looks exactly like a file that was attached.
+    FileNotAttached { path: String, reason: String },
     /// Text typed while the model was working, now joining the conversation.
     QueuedSent(String),
     /// `/init` wrote the project's instructions and they were re-read.

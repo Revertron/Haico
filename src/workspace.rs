@@ -45,6 +45,12 @@ pub(crate) struct Workspace {
     // separately because it is the one writable root that is not the user's work, and
     // both the system prompt and the auto-mode reviewer have to say so.
     scratch: Option<PathBuf>,
+    // Single files pulled in by an `@mention` that fell outside everything above. Readable
+    // and writable, like `writable`, and kept in their own list for two reasons: a file
+    // path in a list every other entry of which is a directory reads as a mistake wherever
+    // that list is shown, and `/add` and a mention are asking for different things — one
+    // widens the boundary to a tree the user named, the other to the one file they did.
+    attached: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -56,6 +62,7 @@ impl Workspace {
                 .map(|p| absolute_path(&expand_home(p)))
                 .collect(),
             scratch: None,
+            attached: Vec::new(),
         }
     }
 
@@ -102,23 +109,52 @@ impl Workspace {
         Ok(resolved)
     }
 
+    // Make one file readable and writable for the rest of the session.
+    //
+    // Called for a file the user named with `@` that no root covers. Typing the path is
+    // the consent — the same consent `/add` asks for, given about one file instead of a
+    // directory — so there is no prompt. It stays one file: a mention must not open the
+    // directory around it, or `@~/.ssh/config` would hand over every key beside it.
+    //
+    // Says whether it actually widened anything, because that is the part worth telling
+    // the user about; a mention inside the project is not news.
+    pub(crate) fn attach(&mut self, path: &Path) -> bool {
+        let resolved = absolute_path(path);
+        if self.may_read(&resolved) {
+            return false;
+        }
+        self.attached.push(resolved);
+        true
+    }
+
+    pub(crate) fn attached_files(&self) -> &[PathBuf] {
+        &self.attached
+    }
+
     pub(crate) fn may_read(&self, path: &Path) -> bool {
         let path = absolute_path(path);
-        self.writable.iter().chain(self.readable.iter()).any(|root| path.starts_with(root))
+        self.attached.iter().any(|file| file == &path)
+            || self.writable.iter().chain(self.readable.iter()).any(|root| path.starts_with(root))
     }
 
     pub(crate) fn may_write(&self, path: &Path) -> bool {
         let path = absolute_path(path);
-        self.writable.iter().any(|root| path.starts_with(root))
+        self.attached.iter().any(|file| file == &path)
+            || self.writable.iter().any(|root| path.starts_with(root))
     }
 
     // The root a path falls under, so an approval can be keyed to it. Approving writes in
     // one project must not silently extend to a directory added later.
+    //
+    // An attached file is its own root, and is checked first: it is the narrower answer
+    // wherever both could match, and it is the only answer when the file sits outside
+    // every directory in the workspace — which is the case it exists for.
     pub(crate) fn writable_root_for(&self, path: &Path) -> Option<&Path> {
         let path = absolute_path(path);
-        self.writable
+        self.attached
             .iter()
-            .find(|root| path.starts_with(root))
+            .find(|file| *file == &path)
+            .or_else(|| self.writable.iter().find(|root| path.starts_with(root)))
             .map(|root| root.as_path())
     }
 
@@ -155,6 +191,19 @@ impl Workspace {
             note.push_str(&format!(
                 "\n\nThese may be read but never written:\n{}",
                 list(&self.readable)
+            ));
+        }
+
+        // Named individually, because they are the one part of the boundary the model
+        // cannot infer from a directory: the file is fair game and everything beside it in
+        // the same directory is not, and a model that assumed otherwise would spend a
+        // round finding out through a refusal.
+        if !self.attached.is_empty() {
+            note.push_str(&format!(
+                "\n\nThese single files may also be read and written, because the user \
+                 named them in a message. Only these files — not the rest of the \
+                 directories they are in:\n{}",
+                list(&self.attached)
             ));
         }
 
@@ -204,6 +253,18 @@ impl Workspace {
             note.push_str(&format!(
                 "\n\nThese it may read but never write:\n{}",
                 list(&self.readable)
+            ));
+        }
+
+        // The reviewer sees one call with no conversation behind it, so a write to a file
+        // in someone's home directory reads as exactly the thing it is told to deny —
+        // while the user typed that path themselves one message ago.
+        if !self.attached.is_empty() {
+            note.push_str(&format!(
+                "\n\nThe user named these single files in a message, which is what put them \
+                 in reach. Reading and changing them is what was asked for, wherever they \
+                 happen to live:\n{}",
+                list(&self.attached)
             ));
         }
 
@@ -262,7 +323,7 @@ impl Workspace {
 
 // Expand a leading "~" against the user's home directory, so a hand-written config file can
 // say "~/.cargo/registry" without knowing which drive the profile lives on.
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     let trimmed = path.trim();
     let Some(rest) = trimmed.strip_prefix('~') else {
         return PathBuf::from(trimmed);
