@@ -1057,7 +1057,7 @@ In force for '{}':", agent.client.model);
                     agent.reasoning_threshold
                 );
             } else if let Some(chosen) = Reasoning::parse(&rest) {
-                agent.reasoning = chosen;
+                agent.set_reasoning(chosen);
                 outln!("Chain of thought: {} (this session).\n", agent.reasoning);
             } else {
                 outln!("[error] unknown setting '{}'. Use keep, compress or drop.\n", rest);
