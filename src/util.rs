@@ -32,6 +32,50 @@ pub(crate) fn truncate_at_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+// Long output cut in the middle, keeping both ends.
+//
+// The reason a command was run is almost never in the first 30 KB of what it printed. A build
+// lists every crate it compiles and only then says what went wrong; a test run lists every test
+// and only then the failures. Keeping the head is therefore the one way of truncating that
+// reliably throws away the part that was worth having — a `cargo build` over a few hundred
+// crates came back as nothing but `Compiling` lines, with the error that ended it cut off. The
+// tail gets the larger share of the budget for the same reason.
+//
+// Cuts fall on line boundaries so that neither end starts or stops mid-message. The exception is
+// a tail whose first newline is most of the way through it — one very long line, minified JSON or
+// a single-line log — where snapping forward would drop the payload the caller asked to keep.
+pub(crate) fn truncate_middle(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let head = truncate_at_boundary(s, max_bytes / 3);
+    let head_end = match head.rfind('\n') {
+        Some(i) => i + 1,
+        None => head.len(),
+    };
+
+    let mut tail_start = s.len() - (max_bytes - max_bytes / 3);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if let Some(i) = s[tail_start..].find('\n') {
+        let snapped = tail_start + i + 1;
+        if s.len() - snapped >= (s.len() - tail_start) / 2 {
+            tail_start = snapped;
+        }
+    }
+
+    let omitted = &s[head_end..tail_start];
+    format!(
+        "{}\n[... {} lines omitted, {} characters ...]\n{}",
+        &s[..head_end],
+        omitted.lines().count(),
+        omitted.len(),
+        &s[tail_start..]
+    )
+}
+
 // Terminal escape sequences, removed.
 //
 // The diff behind a permission prompt is rendered for a terminal, so it is full of color
@@ -213,6 +257,53 @@ mod tests {
         assert_eq!(truncate_at_boundary("🦀", 3), "");
         assert_eq!(truncate_at_boundary("🦀", 4), "🦀");
         assert_eq!(truncate_at_boundary("a🦀", 2), "a");
+    }
+
+    #[test]
+    fn middle_truncation_keeps_both_ends() {
+        // Short enough to pass through untouched.
+        assert_eq!(truncate_middle("hello\nworld\n", 100), "hello\nworld\n");
+
+        // The shape this exists for: a build's progress first, its error last.
+        let mut log = String::new();
+        for i in 0..2000 {
+            log.push_str(&format!("Compiling crate-{}\n", i));
+        }
+        log.push_str("error[E0308]: mismatched types\n");
+
+        let cut = truncate_middle(&log, 3000);
+        assert!(cut.len() < 3400, "budget blown: {} bytes", cut.len());
+        assert!(cut.starts_with("Compiling crate-0\n"));
+        assert!(
+            cut.ends_with("error[E0308]: mismatched types\n"),
+            "the error at the end is what must survive"
+        );
+        assert!(cut.contains("lines omitted"));
+        // The tail is the larger half, so it holds more of the log than the head does.
+        let marker = cut.find("[...").unwrap();
+        assert!(cut.len() - marker > marker, "the head kept more than the tail");
+    }
+
+    #[test]
+    fn middle_truncation_cuts_on_boundaries() {
+        // Cuts land on line ends, so no line is served in halves.
+        let lines: String = (0..100).map(|i| format!("line-{:03}\n", i)).collect();
+        let cut = truncate_middle(&lines, 300);
+        for line in cut.lines().filter(|l| l.starts_with("line-")) {
+            assert_eq!(line.len(), 8, "half a line survived: {:?}", line);
+        }
+
+        // One long line with no newline to snap to: both ends still come back whole-ish
+        // rather than the tail being dropped for want of a boundary.
+        let blob = format!("head\n{}tail", "x".repeat(5000));
+        let cut = truncate_middle(&blob, 300);
+        assert!(cut.starts_with("head\n"));
+        assert!(cut.ends_with("tail"), "the payload was snapped away: {:?}", cut);
+
+        // Multi-byte characters are never split.
+        let wide: String = std::iter::repeat("привет\n").take(500).collect();
+        let cut = truncate_middle(&wide, 301);
+        assert!(cut.contains("привет"));
     }
 
     #[test]

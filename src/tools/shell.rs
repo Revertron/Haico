@@ -1,5 +1,5 @@
 use super::MyMcpServer;
-use crate::util::truncate_at_boundary;
+use crate::util::{truncate_at_boundary, truncate_middle};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -225,6 +225,10 @@ pub(crate) struct BackgroundJobs {
 // A dev server can log indefinitely, so what it produced an hour ago is not worth holding.
 const BACKGROUND_OUTPUT_CAP: usize = 256 * 1024;
 
+// What one finished command may hand back to the model. Anything longer is cut in the middle
+// rather than at the end — see truncate_middle for why.
+const MAX_OUTPUT: usize = 30000;
+
 // Build the shell invocation for a command line.
 //
 // On Windows this is deliberately not the obvious `Command::new("cmd").arg("/C").arg(command)`.
@@ -444,7 +448,10 @@ impl MyMcpServer {
             let detail = if result_text.is_empty() {
                 String::new()
             } else {
-                format!("\n\nOutput before it was killed:\n{}", result_text)
+                format!(
+                    "\n\nOutput before it was killed:\n{}",
+                    truncate_middle(&result_text, MAX_OUTPUT)
+                )
             };
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Command timed out after {} seconds and was killed.{}",
@@ -459,16 +466,9 @@ impl MyMcpServer {
             );
         }
 
-        // Truncate if too long
-        const MAX_OUTPUT: usize = 30000;
+        // Cut in the middle, not at the end: a build says what went wrong last.
         if result_text.len() > MAX_OUTPUT {
-            let shown = truncate_at_boundary(&result_text, MAX_OUTPUT);
-            result_text = format!(
-                "{}\n\n[Output truncated - {} of {} characters shown]",
-                shown,
-                shown.len(),
-                result_text.len()
-            );
+            result_text = truncate_middle(&result_text, MAX_OUTPUT);
         }
 
         if status.success() {
@@ -1099,8 +1099,10 @@ mod tests {
         assert!(ok, "got: {}", truncate_at_boundary(&out, 300));
         // It terminates at all, and returns the 30k cap's worth rather than deadlocking or
         // coming back empty.
-        assert!(out.contains("[Output truncated"), "got {} bytes", out.len());
+        assert!(out.contains("lines omitted"), "got {} bytes", out.len());
         assert!(out.len() > 29_000, "only got {} bytes", out.len());
+        // The cut is in the middle, so the command's own last line is still the last line here.
+        assert!(out.trim_end().ends_with('a'), "the tail was cut instead of the middle");
     }
 
     #[cfg(target_os = "windows")]
