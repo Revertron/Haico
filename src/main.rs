@@ -67,9 +67,10 @@ fn print_repl_help() {
     outln!("  /model [name]      Switch model; with no name, pick from the server's list");
     outln!("  /config            Show the settings in force and where each came from");
     outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, min_p,");
-    outln!("                     repeat_penalty, max_tokens or reasoning_threshold ('/set");
-    outln!("                     <name> unset' to undo). '/temp' is short for '/set");
-    outln!("                     temperature'.");
+    outln!("                     repeat_penalty, max_tokens, reasoning_effort or");
+    outln!("                     reasoning_threshold ('/set <name> unset' to undo).");
+    outln!("                     '/temp' and '/effort' are short for '/set temperature'");
+    outln!("                     and '/set reasoning_effort'.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
@@ -168,9 +169,15 @@ async fn ask_about_call(
 // The right-hand end of the status bar.
 // Takes the count rather than the history: during a turn the frontend draws this
 // while the turn owns the messages, so the number has to arrive as a number.
-fn status_line(model: &str, used: usize, context_tokens: usize) -> String {
+fn status_line(model: &str, effort: Option<&str>, used: usize, context_tokens: usize) -> String {
     let percent = (used as f64 / context_tokens.max(1) as f64) * 100.0;
-    format!("{}  ctx {:.0}%", model, percent)
+    // Only when one is set. An unset effort means the model thinks as much as it thinks,
+    // and saying so on every model that has no such setting would be a word of chrome that
+    // never changes — the bar is worth its row for what varies.
+    match effort {
+        Some(effort) => format!("{} • {} effort • ctx {:.0}%", model, effort, percent),
+        None => format!("{} • ctx {:.0}%", model, percent),
+    }
 }
 // Run one turn with the input box still live underneath it.
 //
@@ -195,8 +202,12 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
     // and Busy events — the pump cannot look at the agent again until the turn has
     // given it back. The mode needs no event: the link is shared, so both sides
     // already see the same one.
-    let mut status =
-        status_line(agent.model(), estimate_tokens(&agent.messages), agent.context_tokens);
+    let mut status = status_line(
+        agent.model(),
+        agent.reasoning_effort(),
+        estimate_tokens(&agent.messages),
+        agent.context_tokens,
+    );
     let mut busy = get_thinking_message().to_string();
     // Whether the label is one a character count belongs on — see `Waiting::Model`.
     let mut counting = true;
@@ -252,13 +263,13 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
                 break;
             };
 
-            let label = crate::input::busy_label(&busy, if counting { streamed } else { 0 });
+            let label = busy_label(&busy, if counting { streamed } else { 0 });
             let plan = todos.lock().unwrap().clone();
             if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
                 let queued = link.queued();
-                crate::input::draw(
+                draw(
                     &mut io.editor,
-                    &crate::input::Chrome {
+                    &Chrome {
                         mode: link.mode(),
                         busy: Some(label.as_str()),
                         // Something is running, so the bar has better than history
@@ -295,8 +306,18 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
                                     // anything by a character count.
                                     counting = matches!(waiting, Waiting::Model);
                                 }
-                                AgentEvent::Status { model, used_tokens, context_tokens } => {
-                                    status = status_line(model, *used_tokens, *context_tokens);
+                                AgentEvent::Status {
+                                    model,
+                                    used_tokens,
+                                    context_tokens,
+                                    effort,
+                                } => {
+                                    status = status_line(
+                                        model,
+                                        effort.as_deref(),
+                                        *used_tokens,
+                                        *context_tokens,
+                                    );
                                 }
                                 AgentEvent::ReplyStart => streamed = 0,
                                 AgentEvent::ReasoningChunk(text)
@@ -376,7 +397,7 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
     // where the user takes over.
     io.queued = link.take_queued();
     if let Some(path) = &io.history_path {
-        crate::input::save_history(path, io.editor.history());
+        save_history(path, io.editor.history());
     }
 }
 
@@ -504,7 +525,7 @@ async fn main() -> Result<()> {
     // which is what lets the input box exist while the model is working. Piped input
     // has no keyboard to read, so it keeps the plain line-at-a-time path; scripting
     // haico still works.
-    let interactive = crate::input::stdin_is_a_terminal();
+    let interactive = stdin_is_a_terminal();
     let _terminal = TerminalGuard(interactive);
     // Which renderer draws the session, and then the keyboard — in that order, because
     // taking the screen is what decides how the keyboard has to be read. On Windows the
@@ -624,7 +645,7 @@ async fn main() -> Result<()> {
     let history_path = history_file_path();
     let history = history_path
         .as_deref()
-        .map(crate::input::load_history)
+        .map(load_history)
         .unwrap_or_default();
     // The keyboard joins the rest of the frontend's state here, once the model
     // picker (the one thing that needs it before a session exists) is done with it.
@@ -652,7 +673,12 @@ async fn main() -> Result<()> {
         } else {
             match io.keys.as_mut() {
                 Some(keys) => {
-                    let status = status_line(agent.model(), estimate_tokens(&agent.messages), agent.context_tokens);
+                    let status = status_line(
+                        agent.model(),
+                        agent.reasoning_effort(),
+                        estimate_tokens(&agent.messages),
+                        agent.context_tokens,
+                    );
                     let plan = agent.plan();
                     match read_command(
                         keys,
@@ -683,7 +709,7 @@ async fn main() -> Result<()> {
                         Input::CycleMode | Input::TogglePlan | Input::ToggleExpand => continue,
                     }
                 }
-                None => match crate::input::read_piped_line() {
+                None => match read_piped_line() {
                     Some(line) => line,
                     None => {
                         outln!("Goodbye!");
@@ -866,26 +892,38 @@ async fn main() -> Result<()> {
             }
             outln!("
 In force for '{}':", agent.client.model);
-            outln!("  url             {}", agent.client.base_url);
+            outln!("  url               {}", agent.client.base_url);
             outln!(
-                "  token           {}",
+                "  token             {}",
                 if agent.client.token.is_some() { "set" } else { "not set" }
             );
             outln!(
-                "  context         {}  [{}]",
+                "  context           {}  [{}]",
                 agent.context_tokens, agent.settings.context_source
             );
-            outln!("  temperature     {}", agent.settings.temperature.describe());
-            outln!("  top_p           {}", agent.settings.top_p.describe());
-            outln!("  top_k           {}", agent.settings.top_k.describe());
-            outln!("  min_p           {}", agent.settings.min_p.describe());
-            outln!("  repeat_penalty  {}", agent.settings.repeat_penalty.describe());
-            outln!("  max_tokens      {}", agent.settings.max_tokens.describe());
+            outln!("  temperature       {}", agent.settings.temperature.describe());
+            outln!("  top_p             {}", agent.settings.top_p.describe());
+            outln!("  top_k             {}", agent.settings.top_k.describe());
+            outln!("  min_p             {}", agent.settings.min_p.describe());
+            outln!("  repeat_penalty    {}", agent.settings.repeat_penalty.describe());
+            outln!("  max_tokens        {}", agent.settings.max_tokens.describe());
+            outln!("  reasoning_effort  {}", agent.settings.reasoning_effort.describe());
+            // Unset still says more than the bare "-" the request fields share, but for the
+            // opposite reason it used to: it no longer sends anything at all, so what needs
+            // saying is not what it does but what it does not do — inherit the level above.
+            outln!(
+                "  sub_agent_effort  {}",
+                match &agent.settings.sub_agent_effort {
+                    Some(effort) => format!("{}  [config [models]]", effort),
+                    None => "-  [unset (the model's own default, never the level above)]"
+                        .to_string(),
+                }
+            );
             // Shown as what is actually in force rather than as what the file said, since
             // /reasoning can have moved it since. The source string is only honest for the
             // former case, so it is replaced rather than kept when they differ.
             outln!(
-                "  reasoning       {}{}",
+                "  reasoning         {}{}",
                 agent.reasoning,
                 if agent.reasoning == agent.settings.reasoning() {
                     format!("  [{}]", agent.settings.reasoning_source())
@@ -894,7 +932,7 @@ In force for '{}':", agent.client.model);
                 }
             );
             outln!(
-                "  system prompt   {}",
+                "  system prompt     {}",
                 match (agent.settings.use_system_prompt, &agent.system_prompt) {
                     (true, _) => "haico's own",
                     (false, Some(_)) => "off — project instructions only  [config [models]]",
@@ -911,11 +949,18 @@ In force for '{}':", agent.client.model);
 
         // One command for every sampling knob rather than one command each. "/temp" is kept
         // as a shorthand for the one that gets touched most.
-        if input == "/set" || input.starts_with("/set ") || input.starts_with("/temp") {
+        if input == "/set"
+            || input.starts_with("/set ")
+            || input.starts_with("/temp")
+            || input.starts_with("/effort")
+        {
             // `/temp 0.7` is the shorthand that predates `/set`, kept because it
-            // is what fingers already know.
+            // is what fingers already know. `/effort high` earns the same: it is a
+            // knob that gets changed with the task in hand rather than tuned once.
             let rest = if let Some(rest) = input.strip_prefix("/temp") {
                 format!("temperature {}", rest.trim())
+            } else if let Some(rest) = input.strip_prefix("/effort") {
+                format!("reasoning_effort {}", rest.trim())
             } else {
                 input.strip_prefix("/set").unwrap_or("").trim().to_string()
             };
@@ -1108,7 +1153,7 @@ In force for '{}':", agent.client.model);
     }
 
     if let Some(path) = &io.history_path {
-        crate::input::save_history(path, io.editor.history());
+        save_history(path, io.editor.history());
     }
 
     // Every way out of the loop lands here, so a dev server started mid-session does not
@@ -1290,6 +1335,24 @@ mod tests {
     use chrono::TimeZone;
     use std::time::Duration;
 
+    /// The bar earns its row for what varies, so an unset effort is absent rather than
+    /// spelled out: a model with no such setting would otherwise carry a word that never
+    /// changes. The two-space gaps are the separator the bar is built from.
+    #[test]
+    fn the_status_bar_names_the_effort_only_when_one_is_set() {
+        assert_eq!(status_line("qwen3", None, 900, 32768), "qwen3 • ctx 3%");
+        assert_eq!(
+            status_line("qwen3", Some("high"), 900, 32768),
+            "qwen3 • high effort • ctx 3%"
+        );
+        // Shown as given. A level haico does not know is a model it has not met, and the
+        // bar is the one place the user can see which one was actually sent.
+        assert_eq!(
+            status_line("m", Some("xhigh"), 0, 32768),
+            "m • xhigh effort • ctx 0%"
+        );
+    }
+
     #[test]
     fn elapsed_uses_two_units_at_most() {
         assert_eq!(format_elapsed(Duration::from_millis(400)), "0s");
@@ -1410,7 +1473,7 @@ mod turn_tests {
         reasoning: Reasoning,
     ) -> ((Agent, usize), Vec<AgentEvent>) {
         let (url, served) = serve_sequence(bodies).await;
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
         agent.mode = mode;
         agent.reasoning = reasoning;
@@ -1466,7 +1529,7 @@ mod turn_tests {
     /// original bug report.
     #[tokio::test]
     async fn every_tool_call_id_is_answered_even_when_malformed() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
             "tool_calls":[
                 {"id":"call_no_name","type":"function","function":{"arguments":"{}"}},
@@ -1505,10 +1568,10 @@ mod turn_tests {
     /// rather than spending a round on a `read` the user has already asked for.
     #[tokio::test]
     async fn a_mentioned_file_arrives_in_the_message() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
 
-        let dir = crate::testutil::TempDir::new("mention-turn");
+        let dir = testutil::TempDir::new("mention-turn");
         let file = dir.join("notes.txt");
         std::fs::write(&file, "the quick brown fox").unwrap();
 
@@ -1541,10 +1604,10 @@ mod turn_tests {
     /// text: `content` becomes the parts array, with the image as a data URL.
     #[tokio::test]
     async fn a_mentioned_image_becomes_a_content_part() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
 
-        let dir = crate::testutil::TempDir::new("mention-image-turn");
+        let dir = testutil::TempDir::new("mention-image-turn");
         let png = dir.join("shot.png");
         // A signature and some bytes after it: nothing decodes this, and what
         // is asserted is the shape of the message, not the picture.
@@ -1592,7 +1655,7 @@ mod turn_tests {
         let mut heavy = message.clone();
         heavy["content"][0]["image_url"]["url"] =
             Value::String(format!("data:image/png;base64,{}", "A".repeat(400_000)));
-        let estimate = crate::session::estimate_tokens(&[heavy]);
+        let estimate = estimate_tokens(&[heavy]);
         assert!(
             estimate < 2000,
             "a 300 KB image is being counted as {estimate} tokens of text"
@@ -1605,9 +1668,9 @@ mod turn_tests {
     /// round has its reply.
     #[tokio::test]
     async fn reading_an_image_puts_it_in_a_user_message_after_the_tool_reply() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
 
-        let dir = crate::testutil::TempDir::new("read-image");
+        let dir = testutil::TempDir::new("read-image");
         let png = dir.join("shot.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
 
@@ -1621,14 +1684,14 @@ mod turn_tests {
             )
             .unwrap()
         );
-        let (url, requests) = crate::testutil::serve_sequence(Box::leak(Box::new([
+        let (url, requests) = serve_sequence(Box::leak(Box::new([
             &*Box::leak(call.into_boxed_str()),
             r#"{"choices":[{"message":{"role":"assistant","content":"a tiny png"}}]}"#,
         ])))
         .await;
 
-        let cwd = std::env::current_dir().unwrap();
-        let mut agent = Agent::new(crate::testutil::test_config(&url), "m".to_string(), &cwd);
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
         // The temp directory is outside the project, so without this the read is
         // refused by the workspace and never reaches the image path at all.
         agent.workspace.attach(&png);
@@ -1665,21 +1728,21 @@ mod turn_tests {
     /// back a history that can only fail.
     #[tokio::test]
     async fn a_refused_image_is_stripped_and_the_request_retried() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
 
-        let dir = crate::testutil::TempDir::new("strip-image");
+        let dir = testutil::TempDir::new("strip-image");
         let png = dir.join("shot.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
 
         // The server refuses the first request outright, then answers. That is
         // the shape of a text-only model being handed an image.
-        let (url, served) = crate::testutil::serve_sequence(&[
+        let (url, served) = serve_sequence(&[
             "not json, and not a 200 either",
             r#"{"choices":[{"message":{"role":"assistant","content":"no picture here"}}]}"#,
         ])
         .await;
-        let cwd = std::env::current_dir().unwrap();
-        let mut agent = Agent::new(crate::testutil::test_config(&url), "m".to_string(), &cwd);
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
 
         let link = TurnLink::new(Mode::Normal);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -1707,7 +1770,7 @@ mod turn_tests {
                 assert!(!parts.is_empty(), "a message was left with no content at all");
             }
         }
-        let user = crate::session::message_text(&agent.messages[1]);
+        let user = message_text(&agent.messages[1]);
         assert!(user.contains("removed"), "the model was not told why: {user}");
     }
 
@@ -1722,7 +1785,7 @@ mod turn_tests {
                 {"type": "text", "text": "why is this button grey?"}
             ]
         });
-        let text = crate::session::message_text(&message);
+        let text = message_text(&message);
         assert!(text.contains("why is this button grey?"));
         assert!(text.contains("[an image]"), "the image left no mark: {text}");
         assert!(!text.contains("AAAA"), "the base64 reached the summarizer: {text}");
@@ -1734,12 +1797,12 @@ mod turn_tests {
     /// over the keys beside it.
     #[tokio::test]
     async fn a_mention_outside_the_workspace_reaches_that_file_alone() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
 
         // Outside the working directory the test agent is built in, which is the
         // crate root.
-        let dir = crate::testutil::TempDir::new("mention-outside");
+        let dir = testutil::TempDir::new("mention-outside");
         let named = dir.join("named.txt");
         let sibling = dir.join("sibling.txt");
         std::fs::write(&named, "in reach").unwrap();
@@ -1757,11 +1820,11 @@ mod turn_tests {
         // next request would carry rather than what the system prompt holds.
         let note = agent.workspace.note();
         assert!(
-            note.contains(&crate::util::display_path(&crate::util::absolute_path(&named))),
+            note.contains(&display_path(&absolute_path(&named))),
             "the attached file is not in the workspace note: {note}"
         );
         assert!(
-            !note.contains(&crate::util::display_path(&crate::util::absolute_path(&sibling))),
+            !note.contains(&display_path(&absolute_path(&sibling))),
             "the note names a file that was never attached: {note}"
         );
     }
@@ -1771,7 +1834,7 @@ mod turn_tests {
     /// asserted so that the interesting ones above have a baseline.
     #[tokio::test]
     async fn a_plain_answer_ends_the_turn() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello back"}}]}"#;
 
         let (agent, served) = run_one(&[ANSWER], "hello").await;
@@ -1789,7 +1852,7 @@ mod turn_tests {
     /// tool call forever must therefore still terminate.
     #[tokio::test]
     async fn an_identical_call_repeated_forever_still_terminates() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         // `serve_sequence` repeats its last body forever, so this is a model that
         // never stops asking for the same thing.
         const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
@@ -1832,7 +1895,7 @@ mod turn_tests {
     /// because writing it first would have hung the suite rather than failed.
     #[tokio::test]
     async fn auto_mode_still_bounds_a_repeated_malformed_call() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
             "tool_calls":[{"id":"same","type":"function","function":{"name":"read","arguments":"still not json"}}]}}]}"#;
 
@@ -1855,7 +1918,7 @@ mod turn_tests {
     /// directly rather than inferred from terminal output.
     #[tokio::test]
     async fn a_malformed_call_is_narrated_as_well_as_answered() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
             "tool_calls":[{"id":"bad","type":"function","function":{"name":"read","arguments":"nope"}}]}}]}"#;
         const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
@@ -1891,7 +1954,7 @@ mod turn_tests {
     /// was worth keeping, and the original is gone by then.
     #[tokio::test]
     async fn a_compressed_trace_is_reported_with_the_text_that_replaced_it() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         // Well over the 800-token threshold, so the turn spends a request on
         // compressing it and the second body is the compressor's answer.
         // `serve_sequence` wants `'static` bodies and a trace this long has to be
@@ -1936,11 +1999,11 @@ mod turn_tests {
     /// user message is in the history and nothing is left half-written.
     #[tokio::test]
     async fn a_cancelled_turn_stops_without_orphaning_anything() {
-        let _capture = crate::out::capture_guard();
+        let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
 
         let (url, served) = serve_sequence(&[ANSWER]).await;
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
         let link = TurnLink::new(agent.mode);
         // Cancelled up front: `until_cancelled` has to see a flag that was already

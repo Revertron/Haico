@@ -361,7 +361,15 @@ pub(crate) enum AgentEvent {
     /// The numbers behind the status bar, sent when the history changes. The
     /// numbers rather than the line: the turn can count its own messages and
     /// tokens, but how wide the bar is and what it puts where is the frontend's.
-    Status { model: String, used_tokens: usize, context_tokens: usize },
+    Status {
+        model: String,
+        used_tokens: usize,
+        context_tokens: usize,
+        /// The thinking level, when one is set. Carried with the numbers rather than read
+        /// off the agent by the frontend, for the same reason the model name is: while a
+        /// turn is running the frontend cannot look at the agent at all.
+        effort: Option<String>,
+    },
     /// A question, and the channel to answer it on. Not a `Notice`: this is the
     /// one kind of event the frontend must *do* something about.
     Ask(Ask),

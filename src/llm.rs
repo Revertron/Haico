@@ -75,6 +75,19 @@ pub(crate) struct LMStudioClient {
     pub(crate) top_k: Option<u64>,
     pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
+    // How hard to think. Not a sampler — the server hands it to the chat template, which is
+    // what decides where its own level names set the budget — but it lives with the sampling
+    // for the same reason: None leaves the field out, so the model's default survives.
+    pub(crate) reasoning_effort: Option<String>,
+    // Sent as chat_template_kwargs.enable_thinking, which is how a Qwen3-style template is
+    // told not to think at all — `reasoning_effort` cannot say it, because "off" is not one
+    // of the levels every model offers. Nothing sets it at the moment: `for_sub_agent` did,
+    // and that is the change this comment outlived. Kept because it is still the only way to
+    // say the thing, for the next model that needs it said.
+    pub(crate) enable_thinking: Option<bool>,
+    // The level a sub-agent's own conversation asks for, straight from the config. Read
+    // only by `for_sub_agent` — the main conversation never sends this one.
+    pub(crate) sub_agent_effort: Option<String>,
 }
 
 
@@ -91,7 +104,30 @@ impl LMStudioClient {
             top_k: None,
             min_p: None,
             repeat_penalty: None,
+            reasoning_effort: None,
+            enable_thinking: None,
+            sub_agent_effort: None,
         }
+    }
+
+    /// A copy of this client for a sub-agent's own conversation.
+    ///
+    /// The main conversation's effort deliberately does not carry over. A sub-agent is
+    /// summarizing, judging or looking something up, and asking it to think as hard as the
+    /// coding model spends the user's waiting time on a chain of thought that is dropped
+    /// with the message list when the call returns.
+    ///
+    /// Unset says nothing at all rather than saying "do not think", which is what it said
+    /// first. Forbidding it through the template broke the sub-agents it was meant to make
+    /// cheaper: the compressor, answering cold, read the trace it was handed as a question
+    /// and answered it — a fix with a fenced code block, written in the voice of an adviser
+    /// rather than in the model's own, and stored as that reply's chain of thought. The
+    /// brief deliberation was what the summary was being made out of. A level named in the
+    /// config is still sent as it stands, and the template decides what it means.
+    pub(crate) fn for_sub_agent(&self) -> Self {
+        let mut client = self.clone();
+        client.reasoning_effort = self.sub_agent_effort.clone();
+        client
     }
 
     // Apply the settings resolved for the model currently in use.
@@ -102,6 +138,24 @@ impl LMStudioClient {
         self.top_k = settings.top_k.value;
         self.min_p = settings.min_p.value;
         self.repeat_penalty = settings.repeat_penalty.value;
+        self.reasoning_effort = settings.reasoning_effort.value.clone();
+        // Not applied to this client's own requests — `for_sub_agent` is what reads it.
+        self.sub_agent_effort = settings.sub_agent_effort.clone();
+    }
+
+    // How much to think. Its own method rather than part of `set_sampling` because the
+    // plain completion builds its body by hand and skips the sampling entirely, and the
+    // calls that go through it are exactly the ones that most need this said.
+    pub(crate) fn set_thinking(&self, body: &mut Value) {
+        // Sent as the user typed it, for the same reason it is stored as a string: the level
+        // names are the template's, so a value haico does not recognize is far more likely to
+        // be a model it has not met than a typo worth refusing to send.
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
+        if let Some(enable_thinking) = self.enable_thinking {
+            body["chat_template_kwargs"] = json!({ "enable_thinking": enable_thinking });
+        }
     }
 
     // Add the sampling fields that are actually configured, and only those.
@@ -127,6 +181,7 @@ impl LMStudioClient {
         if let Some(repeat_penalty) = self.repeat_penalty {
             body["repeat_penalty"] = json!(repeat_penalty);
         }
+        self.set_thinking(body);
     }
 
     // Attach the bearer token, when one is configured.
@@ -188,6 +243,11 @@ impl LMStudioClient {
             body["max_tokens"] = json!(max_tokens);
         }
         self.set_model(&mut body);
+        // Every caller of this is a sub-agent, and every one of them reaches it through a
+        // `for_sub_agent` copy — so what this sends is the sub-agent's thinking, never the
+        // main conversation's. A main-client call landing here would send the main effort,
+        // which is the bug this comment exists to make visible if one is ever added.
+        self.set_thinking(&mut body);
 
         let response = self.post_chat(&body).await?;
 
@@ -1091,7 +1151,15 @@ mod tests {
         let client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
         let mut body = json!({"messages": []});
         client.set_sampling(&mut body);
-        for field in ["temperature", "max_tokens", "top_p", "top_k", "min_p", "repeat_penalty"] {
+        for field in [
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "top_k",
+            "min_p",
+            "repeat_penalty",
+            "reasoning_effort",
+        ] {
             assert!(body.get(field).is_none(), "{} should not be sent", field);
         }
 
@@ -1103,8 +1171,65 @@ mod tests {
         assert_eq!(body["temperature"], 0.25);
         assert_eq!(body["top_p"], 0.8);
         assert!(body.get("max_tokens").is_none());
+
+        // reasoning_effort goes out as the string it came in as, unparsed: "high" and a
+        // level only one model has both have to survive the trip, because what the names
+        // mean is the chat template's business rather than haico's.
+        let mut settings = settings_of(None, None, None, None, None, None);
+        settings.reasoning_effort =
+            crate::Setting { value: Some("high".to_string()), source: "test" };
+        let mut client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.set_sampling(&mut body);
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
+
+    /// A sub-agent asks for its own thinking, never the main conversation's: a copy that
+    /// quietly inherited "high" would spend the user's waiting time on a chain of thought
+    /// that is dropped when the call returns. Unset is the interesting half — it says
+    /// nothing rather than saying "do not think". Forbidding it outright was tried, and the
+    /// compressor answering cold read the trace it was handed as a question and answered it.
+    #[test]
+    fn a_sub_agent_asks_for_its_own_thinking() {
+        use crate::LMStudioClient;
+
+        let mut settings = settings_of(None, None, None, None, None, None);
+        settings.reasoning_effort =
+            crate::Setting { value: Some("high".to_string()), source: "test" };
+        let mut client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
+        client.apply_settings(&settings);
+
+        // Nothing configured for sub-agents: nothing is said about thinking either way, so
+        // the model's own default applies, and the main conversation's "high" is gone rather
+        // than carried over.
+        let helper = client.for_sub_agent();
+        let mut body = json!({"messages": []});
+        helper.set_thinking(&mut body);
+        assert!(body.get("reasoning_effort").is_none(), "the main effort must not ride along");
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "a sub-agent told not to think answers cold, which is what broke the compressor"
+        );
+
+        // A level named in the config is sent instead, and then nothing is said about
+        // enable_thinking — asking for a level and forbidding thinking at once is the one
+        // request that cannot mean anything.
+        settings.sub_agent_effort = Some("low".to_string());
+        client.apply_settings(&settings);
+        let helper = client.for_sub_agent();
+        let mut body = json!({"messages": []});
+        helper.set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(body.get("chat_template_kwargs").is_none());
+
+        // And the main client is untouched by any of it.
+        let mut body = json!({"messages": []});
+        client.set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
 
     #[test]
     fn normalizes_base_urls() {

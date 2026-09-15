@@ -44,16 +44,16 @@ impl Mode {
     // The one word for the status bar, where there is no room for the sentence.
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            Mode::Normal => "normal",
-            Mode::Plan => "plan",
+            Mode::Normal => "manual",
+            Mode::Plan => "planning",
             Mode::Auto => "auto",
         }
     }
 
     pub(crate) fn describe(&self) -> &'static str {
         match self {
-            Mode::Normal => "normal — every gated call asks you",
-            Mode::Plan => "plan — research and propose only, no changes until you approve",
+            Mode::Normal => "manual — every gated call asks you",
+            Mode::Plan => "planning — research and propose only, no changes until you approve",
             Mode::Auto => "auto — routine calls are reviewed and run; the rest still ask you",
         }
     }
@@ -517,7 +517,12 @@ pub(crate) async fn judge_tool_call(
     // a reasoning model thinks first, and a cap that cuts it off mid-thought yields a reply
     // with no JSON in it at all. That surfaced as "Review failed: no JSON object" on a
     // perfectly ordinary `cargo build`.
-    let reply = client.chat_completion_plain(messages, Some(2000)).await?;
+    // Through a sub-agent copy: the reviewer answers two fields about one tool call, and
+    // the main conversation's effort is no more relevant to that than its temperature is.
+    let reply = client
+        .for_sub_agent()
+        .chat_completion_plain(messages, Some(2000))
+        .await?;
 
     // The reply is already in the log, written by the client. This adds only which end of
     // the parse it came out of, so a run of failures can be read back without re-reading
@@ -820,6 +825,49 @@ mod tests {
             verdict, reason
         );
         json!({"choices": [{"message": {"role": "assistant", "content": content}}]}).to_string()
+    }
+
+    /// The whole point, checked on the wire rather than on the client: the reviewer is a
+    /// sub-agent, so the main conversation's effort does not reach it. Worth an HTTP round
+    /// trip because the path from the config to this body runs through `for_sub_agent` and
+    /// a plain completion that builds its own body — neither of which a unit test on the
+    /// client would notice going missing.
+    #[tokio::test]
+    async fn the_reviewer_does_not_inherit_the_main_conversations_effort() {
+        let arguments = json!({"command": "ls"});
+        let body: &'static str =
+            Box::leak(verdict_body("allow", "lists files").into_boxed_str());
+        let (url, captured) =
+            crate::testutil::serve_once_capturing(body, "application/json").await;
+
+        let mut client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        // The main conversation thinking hard is exactly the case that must not leak.
+        let mut settings = crate::testutil::settings_of(None, None, None, None, None, None);
+        settings.reasoning_effort =
+            crate::Setting { value: Some("high".to_string()), source: "test" };
+        client.apply_settings(&settings);
+
+        let mut cache = ReviewCache::new();
+        judge_tool_call(&client, &mut cache, &ws(), "run_command", &arguments)
+            .await
+            .unwrap();
+
+        // The fixture captures the whole request, headers and all; the body is what is
+        // past the blank line.
+        let sent = captured.lock().unwrap().clone();
+        let body = sent.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or(&sent);
+        let sent: serde_json::Value =
+            serde_json::from_str(body).expect("the reviewer must send a JSON body");
+        assert!(
+            sent.get("reasoning_effort").is_none(),
+            "the main conversation's effort must not reach the reviewer: {sent}"
+        );
+        // And it is not told to skip thinking either. That was tried, and a sub-agent
+        // answering cold is what broke the compressor.
+        assert!(
+            sent.get("chat_template_kwargs").is_none(),
+            "the reviewer must not be told not to think: {sent}"
+        );
     }
 
     #[tokio::test]

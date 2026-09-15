@@ -157,6 +157,13 @@ impl MyMcpServer {
         ));
         crate::debug::log("research question", question);
 
+        // One sub-agent copy for the whole loop, so the main conversation's thinking level
+        // does not ride along. This is where it would cost the most: up to ten rounds, each
+        // one prefilling every page fetched so far, and none of the thinking kept — what
+        // comes back is the answer and its sources. `sub_agent_effort` is where to turn it
+        // down for a model that takes a level.
+        let client = self.llm_client.for_sub_agent();
+
         // Built from the real router rather than written out here, so the descriptions the
         // sub-agent reads are the same ones the main model reads.
         let tools: Vec<Value> = super::mcp_tools_to_openai_format(self)
@@ -186,8 +193,7 @@ impl MyMcpServer {
             // tools array, and the sub-agent's own text is not for the screen. It also
             // carries the fallback for a server that ignores "stream", which a hand-rolled
             // request here would have to repeat.
-            let message = match self
-                .llm_client
+            let message = match client
                 .chat_completion_streaming(messages.clone(), tools.clone(), |_| {})
                 .await
             {
@@ -275,7 +281,7 @@ impl MyMcpServer {
             ),
         }));
 
-        match self.llm_client.chat_completion_plain(messages, None).await {
+        match client.chat_completion_plain(messages, None).await {
             Ok(answer) => self.finish(question, without_think_block(&answer), &sources),
             Err(e) => {
                 crate::debug::log("research answer failed", &format!("{:#}", e));

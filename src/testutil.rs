@@ -395,6 +395,10 @@ pub(crate) fn settings_of(
         top_k: at(top_k),
         min_p: at(min_p),
         repeat_penalty: at(repeat_penalty),
+        // Not a seventh positional argument: that would be paid for by every call site to
+        // serve the one test that cares, which sets the field on the result instead.
+        reasoning_effort: at(None),
+        sub_agent_effort: None,
         use_system_prompt: true,
         reasoning_setting: at(None),
         reasoning_threshold_setting: at(None),

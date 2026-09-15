@@ -322,6 +322,27 @@ pub(crate) struct ModelSettingsFile {
     pub(crate) top_k: Option<u64>,
     pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
+    // How hard the model should think, handed straight to the server as `reasoning_effort`.
+    // A string rather than an enum on purpose: the levels belong to the model's own chat
+    // template, not to the API — three on one model, `minimal` or `none` on the next — so a
+    // fixed set here would reject the next model that ships a vocabulary of its own.
+    pub(crate) reasoning_effort: Option<String>,
+    // What the sub-agents ask for, which is deliberately not what the main conversation
+    // asks for. They summarize, judge and look things up, and asking them to think as hard
+    // as the coding model spends the user's waiting time on a chain of thought that is
+    // thrown away with their message list.
+    //
+    // Unset says nothing at all, so the model's own default applies. It asked for none at
+    // first, through the template, on the grounds that what a sub-agent thinks is discarded
+    // either way — true, and beside the point: the compressor, answering cold, read the
+    // trace it was handed as a question and answered it, storing a fix with a fenced code
+    // block as that reply's chain of thought. The brief deliberation was what the summary
+    // was being made out of. Naming a level here sends that instead, for a model that takes
+    // one and where less of it is worth the wait.
+    //
+    // Per model only, like `use_system_prompt`: whether a template takes a level at all,
+    // and what it calls it, is a property of the model rather than of the machine.
+    pub(crate) sub_agent_effort: Option<String>,
     // "keep" (default), "compress" or "drop". Layered like the sampling settings rather
     // than per-model only, but it belongs here first: whether a model even produces a
     // chain of thought is a property of the model, so the useful setting is usually the
@@ -363,6 +384,7 @@ pub(crate) struct FileConfig {
     pub(crate) top_k: Option<u64>,
     pub(crate) min_p: Option<f64>,
     pub(crate) repeat_penalty: Option<f64>,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
 
@@ -457,6 +479,14 @@ pub(crate) struct ResolvedSettings {
     pub(crate) top_k: Setting<u64>,
     pub(crate) min_p: Setting<f64>,
     pub(crate) repeat_penalty: Setting<f64>,
+    // A request field like the six above rather than one of haico's own, so it travels with
+    // them and reaches the server the same way — unset means the field is left out, and the
+    // template's own default thinking budget applies.
+    pub(crate) reasoning_effort: Setting<String>,
+    // No provenance and no layers: per model or not at all, so there is only ever one place
+    // it can have come from. `None` means the sub-agents say nothing about thinking, and get
+    // whatever the model does by default.
+    pub(crate) sub_agent_effort: Option<String>,
     // Not layered like the rest: it only exists per model, so there is nothing to fall
     // through to. Absent means true.
     pub(crate) use_system_prompt: bool,
@@ -530,6 +560,15 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
             per_model.repeat_penalty,
             config.file.repeat_penalty,
         ),
+        // No command-line layer: which levels exist at all is a property of the model's
+        // chat template, so the per-model section is where the answer belongs, and /effort
+        // covers wanting a different one for a single session.
+        reasoning_effort: pick(
+            None,
+            per_model.reasoning_effort,
+            config.file.reasoning_effort.clone(),
+        ),
+        sub_agent_effort: per_model.sub_agent_effort,
         use_system_prompt: per_model.use_system_prompt.unwrap_or(true),
         // No command-line layer for either: both are properties of the model and of what
         // the user wants done with its output, neither of which is worth a flag when the
@@ -603,6 +642,8 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  top_k          = 40");
     println!("  min_p          = 0.05");
     println!("  repeat_penalty = 1.1");
+    println!("  reasoning_effort = \"high\"  # how hard to think, if the model takes it");
+    println!("  sub_agent_effort = \"low\"   # haico's own sub-agents; unset follows the model");
     println!("  use_system_prompt = false  # send only the project's own instructions");
     println!("  reasoning      = \"keep\"    # keep | compress | drop the chain of thought");
     println!("  reasoning_threshold = 800  # tokens of thinking before compressing is worth it");
@@ -611,6 +652,14 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("llama.cpp's --reasoning-preserve is for; 'drop' strips it, as most clients do;");
     println!("'compress' replaces it with its hard points, at the cost of one extra request");
     println!("per reply. /reasoning switches it for one session.");
+    println!("\nreasoning_effort is sent to the server verbatim, so the levels are whatever that");
+    println!("model's chat template accepts — commonly low, medium and high. Left out, the");
+    println!("field is omitted and the model thinks as much as it thinks. /effort switches it");
+    println!("for one session.");
+    println!("\nsub_agent_effort is the same setting for haico's own sub-agents — research, the");
+    println!("auto-mode reviewer and the reasoning compressor. Left out, nothing is sent and");
+    println!("they think as much as the model thinks; the main conversation's level is never");
+    println!("carried over to them.");
     println!("\nInstructions: ~/.haico/HAICO.md holds preferences that apply everywhere; a");
     println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
     println!("own, and takes precedence over both. Both are sent even to a model configured");
@@ -727,6 +776,8 @@ mod tests {
             top_k = 40
             min_p = 0.05
             repeat_penalty = 1.15
+            reasoning_effort = "high"
+            sub_agent_effort = "low"
         "#;
 
         // A model with its own section beats the file's top level.
@@ -746,6 +797,16 @@ mod tests {
         assert_eq!(small.top_k.source, FROM_MODEL);
         assert_eq!(small.min_p.value, Some(0.05));
         assert_eq!(small.repeat_penalty.value, Some(1.15));
+        // A string setting layers by the same rule as the numbers, and is kept verbatim:
+        // the level names are the model's chat template's, so there is nothing to normalize
+        // it to and nothing to reject it against.
+        assert_eq!(small.reasoning_effort.value.as_deref(), Some("high"));
+        assert_eq!(small.reasoning_effort.source, FROM_MODEL);
+        assert_eq!(big.reasoning_effort.value, None);
+        // The sub-agents' own level is per model and nothing else, so a model without one
+        // gets None — which is not "inherit", it is the setting that means no thinking.
+        assert_eq!(small.sub_agent_effort.as_deref(), Some("low"));
+        assert_eq!(big.sub_agent_effort, None);
         // ...and a model that does not name them leaves them unset, not inherited from a
         // sibling model's section.
         assert_eq!(big.top_k.value, None);

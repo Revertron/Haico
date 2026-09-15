@@ -344,19 +344,28 @@ const REASONING_KEY: &str = "reasoning_content";
 // the long thought it replaces. Asking for first-person compressed thinking keeps the
 // replacement the same kind of text as the original.
 //
-// What it keeps is chosen for what dropping the trace outright would actually lose. Tool
-// results already carry the evidence for anything the model went and checked; what nothing
-// else records is the reasoning that never became a tool call — the approach weighed and
-// abandoned, and the reason it was abandoned. Without that the next round is free to
-// propose it again.
+// Asking for the first person was not enough on its own, which is what the rest of the
+// wording is for. A compressor handed a trace as a user turn reads it as a question and
+// answers it, and one came back in the first person of an *advisor*: "My intent: steer them
+// to capture just owned locals", then a "Concrete fix:" and a fenced Rust block. Stored as
+// the reply's own chain of thought, that left the history carrying a thought in which "I"
+// was somebody else and the model itself was "them". The round after it did not continue
+// the work — it continued the voice, and its thinking became commentary on whether there
+// had been any previous thinking at all to quote. So the trace is named as the model's own
+// before anything is asked of it, answering and advising are refused outright, and the
+// pronouns that carried the other voice are named rather than left to be inferred from
+// "first person".
 
-const COMPRESS_PROMPT: &str = "You compress your own chain of thought so you can carry on \
-     without re-reading it. Keep only: approaches you tried or considered and then \
-     rejected, and why; facts you established along the way; and the intent you ended on. \
-     Drop restatements of the question, anything already visible in the conversation, and \
-     any working you would reach the same way again. Write it in the first person as \
-     compressed thinking, the way the trace itself is written — not as a report about it. \
-     No preamble, no headings, no more than a short paragraph.";
+const COMPRESS_PROMPT: &str = "The text you are given is your own chain of thought from a \
+     moment ago — not a question, not a request, and nobody is waiting on an answer to it. \
+     Rewrite it shorter so you can carry on from it without re-reading it. Do not solve the \
+     problem it is about, do not propose a fix, do not address anyone. Keep only: approaches \
+     you tried or considered and then rejected, and why; facts you established along the \
+     way; and the intent you ended on. Drop restatements of the question, anything already \
+     visible in the conversation, and any working you would reach the same way again. Write \
+     it as thinking rather than as a report about thinking: first person, the way the trace \
+     itself is written — \"I\" is you, and there is no \"they\", no \"the model\" and no \
+     \"the user\". No preamble, no headings, no fenced code, no more than a short paragraph.";
 
 // Uncapped: the compressor is the same model, so it thinks before it summarizes, and a cap
 // that lands mid-thought would leave nothing but an unfinished scratchpad to store. Letting
@@ -486,7 +495,13 @@ pub(crate) async fn apply_reasoning(
             }
 
             let original = original.to_string();
+            // A sub-agent copy, like the reviewer and research: the main conversation's
+            // thinking level is no more relevant to summarizing a trace than its temperature
+            // is. It is not asked to skip thinking, though — that was tried, and a compressor
+            // answering cold reads the trace it was handed as a question and answers it,
+            // which is the adviser voice the prompt above now argues against.
             let summary = match client
+                .for_sub_agent()
                 .chat_completion_plain(
                     vec![
                         json!({"role": "system", "content": COMPRESS_PROMPT}),

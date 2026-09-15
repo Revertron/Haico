@@ -395,9 +395,12 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             };
             show(handle, move |ui| set_label(ui, BUSY, &text));
         }
-        AgentEvent::Status { model, used_tokens, context_tokens } => {
+        AgentEvent::Status { model, used_tokens, context_tokens, effort } => {
             let percent = (used_tokens as f64 / context_tokens.max(1) as f64) * 100.0;
-            let text = format!("{model}    ctx {percent:.0}%");
+            let text = match effort {
+                Some(effort) => format!("{model}    effort {effort}    ctx {percent:.0}%"),
+                None => format!("{model}    ctx {percent:.0}%"),
+            };
             show(handle, move |ui| set_label(ui, STATUS, &text));
         }
         AgentEvent::ReplyStart => show(handle, |ui| close_open(ui)),
@@ -1634,7 +1637,12 @@ mod tests {
     #[test]
     fn a_whole_exchange_renders() {
         let events = vec![
-            AgentEvent::Status { model: "m".into(), used_tokens: 900, context_tokens: 32768 },
+            AgentEvent::Status {
+                model: "m".into(),
+                used_tokens: 900,
+                context_tokens: 32768,
+                effort: None,
+            },
             AgentEvent::Busy(Waiting::Model),
             AgentEvent::ReplyStart,
             AgentEvent::ReasoningChunk("Let me look at the file first. ".into()),

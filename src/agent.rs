@@ -603,6 +603,7 @@ pub(crate) async fn run_turn(
                 model: agent.client.model.clone(),
                 used_tokens: estimate_tokens(&agent.messages),
                 context_tokens: agent.context_tokens,
+                effort: agent.reasoning_effort().map(str::to_string),
             });
             // Re-read every round rather than captured once: approving a plan can switch
             // into auto mode mid-turn, and the cap should stop applying from that point.
@@ -1489,6 +1490,9 @@ pub(crate) enum Knob {
     MinP,
     RepeatPenalty,
     MaxTokens,
+    /// A string rather than a number, and the only one: the level names come from the
+    /// model's chat template, so there is nothing here to parse them against.
+    ReasoningEffort,
     /// haico's own rather than the server's: it never goes into a request, so
     /// there is nothing to apply to the clients afterwards, and clearing it means
     /// falling back to the config file rather than letting the server decide.
@@ -1504,6 +1508,7 @@ impl Knob {
         Knob::MinP,
         Knob::RepeatPenalty,
         Knob::MaxTokens,
+        Knob::ReasoningEffort,
         Knob::ReasoningThreshold,
     ];
 
@@ -1516,6 +1521,7 @@ impl Knob {
             Knob::MinP => "min_p",
             Knob::RepeatPenalty => "repeat_penalty",
             Knob::MaxTokens => "max_tokens",
+            Knob::ReasoningEffort => "reasoning_effort",
             Knob::ReasoningThreshold => "reasoning_threshold",
         }
     }
@@ -1531,6 +1537,7 @@ impl Knob {
                 Some(Knob::RepeatPenalty)
             }
             "max_tokens" | "max-tokens" | "max" => Some(Knob::MaxTokens),
+            "reasoning_effort" | "reasoning-effort" | "effort" => Some(Knob::ReasoningEffort),
             "reasoning_threshold" | "reasoning-threshold" | "threshold" => {
                 Some(Knob::ReasoningThreshold)
             }
@@ -1555,6 +1562,7 @@ impl Agent {
             Knob::MinP => self.settings.min_p.describe(),
             Knob::RepeatPenalty => self.settings.repeat_penalty.describe(),
             Knob::MaxTokens => self.settings.max_tokens.describe(),
+            Knob::ReasoningEffort => self.settings.reasoning_effort.describe(),
             // Never absent: unset means the configured default, not "no value".
             Knob::ReasoningThreshold => format!("{} tokens", self.reasoning_threshold),
         }
@@ -1570,6 +1578,7 @@ impl Agent {
             Knob::MinP => self.settings.min_p.value.map(|v| v.to_string()),
             Knob::RepeatPenalty => self.settings.repeat_penalty.value.map(|v| v.to_string()),
             Knob::MaxTokens => self.settings.max_tokens.value.map(|v| v.to_string()),
+            Knob::ReasoningEffort => self.settings.reasoning_effort.value.clone(),
             Knob::ReasoningThreshold => Some(self.reasoning_threshold.to_string()),
         }
     }
@@ -1607,11 +1616,20 @@ impl Agent {
                 Knob::MinP => self.settings.min_p = Setting::unset(FROM_UNSET),
                 Knob::RepeatPenalty => self.settings.repeat_penalty = Setting::unset(FROM_UNSET),
                 Knob::MaxTokens => self.settings.max_tokens = Setting::unset(FROM_UNSET),
+                Knob::ReasoningEffort => {
+                    self.settings.reasoning_effort = Setting::unset(FROM_UNSET)
+                }
                 Knob::ReasoningThreshold => unreachable!("handled above"),
             }
         } else {
             let text = text.expect("not clearing implies text");
-            if knob.is_count() {
+            if knob == Knob::ReasoningEffort {
+                // Nothing to validate against. Whatever the template does not recognize it
+                // ignores, and refusing an unknown level here would only mean haico deciding
+                // which models exist.
+                self.settings.reasoning_effort =
+                    Setting { value: Some(text.to_string()), source: SET_HERE };
+            } else if knob.is_count() {
                 let parsed = text
                     .parse::<u64>()
                     .map_err(|_| format!("{} needs a whole number", knob.name()))?;
@@ -1644,6 +1662,12 @@ impl Agent {
         Ok(())
     }
 
+    /// The thinking level in force, if any. `None` means the field is left out of the
+    /// request, so the model thinks as much as it thinks.
+    pub(crate) fn reasoning_effort(&self) -> Option<&str> {
+        self.settings.reasoning_effort.value.as_deref()
+    }
+
     /// Change what happens to a reply's chain of thought once the turn moves on.
     pub(crate) fn set_reasoning(&mut self, reasoning: Reasoning) {
         self.reasoning = reasoning;
@@ -1670,6 +1694,7 @@ mod knob_tests {
         assert_eq!(Knob::parse("TOP-P"), Some(Knob::TopP));
         assert_eq!(Knob::parse("penalty"), Some(Knob::RepeatPenalty));
         assert_eq!(Knob::parse("threshold"), Some(Knob::ReasoningThreshold));
+        assert_eq!(Knob::parse("effort"), Some(Knob::ReasoningEffort));
         assert_eq!(Knob::parse("nonsense"), None);
     }
 
@@ -1721,6 +1746,28 @@ mod knob_tests {
         assert_eq!(agent.knob_value(Knob::ReasoningThreshold), Some("1234".to_string()));
         agent.set_knob(Knob::ReasoningThreshold, Some("unset")).unwrap();
         assert_eq!(agent.knob_value(Knob::ReasoningThreshold), Some(configured));
+    }
+
+    /// The one knob that is a string. It takes a level whole rather than parsing it,
+    /// and still clears back to absent like the request fields it sits among — unlike
+    /// the threshold above, which falls back to a configured value instead.
+    #[test]
+    fn the_effort_is_taken_whole_and_clears_to_absent() {
+        let mut agent = agent();
+        assert_eq!(agent.knob_value(Knob::ReasoningEffort), None, "starts unset");
+
+        // A level haico has never heard of is still sent: the set belongs to the model.
+        agent.set_knob(Knob::ReasoningEffort, Some("xhigh")).unwrap();
+        assert_eq!(agent.knob_value(Knob::ReasoningEffort), Some("xhigh".to_string()));
+        assert_eq!(agent.reasoning_effort(), Some("xhigh"));
+        // And it reaches both clients, for the same reason the sampling does.
+        assert_eq!(agent.client.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(agent.server.llm_client.reasoning_effort.as_deref(), Some("xhigh"));
+
+        agent.set_knob(Knob::ReasoningEffort, Some("unset")).unwrap();
+        assert_eq!(agent.knob_value(Knob::ReasoningEffort), None);
+        assert_eq!(agent.reasoning_effort(), None);
+        assert_eq!(agent.client.reasoning_effort, None, "the field is left out again");
     }
 
     /// Both clients get the sampling, because `web_fetch` summarizes through the
