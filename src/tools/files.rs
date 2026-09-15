@@ -494,6 +494,25 @@ impl MyMcpServer {
             return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
         }
 
+        // A write whose bytes are already on disk changed nothing, but it reported a byte
+        // count like any other and the model read that as its edit having landed — the same
+        // blind spot `edit` names when old_string and new_string are identical. The diff
+        // drawn above the call has said "No changes" all along; this is that fact reaching
+        // the model, which never sees the diff.
+        //
+        // Compared as bytes rather than text because write_file can legitimately overwrite
+        // binary, the same reason the checkpoint stores bytes. Returning before the
+        // checkpoint and the write is what makes it a real no-op: nothing pointless to undo,
+        // and the mtime left alone so nothing downstream rebuilds over it. The read gate
+        // above has already run, so this is not a way around it.
+        if fs::read(&file_path).is_ok_and(|bytes| bytes == params.0.content.as_bytes()) {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "No changes made - {} already contains exactly this content ({} bytes)",
+                params.0.file_path,
+                params.0.content.len()
+            ))]));
+        }
+
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 McpError::internal_error(format!("Failed to create directories: {}", e), None)
@@ -1076,6 +1095,52 @@ mod tests {
 
         let _ = std::fs::remove_file(&fresh);
         let _ = std::fs::remove_file(&unseen);
+    }
+
+
+    #[tokio::test]
+    async fn write_file_says_so_when_it_changed_nothing() {
+        let server = test_server();
+        let path = scratch("identical.rs", "");
+        let _ = std::fs::remove_file(&path);
+
+        let write = |content: &str| {
+            let content = content.to_string();
+            let server = server.clone();
+            let path = path.clone();
+            async move {
+                server
+                    .write_file(rmcp::handler::server::wrapper::Parameters(
+                        crate::WriteParams {
+                            file_path: path.display().to_string(),
+                            content,
+                        },
+                    ))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let result = write("fn main() {}\n").await;
+        assert!(result_text(&result).contains("Successfully wrote"), "{}", result_text(&result));
+        let written_at = modified_time(&path);
+
+        // The same bytes again: said plainly rather than reported as a byte count, and not
+        // an error — the file is in the state that was asked for, so retrying would loop.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let result = write("fn main() {}\n").await;
+        assert!(!result.is_error.unwrap_or(false), "{}", result_text(&result));
+        assert!(result_text(&result).contains("No changes made"), "{}", result_text(&result));
+
+        // And nothing was written, which the untouched timestamp is what proves.
+        assert_eq!(modified_time(&path), written_at);
+
+        // A real change still goes through.
+        let result = write("fn main() { todo!() }\n").await;
+        assert!(result_text(&result).contains("Successfully wrote"), "{}", result_text(&result));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn main() { todo!() }\n");
+
+        let _ = std::fs::remove_file(&path);
     }
 
 
