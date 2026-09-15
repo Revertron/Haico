@@ -1061,7 +1061,7 @@ In force for '{}':", agent.client.model);
                 outln!("Plan:");
                 for item in &todos {
                     let mark = match item.status.as_str() {
-                        "done" => "x",
+                        "completed" => "x",
                         "in_progress" => "»",
                         _ => " ",
                     };

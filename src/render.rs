@@ -987,9 +987,17 @@ pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
         },
         "todo_write" => match arguments["todos"].as_array() {
             Some(todos) => {
+                // Counted through the normalizer because these are the raw arguments: the
+                // tool has not run yet, so a model that wrote "done" or "complete" would
+                // otherwise have its finished list summarized here as 0/4.
                 let done = todos
                     .iter()
-                    .filter(|t| t["status"] == "done")
+                    .filter(|t| {
+                        t["status"]
+                            .as_str()
+                            .and_then(crate::tools::normalize_status)
+                            == Some("completed")
+                    })
                     .count();
                 format!("{}/{} done", done, todos.len())
             }
@@ -1242,9 +1250,15 @@ mod log_tests {
         assert_eq!(s("web_search", json!({"query": "axum routing"})), "axum routing");
         assert_eq!(s("background_stop", json!({"id": 3})), "job 3");
         assert_eq!(s("background_stop", json!({})), "all");
+        // Either word counts: the arguments have not been through the tool's normalizer.
         assert_eq!(
             s("todo_write", json!({"todos": [
                 {"task": "a", "status": "done"}, {"task": "b", "status": "pending"}]})),
+            "1/2 done"
+        );
+        assert_eq!(
+            s("todo_write", json!({"todos": [
+                {"task": "a", "status": "completed"}, {"task": "b", "status": "pending"}]})),
             "1/2 done"
         );
 

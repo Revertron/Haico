@@ -119,7 +119,7 @@ pub(crate) fn save_session(path: &std::path::Path, messages: &[Value], model: &s
 
 pub(crate) fn load_session(path: &std::path::Path) -> Result<SavedSession> {
     let raw = fs::read_to_string(path).context("no saved session for this directory")?;
-    let session: SavedSession =
+    let mut session: SavedSession =
         serde_json::from_str(&raw).context("saved session could not be read")?;
 
     if session.version != SESSION_FORMAT_VERSION {
@@ -128,6 +128,15 @@ pub(crate) fn load_session(path: &std::path::Path) -> Result<SavedSession> {
             session.version,
             SESSION_FORMAT_VERSION
         );
+    }
+
+    // A session saved before 'done' became 'completed' is the same format and loads fine,
+    // so it is not worth a version bump — but left alone its finished items would come
+    // back looking outstanding, and the model would be handed a plan it has to do twice.
+    for item in &mut session.todos {
+        if let Some(status) = crate::tools::normalize_status(&item.status) {
+            item.status = status.to_string();
+        }
     }
 
     Ok(session)

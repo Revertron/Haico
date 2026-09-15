@@ -21,8 +21,16 @@ pub(crate) struct CalculatorParams {
 pub(crate) struct TodoItem {
     #[schemars(description = "What needs doing, phrased as an action (e.g. 'Add the --context flag')")]
     pub(crate) task: String,
+    // The three values are in the schema and not only in the description because a server
+    // that builds a decoding grammar from the schema (llama.cpp, LM Studio) can then only
+    // ever produce one of them — a constrained model cannot mis-say the word, whereas a
+    // description is a suggestion and the first thing to lose an argument with the model's
+    // own prior. The field stays a String rather than becoming a Rust enum so that a server
+    // which constrains nothing still reaches `normalize_status` instead of failing to
+    // deserialize: the schema in front, the synonym table as the net under it.
     #[schemars(
-        description = "One of: 'pending', 'in_progress', 'done'. Keep exactly one item in_progress at a time."
+        extend("enum" = ["pending", "in_progress", "completed"]),
+        description = "One of: 'pending', 'in_progress', 'completed'. Keep exactly one item in_progress at a time."
     )]
     pub(crate) status: String,
 }
@@ -31,7 +39,7 @@ pub(crate) struct TodoItem {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct TodoWriteParams {
     #[schemars(
-        description = "The complete list, in order. This replaces the previous list entirely, so include finished items with status 'done' rather than dropping them."
+        description = "The complete list, in order. This replaces the previous list entirely, so include finished items with status 'completed' rather than dropping them."
     )]
     pub(crate) todos: Vec<TodoItem>,
 }
@@ -58,6 +66,38 @@ pub(crate) struct PresentPlanParams {
     pub(crate) plan: String,
 }
 
+
+/// Map whatever the model called a status onto one of the three real ones, or `None`.
+///
+/// `completed` is canonical because it is the word every agent-tuned model already has:
+/// Claude Code's own todo tool ships `pending` / `in_progress` / `completed`, so that is
+/// what the training data says, and a local model half a context window into a job falls
+/// back on that prior long before it re-reads this tool's description. Renaming `done`
+/// to match it turns the most common failure into no failure at all.
+///
+/// The rest of the table is the same argument applied to the words the prior does not
+/// cover. A rejected call is not free: it costs a whole round trip on a local model to
+/// say nothing except "use the other word", and it lands in the history where the next
+/// turn reads it. Anything still unrecognized is refused rather than guessed at — a
+/// status nobody meant, silently filed as pending, is a task the model believes it has
+/// already dealt with.
+pub(crate) fn normalize_status(raw: &str) -> Option<&'static str> {
+    let key: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == ' ' { '_' } else { c })
+        .collect();
+    match key.as_str() {
+        "pending" | "todo" | "to_do" | "not_started" | "open" | "new" | "queued" | "waiting" => {
+            Some("pending")
+        }
+        "in_progress" | "inprogress" | "doing" | "active" | "working" | "started" | "wip"
+        | "current" => Some("in_progress"),
+        "completed" | "complete" | "done" | "finished" | "closed" | "x" => Some("completed"),
+        _ => None,
+    }
+}
 
 #[tool_router(router = basics_router, vis = "pub(crate)")]
 impl MyMcpServer {
@@ -99,26 +139,28 @@ impl MyMcpServer {
 
 
     #[tool(
-        description = "Track a multi-step task so you do not lose the thread. Call this at the start of any job that needs more than a couple of steps, writing out the whole plan; then call it again after each step to mark what is done and what you are on now. Keeping the list in front of you is what stops you forgetting a requirement halfway through, repeating work already finished, or stopping early while items are still pending. Pass the complete list every time — it replaces the previous one, so carry finished items over with status 'done'. Skip it for genuinely single-step requests, where it is just noise."
+        description = "Track a multi-step task so you do not lose the thread. Call this at the start of any job that needs more than a couple of steps, writing out the whole plan; then call it again after each step to mark what is done and what you are on now. Keeping the list in front of you is what stops you forgetting a requirement halfway through, repeating work already finished, or stopping early while items are still pending. Pass the complete list every time — it replaces the previous one, so carry finished items over with status 'completed'. Skip it for genuinely single-step requests, where it is just noise."
     )]
     pub(crate) async fn todo_write(
         &self,
         params: Parameters<TodoWriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        const VALID: [&str; 3] = ["pending", "in_progress", "done"];
+        let mut todos = params.0.todos;
 
-        for item in &params.0.todos {
-            if !VALID.contains(&item.status.as_str()) {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Invalid status '{}' for '{}'. Use one of: pending, in_progress, done.",
-                    item.status, item.task
-                ))]));
+        for item in &mut todos {
+            match normalize_status(&item.status) {
+                Some(status) => item.status = status.to_string(),
+                None => {
+                    let hint = format!(
+                        "Invalid status '{}' for '{}'. Use one of: pending, in_progress, completed.",
+                        item.status, item.task
+                    );
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(hint)]));
+                }
             }
         }
 
-        let in_progress = params
-            .0
-            .todos
+        let in_progress = todos
             .iter()
             .filter(|item| item.status == "in_progress")
             .count();
@@ -130,7 +172,7 @@ impl MyMcpServer {
             ))]));
         }
 
-        *self.todos.lock().unwrap() = params.0.todos.clone();
+        *self.todos.lock().unwrap() = todos.clone();
 
         // Nothing to print in the REPL: the list is pinned above the input box, and the
         // next draw picks the new one up from here. A piped session has no bottom region
@@ -138,9 +180,9 @@ impl MyMcpServer {
         // the next few tool calls, but shown, which beats not shown at all.
         if self.interactive && !crate::out::has_region() {
             outln!("\n  Plan:");
-            for item in &params.0.todos {
+            for item in &todos {
                 let mark = match item.status.as_str() {
-                    "done" => "x",
+                    "completed" => "x",
                     "in_progress" => "»",
                     _ => " ",
                 };
@@ -149,18 +191,14 @@ impl MyMcpServer {
             outln!();
         }
 
-        let done = params
-            .0
-            .todos
+        let done = todos
             .iter()
-            .filter(|item| item.status == "done")
+            .filter(|item| item.status == "completed")
             .count();
-        let total = params.0.todos.len();
-        let remaining: Vec<&str> = params
-            .0
-            .todos
+        let total = todos.len();
+        let remaining: Vec<&str> = todos
             .iter()
-            .filter(|item| item.status != "done")
+            .filter(|item| item.status != "completed")
             .map(|item| item.task.as_str())
             .collect();
 
@@ -278,7 +316,7 @@ mod tests {
         assert_eq!(server.todos.lock().unwrap().len(), 3);
 
         let (ok, out) = write(vec![
-            ("Add the flag", "done"),
+            ("Add the flag", "completed"),
             ("Write tests", "in_progress"),
             ("Update docs", "pending"),
         ])
@@ -289,9 +327,9 @@ mod tests {
         assert!(!out.contains("Add the flag"), "got: {}", out);
 
         let (ok, out) = write(vec![
-            ("Add the flag", "done"),
-            ("Write tests", "done"),
-            ("Update docs", "done"),
+            ("Add the flag", "completed"),
+            ("Write tests", "completed"),
+            ("Update docs", "completed"),
         ])
         .await;
         assert!(ok);
@@ -311,4 +349,62 @@ mod tests {
         assert_eq!(server.todos.lock().unwrap().len(), 3);
     }
 
+    #[tokio::test]
+    async fn todo_write_takes_the_words_a_model_actually_uses() {
+        let server = test_server();
+
+        let todos = vec![
+            ("Add the flag", "COMPLETED"),
+            ("Write tests", "Done"),
+            ("Update docs", "in-progress"),
+            ("Ship it", "not started"),
+        ]
+        .into_iter()
+        .map(|(task, status)| crate::TodoItem {
+            task: task.to_string(),
+            status: status.to_string(),
+        })
+        .collect();
+
+        let result = server
+            .todo_write(rmcp::handler::server::wrapper::Parameters(
+                crate::TodoWriteParams { todos },
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "got: {}", result_text(&result));
+        assert!(result_text(&result).contains("2/4 done"), "got: {}", result_text(&result));
+
+        // Stored canonically, so everything downstream still only has three words to know.
+        let stored: Vec<String> = server
+            .todos
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| item.status.clone())
+            .collect();
+        assert_eq!(
+            stored,
+            ["completed", "completed", "in_progress", "pending"]
+        );
+    }
+
+    #[test]
+    fn todo_schema_names_the_three_statuses() {
+        // The description is only a suggestion; the enum in the schema is what a server
+        // doing constrained decoding turns into a grammar, so it has to reach the wire.
+        let server = test_server();
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "todo_write")
+            .expect("todo_write is routed");
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(
+            schema.contains(r#"["pending","in_progress","completed"]"#),
+            "got: {}",
+            schema
+        );
+    }
 }

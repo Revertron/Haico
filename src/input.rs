@@ -844,9 +844,12 @@ pub(crate) fn plan_rows(
     .min(room);
 
     let columns = width.saturating_sub(1);
-    let done = todos.iter().filter(|item| item.status == "done").count();
+    let done = todos
+        .iter()
+        .filter(|item| item.status == "completed")
+        .count();
     let mark = |item: &TodoItem| match item.status.as_str() {
-        "done" => "x",
+        "completed" => "x",
         "in_progress" => "»",
         _ => " ",
     };
@@ -857,7 +860,7 @@ pub(crate) fn plan_rows(
     let focus = todos
         .iter()
         .position(|item| item.status == "in_progress")
-        .or_else(|| todos.iter().position(|item| item.status != "done"))
+        .or_else(|| todos.iter().position(|item| item.status != "completed"))
         .unwrap_or(todos.len() - 1);
 
     let heading = format!("  Plan  {}/{}", done, todos.len());
@@ -895,7 +898,7 @@ pub(crate) fn plan_rows(
         let line = fit(&format!("   [{}] {}", mark(item), item.task), columns);
         // Only what is left to do is worth full brightness: the finished items are there
         // to say the plan is being followed, not to be read again.
-        rows.push(if item.status == "done" { dim(line) } else { line });
+        rows.push(if item.status == "completed" { dim(line) } else { line });
     }
     if end < todos.len() {
         rows.push(dim(fit(
@@ -1819,7 +1822,7 @@ mod tests {
     // A plan long enough that no view can show all of it, with the work part way down.
     fn long_plan() -> Vec<TodoItem> {
         let mut plan: Vec<TodoItem> = (0..20)
-            .map(|index| todo(&format!("step {}", index), "done"))
+            .map(|index| todo(&format!("step {}", index), "completed"))
             .collect();
         plan[12].status = "in_progress".to_string();
         for item in plan.iter_mut().skip(13) {
@@ -1834,7 +1837,7 @@ mod tests {
         assert!(plan_rows(&[], 80, 20, PlanView::Windowed).is_empty());
 
         let short = vec![
-            todo("write the config", "done"),
+            todo("write the config", "completed"),
             todo("write the server", "in_progress"),
             todo("write main", "pending"),
         ];
