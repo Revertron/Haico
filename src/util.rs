@@ -217,6 +217,73 @@ pub(crate) fn modified_time(path: &std::path::Path) -> Option<std::time::SystemT
 }
 
 
+// Line endings, and why the file tools have to think about them at all.
+//
+// `read` shows the model the file through `BufRead::lines`, which strips `\n` *and* `\r\n`.
+// So the model is shown every file as if it were LF, and has no way to discover otherwise —
+// `grep` goes through `str::lines` and strips the same byte. `edit` then matched the
+// model's LF-shaped `old_string` against bytes still holding their `\r`, and every
+// multi-line edit to a CRLF file failed with "String not found", which tells the model
+// nothing it can act on: more context, less context, re-reading the file are all still LF,
+// so it retried until the round limit. Single-line edits worked the whole time, because a
+// one-line `old_string` has no newline in it to disagree about.
+//
+// The fix is to meet the model where `read` left it: translate its strings to whatever the
+// file on disk actually uses, rather than asking it to guess a byte it was never shown.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+/// What the file uses, by majority. Counting rather than sampling the first line is what
+/// gets a file haico itself has damaged right: a CRLF file with three lone LFs spliced into
+/// it by an older edit is still a CRLF file, and normalizing it to CRLF is the repair.
+///
+/// A file with no line breaks at all reports `Lf`, which costs nothing — there is no ending
+/// in it to preserve, so both answers translate to the same bytes.
+pub(crate) fn dominant_line_ending(text: &str) -> LineEnding {
+    let crlf = text.matches("\r\n").count();
+    // Every `\r\n` contains a `\n`, so the lone ones are what is left over.
+    let lone_lf = text.matches('\n').count() - crlf;
+    if crlf > lone_lf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+/// Rewrite every line break in `text` as `ending`, leaving everything else alone.
+///
+/// Borrows when the text already agrees, so the common LF-file edit does not copy the whole
+/// file to discover there was nothing to do.
+///
+/// A lone `\r` is deliberately not a line break here: `BufRead::lines` does not split on one
+/// either, so as far as the model can see it is an ordinary character in the middle of a
+/// line, and turning it into a newline would invent a line the model never read.
+pub(crate) fn with_line_endings(text: &str, ending: LineEnding) -> std::borrow::Cow<'_, str> {
+    if already_uses(text, ending) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // Via LF, so the conversion is idempotent and a mixed file lands wholly on one ending
+    // rather than on whichever one it happened to have first.
+    let lf = text.replace("\r\n", "\n");
+    std::borrow::Cow::Owned(match ending {
+        LineEnding::Lf => lf,
+        LineEnding::Crlf => lf.replace('\n', "\r\n"),
+    })
+}
+
+fn already_uses(text: &str, ending: LineEnding) -> bool {
+    match ending {
+        LineEnding::Lf => !text.contains("\r\n"),
+        // Every `\n` must have its `\r`; a lone one means there is work to do.
+        LineEnding::Crlf => text.matches('\n').count() == text.matches("\r\n").count(),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
@@ -385,5 +452,40 @@ mod tests {
         assert_eq!(strip_ansi("plain line"), "plain line");
         // A lone escape at the end must not run off the end of the string.
         assert_eq!(strip_ansi("tail\x1b"), "tail");
+    }
+
+    #[test]
+    fn line_endings_are_decided_by_majority_and_converted_both_ways() {
+        assert_eq!(dominant_line_ending("a\nb\n"), LineEnding::Lf);
+        assert_eq!(dominant_line_ending("a\r\nb\r\n"), LineEnding::Crlf);
+        // No line breaks at all: nothing to preserve, and Lf converts to the same bytes.
+        assert_eq!(dominant_line_ending("one line"), LineEnding::Lf);
+
+        // The case this exists for: a CRLF file an older haico spliced a lone LF into is
+        // still a CRLF file, and the majority is what says so.
+        assert_eq!(dominant_line_ending("a\r\nb\nc\r\nd\r\n"), LineEnding::Crlf);
+        // And the mirror image, so a stray CRLF pasted into an LF file does not flip it.
+        assert_eq!(dominant_line_ending("a\nb\r\nc\nd\n"), LineEnding::Lf);
+
+        assert_eq!(with_line_endings("a\nb\n", LineEnding::Crlf), "a\r\nb\r\n");
+        assert_eq!(with_line_endings("a\r\nb\r\n", LineEnding::Lf), "a\nb\n");
+        // Idempotent, and a mixed input lands wholly on one ending either way.
+        assert_eq!(with_line_endings("a\r\nb\nc", LineEnding::Crlf), "a\r\nb\r\nc");
+        assert_eq!(with_line_endings("a\r\nb\nc", LineEnding::Lf), "a\nb\nc");
+
+        // A lone \r is a character inside a line, not a line break: BufRead::lines does not
+        // split on one, so the model never saw a line boundary there to preserve.
+        assert_eq!(with_line_endings("a\rb\n", LineEnding::Crlf), "a\rb\r\n");
+        assert_eq!(with_line_endings("a\rb\r\n", LineEnding::Lf), "a\rb\n");
+
+        // Text that already agrees is handed straight back rather than copied.
+        assert!(matches!(
+            with_line_endings("a\nb\n", LineEnding::Lf),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_line_endings("a\r\nb\r\n", LineEnding::Crlf),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

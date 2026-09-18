@@ -1,6 +1,6 @@
 //! Terminal rendering: markdown, diffs, and the model picker.
 
-use crate::util::truncate_at_boundary;
+use crate::util::{dominant_line_ending, truncate_at_boundary, with_line_endings};
 use crate::input::Keys;
 use anyhow::Result;
 use crossterm::{
@@ -1079,7 +1079,16 @@ pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<Str
                 // Check if file exists and read old content
                 if PathBuf::from(file_path).exists() {
                     if let Ok(old_content) = fs::read_to_string(file_path) {
-                        generate_diff(file_path, &old_content, new_content).ok()
+                        // As write_file will: the model's content is LF and the file may not
+                        // be, and a preview that did not follow it would report every line
+                        // as changed on a CRLF file.
+                        let ending = dominant_line_ending(&old_content);
+                        generate_diff(
+                            file_path,
+                            &with_line_endings(&old_content, ending),
+                            &with_line_endings(new_content, ending),
+                        )
+                        .ok()
                     } else {
                         None
                     }
@@ -1095,18 +1104,31 @@ pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<Str
                 let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
 
                 // Read current content and generate preview
-                if let Ok(content) = fs::read_to_string(file_path) {
+                if let Ok(on_disk) = fs::read_to_string(file_path) {
+                    // The same translation `edit` does, for the same reason and so that the
+                    // two agree. Without it the preview searched for an LF old_string in a
+                    // CRLF file, found nothing, and drew "No changes" over an edit that was
+                    // about to fail — the user approved a no-op and got an error.
+                    //
+                    // Both sides of the diff are normalized, so a mixed file's repaired
+                    // endings are not shown as a wall of changed lines around the one change
+                    // the user is actually being asked about.
+                    let ending = dominant_line_ending(&on_disk);
+                    let content = with_line_endings(&on_disk, ending);
+                    let old_string = with_line_endings(old_string, ending);
+                    let new_string = with_line_endings(new_string, ending);
+
                     let new_content = if replace_all {
-                        content.replace(old_string, new_string)
+                        content.replace(old_string.as_ref(), &new_string)
                     } else {
-                        if let Some(pos) = content.find(old_string) {
+                        if let Some(pos) = content.find(old_string.as_ref()) {
                             let mut result = String::with_capacity(content.len());
                             result.push_str(&content[..pos]);
-                            result.push_str(new_string);
+                            result.push_str(&new_string);
                             result.push_str(&content[pos + old_string.len()..]);
                             result
                         } else {
-                            content.clone()
+                            content.to_string()
                         }
                     };
                     generate_diff(file_path, &content, &new_content).ok()
@@ -1119,8 +1141,10 @@ pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<Str
 
                 // Same order the tool applies them in, so the preview shows
                 // what will actually land rather than each edit in isolation.
-                if let Ok(content) = fs::read_to_string(file_path) {
-                    let mut working = content.clone();
+                if let Ok(on_disk) = fs::read_to_string(file_path) {
+                    let ending = dominant_line_ending(&on_disk);
+                    let content = with_line_endings(&on_disk, ending);
+                    let mut working = content.to_string();
                     if let Some(edits) = arguments["edits"].as_array() {
                         for edit in edits {
                             let old_string = edit["old_string"].as_str().unwrap_or("");
@@ -1128,10 +1152,12 @@ pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<Str
                             if old_string.is_empty() {
                                 continue;
                             }
+                            let old_string = with_line_endings(old_string, ending);
+                            let new_string = with_line_endings(new_string, ending);
                             working = if edit["replace_all"].as_bool().unwrap_or(false) {
-                                working.replace(old_string, new_string)
+                                working.replace(old_string.as_ref(), &new_string)
                             } else {
-                                working.replacen(old_string, new_string, 1)
+                                working.replacen(old_string.as_ref(), &new_string, 1)
                             };
                         }
                     }
@@ -1336,6 +1362,55 @@ mod log_tests {
         assert!(file_change_diff("read", &json!({"file_path": path})).is_none());
         // A path that cannot be read must not panic.
         assert!(file_change_diff("edit", &json!({"file_path": "no/such/file"})).is_none());
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn a_crlf_file_previews_the_change_rather_than_no_changes() {
+        use super::file_change_diff;
+
+        let dir = std::env::temp_dir().join(format!("haico-crlf-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("crlf.rs");
+        let path = file.display().to_string();
+        std::fs::write(&file, "fn a() {\r\n    let x = 1;\r\n}\r\n").unwrap();
+
+        // The preview used to search for the model's LF old_string in these CRLF bytes,
+        // find nothing, and fall back to the unchanged file — so it drew "No changes" over
+        // an edit that was about to fail, and the user approved a no-op.
+        let diff = file_change_diff("edit", &json!({
+            "file_path": path,
+            "old_string": "fn a() {\n    let x = 1;\n}",
+            "new_string": "fn a() {\n    let x = 2;\n}",
+        }))
+        .unwrap();
+        assert!(!diff.contains("No changes"), "got: {}", diff);
+        assert!(diff.contains("let x = 2;"), "got: {}", diff);
+
+        // A whole-file rewrite is shown as the one line it changes, not as every line
+        // changing because the model's content is LF and the file is not.
+        let diff = file_change_diff("write_file", &json!({
+            "file_path": path, "content": "fn a() {\n    let x = 3;\n}\n"
+        }))
+        .unwrap();
+        assert!(diff.contains("let x = 3;"), "got: {}", diff);
+        // One line out, one line in — the rest of the file is context. Without the
+        // normalization every line came back changed, because the whole file was being
+        // converted to LF underneath the one edit.
+        let changed = crate::util::strip_ansi(&diff)
+            .lines()
+            .filter(|line| matches!(line.as_bytes().get(7), Some(b'-') | Some(b'+')))
+            .count();
+        assert_eq!(changed, 2, "whole file redrawn: {}", diff);
+
+        let diff = file_change_diff("multi_edit", &json!({
+            "file_path": path,
+            "edits": [{"old_string": "fn a() {\n    let x = 1;", "new_string": "fn a() {\n    let y = 1;"}]
+        }))
+        .unwrap();
+        assert!(diff.contains("let y = 1;"), "got: {}", diff);
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);

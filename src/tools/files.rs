@@ -1,5 +1,7 @@
 use super::MyMcpServer;
-use crate::util::{display_path, modified_time, truncate_at_boundary};
+use crate::util::{
+    display_path, dominant_line_ending, modified_time, truncate_at_boundary, with_line_endings,
+};
 use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -494,6 +496,25 @@ impl MyMcpServer {
             return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
         }
 
+        // Read once, as bytes: what is already there decides both whether this write is a
+        // no-op and what line endings it should land in.
+        let existing = fs::read(&file_path).ok();
+
+        // A whole-file rewrite used to convert the file: the model's content is LF, because
+        // that is all `read` shows it, so replacing a CRLF file turned every line in it over
+        // and a one-line change arrived in git as a whole-file diff. Follow whatever is
+        // already on disk instead.
+        //
+        // Only when the target is text — `str::from_utf8` failing is a binary file, which
+        // write_file may legitimately overwrite, and there is nothing to preserve in it. A
+        // file that does not exist yet is left exactly as the model wrote it: there is no
+        // convention to inherit, and guessing one from the platform would be haico deciding
+        // something nobody asked it to.
+        let content = match existing.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()) {
+            Some(text) => with_line_endings(&params.0.content, dominant_line_ending(text)),
+            None => std::borrow::Cow::Borrowed(params.0.content.as_str()),
+        };
+
         // A write whose bytes are already on disk changed nothing, but it reported a byte
         // count like any other and the model read that as its edit having landed — the same
         // blind spot `edit` names when old_string and new_string are identical. The diff
@@ -505,11 +526,11 @@ impl MyMcpServer {
         // checkpoint and the write is what makes it a real no-op: nothing pointless to undo,
         // and the mtime left alone so nothing downstream rebuilds over it. The read gate
         // above has already run, so this is not a way around it.
-        if fs::read(&file_path).is_ok_and(|bytes| bytes == params.0.content.as_bytes()) {
+        if existing.is_some_and(|bytes| bytes == content.as_bytes()) {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No changes made - {} already contains exactly this content ({} bytes)",
                 params.0.file_path,
-                params.0.content.len()
+                content.len()
             ))]));
         }
 
@@ -528,17 +549,17 @@ impl MyMcpServer {
             ),
         );
 
-        fs::write(&file_path, &params.0.content).map_err(|e| {
+        fs::write(&file_path, content.as_bytes()).map_err(|e| {
             McpError::internal_error(format!("Failed to write file: {}", e), None)
         })?;
 
         // The file now matches what the model just produced, so a follow-up edit is working
         // from known contents and must not be rejected as unread or stale.
-        self.mark_written(&file_path, params.0.content.as_bytes());
+        self.mark_written(&file_path, content.as_bytes());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Successfully wrote {} bytes to {}",
-            params.0.content.len(),
+            content.len(),
             params.0.file_path
         ))]))
     }
@@ -565,11 +586,21 @@ impl MyMcpServer {
             )]));
         }
 
-        let content = fs::read_to_string(&file_path).map_err(|e| {
+        let on_disk = fs::read_to_string(&file_path).map_err(|e| {
             McpError::internal_error(format!("Failed to read file: {}", e), None)
         })?;
 
-        let matches = content.matches(&params.0.old_string).count();
+        // The model's strings are LF, because that is all `read` ever shows it — see
+        // `with_line_endings`. Match and splice in the file's own ending instead, so a
+        // multi-line old_string is not defeated by a byte the model was never given.
+        // `content` is normalized too: on a file whose endings are already consistent that
+        // is the same bytes back, and on one that is not it is the repair.
+        let ending = dominant_line_ending(&on_disk);
+        let content = with_line_endings(&on_disk, ending);
+        let old_string = with_line_endings(&params.0.old_string, ending);
+        let new_string = with_line_endings(&params.0.new_string, ending);
+
+        let matches = content.matches(old_string.as_ref()).count();
 
         if matches == 0 {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -592,10 +623,10 @@ impl MyMcpServer {
         }
 
         let new_content = if params.0.replace_all {
-            content.replace(&params.0.old_string, &params.0.new_string)
+            content.replace(old_string.as_ref(), &new_string)
         } else {
             // Exactly one occurrence, so replacen and find agree.
-            content.replacen(&params.0.old_string, &params.0.new_string, 1)
+            content.replacen(old_string.as_ref(), &new_string, 1)
         };
 
         self.checkpoint(
@@ -646,14 +677,17 @@ impl MyMcpServer {
             )]));
         }
 
-        let original = fs::read_to_string(&file_path).map_err(|e| {
+        let on_disk = fs::read_to_string(&file_path).map_err(|e| {
             McpError::internal_error(format!("Failed to read file: {}", e), None)
         })?;
+
+        // Same reason as `edit`: the model's strings are LF whatever the file is.
+        let ending = dominant_line_ending(&on_disk);
 
         // Applied to a working copy first. A partial application would leave the file in a
         // state neither the model nor the user asked for, and the model's next edit would
         // then be matching against text that no longer exists.
-        let mut working = original.clone();
+        let mut working = with_line_endings(&on_disk, ending).into_owned();
         let mut replacements = 0usize;
 
         for (index, edit) in params.0.edits.iter().enumerate() {
@@ -667,7 +701,10 @@ impl MyMcpServer {
                 ))]));
             }
 
-            let matches = working.matches(&edit.old_string).count();
+            let old_string = with_line_endings(&edit.old_string, ending);
+            let new_string = with_line_endings(&edit.new_string, ending);
+
+            let matches = working.matches(old_string.as_ref()).count();
 
             if matches == 0 {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -690,9 +727,9 @@ impl MyMcpServer {
             }
 
             working = if edit.replace_all {
-                working.replace(&edit.old_string, &edit.new_string)
+                working.replace(old_string.as_ref(), &new_string)
             } else {
-                working.replacen(&edit.old_string, &edit.new_string, 1)
+                working.replacen(old_string.as_ref(), &new_string, 1)
             };
             replacements += matches;
         }
@@ -1144,6 +1181,124 @@ mod tests {
     }
 
 
+    // `read` hands the model a file through BufRead::lines, which eats the `\r`, so every
+    // string the model sends back is LF whatever the file is. These are the regressions for
+    // matching it against a file that is not: before this, a multi-line old_string could not
+    // match a CRLF file at all and the model was told only "String not found", which none of
+    // its retries could fix.
+    #[tokio::test]
+    async fn a_multi_line_edit_lands_in_a_crlf_file_and_leaves_it_crlf() {
+        let server = test_server();
+        let path = scratch("crlf_edit.rs", "fn a() {\r\n    let x = 1;\r\n}\r\n");
+        read_file(&server, &path).await;
+
+        // Exactly what the model can reconstruct from what `read` showed it.
+        let (ok, out) = try_edit(
+            &server,
+            &path,
+            "fn a() {\n    let x = 1;\n}",
+            "fn a() {\n    let x = 2;\n}",
+            false,
+        )
+        .await;
+        assert!(ok, "got: {}", out);
+
+        // Changed, and still CRLF throughout — a lone LF spliced in here is what used to
+        // leave these files with mixed endings.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn a() {\r\n    let x = 2;\r\n}\r\n"
+        );
+
+        // An LF file is left alone by the same code path.
+        let lf = scratch("lf_edit.rs", "fn a() {\n    let x = 1;\n}\n");
+        read_file(&server, &lf).await;
+        let (ok, out) = try_edit(&server, &lf, "let x = 1;\n}", "let x = 2;\n}", false).await;
+        assert!(ok, "got: {}", out);
+        assert_eq!(
+            std::fs::read_to_string(&lf).unwrap(),
+            "fn a() {\n    let x = 2;\n}\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lf);
+    }
+
+
+    #[tokio::test]
+    async fn an_edit_repairs_a_file_haico_left_with_mixed_endings() {
+        let server = test_server();
+        // A CRLF file with two lone LFs in it — what an older haico's single-line edits left
+        // behind. The majority still says CRLF, so that is what the whole file becomes.
+        let path = scratch("mixed.rs", "one\r\ntwo\nthree\r\nfour\nfive\r\n");
+        read_file(&server, &path).await;
+
+        let (ok, out) = try_edit(&server, &path, "three", "THREE", false).await;
+        assert!(ok, "got: {}", out);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\r\ntwo\r\nTHREE\r\nfour\r\nfive\r\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[tokio::test]
+    async fn write_file_keeps_the_endings_the_file_already_had() {
+        let server = test_server();
+        let path = scratch("crlf_write.rs", "old\r\nlines\r\n");
+        read_file(&server, &path).await;
+
+        let write = |content: &str| {
+            let content = content.to_string();
+            let server = server.clone();
+            let path = path.clone();
+            async move {
+                server
+                    .write_file(rmcp::handler::server::wrapper::Parameters(
+                        crate::WriteParams {
+                            file_path: path.display().to_string(),
+                            content,
+                        },
+                    ))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A whole-file rewrite used to convert the file: one changed line arrived in git as
+        // every line changed.
+        let result = write("new\nlines\n").await;
+        assert!(result_text(&result).contains("Successfully wrote"), "{}", result_text(&result));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\r\nlines\r\n");
+
+        // And the no-op check compares what would actually be written, so sending the same
+        // LF content again is recognized as changing nothing rather than rewriting the file.
+        let written_at = modified_time(&path);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let result = write("new\nlines\n").await;
+        assert!(result_text(&result).contains("No changes made"), "{}", result_text(&result));
+        assert_eq!(modified_time(&path), written_at);
+
+        // A file that does not exist yet has no convention to inherit and is written exactly
+        // as the model produced it.
+        let fresh = scratch("fresh_write.rs", "");
+        let _ = std::fs::remove_file(&fresh);
+        server
+            .write_file(rmcp::handler::server::wrapper::Parameters(crate::WriteParams {
+                file_path: fresh.display().to_string(),
+                content: "brand\nnew\n".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "brand\nnew\n");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fresh);
+    }
+
+
     #[tokio::test]
     async fn multi_edit_applies_in_order_or_not_at_all() {
         let server = test_server();
@@ -1204,6 +1359,35 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap().matches("pub fn ").count(),
             3
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[tokio::test]
+    async fn multi_edit_matches_crlf_the_same_way_edit_does() {
+        let server = test_server();
+        let path = scratch(
+            "crlf_multi.rs",
+            "fn one() {\r\n    a();\r\n}\r\nfn two() {\r\n    b();\r\n}\r\n",
+        );
+        read_file(&server, &path).await;
+
+        // Both old_strings span lines, so both used to fail here.
+        let (ok, out) = try_multi_edit(
+            &server,
+            &path,
+            vec![
+                ("fn one() {\n    a();", "fn one() {\n    aa();", false),
+                ("fn two() {\n    b();", "fn two() {\n    bb();", false),
+            ],
+        )
+        .await;
+        assert!(ok, "got: {}", out);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn one() {\r\n    aa();\r\n}\r\nfn two() {\r\n    bb();\r\n}\r\n"
         );
 
         let _ = std::fs::remove_file(&path);
