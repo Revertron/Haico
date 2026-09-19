@@ -693,8 +693,37 @@ impl StreamAssembler {
 // `/v1/models` is no help for this. Depending on the version it lists everything
 // downloaded or only what is in memory, and it carries no field to tell the two apart.
 pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> Vec<String> {
-    // LM Studio's own REST API: every model it knows, each with the state it is in.
-    // Embedding models are loaded alongside chat ones and would be a nonsense choice here.
+    // LM Studio's own REST API, v1 — released with LM Studio 0.4.0 and the one it now
+    // recommends. `/api/v0` is still answered and is still the fallback below, because a
+    // v1 request to anything older 404s.
+    //
+    // The state is the shape of `loaded_instances` rather than a string: a model with
+    // none is merely downloaded. And the name worth reporting is the *instance's* id, not
+    // the entry's `key` — the key carries the quantization suffix and names the file on
+    // disk (`nail-qwen3.6-35b@q4_k_xl`), while the instance answers to the bare name
+    // (`nail-qwen3.6-35b`). Both are accepted in a request's `model` field, so taking the
+    // key would look like it worked while naming something other than what is in memory.
+    #[derive(Deserialize)]
+    struct LmStudioV1 {
+        #[serde(default)]
+        models: Vec<LmStudioV1Model>,
+    }
+    #[derive(Deserialize)]
+    struct LmStudioV1Model {
+        #[serde(default)]
+        key: String,
+        #[serde(default, rename = "type")]
+        kind: String,
+        #[serde(default)]
+        loaded_instances: Vec<LmStudioInstance>,
+    }
+    #[derive(Deserialize)]
+    struct LmStudioInstance {
+        #[serde(default)]
+        id: String,
+    }
+
+    // LM Studio's v0: every model it knows, each with the state it is in.
     #[derive(Deserialize)]
     struct LmStudioModels {
         #[serde(default)]
@@ -707,6 +736,14 @@ pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> 
         state: String,
         #[serde(default, rename = "type")]
         kind: String,
+    }
+
+    // Embedding models are loaded alongside chat ones and would be a nonsense choice
+    // here. Matched by prefix because the two APIs disagree on the word: v0 says
+    // "embeddings" and v1 says "embedding", and a filter copied from one to the other
+    // would quietly stop excluding anything.
+    fn is_embedding(kind: &str) -> bool {
+        kind.starts_with("embedding")
     }
 
     // Ollama's: only what is loaded right now, which is exactly the question being asked.
@@ -734,13 +771,39 @@ pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> 
         .send()
     };
 
+    if let Ok(response) = get("/api/v1/models").await {
+        if response.status().is_success() {
+            if let Ok(listed) = response.json::<LmStudioV1>().await {
+                let mut loaded = Vec::new();
+                for model in listed.models {
+                    if is_embedding(&model.kind) {
+                        continue;
+                    }
+                    let LmStudioV1Model { key, loaded_instances, .. } = model;
+                    for instance in loaded_instances {
+                        // The key only as a last resort: an instance with no id of its own
+                        // is still something running, and naming it by its file beats
+                        // dropping it from the list entirely.
+                        let name = if instance.id.is_empty() { key.clone() } else { instance.id };
+                        if !name.is_empty() {
+                            loaded.push(name);
+                        }
+                    }
+                }
+                if !loaded.is_empty() {
+                    return loaded;
+                }
+            }
+        }
+    }
+
     if let Ok(response) = get("/api/v0/models").await {
         if response.status().is_success() {
             if let Ok(listed) = response.json::<LmStudioModels>().await {
                 let loaded: Vec<String> = listed
                     .data
                     .into_iter()
-                    .filter(|model| model.state == "loaded" && model.kind != "embeddings")
+                    .filter(|model| model.state == "loaded" && !is_embedding(&model.kind))
                     .map(|model| model.id)
                     .collect();
                 if !loaded.is_empty() {
@@ -1001,20 +1064,50 @@ mod tests {
 
 
 
+    // The shapes in these three are trimmed from what a real LM Studio answered, which is
+    // the only way to be sure of them: neither API publishes a response schema.
+
     #[tokio::test]
-    async fn only_what_is_actually_loaded_counts_as_running() {
-        // LM Studio lists everything it knows, in whatever state it is in. Only the loaded
-        // ones are running, and an embedding model is not a thing to hold a conversation
-        // with even when it is.
-        const LM_STUDIO: &str = concat!(
-            r#"{"data":[
-                {"id":"qwen2.5-14b","type":"llm","state":"loaded"},
-                {"id":"llama-3.1-8b","type":"llm","state":"not-loaded"},
-                {"id":"nomic-embed","type":"embeddings","state":"loaded"}
-            ]}"#
-        );
-        let url = serve_routes(&[("/api/v0/models", LM_STUDIO)]).await;
+    async fn the_v1_api_reports_the_instance_that_is_running_not_the_file_on_disk() {
+        // `loaded_instances` is the load state — an empty one means merely downloaded.
+        // The instance's id is the bare name and the entry's `key` carries the quant
+        // suffix; both are accepted as a request's `model`, so taking the key would look
+        // like it worked while naming something other than what is in memory. Note v1
+        // spells the embedding type in the singular, where v0 uses the plural.
+        const LM_STUDIO_V1: &str = r#"{"models":[
+            {"key":"qwen2.5-14b@q4_k_xl","type":"llm",
+             "loaded_instances":[{"id":"qwen2.5-14b","config":{"context_length":262144}}]},
+            {"key":"llama-3.1-8b@q8_0","type":"llm","loaded_instances":[]},
+            {"key":"nomic-embed@f16","type":"embedding",
+             "loaded_instances":[{"id":"nomic-embed"}]}
+        ]}"#;
+        let url = serve_routes(&[("/api/v1/models", LM_STUDIO_V1)]).await;
         assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5-14b"]);
+    }
+
+    #[tokio::test]
+    async fn an_lm_studio_too_old_for_v1_is_still_asked_the_old_way() {
+        // v1 arrived in LM Studio 0.4.0; anything older 404s it and answers v0. Falling
+        // through matters more than it looks — concluding "nothing is loaded" would send
+        // the picker's user to choose a model that is already in memory.
+        const LM_STUDIO_V0: &str = r#"{"data":[
+            {"id":"qwen2.5-14b","type":"llm","state":"loaded"},
+            {"id":"llama-3.1-8b","type":"llm","state":"not-loaded"},
+            {"id":"nomic-embed","type":"embeddings","state":"loaded"}
+        ]}"#;
+        let url = serve_routes(&[("/api/v0/models", LM_STUDIO_V0)]).await;
+        assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5-14b"]);
+    }
+
+    #[tokio::test]
+    async fn a_v1_server_with_nothing_loaded_does_not_stop_the_fallbacks() {
+        // Every entry present and none of them running. The v1 arm returns nothing rather
+        // than an answer, so the probe carries on to the next server instead of reporting
+        // an empty list as fact.
+        const EMPTY_V1: &str = r#"{"models":[{"key":"qwen2.5-14b@q4_k_xl","type":"llm","loaded_instances":[]}]}"#;
+        const OLLAMA: &str = r#"{"models":[{"name":"qwen2.5:14b","model":"qwen2.5:14b"}]}"#;
+        let url = serve_routes(&[("/api/v1/models", EMPTY_V1), ("/api/ps", OLLAMA)]).await;
+        assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5:14b"]);
     }
 
     #[tokio::test]
