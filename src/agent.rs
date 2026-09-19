@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    autocompact_threshold, resolve_settings, Config, Reasoning, ResolvedSettings, Setting,
-    AUTOCOMPACT_FRACTION, FROM_UNSET,
+    autocompact_threshold, resolve_settings, save_default_model, save_model_context, Config,
+    Reasoning, ResolvedSettings, Setting, AUTOCOMPACT_FRACTION, FROM_UNSET,
 };
 use crate::ask::{self, ASK_USER};
 use crate::llm::{Chunk, LMStudioClient};
@@ -321,12 +321,18 @@ impl Agent {
     }
 
     /// Point the conversation at a different model, re-resolving everything that
-    /// is configured per model.
+    /// is configured per model, and record it as the one to start with next time.
     ///
     /// Re-resolving is the whole point: a 131072-token budget carried onto a 32k
     /// model would warn far too late to be any use. The conversation itself is
     /// kept — switching model is not starting over.
-    pub(crate) fn switch_model(&mut self, model: String) {
+    ///
+    /// Saving happens here rather than in either frontend because there are two of
+    /// them and this is the one place both go through; the same choice made in two
+    /// places is the one that ends up made in one. The return value says whether it
+    /// reached the file, for the caller to word — the switch itself has already
+    /// happened either way.
+    pub(crate) fn switch_model(&mut self, model: String) -> Kept {
         self.settings = resolve_settings(&self.config, &model);
         self.context_tokens = self.settings.context_tokens;
         // Re-resolved with the rest: whether a chain of thought is worth keeping
@@ -341,12 +347,31 @@ impl Agent {
         // model for half the work.
         self.client.model = model.clone();
         self.client.apply_settings(&self.settings);
-        self.server.llm_client.model = model;
+        self.server.llm_client.model = model.clone();
         self.server.llm_client.apply_settings(&self.settings);
 
         // The reviewer is this model too, so its verdicts leave with it.
         self.review_cache.clear();
         self.rebuild_system_prompt();
+
+        self.keep(|path| save_default_model(path, &model))
+    }
+
+    /// Put a change in the config file, so it is still true next run.
+    ///
+    /// Writing the file is not printing, so the core may do it; saying whether it
+    /// worked is the frontend's, which is what `Kept` is carried back for. No
+    /// config path means no home directory to keep one in — reported rather than
+    /// swallowed, because a setting the user was told would last and did not is
+    /// worse than one they know never made it.
+    fn keep(&self, write: impl FnOnce(&Path) -> Result<()>) -> Kept {
+        let Some(path) = self.config.config_path.as_deref() else {
+            return Kept::Failed("haico found no home directory to keep a config in".to_string());
+        };
+        match write(path) {
+            Ok(()) => Kept::Config,
+            Err(e) => Kept::Failed(format!("{:#}", e)),
+        }
     }
 
     /// The model currently in use.
@@ -1517,6 +1542,23 @@ mod send_check {
 // Model settings
 // ---------------------------------------------------------------------------
 
+/// How long a change just made is going to last, for the frontend to say.
+///
+/// Most settings are session-only on purpose — a temperature is something to try
+/// against the task in hand — so `Session` is not a failure, it is the usual
+/// answer. `Failed` is the one that has to be reported: a setting the user was
+/// told would last and did not is worse than one they know never made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// This session only. Nothing was written, and nothing was meant to be.
+    Session,
+    /// Written to the config file, so it is still in force next run.
+    Config,
+    /// Meant for the config file and did not get there. Carries why, in words a
+    /// frontend can show as they are.
+    Failed(String),
+}
+
 /// A model setting a frontend can read and change.
 ///
 /// These were only ever reachable through `/set`, which meant the parsing, the
@@ -1526,6 +1568,11 @@ mod send_check {
 /// the wording stays with each frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Knob {
+    /// The model's context window. Not a request field and not session-only:
+    /// how big a model's window is is a fact about the model, true again the
+    /// next time it is loaded, so setting it writes it into that model's
+    /// section of the config file.
+    Context,
     Temperature,
     TopP,
     TopK,
@@ -1544,6 +1591,7 @@ pub(crate) enum Knob {
 impl Knob {
     /// Every knob, in the order a frontend should show them.
     pub(crate) const ALL: &'static [Knob] = &[
+        Knob::Context,
         Knob::Temperature,
         Knob::TopP,
         Knob::TopK,
@@ -1557,6 +1605,7 @@ impl Knob {
     /// The canonical wire name — what the config file and the request field use.
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Knob::Context => "context",
             Knob::Temperature => "temperature",
             Knob::TopP => "top_p",
             Knob::TopK => "top_k",
@@ -1571,6 +1620,7 @@ impl Knob {
     /// Resolve a name a person typed, including the abbreviations they use.
     pub(crate) fn parse(name: &str) -> Option<Knob> {
         match name.to_lowercase().as_str() {
+            "context" | "context_length" | "ctx" => Some(Knob::Context),
             "temp" | "temperature" => Some(Knob::Temperature),
             "top_p" | "top-p" | "topp" => Some(Knob::TopP),
             "top_k" | "top-k" | "topk" => Some(Knob::TopK),
@@ -1590,7 +1640,10 @@ impl Knob {
     /// Whether this one is a count. `top_k` and `max_tokens` are: sending 40.0
     /// where a server wants an integer is a needless way to get a 400 back.
     fn is_count(self) -> bool {
-        matches!(self, Knob::TopK | Knob::MaxTokens | Knob::ReasoningThreshold)
+        matches!(
+            self,
+            Knob::TopK | Knob::MaxTokens | Knob::ReasoningThreshold | Knob::Context
+        )
     }
 }
 
@@ -1598,6 +1651,11 @@ impl Agent {
     /// The knob's current value and where it came from, ready to show.
     pub(crate) fn knob(&self, knob: Knob) -> String {
         match knob {
+            // Never absent: there is always a window in force, even if it is only
+            // the built-in guess at one.
+            Knob::Context => {
+                format!("{}  [{}]", self.context_tokens, self.settings.context_source)
+            }
             Knob::Temperature => self.settings.temperature.describe(),
             Knob::TopP => self.settings.top_p.describe(),
             Knob::TopK => self.settings.top_k.describe(),
@@ -1614,6 +1672,7 @@ impl Agent {
     /// `None` for a knob that is not set, which a field shows as empty.
     pub(crate) fn knob_value(&self, knob: Knob) -> Option<String> {
         match knob {
+            Knob::Context => Some(self.context_tokens.to_string()),
             Knob::Temperature => self.settings.temperature.value.map(|v| v.to_string()),
             Knob::TopP => self.settings.top_p.value.map(|v| v.to_string()),
             Knob::TopK => self.settings.top_k.value.map(|v| v.to_string()),
@@ -1631,10 +1690,17 @@ impl Agent {
     /// "stop overriding it" all clear. `Err` carries what was wrong with the
     /// text, for the frontend to say in its own words; nothing changes when it
     /// does, so a rejected field leaves the session exactly as it was.
-    pub(crate) fn set_knob(&mut self, knob: Knob, value: Option<&str>) -> Result<(), String> {
+    ///
+    /// `Ok` says how long the change lasts: `Session` for every request field,
+    /// and `Config` for the one knob that is written back to the file.
+    pub(crate) fn set_knob(&mut self, knob: Knob, value: Option<&str>) -> Result<Kept, String> {
         const SET_HERE: &str = "set here";
         let text = value.map(str::trim).filter(|v| !v.is_empty());
         let clearing = text.is_none() || matches!(text, Some("unset" | "default" | "-"));
+
+        if knob == Knob::Context {
+            return self.set_context(text.filter(|_| !clearing));
+        }
 
         if knob == Knob::ReasoningThreshold {
             // Its own path, because it is not a request field: clearing means the
@@ -1647,7 +1713,7 @@ impl Agent {
                     .map_err(|_| format!("{} needs a whole number of tokens", knob.name()))?,
                 None => unreachable!("not clearing implies text"),
             };
-            return Ok(());
+            return Ok(Kept::Session);
         }
 
         if clearing {
@@ -1661,7 +1727,7 @@ impl Agent {
                 Knob::ReasoningEffort => {
                     self.settings.reasoning_effort = Setting::unset(FROM_UNSET)
                 }
-                Knob::ReasoningThreshold => unreachable!("handled above"),
+                Knob::ReasoningThreshold | Knob::Context => unreachable!("handled above"),
             }
         } else {
             let text = text.expect("not clearing implies text");
@@ -1701,7 +1767,64 @@ impl Agent {
         // would silently keep the old sampling for half the work.
         self.client.apply_settings(&self.settings);
         self.server.llm_client.apply_settings(&self.settings);
-        Ok(())
+        Ok(Kept::Session)
+    }
+
+    /// The context knob's own path, because it is nothing like the others: it is
+    /// not a request field, there is nothing to push to the clients, and it is the
+    /// one setting that outlives the session.
+    ///
+    /// `None` clears it, which means taking it back out of the config file and
+    /// falling through the layers again rather than leaving a value nothing wrote.
+    fn set_context(&mut self, tokens: Option<&str>) -> Result<Kept, String> {
+        let tokens = match tokens {
+            Some(text) => Some(
+                text.parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| "context needs a whole number of tokens".to_string())?,
+            ),
+            None => None,
+        };
+
+        // The model in force is the one this is a fact about. A window set while one
+        // model is loaded has no business following the user onto the next.
+        let model = self.client.model.clone();
+        let already = self.config.file.models.get(&model).and_then(|s| s.context);
+
+        // The parsed file has to move with the one on disk: `switch_model` re-resolves
+        // from it, so a switch away and straight back would otherwise hand back the
+        // window this just replaced.
+        self.config.file.models.entry(model.clone()).or_default().context = tokens;
+
+        match tokens {
+            Some(tokens) => {
+                self.context_tokens = tokens;
+                self.settings.context_tokens = tokens;
+                // "set here" rather than the config's own provenance, even though that
+                // is where it has just gone: `--context` on the command line outranks
+                // the file, and a number typed at the prompt has to win for the rest of
+                // the session whatever was passed at startup.
+                self.settings.context_source = "set here";
+            }
+            None => {
+                // Back through every layer rather than to the built-in default: the top
+                // level of the file, or the command line, may still have an answer.
+                let resolved = resolve_settings(&self.config, &model);
+                self.context_tokens = resolved.context_tokens;
+                self.settings.context_tokens = resolved.context_tokens;
+                self.settings.context_source = resolved.context_source;
+            }
+        }
+
+        // The file already says exactly this, so there is nothing to write. Worth the
+        // check because a settings dialog hands back every field whether or not it was
+        // touched, and rewriting the file on each apply would be a file rewritten for
+        // nothing.
+        if tokens.is_some() && tokens == already {
+            return Ok(Kept::Config);
+        }
+        Ok(self.keep(|path| save_model_context(path, &model, tokens)))
     }
 
     /// The thinking level in force, if any. `None` means the field is left out of the
@@ -1724,6 +1847,86 @@ mod knob_tests {
     fn agent() -> Agent {
         let cwd = std::env::current_dir().unwrap();
         Agent::new(test_config("http://127.0.0.1:1"), "m".to_string(), &cwd)
+    }
+
+    /// An agent whose config file is a scratch one, for the two settings that are
+    /// written back. `test_config` leaves the path `None` on purpose so that no other
+    /// test can reach the user's own config; a test about saving has to supply one.
+    fn agent_saving_to(name: &str) -> (Agent, std::path::PathBuf) {
+        let path = crate::testutil::scratch(name, "");
+        let mut config = test_config("http://127.0.0.1:1");
+        config.config_path = Some(path.clone());
+        let cwd = std::env::current_dir().unwrap();
+        (Agent::new(config, "m".to_string(), &cwd), path)
+    }
+
+    /// Picking a model is answering "which model", which is asked once per machine
+    /// rather than once per session.
+    #[test]
+    fn switching_model_records_it_as_the_default() {
+        let (mut agent, path) = agent_saving_to("agent-saves-model.toml");
+
+        assert_eq!(agent.switch_model("qwen2.5:14b".to_string()), Kept::Config);
+        assert_eq!(agent.model(), "qwen2.5:14b");
+        assert_eq!(
+            crate::config::load_file_config(Some(&path)).model.as_deref(),
+            Some("qwen2.5:14b")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nowhere to save is reported rather than swallowed: a choice the user was told
+    /// would last and did not is worse than one they know never made it. The switch
+    /// itself happens either way.
+    #[test]
+    fn with_nowhere_to_save_the_switch_still_happens_and_says_so() {
+        let mut agent = agent();
+        assert!(matches!(agent.switch_model("other".to_string()), Kept::Failed(_)));
+        assert_eq!(agent.model(), "other");
+    }
+
+    /// The context window is the one knob that outlives the session, and it belongs to
+    /// the model rather than to the machine.
+    #[test]
+    fn the_context_window_is_kept_in_the_model_s_own_section() {
+        use crate::config::{load_file_config, DEFAULT_CONTEXT_TOKENS};
+        let (mut agent, path) = agent_saving_to("agent-saves-context.toml");
+
+        assert_eq!(agent.set_knob(Knob::Context, Some("32768")), Ok(Kept::Config));
+        assert_eq!(agent.context_tokens, 32768);
+        assert_eq!(load_file_config(Some(&path)).models["m"].context, Some(32768));
+
+        // Switching away and back re-resolves from the parsed config, which has to have
+        // moved with the file or the window just set would be forgotten on the way back.
+        agent.switch_model("other".to_string());
+        assert_eq!(agent.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        agent.switch_model("m".to_string());
+        assert_eq!(agent.context_tokens, 32768);
+
+        // Clearing takes the key out and falls back through the layers, not straight to
+        // the built-in default: the top level may still have an answer.
+        agent.config.file.context = Some(4096);
+        assert_eq!(agent.set_knob(Knob::Context, Some("unset")), Ok(Kept::Config));
+        assert_eq!(agent.context_tokens, 4096);
+        assert_eq!(load_file_config(Some(&path)).models["m"].context, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A window of no tokens is not a window, and neither is half of one.
+    #[test]
+    fn the_context_window_refuses_nonsense_and_changes_nothing() {
+        let (mut agent, path) = agent_saving_to("agent-context-nonsense.toml");
+        agent.set_knob(Knob::Context, Some("32768")).unwrap();
+
+        for bad in ["0", "lots", "32k", "-1", "8192.5"] {
+            let complaint = agent.set_knob(Knob::Context, Some(bad)).unwrap_err();
+            assert!(complaint.contains("whole number"), "unhelpful complaint: {complaint}");
+            assert_eq!(agent.context_tokens, 32768, "{bad:?} should have changed nothing");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

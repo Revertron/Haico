@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "haico"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2050,6 +2050,7 @@ dependencies = [
  "terminput-crossterm",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-width",
  "url",
  "urlencoding",
@@ -5206,6 +5207,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

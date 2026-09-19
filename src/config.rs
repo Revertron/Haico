@@ -5,7 +5,8 @@ use getopts::Options;
 use serde::Deserialize;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table};
 
 // Which renderer draws the REPL.
 //
@@ -415,6 +416,93 @@ pub(crate) fn load_file_config(path: Option<&std::path::Path>) -> FileConfig {
             FileConfig::default()
         }
     }
+}
+
+// Writing one setting back into the config file.
+//
+// Two of them outlive the session: the model chosen with /model, and the context window
+// set with /set context. Both are answers to "which model, and how big is its window" —
+// asked once per machine and then true until the machine changes — where a sampling knob
+// is something tried against the task in hand and rightly forgotten with the session.
+//
+// Edited with toml_edit rather than serialized back out of `FileConfig`, because the file
+// belongs to the user: it is written by hand, commented, and ordered the way they wanted
+// it. Rewriting it from the struct would answer "set one key" by deleting every comment
+// in the file, and the loss would only be noticed later.
+
+fn edit_config_file(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
+    // A missing file is the ordinary first case — the config is optional, and saving is
+    // most use to the user who never wrote one. A *malformed* one is refused rather than
+    // treated as empty: parsing failure here would replace whatever the user has with a
+    // one-line file, which is the worst possible way to answer a typo.
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).context(format!("could not read {}", path.display())),
+    };
+    let mut doc: DocumentMut = raw
+        .parse()
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+
+    edit(&mut doc)?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    fs::write(path, doc.to_string()).with_context(|| format!("could not write {}", path.display()))
+}
+
+// Record the model to start with next time.
+
+pub(crate) fn save_default_model(path: &Path, model: &str) -> Result<()> {
+    edit_config_file(path, |doc| {
+        doc["model"] = toml_edit::value(model);
+        Ok(())
+    })
+}
+
+// Record a model's context window in that model's own section, or take it back out
+// again when `None`.
+//
+// Per model rather than at the top level because that is what a context window is: a
+// property of the model, not of the machine. The top-level `context` stays what it was —
+// the user's own fallback for every model they never set one for.
+
+pub(crate) fn save_model_context(path: &Path, model: &str, context: Option<usize>) -> Result<()> {
+    edit_config_file(path, |doc| {
+        let models = doc.as_table_mut().entry("models").or_insert_with(|| {
+            let mut table = Table::new();
+            // Implicit so a new section is written as `[models."name"]` alone, rather
+            // than as an empty `[models]` header with the real one underneath it.
+            table.set_implicit(true);
+            Item::Table(table)
+        });
+        // `models` written as an inline table parses and resolves fine, and rewriting it
+        // into sections behind the user's back is not this function's business. Said
+        // rather than silently skipped: a save that changed nothing must not report that
+        // it saved.
+        let models = models
+            .as_table_mut()
+            .context("[models] is an inline table in the config file; edit it by hand")?;
+
+        let section = models
+            .entry(model)
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .with_context(|| format!("[models.\"{}\"] is an inline table; edit it by hand", model))?;
+
+        match context {
+            Some(tokens) => section["context"] = toml_edit::value(tokens as i64),
+            // Only the key goes. An emptied section stays where it is: it may carry the
+            // user's own comments, and throwing those away to tidy up after one removed
+            // setting is not a trade anybody asked for.
+            None => {
+                section.remove("context");
+            }
+        }
+        Ok(())
+    })
 }
 
 // Where a resolved setting came from, for /config.
@@ -976,6 +1064,94 @@ mod tests {
         let _ = std::fs::remove_file(&absent);
         assert!(load_file_config(Some(&absent)).url.is_none());
         assert!(load_file_config(None).url.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The file is the user's: hand-written, commented, ordered the way they wanted it.
+    // Saving one setting has to leave all of that alone, which is the whole reason the
+    // writing goes through toml_edit rather than through `FileConfig`.
+    #[test]
+    fn saving_the_model_leaves_the_rest_of_the_file_as_it_was() {
+        let path = scratch(
+            "save-default-model.toml",
+            "# the machine's own notes\nurl = \"http://127.0.0.1:1234\"\n\n\
+             [models.\"other\"]\n# small on purpose\ncontext = 8192\n",
+        );
+
+        save_default_model(&path, "qwen2.5:14b").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# the machine's own notes"), "comment lost:\n{raw}");
+        assert!(raw.contains("# small on purpose"), "comment lost:\n{raw}");
+
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.model.as_deref(), Some("qwen2.5:14b"));
+        assert_eq!(parsed.url.as_deref(), Some("http://127.0.0.1:1234"));
+        assert_eq!(parsed.models["other"].context, Some(8192));
+
+        // Saving again replaces the key rather than adding a second one.
+        save_default_model(&path, "llama3.1:8b").unwrap();
+        assert_eq!(load_file_config(Some(&path)).model.as_deref(), Some("llama3.1:8b"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Per model, because that is what a context window is. The top level stays the
+    // user's own fallback for every model they never set one for.
+    #[test]
+    fn a_context_window_goes_into_the_model_s_own_section() {
+        let path = scratch("save-model-context.toml", "context = 4096\n");
+
+        save_model_context(&path, "qwen2.5:14b", Some(32768)).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[models.\"qwen2.5:14b\"]"), "wrong shape:\n{raw}");
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.context, Some(4096), "the top level is not the model's");
+        assert_eq!(parsed.models["qwen2.5:14b"].context, Some(32768));
+
+        save_model_context(&path, "qwen2.5:14b", Some(16384)).unwrap();
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.models["qwen2.5:14b"].context, Some(16384));
+
+        // Clearing takes the key out and nothing else with it.
+        save_model_context(&path, "qwen2.5:14b", None).unwrap();
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.models["qwen2.5:14b"].context, None);
+        assert_eq!(parsed.context, Some(4096));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Saving is most use to the user who never wrote a config, so a missing file is
+    // the ordinary case and not an error.
+    #[test]
+    fn saving_writes_a_config_that_was_never_there() {
+        let path = scratch("save-into-nothing.toml", "");
+        std::fs::remove_file(&path).unwrap();
+
+        save_model_context(&path, "m", Some(8192)).unwrap();
+        save_default_model(&path, "m").unwrap();
+
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.model.as_deref(), Some("m"));
+        assert_eq!(parsed.models["m"].context, Some(8192));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A file that does not parse is left exactly where it is. Starting from an empty
+    // document instead would answer one stray character by replacing everything the
+    // user has with a one-line file.
+    #[test]
+    fn saving_refuses_a_malformed_file_rather_than_replacing_it() {
+        let path = scratch("save-over-broken.toml", "this is not valid toml {{{");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        assert!(save_default_model(&path, "m").is_err());
+        assert!(save_model_context(&path, "m", Some(8192)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let _ = std::fs::remove_file(&path);
     }

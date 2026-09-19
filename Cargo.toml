@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 description = "Interactive CLI coding assistant for local LLMs (via LM Studio) with a custom “MCP” tool router."
 
@@ -46,6 +46,12 @@ ego-tree = "0.11.0"
 ignore = "0.4.33"
 globset = "0.4.20"
 toml = "1.1.4"
+# Reading the config is `toml`'s job; writing one setting back into it is this one's.
+# The file is the user's — hand-written, commented, ordered the way they wanted it — so
+# saving a model or a context window has to edit the one key and leave the rest of the
+# document byte for byte as it was. Serializing `FileConfig` back over it would answer
+# "set one key" by deleting every comment in the file.
+toml_edit = "0.25"
 unicode-width = "0.2.2"
 # An image in a message goes out as a data: URL, which is what every OpenAI-compatible
 # server takes. Encoding one is the whole use.

@@ -66,13 +66,15 @@ fn print_repl_help() {
     outln!("  /mode              Show which of the three is in force");
     outln!("  /init              Study the project and write its instruction file");
     outln!("  /tools             List available tools and whether they prompt");
-    outln!("  /model [name]      Switch model; with no name, pick from the server's list");
+    outln!("  /model [name]      Switch model and save it as the default; with no name,");
+    outln!("                     pick from the server's list");
     outln!("  /config            Show the settings in force and where each came from");
-    outln!("  /set [name] [val]  Show or set temperature, top_p, top_k, min_p,");
+    outln!("  /set [name] [val]  Show or set context, temperature, top_p, top_k, min_p,");
     outln!("                     repeat_penalty, max_tokens, reasoning_effort or");
     outln!("                     reasoning_threshold ('/set <name> unset' to undo).");
     outln!("                     '/temp' and '/effort' are short for '/set temperature'");
-    outln!("                     and '/set reasoning_effort'.");
+    outln!("                     and '/set reasoning_effort'. All last for the session");
+    outln!("                     except 'context', which is saved for this model.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
@@ -869,10 +871,21 @@ async fn main() -> Result<()> {
                 // Everything that is configured per model is re-resolved inside
                 // `switch_model` — the context budget, the sampling, the
                 // reasoning policy, both copies of the client, and the system
-                // message. The conversation itself is kept.
-                agent.switch_model(model.clone());
+                // message. The conversation itself is kept. It also records the
+                // choice in the config file, which is what comes back here.
+                let kept = agent.switch_model(model.clone());
 
-                outln!("Now using model: {}", model);
+                outln!(
+                    "Now using model: {}{}",
+                    model,
+                    match kept {
+                        Kept::Config => "  (saved as the default)",
+                        _ => "",
+                    }
+                );
+                if let Kept::Failed(why) = &kept {
+                    outln!("  [warning] not saved as the default: {}", why);
+                }
                 outln!(
                     "  context {} ({}){}\n",
                     agent.context_tokens,
@@ -996,10 +1009,27 @@ In force for '{}':", agent.client.model);
             }
 
             match agent.set_knob(knob, Some(value)) {
-                Ok(()) => match agent.knob_value(knob) {
-                    Some(now) => outln!("{} = {} for this session.\n", knob.name(), now),
-                    None => outln!("{} unset — the server decides again.\n", knob.name()),
-                },
+                Ok(kept) => {
+                    match agent.knob_value(knob) {
+                        // "the config file is updated" rather than calling the value
+                        // shown the saved one: clearing `context` writes too, and what
+                        // it writes is the key's absence, not the number now in force.
+                        Some(now) => outln!(
+                            "{} = {} for this session{}.",
+                            knob.name(),
+                            now,
+                            match kept {
+                                Kept::Config => ", and the config file is updated",
+                                _ => "",
+                            }
+                        ),
+                        None => outln!("{} unset — the server decides again.", knob.name()),
+                    }
+                    if let Kept::Failed(why) = kept {
+                        outln!("  [warning] the config file was not updated: {}", why);
+                    }
+                    outln!();
+                }
                 Err(complaint) => outln!("{}, got '{}'.\n", complaint, value),
             }
             continue;
