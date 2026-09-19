@@ -1593,7 +1593,13 @@ mod tests {
             AgentEvent::Busy(_) => set_label(ui, BUSY, "thinking…"),
             AgentEvent::Status { .. } => set_label(ui, STATUS, "test-model    ctx 7%"),
             AgentEvent::Finished { .. } => line(ui, "done in 2s", Tone::Muted),
-            AgentEvent::DidTool { .. } | AgentEvent::Ask(_) => {}
+            // Nothing reaches the window for these, which is what `dispatch` decides
+            // too: there is no counter on the busy label for a tool call's chunks to
+            // move, and the call itself is drawn whole when it starts. Listed rather
+            // than caught by `_` for the same reason `present.rs` lists them — a
+            // variant added later should fail to compile here until someone has said
+            // which side of the window it belongs on. That is what caught this one.
+            AgentEvent::DidTool { .. } | AgentEvent::ToolCallChunk(_) | AgentEvent::Ask(_) => {}
         }
     }
 
