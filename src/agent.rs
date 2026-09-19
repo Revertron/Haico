@@ -51,8 +51,8 @@ use crate::session::{
 };
 use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer, ReadParams};
 use crate::turn::*;
-use crate::util::{display_path, truncate_at_boundary};
-use crate::workspace::Workspace;
+use crate::util::{absolute_path, display_path, truncate_at_boundary};
+use crate::workspace::{expand_home, Workspace};
 
 /// What a successful [`Agent::resume`] restored, for the caller to report.
 pub(crate) struct Resumed {
@@ -293,6 +293,60 @@ impl Agent {
         let changed = rebuilt != self.system_prompt;
         self.system_prompt = rebuilt;
         changed
+    }
+
+    /// Move the conversation to another directory, for `/cd`.
+    ///
+    /// Everything that answers "which project is this" is re-derived here, in one
+    /// place and in this order, because the process's own working directory is what
+    /// nearly all of it reads: `load_project_context` opens `HAICO.md` by a relative
+    /// path, `index_for_cwd` walks `.haico/memory`, and `build_system_prompt` asks git
+    /// where it is. So the `set_current_dir` has to land first and the rest has to
+    /// follow it — which is why this is a method rather than five calls in a frontend
+    /// that would have to remember the order.
+    ///
+    /// The prompt is rebuilt in place rather than left to the `/clear` the caller goes
+    /// on to suggest. It names the working directory, its branch and the roots the file
+    /// tools may touch, and every one of those has just changed; a model still told the
+    /// old ones would be writing into a project it has left and having the write
+    /// refused. It costs a re-prefill of the history, which is what keeping the history
+    /// across the move is worth.
+    ///
+    /// The history itself is deliberately kept — `/cd` moves, it does not start over —
+    /// and that is the one thing the caller has to say out loud, because a conversation
+    /// about the last project is still in front of the model.
+    pub(crate) fn change_directory(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let requested = expand_home(&path.to_string_lossy());
+        std::env::set_current_dir(&requested).map_err(|e| {
+            format!("Could not move to {}: {}", display_path(&absolute_path(&requested)), e)
+        })?;
+
+        // Read back rather than kept from above, and the `\\?\` prefix is why. Handing
+        // `set_current_dir` the canonicalized path leaves the process reporting that form
+        // for the rest of the run, and `session_file_path` hashes whatever
+        // `current_dir` says — so the same directory would answer to two different
+        // session files depending on whether haico started here or walked here. Letting
+        // the OS name it means everything downstream agrees with a fresh start.
+        let target = std::env::current_dir()
+            .map_err(|e| format!("Moved, but cannot tell where to: {}", e))?;
+
+        // Where a session is saved is keyed by directory, so leaving this pointing at
+        // the old one would file the rest of this conversation under the project the
+        // user has just left. Nulled in a test binary for `Agent::new`'s reason.
+        self.session_path = if cfg!(test) { None } else { session_file_path() };
+
+        // Consent was given about a project, not about a machine: "yes, run `cargo test`"
+        // was an answer about this code, and carrying it into somewhere else would run a
+        // command the user approved against a repository they have never seen. Unlike
+        // `clear`, which keeps them — clearing a conversation does not move the boundary
+        // they were given inside of.
+        self.permissions = PermissionManager::new();
+
+        self.workspace.set_cwd(&target);
+        self.project_context = load_project_context();
+        self.memory_index = memory::index_for_cwd();
+        self.rebuild_system_prompt();
+        Ok(target)
     }
 
     /// Recompose the system prompt and, if it changed, replace it in the history

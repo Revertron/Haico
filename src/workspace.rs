@@ -83,6 +83,24 @@ impl Workspace {
         }
     }
 
+    // Move the working root, for `/cd`.
+    //
+    // Replaces the first entry rather than pushing a second one: the working directory is
+    // always `writable[0]`, and a `/cd` that only added would quietly widen the boundary to
+    // two projects where the user asked to move between them. Everything else stays — a
+    // directory `/add`ed this session and a file pulled in by a mention were both named by
+    // hand, and moving house is not a reason to decide the user stopped meaning them.
+    //
+    // A later entry naming the directory being moved into goes, because it is this one now:
+    // the user may well have `/add`ed the project before deciding to work in it, and
+    // `/workspace` would otherwise list it twice.
+    pub(crate) fn set_cwd(&mut self, cwd: &Path) {
+        let resolved = absolute_path(cwd);
+        self.writable.remove(0);
+        self.writable.retain(|root| root != &resolved);
+        self.writable.insert(0, resolved);
+    }
+
     pub(crate) fn scratch(&self) -> Option<&Path> {
         self.scratch.as_deref()
     }
@@ -369,6 +387,41 @@ mod tests {
         // whole point — a secret two directories over is not reachable by asking nicely.
         assert!(!workspace.may_read(&elsewhere.join("secrets.env")));
         assert!(!workspace.may_write(&elsewhere.join("secrets.env")));
+    }
+
+    /// `/cd` moves the boundary rather than widening it: the project being left stops
+    /// being writable, while a directory the user named by hand this session survives
+    /// the move. The scratch directory does too — it belongs to the conversation, which
+    /// `/cd` does not end.
+    #[test]
+    fn changing_the_working_directory_moves_the_root_and_keeps_what_was_added() {
+        let (base, project, client, elsewhere) = scratch_dirs();
+        let scratch = base.subdir("scratch");
+        let mut workspace = Workspace::new(&project, &[]);
+        workspace.set_scratch(Some(&scratch));
+        workspace.add(&client).unwrap();
+
+        workspace.set_cwd(&elsewhere);
+
+        assert!(workspace.may_write(&elsewhere.join("src/main.rs")));
+        assert!(!workspace.may_read(&project.join("src/main.rs")));
+        assert!(workspace.may_write(&client.join("app.ts")));
+        assert!(workspace.may_write(&scratch.join("notes.md")));
+        // Still the first entry, which is what everything else here assumes it is.
+        assert_eq!(workspace.writable_roots()[0], absolute_path(&elsewhere));
+    }
+
+    /// Moving into a directory that was `/add`ed earlier leaves one entry, not two —
+    /// `/workspace` would otherwise list the same path twice.
+    #[test]
+    fn moving_into_an_added_directory_does_not_list_it_twice() {
+        let (_base, project, client, _) = scratch_dirs();
+        let mut workspace = Workspace::new(&project, &[]);
+        workspace.add(&client).unwrap();
+
+        workspace.set_cwd(&client);
+
+        assert_eq!(workspace.writable_roots(), [absolute_path(&client)]);
     }
 
     #[test]

@@ -63,6 +63,7 @@ fn print_repl_help() {
     outln!("  /normal            Back to answering every prompt yourself");
     outln!("  /add <path>        Let the file tools read and write another directory too");
     outln!("  /workspace         Show which paths the file tools may touch");
+    outln!("  /cd [path]         Move to another project; with no path, show where you are");
     outln!("  /mode              Show which of the three is in force");
     outln!("  /init              Study the project and write its instruction file");
     outln!("  /tools             List available tools and whether they prompt");
@@ -81,6 +82,7 @@ fn print_repl_help() {
     outln!("  /context           Show how much context the conversation is using");
     outln!("  /reasoning [what]  Keep, compress or drop the model's chain of thought");
     outln!("  /compact           Replace the history with a summary, freeing context");
+    outln!("  /resume            Load this directory's saved conversation, dropping the current one");
     outln!("  /clear /new /reset Start over, keeping the system prompt");
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
     outln!();
@@ -608,7 +610,7 @@ async fn main() -> Result<()> {
     // permissions, workspace, mode — now lives in one place with no terminal
     // attached (`src/agent.rs`). What stays out here is this frontend's own:
     // the keyboard, the editor, and every line printed.
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resume_requested = config.resume;
     let mut agent = Agent::new(config, selected_model, &cwd);
 
@@ -629,7 +631,7 @@ async fn main() -> Result<()> {
             Err(e) => outln!("Could not resume: {:#}. Starting fresh.", e),
         }
     } else if agent.has_saved_session() {
-        outln!("A previous conversation exists here — start with --resume to continue it.");
+        outln!("A previous conversation exists here — /resume to continue it.");
     }
     if !agent.workspace.readable_roots().is_empty() {
         outln!(
@@ -780,6 +782,37 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        if input == "/cd" || input.starts_with("/cd ") {
+            let requested = input.strip_prefix("/cd").unwrap_or("").trim();
+            if requested.is_empty() {
+                outln!("Working directory: {}\n", display_path(&cwd));
+                continue;
+            }
+            match agent.change_directory(std::path::Path::new(requested)) {
+                Ok(moved) => {
+                    // The project is now the new one — its instructions, its memory, its
+                    // branch, its writable root. What has not moved is the conversation,
+                    // and that is the whole of the reminder: the model is still carrying
+                    // a history about somewhere else.
+                    cwd = moved;
+                    outln!("Working directory: {}", display_path(&cwd));
+                    if let Some((name, _)) = &agent.project_context {
+                        outln!("Loaded project context from {}", name);
+                    }
+                    outln!("The conversation came with you — /clear (or /new) to start fresh here.");
+                    // Said after the reminder rather than before it, because it is the
+                    // alternative to it: one throws the history away, the other swaps it
+                    // for the one this directory was left in.
+                    if agent.has_saved_session() {
+                        outln!("A conversation was saved here before — /resume picks it up instead.");
+                    }
+                    outln!();
+                }
+                Err(why) => outln!("{}\n", why),
+            }
+            continue;
+        }
+
         if matches!(input, "/plan" | "/auto" | "/normal" | "/mode") {
             let requested = match input {
                 "/plan" => Some(Mode::Plan),
@@ -804,6 +837,28 @@ async fn main() -> Result<()> {
                     "It is the same model, so treat it as a check against drift and \
                      mistakes, not as a security boundary.\n"
                 );
+            }
+            continue;
+        }
+
+        if input == "/resume" {
+            if !agent.has_saved_session() {
+                outln!("No saved conversation for this directory.\n");
+                continue;
+            }
+            // Dropped through `clear` rather than by emptying the history here: what goes
+            // with a conversation and what survives it is the core's business, and a
+            // second answer to that question in the frontend is the one that would drift.
+            // The screen goes with it for `/clear`'s reason — the transcript on it belongs
+            // to a conversation that is no longer in the history.
+            out::clear_screen();
+            let _ = agent.clear();
+            match agent.resume() {
+                Ok(restored) => outln!(
+                    "Resumed {} message(s) from {} (model then: {}).\n",
+                    restored.messages, restored.saved_at, restored.model
+                ),
+                Err(e) => outln!("Could not resume: {:#}. The conversation is empty.\n", e),
             }
             continue;
         }
