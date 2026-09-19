@@ -22,8 +22,7 @@ fn log_path() -> Option<&'static PathBuf> {
         if flag.is_empty() || flag == "0" {
             return None;
         }
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        Some(PathBuf::from(home).join(".haico").join("debug.log"))
+        crate::store::path("debug.log")
     })
     .as_ref()
 }

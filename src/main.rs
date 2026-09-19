@@ -30,6 +30,7 @@ mod readable;
 mod render;
 mod scratch;
 mod session;
+mod store;
 #[cfg(test)]
 mod testutil;
 mod tools;
@@ -615,7 +616,7 @@ async fn main() -> Result<()> {
         outln!("Loaded project context from {}", name);
     }
     if agent.user_context.is_some() {
-        outln!("Loaded user context from {}", USER_CONTEXT_FILE);
+        outln!("Loaded user context from {}", user_context_file());
     }
     if resume_requested {
         match agent.resume() {

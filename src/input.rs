@@ -1506,6 +1506,13 @@ pub(crate) fn load_history(path: &Path) -> Vec<String> {
 }
 
 pub(crate) fn save_history(path: &Path, history: &[String]) {
+    // The directory may not exist yet. It did not have to be made while the history was
+    // `~/.haico_history` and its parent was the home directory; now that it lives inside
+    // haico's own store, a first run with no config file has nothing to write into.
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     let body: String = history
         .iter()
         .map(|entry| format!("{}\n", entry.replace('\\', "\\\\").replace('\n', "\\n")))

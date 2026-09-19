@@ -1,4 +1,4 @@
-//! Command line, environment and ~/.haico/config.toml, layered.
+//! Command line, environment and the config file in haico's own directory, layered.
 
 use anyhow::{Context, Result};
 use getopts::Options;
@@ -162,7 +162,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         std::process::exit(0);
     }
 
-    // ~/.haico/config.toml supplies defaults for everything below, so the usual invocation
+    // The config file supplies defaults for everything below, so the usual invocation
     // is a bare `haico`. Read before anything else resolves, since it sits under the command
     // line and the environment but above the built-in defaults.
     let config_path = config_file_path();
@@ -351,7 +351,7 @@ pub(crate) struct ModelSettingsFile {
     pub(crate) reasoning_threshold: Option<usize>,
 }
 
-// ~/.haico/config.toml, so the usual invocation is just `haico`.
+// the config file (see `crate::store`), so the usual invocation is just `haico`.
 //
 // Unknown fields are rejected rather than ignored: a typo'd key that silently does nothing
 // is the worst outcome for a config file, since it looks like the setting is not working.
@@ -394,8 +394,7 @@ pub(crate) struct FileConfig {
 
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
-    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"))?;
-    Some(PathBuf::from(home).join(".haico").join("config.toml"))
+    crate::store::path("config.toml")
 }
 
 // Read the config file. A missing file is normal; a malformed one is reported and then
@@ -629,8 +628,8 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
     println!("  SEARXNG_URL   SearxNG instance for web_search (overridden by --searxng)");
     println!("  HAICO_CONTEXT Model context window in tokens (overridden by --context)");
-    println!("  HAICO_DEBUG   Set to 1 to append diagnostics to ~/.haico/debug.log");
-    println!("\nConfig file: ~/.haico/config.toml — supplies defaults for all of the above,");
+    println!("  HAICO_DEBUG   Set to 1 to append diagnostics to {}", crate::store::display("debug.log"));
+    println!("\nConfig file: {} — supplies defaults for all of the above,", crate::store::display("config.toml"));
     println!("plus per-model sections. Command line and environment take precedence over it.");
     println!("\n  url   = \"http://127.0.0.1:1234\"");
     println!("  token = \"sk-lm-...\"");
@@ -660,7 +659,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("auto-mode reviewer and the reasoning compressor. Left out, nothing is sent and");
     println!("they think as much as the model thinks; the main conversation's level is never");
     println!("carried over to them.");
-    println!("\nInstructions: ~/.haico/HAICO.md holds preferences that apply everywhere; a");
+    println!("\nInstructions: {} holds preferences that apply everywhere; a", crate::store::display("HAICO.md"));
     println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
     println!("own, and takes precedence over both. Both are sent even to a model configured");
     println!("with use_system_prompt = false.");

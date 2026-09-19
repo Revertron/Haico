@@ -180,7 +180,15 @@ impl Agent {
             project_context,
             user_context,
             memory_index,
-            session_path: session_file_path(),
+            // Never in a test binary. `run_turn` saves after every turn, so an agent
+            // built by a test wrote a session named for whatever directory the suite
+            // was run in straight into the user's own store, among their real saved
+            // conversations — and overwrote it again on every run. Nulled here rather
+            // than at each of the half-dozen places a test builds an agent, because
+            // that list only grows and the next addition would leak again. A test that
+            // wants persistence sets the field, and `session.rs` covers saving and
+            // loading against an explicit temp path.
+            session_path: if cfg!(test) { None } else { session_file_path() },
             permissions: PermissionManager::new(),
             review_cache: ReviewCache::new(),
             mode: Mode::Normal,

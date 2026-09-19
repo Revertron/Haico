@@ -43,7 +43,7 @@ pub(crate) fn session_file_path() -> Option<PathBuf> {
 pub(crate) fn session_file_path_for(cwd: &std::path::Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
 
-    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"))?;
+    let store = crate::store::dir()?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cwd.hash(&mut hasher);
@@ -58,12 +58,7 @@ pub(crate) fn session_file_path_for(cwd: &std::path::Path) -> Option<PathBuf> {
         .take(40)
         .collect();
 
-    Some(
-        PathBuf::from(home)
-            .join(".haico")
-            .join("sessions")
-            .join(format!("{}-{:016x}.json", label, digest)),
-    )
+    Some(store.join("sessions").join(format!("{}-{:016x}.json", label, digest)))
 }
 
 // Where the conversation proper starts. The system message is optional — a model can be
@@ -144,9 +139,11 @@ pub(crate) fn load_session(path: &std::path::Path) -> Result<SavedSession> {
 
 // Where the REPL keeps its input history between sessions.
 
+// Named `history` inside the store rather than staying a second dotfile beside it: it was
+// `~/.haico_history` only because the home directory was the whole of haico's storage, and
+// there is no reason for the input history to be the one thing that lives outside.
 pub(crate) fn history_file_path() -> Option<PathBuf> {
-    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"))?;
-    Some(PathBuf::from(home).join(".haico_history"))
+    crate::store::path("history")
 }
 
 

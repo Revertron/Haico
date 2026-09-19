@@ -850,7 +850,8 @@ fn describe(notice: Notice) -> (String, Tone) {
         }
         Notice::ImagesStripped(detail) => (
             format!(
-                "the request was refused with an image in it — images removed and sent                  again; this model most likely cannot see them ({detail})"
+                "the request was refused with an image in it — images removed and sent \
+                 again; this model most likely cannot see them ({detail})"
             ),
             Tone::Warning,
         ),
