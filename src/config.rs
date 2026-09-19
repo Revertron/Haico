@@ -874,6 +874,7 @@ mod tests {
             false,
             Some("USER RULES"),
             Some(&project),
+            None,
             &workspace,
         )
         .expect("project instructions still make a system message");
@@ -884,7 +885,7 @@ mod tests {
 
         // ...and with nothing to say at all there is no system message to send.
         assert!(
-            compose_system_prompt(Some("CUSTOM"), "raw-model", false, None, None, &workspace)
+            compose_system_prompt(Some("CUSTOM"), "raw-model", false, None, None, None, &workspace)
                 .is_none()
         );
 
@@ -897,13 +898,14 @@ mod tests {
                 true,
                 None,
                 Some(&project),
+                None,
                 &workspace,
             )
             .expect("a prompt is in force");
         assert!(custom.starts_with("CUSTOM"));
         assert!(custom.contains("PROJECT RULES"));
         let ours =
-            compose_system_prompt(None, "guided-model", true, None, None, &workspace)
+            compose_system_prompt(None, "guided-model", true, None, None, None, &workspace)
                 .expect("built-in");
         assert!(ours.contains("guided-model"));
     }

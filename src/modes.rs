@@ -72,7 +72,17 @@ const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch", "resear
 pub(crate) const START_PLAN: &str = "start_plan";
 pub(crate) const PRESENT_PLAN: &str = "present_plan";
 
+// The one tool on the auto-allow list that plan mode has to take back. `remember` is
+// auto-allowed because the user asked for it in so many words, but it writes a file, and
+// plan mode has just promised the user that nothing will be written until they approve.
+// A promise with an exception in it is not one — and the fact is not lost either way,
+// because the conversation that produced it is still there to record it afterwards.
+const PLAN_MODE_DENIES: &[&str] = &["remember"];
+
 pub(crate) fn plan_mode_allows(tool_name: &str) -> bool {
+    if PLAN_MODE_DENIES.contains(&tool_name) {
+        return false;
+    }
     tool_name == PRESENT_PLAN
         || AUTO_ALLOWED_TOOLS.contains(&tool_name)
         || PLAN_MODE_READS.contains(&tool_name)

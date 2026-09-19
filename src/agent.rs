@@ -37,6 +37,7 @@ use crate::modes::{
     ReviewCache, Verdict, PRESENT_PLAN, START_PLAN,
 };
 use crate::permissions::{Gate, PermissionManager, PermissionResponse};
+use crate::memory;
 use crate::prompt::{compose_system_prompt, load_project_context, load_user_context};
 // The one `render` import, and it earns its place: a diff is the *content* of a
 // pending change, which the turn has to compute because only it has the old file.
@@ -102,6 +103,17 @@ pub(crate) struct Agent {
     /// nothing here writes to it, so the reload points the project file needs do
     /// not apply.
     pub(crate) user_context: Option<String>,
+    /// The project's memory index — one line per stored fact — as the system prompt
+    /// carries it.
+    ///
+    /// Refreshed only where the history is being thrown away or rewritten anyway
+    /// (`clear`, and after a compaction), never after a `remember` lands mid-turn. The
+    /// system message is the very front of the prefix the server caches, so rewriting
+    /// it invalidates every token behind it and re-prefills the whole conversation —
+    /// and it would buy nothing, because a fact the model just recorded is already in
+    /// the history two messages up. It is when the history goes that the index has to
+    /// be there instead.
+    pub(crate) memory_index: Option<String>,
     pub(crate) session_path: Option<PathBuf>,
     /// Approvals for this session only, never persisted, so resuming never
     /// silently carries over permission to run something.
@@ -131,6 +143,7 @@ impl Agent {
 
         let project_context = load_project_context();
         let user_context = load_user_context();
+        let memory_index = memory::index_block(cwd);
 
         // Before the prompt, not after: the prompt names the scratch directory, and the
         // file tools can only write there because the workspace was told about it.
@@ -144,6 +157,7 @@ impl Agent {
             settings.use_system_prompt,
             user_context.as_deref(),
             project_context.as_ref(),
+            memory_index.as_deref(),
             &workspace,
         );
 
@@ -165,6 +179,7 @@ impl Agent {
             system_prompt,
             project_context,
             user_context,
+            memory_index,
             session_path: session_file_path(),
             permissions: PermissionManager::new(),
             review_cache: ReviewCache::new(),
@@ -241,6 +256,9 @@ impl Agent {
         // so replacing the system message in it would be work thrown away.
         self.scratch.renew();
         self.workspace.set_scratch(self.scratch.path());
+        // Reloaded with the project's instructions, and for the same reason: anything
+        // the last conversation remembered is about to be the only trace of it left.
+        self.memory_index = memory::index_for_cwd();
         self.recompose_system_prompt();
 
         self.messages.clear();
@@ -261,6 +279,7 @@ impl Agent {
             self.settings.use_system_prompt,
             self.user_context.as_deref(),
             self.project_context.as_ref(),
+            self.memory_index.as_deref(),
             &self.workspace,
         );
         let changed = rebuilt != self.system_prompt;
@@ -278,6 +297,19 @@ impl Agent {
         if self.recompose_system_prompt() {
             set_system_message(&mut self.messages, self.system_prompt.as_deref());
         }
+    }
+
+    /// Re-read the memory index and put it in the prompt.
+    ///
+    /// Called where the history has just been summarized away. Up to that point a fact
+    /// recorded this session was in the conversation itself and the prompt did not need
+    /// to carry it; afterwards the conversation is a paragraph of notes, and the index
+    /// is the only thing that still knows. Cheap here and nowhere else: compaction has
+    /// already invalidated the server's prefix cache, so rewriting the system message
+    /// costs a re-prefill that was going to happen regardless.
+    pub(crate) fn refresh_memory(&mut self) {
+        self.memory_index = memory::index_for_cwd();
+        self.rebuild_system_prompt();
     }
 
     /// Point the conversation at a different model, re-resolving everything that
@@ -637,6 +669,7 @@ pub(crate) async fn run_turn(
                         // The same reclaim /compact does, for the same reason: the cache is
                         // keyed to a history that no longer exists.
                         agent.review_cache.clear();
+                        agent.refresh_memory();
                         let _ = tx.send(Notice::Compacted(report).into());
                         // The compacted history ends on the assistant agreeing that it has
                         // the notes, and asking for a reply straight after that is asking
@@ -1447,6 +1480,7 @@ pub(crate) async fn run_turn(
                     agent.settings.use_system_prompt,
                     agent.user_context.as_deref(),
                     agent.project_context.as_ref(),
+                    agent.memory_index.as_deref(),
                     &agent.workspace,
                 );
                 set_system_message(&mut agent.messages, agent.system_prompt.as_deref());

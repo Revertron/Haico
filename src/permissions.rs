@@ -21,6 +21,16 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     "crate_search",
     "crate_api",
     "todo_write",
+    // Reads one small file inside the project's own memory directory.
+    "recall",
+    // A write, and the only one on this list. It is here because the flow it exists for
+    // is the user saying "remember this" — prompting for permission to do the thing that
+    // was just asked for is the question-about-a-question `ask_user` is exempted for. It
+    // is also bounded in a way no other write is: the path is not the model's to choose,
+    // only ever `.haico/memory/<slug>.md` inside the project, and `remember` with action
+    // 'delete' undoes it. What that buys the model is the ability to record a fact the
+    // user did not ask it to record — noise in a file the user can read, not damage.
+    "remember",
     "background_output",
     "background_stop",
     // Not read-only so much as inert: it changes nothing on this machine, and it is the

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 mod basics;
 mod crates;
 mod files;
+mod memory;
 mod research;
 mod shell;
 mod web;
@@ -26,6 +27,7 @@ mod web;
 pub(crate) use basics::*;
 pub(crate) use crates::*;
 pub(crate) use files::*;
+pub(crate) use memory::*;
 pub(crate) use research::*;
 pub(crate) use shell::*;
 pub(crate) use web::*;
@@ -124,6 +126,7 @@ impl MyMcpServer {
         // and the tool it should reach for first should not be the last one it sees.
         let mut tool_router = Self::basics_router()
             + Self::files_router()
+            + Self::memory_router()
             + Self::research_router()
             + Self::web_router()
             + Self::shell_router()
@@ -368,6 +371,14 @@ impl MyMcpServer {
             "research" => {
                 let params: ResearchParams = serde_json::from_value(arguments)?;
                 self.research(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "remember" => {
+                let params: RememberParams = serde_json::from_value(arguments)?;
+                self.remember(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "recall" => {
+                let params: RecallParams = serde_json::from_value(arguments)?;
+                self.recall(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "ls" => {
                 let params: LSParams = serde_json::from_value(arguments)?;

@@ -144,6 +144,7 @@ pub(crate) fn compose_system_prompt(
     use_system_prompt: bool,
     user_context: Option<&str>,
     project_context: Option<&(String, String)>,
+    memory: Option<&str>,
     workspace: &Workspace,
 ) -> Option<String> {
     let mut content = if !use_system_prompt {
@@ -173,6 +174,20 @@ pub(crate) fn compose_system_prompt(
             "The following comes from this project and takes precedence over the general \
              guidance above wherever the two disagree.",
             project,
+        );
+    }
+
+    // Last, and phrased differently from the two above on purpose. The instruction
+    // files tell the model what to do; this tells it what was true of the project when
+    // somebody last looked. Handing it the same "takes precedence" sentence would make
+    // a remembered fact outrank the code it is a fact about, which is exactly backwards
+    // when the two disagree — the memory is the thing that went stale.
+    if let Some(memory) = memory {
+        append_section(
+            &mut content,
+            &format!("# Project memory ({}/)", crate::memory::MEMORY_DIR),
+            "Facts recorded about this project in earlier sessions, one line each. These              are observations, not instructions: where one disagrees with what you can              see in the code now, the code is right and the memory is worth correcting              with `remember`. Call `recall` with a name to read the whole of that fact              before acting on its summary alone.",
+            memory,
         );
     }
 
@@ -505,6 +520,7 @@ mod tests {
             true,
             Some("USER RULES"),
             Some(&project),
+            Some("- a-remembered-fact - REMEMBERED"),
             &ws(),
         )
         .expect("everything is present");
@@ -515,10 +531,18 @@ mod tests {
         assert!(ours < user && user < proj, "wrong order:\n{}", both);
         assert!(both.contains("# User instructions (~/.haico/HAICO.md)"));
 
+        // Memory comes after both instruction files, and is the one section that does
+        // not claim to take precedence over what is above it: a fact about the project
+        // must not outrank an instruction from the user or from the project itself.
+        let memory = both.find("REMEMBERED").unwrap();
+        assert!(proj < memory, "memory is not last: {}", both);
+        let section = &both[both.find("# Project memory").unwrap()..];
+        assert!(!section.contains("takes precedence"), "got: {}", section);
+
         // Alone it is still a system message, and without anything above it the sentence
         // about taking precedence is left out.
         let alone =
-            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, &ws())
+            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, None, &ws())
                 .expect("the user's own file is enough on its own");
         assert!(alone.starts_with("# User instructions"), "got: {}", alone);
         assert!(!alone.contains("takes precedence"), "got: {}", alone);

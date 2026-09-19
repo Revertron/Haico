@@ -20,6 +20,7 @@ mod input;
 mod llm;
 #[cfg(feature = "gui")]
 mod markdown;
+mod memory;
 mod mention;
 mod modes;
 mod permissions;
@@ -1116,6 +1117,10 @@ In force for '{}':", agent.client.model);
                 // session. A compaction that failed freed nothing to go with it.
                 Ok(summary) => {
                     agent.review_cache.clear();
+                    // The history that held anything remembered this session has just
+                    // become a paragraph of notes; the index is now the only thing that
+                    // still knows, so it goes into the prompt here.
+                    agent.refresh_memory();
                     outln!("{}\n", summary)
                 }
                 Err(e) => outln!("[error] could not compact: {:#}\n", e),
