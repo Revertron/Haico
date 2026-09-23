@@ -30,6 +30,7 @@ mod readable;
 mod render;
 mod scratch;
 mod session;
+mod skills;
 mod store;
 #[cfg(test)]
 mod testutil;
@@ -85,6 +86,10 @@ fn print_repl_help() {
     outln!("  /resume            Load this directory's saved conversation, dropping the current one");
     outln!("  /clear /new /reset Start over, keeping the system prompt");
     outln!("  /exit /quit        Leave (Ctrl+D also works)");
+    outln!("  /skills            List the skills the model can load, and where each lives");
+    outln!("  /update-skills     Re-read the skills directories into the system prompt");
+    outln!("  /<skill> [args]    Run a skill by name; the model is shown the list and loads");
+    outln!("                     one on its own when a request matches it");
     outln!();
     outln!("In a message:  write @path to send the file with it — relative or absolute,");
     outln!("               and a file outside the workspace comes into reach with it.");
@@ -105,6 +110,8 @@ fn print_repl_help() {
     outln!("               On Windows the wheel needs Shift held to select text; set");
     outln!("               mouse = \"off\" to keep plain drag-selection instead.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
+    outln!("Skills:         <name>/SKILL.md under .haico/skills, .agents/skills or .claude/skills");
+    outln!("                in the project, or under {}.", crate::store::display("skills"));
     outln!();
 }
 
@@ -894,6 +901,36 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        if input == "/skills" {
+            let found = skills::discover(&skills::roots_for_cwd());
+            if found.is_empty() {
+                outln!("No skills found. Put <name>/SKILL.md under .haico/skills, .agents/skills");
+                outln!("or .claude/skills in the project, or under {}.
+", store::display("skills"));
+            } else {
+                outln!("{} skill(s):", found.len());
+                for skill in &found {
+                    outln!("  /{} — {}", skill.name, skill.description);
+                    outln!("      {}", display_path(&skill.dir));
+                }
+                outln!();
+            }
+            continue;
+        }
+
+        if input == "/update-skills" {
+            let changed = agent.reload_skills();
+            let count = skills::discover(&skills::roots_for_cwd()).len();
+            if changed {
+                outln!("Skills reloaded: {} available. The system prompt was updated.
+", count);
+            } else {
+                outln!("Skills unchanged: {} available.
+", count);
+            }
+            continue;
+        }
+
         if input == "/model" || input.starts_with("/model ") {
             let requested = input.strip_prefix("/model").unwrap_or("").trim().to_string();
             // Copied out so the borrow ends before agent.client is reassigned below.
@@ -1219,6 +1256,7 @@ In force for '{}':", agent.client.model);
         // the tools, the permission prompts and /undo for free — there is nothing about
         // writing an instruction file that needs its own machinery.
         let init_instruction;
+        let skill_instruction;
         let mut initializing = false;
         let input = if input == "/init" {
             let target = init_target_file(&cwd);
@@ -1236,6 +1274,12 @@ In force for '{}':", agent.client.model);
             initializing = true;
             init_instruction = build_init_prompt(&cwd);
             init_instruction.as_str()
+        } else if let Some(expanded) = skills::expand_command(&skills::roots_for_cwd(), input) {
+            // `/init`'s trick again: the skill's instructions become the message and run as
+            // an ordinary turn. Built-in commands were all matched above, so a skill that
+            // shares a name with one is still there for the model, just not by typing it.
+            skill_instruction = expanded;
+            skill_instruction.as_str()
         } else {
             input
         };

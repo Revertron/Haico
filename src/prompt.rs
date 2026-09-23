@@ -144,6 +144,7 @@ pub(crate) fn compose_system_prompt(
     use_system_prompt: bool,
     user_context: Option<&str>,
     project_context: Option<&(String, String)>,
+    skills: Option<&str>,
     memory: Option<&str>,
     workspace: &Workspace,
 ) -> Option<String> {
@@ -174,6 +175,19 @@ pub(crate) fn compose_system_prompt(
             "The following comes from this project and takes precedence over the general \
              guidance above wherever the two disagree.",
             project,
+        );
+    }
+
+    // After the instruction files and claiming no precedence over them: a skill is how to
+    // do one kind of task, not a rule about this project, and it is not even in force until
+    // it is loaded. Only the index is here — the body costs a `skill` call, and only for
+    // the task it is about.
+    if let Some(skills) = skills {
+        append_section(
+            &mut content,
+            "# Skills",
+            "Instructions for particular kinds of task, one line each saying when it applies.              When the user's request matches one, call `skill` with its name before starting              and follow what it returns.",
+            skills,
         );
     }
 
@@ -527,6 +541,7 @@ mod tests {
             true,
             Some("USER RULES"),
             Some(&project),
+            Some("- a-skill - SKILLFUL"),
             Some("- a-remembered-fact - REMEMBERED"),
             &ws(),
         )
@@ -550,13 +565,20 @@ mod tests {
         // must not outrank an instruction from the user or from the project itself.
         let memory = both.find("REMEMBERED").unwrap();
         assert!(proj < memory, "memory is not last: {}", both);
+
+        // Skills sit between the instruction files and memory, and claim no precedence
+        // either: a skill is how to do one kind of task, not a rule that outranks the user's.
+        let skills = both.find("SKILLFUL").unwrap();
+        assert!(proj < skills && skills < memory, "skills out of place: {}", both);
+        let section = &both[both.find("# Skills").unwrap()..both.find("# Project memory").unwrap()];
+        assert!(!section.contains("takes precedence"), "got: {}", section);
         let section = &both[both.find("# Project memory").unwrap()..];
         assert!(!section.contains("takes precedence"), "got: {}", section);
 
         // Alone it is still a system message, and without anything above it the sentence
         // about taking precedence is left out.
         let alone =
-            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, None, &ws())
+            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, None, None, &ws())
                 .expect("the user's own file is enough on its own");
         assert!(alone.starts_with("# User instructions"), "got: {}", alone);
         assert!(!alone.contains("takes precedence"), "got: {}", alone);

@@ -44,6 +44,7 @@ use crate::prompt::{compose_system_prompt, load_project_context, load_user_conte
 // How much of it to show is the frontend's, and that half lives there.
 use crate::render::file_change_diff;
 use crate::scratch::Scratch;
+use crate::skills;
 use crate::session::{
     apply_reasoning, compact_history, estimate_tokens, load_session,
     reasoning_needs_a_request, reasoning_text, save_session, session_file_path,
@@ -114,6 +115,10 @@ pub(crate) struct Agent {
     /// the history two messages up. It is when the history goes that the index has to
     /// be there instead.
     pub(crate) memory_index: Option<String>,
+    /// The skills index — one line per skill — as the system prompt carries it. Refreshed
+    /// at exactly the points `memory_index` is and for its reason: a skill dropped in
+    /// mid-turn is not worth re-prefilling the whole conversation for.
+    pub(crate) skill_index: Option<String>,
     pub(crate) session_path: Option<PathBuf>,
     /// Approvals for this session only, never persisted, so resuming never
     /// silently carries over permission to run something.
@@ -127,6 +132,18 @@ pub(crate) struct Agent {
     /// conversation's, not the machine's: `clear` renews it, and dropping the
     /// agent takes it away.
     scratch: Scratch,
+}
+
+/// Make the user's skills directory readable, if it exists.
+///
+/// It lives in haico's store, outside every project, and a skill's instructions routinely
+/// say "read reference.md" or "see templates/". Readable only: following a skill is no
+/// reason to be able to rewrite it. Only once it exists, so the prompt does not list a
+/// read-only root that is not there.
+fn allow_user_skills(workspace: &mut Workspace) {
+    if let Some(dir) = skills::user_dir().filter(|d| d.is_dir()) {
+        workspace.add_readable(&dir);
+    }
 }
 
 impl Agent {
@@ -144,11 +161,13 @@ impl Agent {
         let project_context = load_project_context();
         let user_context = load_user_context();
         let memory_index = memory::index_block(cwd);
+        let skill_index = skills::index_block(&skills::roots(cwd));
 
         // Before the prompt, not after: the prompt names the scratch directory, and the
         // file tools can only write there because the workspace was told about it.
         let scratch = Scratch::new();
         let mut workspace = Workspace::new(cwd, &config.file.read_paths);
+        allow_user_skills(&mut workspace);
         workspace.set_scratch(scratch.path());
 
         let system_prompt = compose_system_prompt(
@@ -157,6 +176,7 @@ impl Agent {
             settings.use_system_prompt,
             user_context.as_deref(),
             project_context.as_ref(),
+            skill_index.as_deref(),
             memory_index.as_deref(),
             &workspace,
         );
@@ -180,6 +200,7 @@ impl Agent {
             project_context,
             user_context,
             memory_index,
+            skill_index,
             // Never in a test binary. `run_turn` saves after every turn, so an agent
             // built by a test wrote a session named for whatever directory the suite
             // was run in straight into the user's own store, among their real saved
@@ -267,6 +288,7 @@ impl Agent {
         // Reloaded with the project's instructions, and for the same reason: anything
         // the last conversation remembered is about to be the only trace of it left.
         self.memory_index = memory::index_for_cwd();
+        self.skill_index = skills::index_for_cwd();
         self.recompose_system_prompt();
 
         self.messages.clear();
@@ -287,6 +309,7 @@ impl Agent {
             self.settings.use_system_prompt,
             self.user_context.as_deref(),
             self.project_context.as_ref(),
+            self.skill_index.as_deref(),
             self.memory_index.as_deref(),
             &self.workspace,
         );
@@ -345,6 +368,7 @@ impl Agent {
         self.workspace.set_cwd(&target);
         self.project_context = load_project_context();
         self.memory_index = memory::index_for_cwd();
+        self.skill_index = skills::index_for_cwd();
         self.rebuild_system_prompt();
         Ok(target)
     }
@@ -371,7 +395,27 @@ impl Agent {
     /// costs a re-prefill that was going to happen regardless.
     pub(crate) fn refresh_memory(&mut self) {
         self.memory_index = memory::index_for_cwd();
+        self.skill_index = skills::index_for_cwd();
         self.rebuild_system_prompt();
+    }
+
+    /// Re-read the skills index, for `/update-skills`. Returns whether it changed.
+    ///
+    /// Only on request, and only then does it touch the history: rewriting the system
+    /// message costs a re-prefill of the whole conversation, which is the user's call to
+    /// make after adding a skill mid-session, not something to do behind their back.
+    pub(crate) fn reload_skills(&mut self) -> bool {
+        // First, and whatever the index says: a skills directory created since startup is
+        // exactly the case this command is for, and its skills are no use if the files
+        // beside their SKILL.md cannot be read.
+        allow_user_skills(&mut self.workspace);
+        let reloaded = skills::index_for_cwd();
+        if reloaded == self.skill_index {
+            return false;
+        }
+        self.skill_index = reloaded;
+        self.rebuild_system_prompt();
+        true
     }
 
     /// Point the conversation at a different model, re-resolving everything that
@@ -1567,6 +1611,7 @@ pub(crate) async fn run_turn(
                     agent.settings.use_system_prompt,
                     agent.user_context.as_deref(),
                     agent.project_context.as_ref(),
+                    agent.skill_index.as_deref(),
                     agent.memory_index.as_deref(),
                     &agent.workspace,
                 );

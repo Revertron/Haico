@@ -9,6 +9,7 @@
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Skills](#skills)
 - [MCP Server Mode](#mcp-server-mode)
 - [License](#license)
 
@@ -36,6 +37,7 @@ The system enables seamless interaction between a language model and programmabl
 - **Web Tools** – `web_fetch` (fetch a page and summarize it via the LLM), `web_get` (fetch a page and return its cleaned text), and `web_search` (DuckDuckGo, or a SearxNG instance via `--searxng`).
 - **Directory Listing** – list contents of a folder.
 - **Command Execution** – `run_command` runs shell commands with timeout controls.
+- **Skills** – reusable instructions for particular tasks, in the same `SKILL.md` format other coding agents use; the model loads one when a request matches it, or you run it with `/<name>`.
 - **MCP Server Mode** – run as a stdio MCP server so other MCP hosts (e.g. LM Studio) can use Haico's tools.
 
 All tools are described via JSON schemas, making them easy to extend or integrate with other systems.
@@ -218,6 +220,61 @@ Examples:
 - **Search web:** `Find articles about Rust concurrency.`
 
 The assistant will automatically parse tool calls, ask for permission (if needed), and execute them.
+
+---
+
+## Skills
+
+A skill is a set of instructions for doing one kind of task well — cutting a release, writing a migration, reviewing a diff — kept in a file instead of being typed into every conversation. Haico uses the same format as other coding agents, so skills written for them work as they are.
+
+Each skill is a directory holding a `SKILL.md`, plus any scripts, templates or reference files its instructions mention:
+
+```
+release/
+├── SKILL.md
+└── scripts/
+    └── bump_version.py
+```
+
+```markdown
+---
+name: release
+description: Cut a new release. Use when the user asks to release, tag or publish a version.
+---
+
+1. Run `python scripts/bump_version.py <version>`.
+2. Update CHANGELOG.md with the commits since the last tag.
+3. Commit, then tag the commit `v<version>`.
+```
+
+The directory's name is the skill's name. The `description` is what the model sees in every conversation, so write it to say **when** the skill applies, not just what it is about.
+
+### Where skills are found
+
+Most specific first — when two places have a skill with the same name, the earlier one wins:
+
+1. `.haico/skills/` in the project
+2. `.agents/skills/` in the project
+3. `.claude/skills/` in the project
+4. `skills/` in Haico's own data directory, for skills you want in every project — `%LOCALAPPDATA%\Haico\skills` on Windows, `~/Library/Application Support/Haico/skills` on macOS, `$XDG_DATA_HOME/haico/skills` (or `~/.local/share/haico/skills`) on Linux
+
+### How they are used
+
+Only one line per skill — its name and description — goes into the system prompt, so having many skills costs little. When a request matches a description, the model calls the `skill` tool to load the full instructions, then follows them. Loading a skill never asks for permission, since it only reads a file; anything the skill then tells the model to run goes through the usual permission prompts.
+
+You can also run a skill yourself by typing its name as a command, with anything after it passed along:
+
+```
+/release 1.4.0
+```
+
+| Command | What it does |
+| --- | --- |
+| `/skills` | List every skill found, with its description and where it lives |
+| `/update-skills` | Re-read the skill directories after adding or editing one mid-session |
+| `/<name> [args]` | Run a skill directly |
+
+Skills are available in the interactive REPL only; in [MCP Server Mode](#mcp-server-mode) the host is expected to have its own.
 
 ---
 

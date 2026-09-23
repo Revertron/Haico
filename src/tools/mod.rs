@@ -22,6 +22,7 @@ mod files;
 mod memory;
 mod research;
 mod shell;
+mod skills;
 mod web;
 
 pub(crate) use basics::*;
@@ -30,6 +31,7 @@ pub(crate) use files::*;
 pub(crate) use memory::*;
 pub(crate) use research::*;
 pub(crate) use shell::*;
+pub(crate) use skills::*;
 pub(crate) use web::*;
 
 #[derive(Clone)]
@@ -127,6 +129,7 @@ impl MyMcpServer {
         let mut tool_router = Self::basics_router()
             + Self::files_router()
             + Self::memory_router()
+            + Self::skills_router()
             + Self::research_router()
             + Self::web_router()
             + Self::shell_router()
@@ -137,6 +140,12 @@ impl MyMcpServer {
         if !expose_web_fetch {
             tool_router.remove_route("web_fetch");
             tool_router.remove_route("research");
+        }
+        // An MCP host has skills of its own, found in its own places and loaded its own way;
+        // a second, differently-rooted set arriving through a tool would be two answers to
+        // one question.
+        if !interactive {
+            tool_router.remove_route("skill");
         }
         Self {
             tool_router,
@@ -379,6 +388,10 @@ impl MyMcpServer {
             "recall" => {
                 let params: RecallParams = serde_json::from_value(arguments)?;
                 self.recall(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "skill" => {
+                let params: SkillParams = serde_json::from_value(arguments)?;
+                self.skill(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "ls" => {
                 let params: LSParams = serde_json::from_value(arguments)?;

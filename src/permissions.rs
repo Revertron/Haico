@@ -23,6 +23,10 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     "todo_write",
     // Reads one small file inside the project's own memory directory.
     "recall",
+    // Reads one SKILL.md from a skills directory, found by name among the ones discovered —
+    // the path is never the model's to choose. Whatever the skill then says to run still
+    // goes through run_command's own gate, so loading one grants nothing.
+    "skill",
     // A write, and the only one on this list. It is here because the flow it exists for
     // is the user saying "remember this" — prompting for permission to do the thing that
     // was just asked for is the question-about-a-question `ask_user` is exempted for. It

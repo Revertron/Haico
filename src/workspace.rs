@@ -149,6 +149,21 @@ impl Workspace {
         &self.attached
     }
 
+    // Make a directory readable for the rest of the session, as if it had been in
+    // `read_paths` from the start.
+    //
+    // For directories haico itself knows the model has business reading — the user's own
+    // skills — that may not have existed at startup. Says whether anything was added, so a
+    // caller can do this unconditionally and repeatedly.
+    pub(crate) fn add_readable(&mut self, path: &Path) -> bool {
+        let resolved = absolute_path(path);
+        if self.readable.iter().any(|root| root == &resolved) {
+            return false;
+        }
+        self.readable.push(resolved);
+        true
+    }
+
     pub(crate) fn may_read(&self, path: &Path) -> bool {
         let path = absolute_path(path);
         self.attached.iter().any(|file| file == &path)
@@ -513,6 +528,19 @@ mod tests {
         assert!(workspace.may_read(&library.join("src/lib.rs")));
         // Readable is not a step on the way to writable: the reason to list a path is that
         // the model has business reading it and none changing it.
+        assert!(!workspace.may_write(&library.join("src/lib.rs")));
+        assert_eq!(workspace.readable_roots().len(), 1);
+    }
+
+    #[test]
+    fn a_readable_root_added_later_is_readable_once_and_never_writable() {
+        let (_base, project, library, _) = scratch_dirs();
+        let mut workspace = Workspace::new(&project, &[]);
+        assert!(!workspace.may_read(&library.join("src/lib.rs")));
+
+        assert!(workspace.add_readable(&library));
+        assert!(!workspace.add_readable(&library), "added twice");
+        assert!(workspace.may_read(&library.join("src/lib.rs")));
         assert!(!workspace.may_write(&library.join("src/lib.rs")));
         assert_eq!(workspace.readable_roots().len(), 1);
     }
