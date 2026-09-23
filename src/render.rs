@@ -1040,26 +1040,22 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
         SetForegroundColor(Color::DarkGrey)
     );
     if !summary.is_empty() {
+        // Not clipped. Cutting at 110 characters is harmless for a path, whose front says
+        // most of what it is, and wrong for everything whose meaning is in the tail: a
+        // command read as a build when the `&& rm -rf` fell off the end, and a long regex
+        // lost exactly the part that narrowed it. out.rs wraps the line, so the whole of
+        // it costs rows rather than legibility. Whitespace is still collapsed, so a
+        // heredoc arrives as one wrapped paragraph rather than ten rows of its own.
         let summary: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-        let clipped = crate::util::truncate_at_boundary(&summary, 110);
-        let _ = write!(
-            line,
-            "  {}{}",
-            clipped,
-            if clipped.len() < summary.len() { "…" } else { "" }
-        );
+        let _ = write!(line, "  {}", summary);
     }
     if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
-        // Clipped harder than the summary: this is a sentence of prose from the model, and
-        // an unbounded one would push the call itself off the line it belongs on.
+        // Not clipped either, and for a sharper reason than the command: this is the whole
+        // account the user gets of why consent was spent on their behalf, on a call that
+        // would otherwise have stopped to ask them. A verdict cut off mid-sentence keeps
+        // the part that restates the call and loses the part that justifies it.
         let note: String = note.split_whitespace().collect::<Vec<_>>().join(" ");
-        let clipped = crate::util::truncate_at_boundary(&note, 90);
-        let _ = write!(
-            line,
-            "  (allowed by auto analyzer: {}{})",
-            clipped,
-            if clipped.len() < note.len() { "…" } else { "" }
-        );
+        let _ = write!(line, "  (allowed by auto analyzer: {})", note);
     }
     let _ = write!(line, "{}", ResetColor);
     line
@@ -1215,14 +1211,15 @@ pub(crate) fn tool_result_line(text: &str) -> Option<String> {
         return None;
     }
 
+    // Whole, not cut at 110 characters. The fold behind this row holds the rest of the
+    // result, but the first line is not the first 110 characters of one — "error[E0308]:
+    // mismatched types" is the half that names the error, and the file and line it wants
+    // are in the half that used to be dropped.
     let first = strip_project_prefix(first);
-    let first = first.as_str();
-    let clipped = crate::util::truncate_at_boundary(first, 110);
     Some(format!(
-        "{}    {}{}{}",
+        "{}    {}{}",
         SetForegroundColor(Color::DarkGrey),
-        clipped,
-        if clipped.len() < first.len() { "…" } else { "" },
+        first,
         ResetColor
     ))
 }

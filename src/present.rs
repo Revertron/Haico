@@ -152,9 +152,9 @@ impl Presenter {
                 }
             }
             AgentEvent::ToolResult(result) => {
-                // The summary is the row that used to be all there was: the first
-                // line, cut to fit. The result itself is kept behind it now rather
-                // than thrown away, and Ctrl+O opens it.
+                // The summary is the row that used to be all there was: the
+                // first line, whole. The result itself is kept behind it now
+                // rather than thrown away, and Ctrl+O opens it.
                 if let Some(line) = tool_result_line(&result) {
                     crate::out::foldable(&line, &result);
                 }
