@@ -29,6 +29,7 @@ mod present;
 mod prompt;
 mod readable;
 mod render;
+mod repetition;
 mod scratch;
 mod session;
 mod skills;
@@ -2104,6 +2105,78 @@ mod turn_tests {
             0,
             "a round left its tool call unanswered"
         );
+    }
+
+    /// A stream whose reasoning restates one paragraph far past the point of
+    /// being a loop, then ends — ending is what lets a test show the stream was
+    /// cut off early rather than read through. Leaked because `serve_sequence`
+    /// wants `'static` bodies.
+    fn looping_stream() -> &'static str {
+        let paragraph = "So after the registration, run() did NOT print the events line NOR \
+                         loop back. It just... stopped printing. The only explanation is that \
+                         it returned right there, or panicked silently.\\n\\n";
+        let event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{paragraph}\"}}}}]}}\n\n"
+        );
+        let body = format!(
+            "{}data: {{\"choices\":[{{\"delta\":{{\"content\":\"finished anyway\"}}}}]}}\n\ndata: [DONE]\n\n",
+            event.repeat(300)
+        );
+        Box::leak(body.into_boxed_str())
+    }
+
+    /// The failure that motivated `repetition`: a model that never calls a tool
+    /// and never finishes, only restates itself, which the tool-call loop guard
+    /// cannot see. The reply is cut off and dropped, the model is shown what it
+    /// was repeating, and the next reply is taken normally. Auto mode, because
+    /// unattended is where it cost the most.
+    #[tokio::test]
+    async fn a_reply_that_repeats_itself_is_dropped_and_the_model_told() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"fixed it"}}]}"#;
+        let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream(), ANSWER]));
+
+        let ((agent, served), events) = run_and_watch(bodies, "debug it", Mode::Auto, Reasoning::Keep).await;
+
+        assert_eq!(served, 2);
+        assert!(
+            notices(&events).iter().any(|n| matches!(n, Notice::Repeating { retrying: true, .. })),
+            "notices: {:?}",
+            notices(&events)
+        );
+        // The looping reply never reached the history: neither its text nor the
+        // content it would have ended on.
+        let history = serde_json::to_string(&agent.messages).unwrap();
+        assert!(!history.contains("finished anyway"), "the looping reply was stored");
+        // Folded into the user's own message, since the loop was the turn's first reply.
+        let user: Vec<&Value> = agent.messages.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(user.len(), 1, "two user messages in a row");
+        let asked = user[0]["content"].as_str().unwrap();
+        assert!(asked.starts_with("debug it") && asked.contains("repeating the same passage"), "{asked}");
+        assert_eq!(agent.messages.last().unwrap()["content"], "fixed it");
+    }
+
+    /// And when telling it does not help, the turn gives up instead of paying
+    /// for the same loop forever — which in auto mode, with no round cap, is
+    /// the only thing that would stop it.
+    #[tokio::test]
+    async fn a_model_that_keeps_repeating_itself_ends_the_turn() {
+        let _capture = out::capture_guard();
+        let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream()]));
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        assert_eq!(run_turn(&mut agent, "debug it", false, &tx, &link).await, TurnEnd::Failed);
+        assert_eq!(*served.lock().unwrap(), 2);
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(notices(&seen).iter().any(|n| matches!(n, Notice::Repeating { retrying: false, .. })));
     }
 
     /// The turn narrates itself, and this is the assertion that could not be

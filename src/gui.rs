@@ -833,6 +833,13 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::LoopBroken { tool, count } => {
             (format!("stopped: '{tool}' called {count} times in a row"), Tone::Warning)
         }
+        Notice::Repeating { passage, retrying: true } => (
+            format!("the reply kept repeating itself, so it was dropped — telling the model: \"{passage}\""),
+            Tone::Warning,
+        ),
+        Notice::Repeating { passage, retrying: false } => {
+            (format!("stopped: the model kept repeating itself: \"{passage}\""), Tone::Warning)
+        }
         Notice::FileAttached { path, lines, outside } => {
             let line = format!("attached {path} ({lines} lines)");
             if outside {
@@ -2340,6 +2347,8 @@ mod tests {
             Notice::PermissionDenied { alternative: "a".into() },
             Notice::LoopNudge { tool: "t".into(), count: 3 },
             Notice::LoopBroken { tool: "t".into(), count: 5 },
+            Notice::Repeating { passage: "p".into(), retrying: true },
+            Notice::Repeating { passage: "p".into(), retrying: false },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: false },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: true },
             Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: false },

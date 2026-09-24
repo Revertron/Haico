@@ -44,6 +44,7 @@ use crate::prompt::{compose_system_prompt, load_project_context, load_user_conte
 // pending change, which the turn has to compute because only it has the old file.
 // How much of it to show is the frontend's, and that half lives there.
 use crate::render::file_change_diff;
+use crate::repetition::Repeating;
 use crate::scratch::Scratch;
 use crate::skills;
 use crate::session::{
@@ -639,6 +640,33 @@ async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Valu
     json!(parts)
 }
 
+/// Say something to the model in the user's voice, from haico rather than from
+/// the user.
+///
+/// Folded into the last message when that is already the user's, because the
+/// first round of a turn ends on the user's own message and two user messages in
+/// a row is an order some chat templates refuse outright. Anywhere else — after
+/// tool results — it is a message of its own, as the loop nudge is. The last
+/// message is the tail of the prefix the server caches, so extending it
+/// invalidates nothing that was not about to be re-sent anyway.
+fn push_user_note(messages: &mut Vec<Value>, note: &str) {
+    if let Some(last) = messages.last_mut().filter(|m| m["role"] == "user") {
+        match &mut last["content"] {
+            Value::String(text) => {
+                text.push_str("\n\n");
+                text.push_str(note);
+                return;
+            }
+            Value::Array(parts) => {
+                parts.push(json!({ "type": "text", "text": note }));
+                return;
+            }
+            _ => {}
+        }
+    }
+    messages.push(json!({ "role": "user", "content": note }));
+}
+
 /// Take every picture out of the history, leaving a line of text where each one
 /// was. Returns how many went.
 ///
@@ -757,6 +785,14 @@ pub(crate) async fn run_turn(
         // Set once the recovery below has run, so a failure that has nothing to do with
         // images cannot make the turn retry forever.
         let mut stripped_images = false;
+
+        // Replies in a row that were cut off for repeating themselves (see `repetition`).
+        // In a row, not per turn: an auto-mode turn lives for hours, and a model that fell
+        // into a loop once, was told, and went on to do an hour of real work has earned the
+        // same second chance the next time. Two in a row means the nudge is not landing, and
+        // a third try would most likely be the same loop at the same cost.
+        const MAX_REPEATING_REPLIES: usize = 2;
+        let mut repeating_replies = 0usize;
 
         let end = loop {
             round += 1;
@@ -897,9 +933,41 @@ pub(crate) async fn run_turn(
             };
 
             let mut message = match result {
-                Ok(message) => message,
+                Ok(message) => {
+                    repeating_replies = 0;
+                    message
+                }
                 Err(e) => {
                     let _ = tx.send(AgentEvent::ReplyEnd);
+
+                    // The stream was cut off because the reply had gone into a loop. The
+                    // partial reply is dropped, exactly as an interrupt drops one — it is
+                    // the loop, and half a tool call in the history is worse than none. The
+                    // history is as consistent as it was before the request, so asking again
+                    // is safe; asking again *unchanged* would mostly get the same loop back,
+                    // which is why the model is shown what it was repeating first.
+                    if let Some(repeating) = e.downcast_ref::<Repeating>() {
+                        repeating_replies += 1;
+                        let retrying = repeating_replies < MAX_REPEATING_REPLIES;
+                        let _ = tx.send(
+                            Notice::Repeating { passage: repeating.passage.clone(), retrying }.into(),
+                        );
+                        if !retrying {
+                            break TurnEnd::Failed;
+                        }
+                        push_user_note(
+                            &mut agent.messages,
+                            &format!(
+                                "Your previous reply was cut off and discarded because it had \
+                                 started repeating the same passage over and over:\n\n> {}\n\n\
+                                 Do not go back over that reasoning again. Decide on one \
+                                 concrete next step and take it now — call a tool, try a \
+                                 different approach, or say plainly what you are stuck on.",
+                                repeating.passage
+                            ),
+                        );
+                        continue;
+                    }
 
                     // An image in the history is the one failure this can back
                     // out of, and the only one worth trying to: a model without

@@ -289,6 +289,10 @@ pub(crate) enum Notice {
     LoopNudge { tool: String, count: usize },
     /// …and this is where the turn gave up on it.
     LoopBroken { tool: String, count: usize },
+    /// A reply was cut off mid-stream for going round in a loop, and dropped.
+    /// `retrying` says whether the model has been told and asked again, or the
+    /// turn has given up; `passage` is a line of what kept coming back.
+    Repeating { passage: String, retrying: bool },
     /// A file the message named with `@` was read into it before the request
     /// went out. `outside` marks the ones that were beyond the workspace and
     /// widened it, which is the half worth reading twice.

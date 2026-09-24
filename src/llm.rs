@@ -1,6 +1,7 @@
 //! The OpenAI-compatible client, including streaming.
 
 use crate::config::ResolvedSettings;
+use crate::repetition::RepetitionGuard;
 use crate::trace::{self, Caller};
 use crate::util::truncate_at_boundary;
 use anyhow::{bail, Context, Result};
@@ -394,6 +395,11 @@ impl LMStudioClient {
         }
 
         let mut assembler = StreamAssembler::default();
+        // One per kind of text: see `repetition`. Returning drops `response`, and with it
+        // the connection, which is what tells the server to stop generating — a loop cut
+        // off here is a loop that stops costing GPU time too.
+        let mut reasoning_guard = RepetitionGuard::default();
+        let mut content_guard = RepetitionGuard::default();
         // Bytes, not a String: a chunk boundary can fall inside a multi-byte character, and
         // decoding early would turn it into a replacement character.
         let mut buffer: Vec<u8> = Vec::new();
@@ -445,7 +451,15 @@ impl LMStudioClient {
                 }
 
                 for piece in assembler.push(&parsed) {
+                    let looping = match &piece {
+                        Chunk::Reasoning(text) => reasoning_guard.push(text),
+                        Chunk::Content(text) => content_guard.push(text),
+                        Chunk::ToolFragment(_) => None,
+                    };
                     on_chunk(piece);
+                    if let Some(repeating) = looping {
+                        return Err(anyhow::Error::new(repeating));
+                    }
                 }
             }
 
