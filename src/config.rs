@@ -119,6 +119,8 @@ pub(crate) struct Config {
     pub(crate) config_path: Option<PathBuf>,
     // Continue this directory's previous conversation instead of starting fresh.
     pub(crate) resume: bool,
+    // A task to run unattended in auto mode, exiting when it is done. `None` is the REPL.
+    pub(crate) prompt: Option<String>,
     // Which renderer to use. Not model-dependent, so it never goes through
     // `resolve_settings` — it is decided once, before the first thing is drawn.
     pub(crate) tui: Tui,
@@ -145,6 +147,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("", "min-p", "Minimum-probability sampling cutoff (default: leave it to the server)", "VALUE");
     opts.optopt("", "repeat-penalty", "Repetition penalty (default: leave it to the server)", "VALUE");
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
+    opts.optopt("p", "prompt", "Run this task unattended in auto mode, then exit", "TASK");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("", "gui", "Open a window instead of using the terminal");
     opts.optflag("h", "help", "Print this help message");
@@ -289,6 +292,9 @@ pub(crate) fn parse_config() -> Result<Config> {
         file: file_config,
         config_path,
         resume: matches.opt_present("r"),
+        // A blank task is treated as none, rather than starting a run with nothing to do
+        // that the model would fill by inventing a task of its own.
+        prompt: matches.opt_str("p").filter(|task| !task.trim().is_empty()),
         // The environment wins so a terminal that cannot cope with the alternate screen
         // can be worked around without editing the config file.
         tui: match env::var("HAICO_TUI").ok().as_deref().map(str::trim) {
@@ -751,6 +757,11 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
     println!("own, and takes precedence over both. Both are sent even to a model configured");
     println!("with use_system_prompt = false.");
+    println!("\n--prompt runs one task in the current directory in auto mode, with no keyboard:");
+    println!("questions are left for the model to decide and anything the reviewer refuses is");
+    println!("not run. A turn that stops with its plan unfinished, on a question, or with an");
+    println!("empty reply is sent back to work up to three times. Exit codes: 0 done, 1 a turn");
+    println!("failed, 2 still unfinished after the follow-ups, 130 interrupted with Ctrl+C.");
     println!("\nAnything left out is omitted from the request, so the server's own setting");
     println!("for that model still applies. top_k, min_p and repeat_penalty are extensions");
     println!("that llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
@@ -767,6 +778,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  {} --searxng http://127.0.0.1:8080  # Search via SearxNG instead of DuckDuckGo", program);
     println!("  {} --context 32768                # Warn about /compact sooner on a small window", program);
     println!("  {} --resume                       # Continue this directory's last conversation", program);
+    println!("  {} -p \"Update dependencies and commit\"  # Run one task unattended, then exit", program);
 }
 
 // Run haico as an stdio MCP server. stdout/stdin carry the JSON-RPC protocol, so this
@@ -805,6 +817,7 @@ mod tests {
             file: toml::from_str(toml_text).expect("test config should parse"),
             config_path: None,
             resume: false,
+            prompt: None,
             tui: crate::config::Tui::Inline,
             mouse: crate::config::Mouse::Scroll,
         }

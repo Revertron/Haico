@@ -397,6 +397,24 @@ pub(crate) enum Waiting {
     Tool(String),
 }
 
+/// How a turn ended, handed back by `run_turn` itself.
+///
+/// The REPL has no use for it — whatever happened, the prompt comes back and the
+/// user reads the transcript. It exists for the one caller with nobody reading:
+/// a `--prompt` run has to decide on its own whether to exit, carry on, or report
+/// a failure, and inferring that from which notices happened to go past would be
+/// guessing at the loop's control flow from its narration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// The model stopped calling tools and replied.
+    Answered,
+    /// Cancelled — Esc in the REPL, Ctrl+C in a `--prompt` run.
+    Interrupted,
+    /// Ended without an answer: the request failed, the reply was malformed, the
+    /// round cap was hit, or the loop guard gave up on a repeated call.
+    Failed,
+}
+
 impl From<Notice> for AgentEvent {
     fn from(notice: Notice) -> Self {
         AgentEvent::Notice(notice)

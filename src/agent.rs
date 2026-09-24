@@ -708,7 +708,7 @@ pub(crate) async fn run_turn(
     initializing: bool,
     tx: &EventSink,
     link: &TurnLink,
-) {
+) -> TurnEnd {
         // Wall clock, started here rather than at the first request: what the summary at
         // the end of the turn reports is how long the user waited, which includes the tool
         // runs, the permission prompts they answered and every round of the loop below —
@@ -757,7 +757,7 @@ pub(crate) async fn run_turn(
         // images cannot make the turn retry forever.
         let mut stripped_images = false;
 
-        loop {
+        let end = loop {
             round += 1;
             // Once a round, because that is when the history has changed and the
             // status bar is what reports it. The numbers, not the line: how wide
@@ -772,7 +772,7 @@ pub(crate) async fn run_turn(
             // into auto mode mid-turn, and the cap should stop applying from that point.
             if link.mode() != Mode::Auto && round > MAX_TOOL_ROUNDS {
                 let _ = tx.send(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
-                break;
+                break TurnEnd::Failed;
             }
 
             // Auto mode is meant to run unattended, so the one thing it must not do at the
@@ -832,7 +832,7 @@ pub(crate) async fn run_turn(
                     // else in this loop.
                     None => {
                         let _ = tx.send(Notice::Interrupted.into());
-                        break;
+                        break TurnEnd::Interrupted;
                     }
                 }
             }
@@ -891,7 +891,7 @@ pub(crate) async fn run_turn(
                 // consistent, so the conversation is still usable.
                 let _ = tx.send(AgentEvent::ReplyEnd);
                 let _ = tx.send(Notice::Interrupted.into());
-                break;
+                break TurnEnd::Interrupted;
             };
 
             let mut message = match result {
@@ -922,7 +922,7 @@ pub(crate) async fn run_turn(
                     // must not end the session. Every tool call made so far already has its
                     // reply, so the history is consistent: drop back to the prompt.
                     let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
-                    break;
+                    break TurnEnd::Failed;
                 }
             };
 
@@ -991,7 +991,7 @@ pub(crate) async fn run_turn(
                     Some(arr) => arr,
                     None => {
                         let _ = tx.send(Notice::ToolCallsMalformed(format!("{:?}", tool_calls)).into());
-                        break;
+                        break TurnEnd::Failed;
                     }
                 };
 
@@ -999,7 +999,7 @@ pub(crate) async fn run_turn(
                 if tool_calls_array.is_empty() {
                     // No actual tool calls, this is the final response — already streamed.
                     agent.messages.push(message.clone());
-                    break;
+                    break TurnEnd::Answered;
                 }
 
                 // Add assistant message with tool call first
@@ -1527,7 +1527,7 @@ pub(crate) async fn run_turn(
 
                 // The break above only leaves the tool loop; this leaves the turn.
                 if interrupted {
-                    break;
+                    break TurnEnd::Interrupted;
                 }
 
                 // The pictures the round's tools produced, in the one position
@@ -1566,7 +1566,7 @@ pub(crate) async fn run_turn(
                         tx.send(Notice::LoopBroken { tool: run.1.clone(), count: run.0 }.into());
                     // Whatever was typed while this ran is deliberately left queued: it
                     // becomes the next prompt, which is where the user takes over.
-                    break;
+                    break TurnEnd::Failed;
                 }
                 if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
                     nudged_at = run.0;
@@ -1608,9 +1608,9 @@ pub(crate) async fn run_turn(
             } else {
                 // No tool call, this is the final response — already streamed above.
                 agent.messages.push(message.clone());
-                break;
+                break TurnEnd::Answered;
             }
-        }
+        };
 
         // Every way out of the loop above lands here, an interrupt and a server error
         // included: the line says how long the turn ran for, not whether it got anywhere,
@@ -1650,6 +1650,8 @@ pub(crate) async fn run_turn(
             let todos = agent.plan();
             save_session(path, &agent.messages, &agent.client.model, &todos);
         }
+
+        end
 }
 
 #[cfg(test)]

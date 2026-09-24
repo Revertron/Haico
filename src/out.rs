@@ -29,6 +29,9 @@ use unicode_width::UnicodeWidthChar;
 
 struct Out {
     raw: bool,
+    // Write text only, every escape dropped. For output that is going to a file or a
+    // pipe rather than a screen — see `set_plain`.
+    plain: bool,
     // Whether the cursor is sitting at the start of a row. The region has to begin on
     // one of its own, so a half-finished line gets a newline before it is drawn.
     at_line_start: bool,
@@ -274,6 +277,8 @@ impl Out {
     fn write_out(&mut self, text: &str) {
         if let Some(buffer) = &mut self.capture {
             buffer.push_str(text);
+        } else if self.plain {
+            let _ = io::stdout().write_all(without_escapes(text).as_bytes());
         } else {
             let _ = io::stdout().write_all(text.as_bytes());
         }
@@ -1469,6 +1474,7 @@ fn lock() -> MutexGuard<'static, Out> {
     OUT.get_or_init(|| {
         Mutex::new(Out {
             raw: false,
+            plain: false,
             at_line_start: true,
             region: Vec::new(),
             caret: (0, 0),
@@ -1520,6 +1526,31 @@ pub(crate) fn flush() {
     if lock().capture.is_none() {
         let _ = io::stdout().flush();
     }
+}
+
+// Drop every escape from what is written, colors included. For a `--prompt` run whose
+// output is going to a log rather than a screen: there a color code is not a color, it is
+// `[38;5;8m` in the middle of the line someone is grepping. Applied where the bytes leave
+// rather than where they are made, because they are made in a dozen places that all
+// rightly assume a terminal.
+pub(crate) fn set_plain(plain: bool) {
+    lock().plain = plain;
+}
+
+fn without_escapes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            take_escape(&mut chars);
+        } else {
+            kept.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(kept)
 }
 
 // Whether line feeds need a carriage return in front of them. On for as long as the
@@ -1870,6 +1901,13 @@ macro_rules! outln {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_output_keeps_the_text_and_nothing_else() {
+        let colored = "\u{1b}[38;5;8m✻ Whirred for 2s\u{1b}[0m\n\u{1b}[2K\u{1b}[1Gnext";
+        assert_eq!(super::without_escapes(colored), "✻ Whirred for 2s\nnext");
+        assert!(matches!(super::without_escapes("as is"), std::borrow::Cow::Borrowed(_)));
+    }
+
     #[test]
     fn raw_mode_returns_the_carriage_on_every_line_feed() {
         let _guard = super::capture_guard();

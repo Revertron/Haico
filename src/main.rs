@@ -16,6 +16,7 @@ mod config;
 mod debug;
 #[cfg(feature = "gui")]
 mod gui;
+mod headless;
 mod input;
 mod llm;
 #[cfg(feature = "gui")]
@@ -516,6 +517,43 @@ exposing web_get (raw page text) and hiding web_fetch (summarization).");
     Ok(())
 }
 
+// Which model the session starts with: the one configured, else the only one loaded, else
+// the user's pick. With no keyboard (`keys` is `None` — piped input, or a `--prompt` run)
+// the last step is an error naming the fix rather than a guess.
+async fn choose_model(config: &Config, keys: Option<&mut Keys>) -> Result<String> {
+    if let Some(model_name) = config.model.clone() {
+        // Model specified via command-line, use it directly
+        outln!("Using specified model: {}\n", model_name);
+        return Ok(model_name);
+    }
+    outln!("Looking for a model...");
+
+    // Whatever is already in memory is almost always what was meant: the server was
+    // started with it, and asking which model to use when there is only one loaded is
+    // a question with a single answer. More than one and it is worth asking, but only
+    // among those — the rest are downloads, not something that is running. The full
+    // list is what the picker falls back to when nothing is loaded at all.
+    let loaded = fetch_loaded_models(&config.llm_url, config.token.as_deref()).await;
+    if let [only] = loaded.as_slice() {
+        outln!("Using the loaded model: {}\n", only);
+        return Ok(only.clone());
+    }
+    let models = if loaded.is_empty() {
+        fetch_available_models(&config.llm_url, config.token.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("Error connecting to LLM: {e}"))?
+    } else {
+        loaded
+    };
+
+    if models.is_empty() {
+        return Err(anyhow::anyhow!("No models available from server"));
+    }
+
+    // Let user select a model interactively
+    pick_model(keys, models).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse configuration first so we know the mode before any stdout output.
@@ -532,6 +570,16 @@ async fn main() -> Result<()> {
     // empty window.
     if config.gui {
         return run_gui(config);
+    }
+
+    // A task given on the command line runs unattended and exits, so it takes neither
+    // the keyboard nor the screen: its output is a log, and it has to read as one in a
+    // pipe or a scheduled task as much as in a terminal. `exit` rather than a return,
+    // because the code is the result — and only once `run` has returned, so the agent's
+    // scratch directory has already been dropped and cleaned up.
+    if let Some(task) = config.prompt.clone() {
+        let code = headless::run(config, task).await?;
+        std::process::exit(code);
     }
 
     // From here on the keyboard is read a key at a time rather than a line at a time,
@@ -567,49 +615,11 @@ async fn main() -> Result<()> {
         outln!("Searching through SearxNG at: {}", searxng);
     }
 
-    // Determine which model to use
-    let selected_model = if let Some(model_name) = config.model.clone() {
-        // Model specified via command-line, use it directly
-        outln!("Using specified model: {}\n", model_name);
-        model_name
-    } else {
-        outln!("Looking for a model...");
-
-        // Whatever is already in memory is almost always what was meant: the server was
-        // started with it, and asking which model to use when there is only one loaded is
-        // a question with a single answer. More than one and it is worth asking, but only
-        // among those — the rest are downloads, not something that is running. The full
-        // list is what the picker falls back to when nothing is loaded at all.
-        let loaded = fetch_loaded_models(&config.llm_url, config.token.as_deref()).await;
-        if let [only] = loaded.as_slice() {
-            outln!("Using the loaded model: {}\n", only);
-            only.clone()
-        } else {
-            let models = if loaded.is_empty() {
-                match fetch_available_models(&config.llm_url, config.token.as_deref()).await {
-                    Ok(models) => models,
-                    Err(e) => {
-                        outln!("Error connecting to LLM: {e}");
-                        return Ok(());
-                    }
-                }
-            } else {
-                loaded
-            };
-
-            if models.is_empty() {
-                return Err(anyhow::anyhow!("No models available from server"));
-            }
-
-            // Let user select a model interactively
-            match keys.as_mut() {
-                Some(keys) => select_model_interactive(keys, models).await?,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "choosing a model needs an interactive terminal; pass --model"
-                    ))
-                }
-            }
+    let selected_model = match choose_model(&config, keys.as_mut()).await {
+        Ok(model) => model,
+        Err(e) => {
+            outln!("{:#}", e);
+            return Ok(());
         }
     };
 
@@ -1650,6 +1660,26 @@ mod turn_tests {
                 )
             })
             .collect()
+    }
+
+    /// A `--prompt` run decides whether to exit, follow up or report a failure from
+    /// what `run_turn` hands back, so an answer and a failed request must not look
+    /// alike. A server that answers garbage is the failure that needs no timing.
+    #[tokio::test]
+    async fn a_turn_says_whether_it_ended_in_an_answer() {
+        let _capture = out::capture_guard();
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"all done"}}]}"#;
+        let cases: [(&'static [&'static str], TurnEnd); 2] =
+            [(&[FINAL], TurnEnd::Answered), (&["not json"], TurnEnd::Failed)];
+        for (bodies, expected) in cases {
+            let (url, _) = serve_sequence(bodies).await;
+            let cwd = env::current_dir().unwrap();
+            let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+            agent.mode = Mode::Auto;
+            let link = TurnLink::new(agent.mode);
+            let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+            assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, expected, "for {bodies:?}");
+        }
     }
 
     /// The invariant that costs the most when it breaks, and shows nothing when
