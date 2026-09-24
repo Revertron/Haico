@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2021"
 description = "Interactive CLI coding assistant for local LLMs (via LM Studio) with a custom “MCP” tool router."
 
@@ -22,8 +22,8 @@ lumio-gui = { path = "../Lumio", optional = true, features = ["backend-software"
 # streaming renderer in render.rs, which emits escapes rather than structure and
 # is not reusable here — see plan.md 11.4.
 pulldown-cmark = { version = "0.13", optional = true, default-features = false }
-rmcp = { version = "3.1.0", features = ["transport-io"] }
-reqwest = { version = "0.13.4", features = ["json", "gzip", "deflate", "brotli", "zstd", "cookies"] }
+rmcp = { version = "3.4.0", features = ["transport-io"] }
+reqwest = { version = "0.13", features = ["json", "gzip", "deflate", "brotli", "zstd", "cookies"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 schemars = "1.0"
@@ -55,7 +55,7 @@ toml_edit = "0.25"
 unicode-width = "0.2.2"
 # An image in a message goes out as a data: URL, which is what every OpenAI-compatible
 # server takes. Encoding one is the whole use.
-base64 = "0.22"
+base64 = "0.23"
 # Decoding one format, and encoding one. WEBP is the format the servers disagree about:
 # LM Studio refuses the string "image/webp" in a data URL while decoding the bytes
 # happily, and llama.cpp is the mirror image — it takes the label and cannot decode the

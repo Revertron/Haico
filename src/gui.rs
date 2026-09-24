@@ -811,13 +811,17 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::PlanModeEntered => ("plan mode — investigating first".into(), Tone::Normal),
         Notice::PlanApproved { auto: false } => ("plan approved".into(), Tone::Normal),
         Notice::PlanApproved { auto: true } => {
-            ("plan approved — auto mode; each call is reviewed first".into(), Tone::Normal)
+            ("plan approved — auto mode; doubtful calls are refused".into(), Tone::Normal)
         }
         Notice::PlanRejected => ("plan sent back for revision".into(), Tone::Warning),
         Notice::AskFailed { what, detail } => {
             (format!("could not ask {what}: {detail}"), Tone::Error)
         }
         Notice::Refused(reason) => (reason, Tone::Error),
+        Notice::ReviewDenied { tool, arguments, reason } => {
+            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            (format!("refused by review: {tool} {summary} — {reason}"), Tone::Error)
+        }
         Notice::PermissionAllowed => ("allowed".into(), Tone::Muted),
         Notice::PermissionAllowedAll(label) => (label, Tone::Muted),
         Notice::PermissionDenied { alternative } => {
@@ -2330,6 +2334,7 @@ mod tests {
             Notice::PlanRejected,
             Notice::AskFailed { what: "w", detail: "d".into() },
             Notice::Refused("r".into()),
+            Notice::ReviewDenied { tool: "t".into(), arguments: json!({}), reason: "r".into() },
             Notice::PermissionAllowed,
             Notice::PermissionAllowedAll("l".into()),
             Notice::PermissionDenied { alternative: "a".into() },

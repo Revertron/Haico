@@ -295,15 +295,19 @@ impl Presenter {
             Notice::PlanApproved { auto: false } => outln!("\n✓ Plan approved — starting work.\n"),
             Notice::PlanApproved { auto: true } => {
                 outln!("\n✓ Plan approved — starting work in auto mode.");
-                // Said plainly, because "auto" sounds like it will stop asking
-                // and right now it does not.
-                outln!("  Each gated call is reviewed first; you still answer the prompt.\n");
+                // Said plainly, because "auto" does not say which way a doubtful
+                // call goes: it is refused, not put to the user.
+                outln!("  Each gated call is reviewed first; what the review rejects is refused.\n");
             }
             Notice::PlanRejected => outln!("\n✗ Plan sent back for revision.\n"),
             Notice::AskFailed { what, detail } => {
                 outln!("\n[error] could not ask {}: {}", what, detail)
             }
             Notice::Refused(reason) => outln!("\n⛔ {}\n", reason),
+            Notice::ReviewDenied { tool, arguments, reason } => {
+                outln!("{}", tool_call_line(&tool, &arguments, None));
+                outln!("⛔ Refused by review: {}\n", reason)
+            }
             Notice::PermissionAllowed => outln!("✓ Permission granted for this request\n"),
             Notice::PermissionAllowedAll(label) => outln!("✓ {}\n", label),
             Notice::PermissionDenied { alternative } => {
@@ -416,12 +420,10 @@ pub(crate) fn permission_description(
         _ => format!("Execute '{}' tool", tool_name),
     };
 
-    // The reviewer's objection goes inside the prompt rather than on a line of
-    // its own: shown twice it reads as two separate verdicts, and a refusal here
-    // is advice, not a decision.
+    // Why the reviewer gave no verdict goes inside the prompt rather than on a
+    // line of its own: it is the reason this prompt is being shown at all.
     if let Some(review) = review {
         let line = match review {
-            ReviewNote::Denied(reason) => format!("🤖 Review: DENY — {}", reason),
             ReviewNote::Failed(detail) => format!("🤖 Review failed: {}", detail),
             ReviewNote::Interrupted => "🤖 Review interrupted.".to_string(),
         };

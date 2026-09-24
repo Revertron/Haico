@@ -1265,10 +1265,16 @@ pub(crate) async fn run_turn(
                     // not have to. Only a call that was going to interrupt is reviewed —
                     // an already-approved one costs nothing and should stay free.
                     //
-                    // An allow ends it here. Anything else — a refusal, an unreadable
-                    // reply, a review the user interrupted — falls through to the prompt
-                    // with the reason attached, so the reviewer can decline to act but
-                    // never decides against the user on its own.
+                    // An allow runs the call unasked, and a deny refuses it unasked. The
+                    // deny used to fall through to the prompt instead, which made auto mode
+                    // useless for the one thing it is for: handing over a task and walking
+                    // away. A single suspicious call parked the whole run on a dialog
+                    // nobody was there to answer. Refusing costs little — the model is told
+                    // why and can find another way or stop and say what it needed.
+                    //
+                    // An unreadable reply or a review the user interrupted still reaches
+                    // the prompt with the reason attached: neither is a judgment, and the
+                    // second means the user is right there.
                     // Why the call is running unasked, and what to add to the prompt when
                     // it still has to be asked. Only one is ever set.
                     let mut auto_note: Option<String> = None;
@@ -1304,7 +1310,26 @@ pub(crate) async fn run_turn(
                                 ask = None;
                             }
                             Some(Ok(Verdict { allow: false, reason, .. })) => {
-                                review_note = Some(ReviewNote::Denied(reason));
+                                let _ = tx.send(
+                                    Notice::ReviewDenied {
+                                        tool: tool_name.to_string(),
+                                        arguments: arguments.clone(),
+                                        reason: reason.clone(),
+                                    }
+                                    .into(),
+                                );
+                                agent.messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": format!(
+                                        "Permission denied: this call was refused as unsafe ({}). \
+                                         It was not run. Do not retry it as is. Reach the goal \
+                                         a safer way if there is one; otherwise finish and tell \
+                                         the user what you needed done and why.",
+                                        reason
+                                    )
+                                }));
+                                continue;
                             }
                             Some(Err(e)) => {
                                 review_note = Some(ReviewNote::Failed(format!("{:#}", e)));

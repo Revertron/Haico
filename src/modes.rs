@@ -2,9 +2,9 @@
 //!
 //! Normal mode asks the user about every gated call. Plan mode refuses to change anything
 //! until a written plan has been approved. Auto mode asks a second copy of the model,
-//! given no conversation history, whether the call looks safe; a yes runs it unasked, and
-//! anything else falls through to the user with the reason attached. The reviewer can
-//! spend the user's consent, never withhold it.
+//! given no conversation history, whether the call looks safe; a yes runs it unasked and a
+//! no refuses it unasked, so a task can be handed over and left to run. Only a review that
+//! produced no verdict (failed, or interrupted) falls through to the user.
 
 use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::llm::LMStudioClient;

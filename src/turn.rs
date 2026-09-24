@@ -211,13 +211,12 @@ pub(crate) enum Ask {
 
 /// Why a gated call reached the user despite auto mode being on.
 ///
-/// Auto mode can only ever *spend* consent, never withhold it, so each of these
-/// means the same thing to the turn — ask the user — and different things to the
-/// person reading the prompt, which is why they stay apart.
+/// A reviewer's no never gets here — it refuses the call on its own (see
+/// [`Notice::ReviewDenied`]). What is left is the reviewer giving no verdict at
+/// all, and each of these means the same thing to the turn — ask the user — and
+/// different things to the person reading the prompt, which is why they stay apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewNote {
-    /// The reviewer said no, and this is its reason.
-    Denied(String),
     /// The reviewer could not be asked at all.
     Failed(String),
     /// Esc arrived while the review was running.
@@ -276,6 +275,10 @@ pub(crate) enum Notice {
     /// The gate refused the call outright, with no prompt: outside the workspace,
     /// or a write in plan mode.
     Refused(String),
+    /// The auto-mode reviewer judged the call unsafe, and it was refused without
+    /// asking. The call travels with the reason, because the user reading back
+    /// through an unattended run needs to see what was stopped, not only why.
+    ReviewDenied { tool: String, arguments: Value, reason: String },
     PermissionAllowed,
     /// Allowed for the rest of the session, under the narrow key it resolved to.
     /// Carries the label so the frontend says what was actually granted.
