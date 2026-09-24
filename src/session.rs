@@ -1,5 +1,6 @@
 //! Saving, resuming and compacting a conversation.
 
+use crate::trace::Caller;
 use crate::config::{compact_hint_threshold, Reasoning};
 use crate::llm::LMStudioClient;
 use crate::tools::TodoItem;
@@ -301,6 +302,7 @@ pub(crate) async fn compact_history(client: &LMStudioClient, messages: &mut Vec<
 
     let summary = client
         .simple_completion(
+            Caller::Compactor,
             "You compress a coding session's transcript so work can continue without it. \
              Preserve: what the user asked for, decisions made and why, files and symbols \
              touched, what has been done, what is still outstanding, and any constraint or \
@@ -509,6 +511,7 @@ pub(crate) async fn apply_reasoning(
             let summary = match client
                 .for_sub_agent()
                 .chat_completion_plain(
+                    Caller::Compressor,
                     vec![
                         json!({"role": "system", "content": COMPRESS_PROMPT}),
                         json!({"role": "user", "content": original.clone()}),

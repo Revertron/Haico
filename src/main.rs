@@ -36,6 +36,7 @@ mod store;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod trace;
 mod turn;
 mod util;
 mod workspace;
@@ -559,9 +560,20 @@ async fn main() -> Result<()> {
     // Parse configuration first so we know the mode before any stdout output.
     let config = parse_config()?;
 
+    // Before anything talks to the model, so the `start` line opens the run, and for
+    // every entry path — the MCP server's `web_fetch` summarizer is a model call too. A
+    // trace that cannot be opened stops the run: asked to record it and not recording it
+    // would be found out only after the run was gone.
+    if let Some(path) = &config.trace {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        trace::init(path, &cwd, config.prompt.as_deref())?;
+    }
+
     // Server mode: hand off to the MCP stdio server and return (no banner, no REPL).
     if config.server {
-        return run_mcp_server(config).await;
+        let result = run_mcp_server(config).await;
+        trace::end(None);
+        return result;
     }
 
     // The window, as a third entry beside the REPL and the MCP server. It needs
@@ -569,7 +581,9 @@ async fn main() -> Result<()> {
     // picker yet — so `--gui` without `--model` says so rather than opening an
     // empty window.
     if config.gui {
-        return run_gui(config);
+        let result = run_gui(config);
+        trace::end(None);
+        return result;
     }
 
     // A task given on the command line runs unattended and exits, so it takes neither
@@ -579,6 +593,7 @@ async fn main() -> Result<()> {
     // scratch directory has already been dropped and cleaned up.
     if let Some(task) = config.prompt.clone() {
         let code = headless::run(config, task).await?;
+        trace::end(Some(code));
         std::process::exit(code);
     }
 
@@ -1308,6 +1323,7 @@ In force for '{}':", agent.client.model);
         outln!("Stopped {} background job(s).", stopped);
     }
 
+    trace::end(None);
     Ok(())
 }
 

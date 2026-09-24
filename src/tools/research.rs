@@ -19,6 +19,7 @@
 //! It is also why this runs on the same client as everything else — a second model would
 //! want a second slot on a GPU that is already full.
 
+use crate::trace::Caller;
 use super::MyMcpServer;
 use crate::session::without_think_block;
 use crate::util::truncate_at_boundary;
@@ -194,7 +195,7 @@ impl MyMcpServer {
             // carries the fallback for a server that ignores "stream", which a hand-rolled
             // request here would have to repeat.
             let message = match client
-                .chat_completion_streaming(messages.clone(), tools.clone(), |_| {})
+                .chat_completion_streaming(Caller::Research, messages.clone(), tools.clone(), |_| {})
                 .await
             {
                 Ok(message) => message,
@@ -281,7 +282,7 @@ impl MyMcpServer {
             ),
         }));
 
-        match client.chat_completion_plain(messages, None).await {
+        match client.chat_completion_plain(Caller::Research, messages, None).await {
             Ok(answer) => self.finish(question, without_think_block(&answer), &sources),
             Err(e) => {
                 crate::debug::log("research answer failed", &format!("{:#}", e));

@@ -435,6 +435,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         config_path: None,
         resume: false,
         prompt: None,
+        trace: None,
         tui: crate::Tui::Inline,
         mouse: Default::default(),
     }

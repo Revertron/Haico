@@ -21,6 +21,7 @@
 //! reads — the flavor text on the activity bar and in the turn summary is picked
 //! by the frontend from a `Waiting` kind and an elapsed time.
 
+use crate::trace::Caller;
 use anyhow::{anyhow, Result};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{json, Value};
@@ -863,6 +864,7 @@ pub(crate) async fn run_turn(
                 link,
                 Waiting::Model,
                 agent.client.chat_completion_streaming(
+                    Caller::Main,
                     request_messages,
                     request_tools,
                     // Both kinds of text are handed on the moment they arrive, so

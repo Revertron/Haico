@@ -1,3 +1,4 @@
 /target
 settings.txt
 test.txt
+__pycache__/

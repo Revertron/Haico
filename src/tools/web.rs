@@ -1,3 +1,4 @@
+use crate::trace::Caller;
 use super::MyMcpServer;
 use crate::util::truncate_at_boundary;
 use rmcp::handler::server::wrapper::Parameters;
@@ -493,7 +494,7 @@ impl MyMcpServer {
         );
 
         let extracted_info = self.llm_client
-            .simple_completion(system_prompt, &user_prompt)
+            .simple_completion(Caller::Summarizer, system_prompt, &user_prompt)
             .await
             .map_err(|e| {
                 McpError::internal_error(format!("Failed to extract information with LLM: {}", e), None)

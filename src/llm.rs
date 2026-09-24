@@ -1,6 +1,7 @@
 //! The OpenAI-compatible client, including streaming.
 
 use crate::config::ResolvedSettings;
+use crate::trace::{self, Caller};
 use crate::util::truncate_at_boundary;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -222,6 +223,30 @@ impl LMStudioClient {
             .context("Failed to parse response")
     }
 
+    // `post_chat`, recorded in the trace when there is one. The reply is recorded as the
+    // assistant message rather than the whole envelope, so every `call` line in the trace
+    // has the same shape whichever path produced it; a server error in a 200 body is
+    // recorded as the error it is.
+    async fn post_chat_traced(&self, caller: Caller, body: &Value) -> Result<Value> {
+        let started = std::time::Instant::now();
+        let response = self.post_chat(body).await;
+        if trace::enabled() {
+            let ending;
+            let outcome = match &response {
+                Ok(reply) => match reply["error"]["message"].as_str() {
+                    Some(error) => Err(error.to_string()),
+                    None => {
+                        ending = Ending::of(reply);
+                        Ok(trace::Reply { message: &reply["choices"][0]["message"], ending: &ending })
+                    }
+                },
+                Err(e) => Err(format!("{:#}", e)),
+            };
+            trace::call(caller, body, outcome, started.elapsed());
+        }
+        response
+    }
+
     // A single completion with no tools and no streaming, for asking the model something
     // that is not part of the conversation.
     //
@@ -231,6 +256,7 @@ impl LMStudioClient {
     // the same answer every time, not whatever temperature suits writing code.
     pub(crate) async fn chat_completion_plain(
         &self,
+        caller: Caller,
         messages: Vec<Value>,
         max_tokens: Option<u64>,
     ) -> Result<String> {
@@ -249,7 +275,7 @@ impl LMStudioClient {
         // which is the bug this comment exists to make visible if one is ever added.
         self.set_thinking(&mut body);
 
-        let response = self.post_chat(&body).await?;
+        let response = self.post_chat_traced(caller, &body).await?;
 
         // Logged whole, before anything is picked out of it: when this reply cannot be
         // parsed the interesting part is usually what the server did instead of answering
@@ -302,9 +328,10 @@ impl LMStudioClient {
     // non-streaming completion instead of failing.
     pub(crate) async fn chat_completion_streaming(
         &self,
+        caller: Caller,
         messages: Vec<Value>,
         tools: Vec<Value>,
-        mut on_chunk: impl FnMut(Chunk),
+        on_chunk: impl FnMut(Chunk),
     ) -> Result<Value> {
         let mut body = json!({
             "messages": messages,
@@ -315,12 +342,39 @@ impl LMStudioClient {
         self.set_model(&mut body);
         self.set_sampling(&mut body);
 
+        // Recorded once the stream is over, as the message it reassembled into: that is
+        // what the model produced, whereas the fragments are only how it travelled. A
+        // stream dropped by an interrupt never gets here — the future is dropped with it.
+        let tracing = trace::enabled();
+        if tracing {
+            // Asked for only while tracing, so an untraced request stays what it always
+            // was; every server this targets accepts it, and the one that did not would
+            // show up as a failed call in the trace rather than as a silent change.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        let started = std::time::Instant::now();
+        let reply = self.stream_chat(&body, on_chunk).await;
+        if tracing {
+            let outcome = match &reply {
+                Ok((message, ending)) => Ok(trace::Reply { message, ending }),
+                Err(e) => Err(format!("{:#}", e)),
+            };
+            trace::call(caller, &body, outcome, started.elapsed());
+        }
+        reply.map(|(message, _)| message)
+    }
+
+    async fn stream_chat(
+        &self,
+        body: &Value,
+        mut on_chunk: impl FnMut(Chunk),
+    ) -> Result<(Value, Ending)> {
         let mut response = self
             .authorize(
                 self.client
                     .post(format!("{}/v1/chat/completions", self.base_url)),
             )
-            .json(&body)
+            .json(body)
             .send()
             .await
             .context("Failed to send request to LM Studio")?;
@@ -441,13 +495,19 @@ impl LMStudioClient {
             {
                 on_chunk(Chunk::Content(text.to_string()));
             }
-            return Ok(message);
+            return Ok((message, Ending::of(&parsed)));
         }
 
-        Ok(assembler.into_message())
+        let ending = std::mem::take(&mut assembler.ending);
+        Ok((assembler.into_message(), ending))
     }
 
-    pub(crate) async fn simple_completion(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    pub(crate) async fn simple_completion(
+        &self,
+        caller: Caller,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String> {
         let messages = vec![
             json!({
                 "role": "system",
@@ -465,7 +525,7 @@ impl LMStudioClient {
         self.set_model(&mut body);
         self.set_sampling(&mut body);
 
-        let result = self.post_chat(&body).await?;
+        let result = self.post_chat_traced(caller, &body).await?;
 
         let content = result["choices"][0]["message"]["content"]
             .as_str()
@@ -545,6 +605,30 @@ pub(crate) struct StreamAssembler {
     pub(crate) content: String,
     pub(crate) reasoning: String,
     pub(crate) tool_calls: Vec<StreamToolCall>,
+    // How the reply ended and what it cost, as far as the server says. Kept out of the
+    // message because the message goes back into the history, and neither is part of
+    // what the model said; only the trace wants them. A stream that hit `max_tokens`
+    // mid-thought looks exactly like a finished one without `finish_reason` — the one
+    // thing a dataset built from the trace most needs to be able to tell.
+    pub(crate) ending: Ending,
+}
+
+/// The two things about a reply that are not the reply. `usage` only arrives on a stream
+/// when asked for (`stream_options.include_usage`), which is done while tracing.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct Ending {
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) usage: Option<Value>,
+}
+
+impl Ending {
+    /// Read off a whole (non-streamed) completion.
+    fn of(response: &Value) -> Ending {
+        Ending {
+            finish_reason: response["choices"][0]["finish_reason"].as_str().map(str::to_string),
+            usage: response.get("usage").filter(|u| u.is_object()).cloned(),
+        }
+    }
 }
 
 // A piece of the reply as it lands, tagged with which of the two streams it came from.
@@ -575,6 +659,14 @@ impl StreamAssembler {
     // single piece; a delta carrying both kinds yields both, thinking first.
     pub(crate) fn push(&mut self, chunk: &Value) -> Vec<Chunk> {
         let mut pieces = Vec::new();
+        // Before the delta is looked for: the usage chunk has an empty `choices`, and the
+        // finishing chunk often an empty delta.
+        if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
+            self.ending.usage = Some(usage.clone());
+        }
+        if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+            self.ending.finish_reason = Some(reason.to_string());
+        }
         let Some(delta) = chunk
             .get("choices")
             .and_then(|choices| choices.get(0))
@@ -875,6 +967,24 @@ mod tests {
     use crate::util::*;
     use serde_json::json;
 
+    /// A reply cut off by `max_tokens` and a finished one differ only in these, and the
+    /// usage chunk arrives with an empty `choices` — the case the delta lookup skips.
+    #[test]
+    fn a_stream_keeps_how_it_ended_out_of_the_message() {
+        use crate::StreamAssembler;
+
+        let mut assembler = StreamAssembler::default();
+        assembler.push(&json!({"choices": [{"delta": {"content": "half a th"}}]}));
+        assembler.push(&json!({"choices": [{"delta": {}, "finish_reason": "length"}]}));
+        assembler.push(&json!({"choices": [], "usage": {"completion_tokens": 512}}));
+
+        let ending = std::mem::take(&mut assembler.ending);
+        assert_eq!(ending.finish_reason.as_deref(), Some("length"));
+        assert_eq!(ending.usage, Some(json!({"completion_tokens": 512})));
+        let message = assembler.into_message();
+        assert!(message.get("finish_reason").is_none() && message.get("usage").is_none());
+    }
+
     #[test]
     fn reassembles_streamed_content_and_tool_calls() {
         use crate::StreamAssembler;
@@ -1018,7 +1128,7 @@ mod tests {
         let (url, captured) = serve_once_capturing(sse, "text/event-stream").await;
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         client
-            .chat_completion_streaming(vec![], vec![], |_| {})
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
             .await
             .unwrap();
         let sent: serde_json::Value =
@@ -1044,7 +1154,7 @@ mod tests {
             Some(1.15),
         ));
         client
-            .chat_completion_streaming(vec![], vec![], |_| {})
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
             .await
             .unwrap();
         let sent: serde_json::Value =
@@ -1141,7 +1251,7 @@ mod tests {
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut streamed = String::new();
         let message = client
-            .chat_completion_streaming(vec![], vec![], |chunk| {
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| {
                 if let crate::Chunk::Content(text) = chunk {
                     streamed.push_str(&text);
                 }
@@ -1174,7 +1284,7 @@ mod tests {
         // Recorded in arrival order, so the test also pins that thinking precedes content.
         let mut order = Vec::new();
         let message = client
-            .chat_completion_streaming(vec![], vec![], |chunk| match chunk {
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| match chunk {
                 crate::Chunk::Reasoning(text) => order.push(format!("think:{}", text)),
                 crate::Chunk::Content(text) => order.push(format!("say:{}", text)),
                 crate::Chunk::ToolFragment(n) => order.push(format!("call:{}", n)),
@@ -1201,7 +1311,7 @@ mod tests {
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut streamed = String::new();
         let message = client
-            .chat_completion_streaming(vec![], vec![], |chunk| {
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| {
                 if let crate::Chunk::Content(text) = chunk {
                     streamed.push_str(&text);
                 }
@@ -1222,7 +1332,7 @@ mod tests {
 
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let error = client
-            .chat_completion_streaming(vec![], vec![], |_| {})
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
             .await
             .unwrap_err();
 
@@ -1373,7 +1483,7 @@ mod tests {
         .await;
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let reply = client
-            .chat_completion_plain(vec![json!({"role": "user", "content": "hi"})], Some(1000))
+            .chat_completion_plain(Caller::Reviewer, vec![json!({"role": "user", "content": "hi"})], Some(1000))
             .await
             .unwrap();
         assert_eq!(reply, "the answer");
@@ -1394,7 +1504,7 @@ mod tests {
         .await;
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         assert!(client
-            .chat_completion_plain(vec![json!({"role": "user", "content": "hi"})], Some(1000))
+            .chat_completion_plain(Caller::Reviewer, vec![json!({"role": "user", "content": "hi"})], Some(1000))
             .await
             .is_err());
     }

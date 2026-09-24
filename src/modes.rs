@@ -6,6 +6,7 @@
 //! no refuses it unasked, so a task can be handed over and left to run. Only a review that
 //! produced no verdict (failed, or interrupted) falls through to the user.
 
+use crate::trace::Caller;
 use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::llm::LMStudioClient;
 use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
@@ -531,7 +532,7 @@ pub(crate) async fn judge_tool_call(
     // the main conversation's effort is no more relevant to that than its temperature is.
     let reply = client
         .for_sub_agent()
-        .chat_completion_plain(messages, Some(2000))
+        .chat_completion_plain(Caller::Reviewer, messages, Some(2000))
         .await?;
 
     // The reply is already in the log, written by the client. This adds only which end of
