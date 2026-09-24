@@ -318,9 +318,48 @@ pub(crate) fn chains_with_semicolon(command: &str) -> bool {
     false
 }
 
+// What a command ending in a lone `&` is told when it is refused.
+pub(crate) const BACKGROUND_REFUSAL: &str = "Not run: run_command waits for the command to \
+    finish, so a trailing `&` cannot put it in the background — the call would sit until the \
+    timeout killed it and return nothing. To start a server or anything else that keeps \
+    running, use run_background, then background_output to read what it printed and \
+    background_stop to end it.";
+
+// Does this command end in a lone `&`, asking for it to be backgrounded?
+//
+// Observed from a model that had just written "let me use run_background" and then sent
+// `cargo run --example smoke > out.txt 2>&1 &` to run_command instead. It waited out the whole
+// 120s timeout and captured nothing, and it cannot work on either platform. In cmd a trailing
+// `&` is only a separator with nothing after it, so the server runs in the foreground. In sh it
+// really is backgrounded, but the background process inherits the output pipe, and the call is
+// still waiting for that pipe to close when the timeout kills the group. So the call is refused
+// in words that name the tool that does this.
+//
+// Only a lone `&` at the very end: `a && b`, `a & b`, a dangling `&&` (an incomplete chain, not
+// a request to background) and an escaped `^&` (cmd) or `\&` (sh) are left to run. Double
+// quotes are tracked everywhere and single quotes outside Windows, where they quote, so an `&`
+// that ends a quoted argument is still an argument.
+pub(crate) fn backgrounds_with_ampersand(command: &str) -> bool {
+    let chars: Vec<char> = command.trim_end().chars().collect();
+    let (mut in_double, mut in_single) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        let escape = if cfg!(windows) { '^' } else { '\\' };
+        let escaped = i > 0 && chars[i - 1] == escape;
+        match c {
+            '"' if !in_single && !escaped => in_double = !in_double,
+            '\'' if !cfg!(windows) && !in_double && !escaped => in_single = !in_single,
+            _ => {}
+        }
+        if i + 1 == chars.len() && c == '&' && !in_double && !in_single {
+            return !escaped && chars.get(i.wrapping_sub(1)) != Some(&'&');
+        }
+    }
+    false
+}
+
 #[tool_router(router = shell_router, vis = "pub(crate)")]
 impl MyMcpServer {
-    #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
+    #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Never end a command with & to background it: this call always waits for it to finish, so start servers and other long-running processes with run_background instead. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
     pub(crate) async fn run_command(&self, params: Parameters<RunCommandParams>) -> Result<CallToolResult, McpError> {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
@@ -328,6 +367,9 @@ impl MyMcpServer {
         #[cfg(target_os = "windows")]
         if chains_with_semicolon(&command) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
+        }
+        if backgrounds_with_ampersand(&command) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(BACKGROUND_REFUSAL)]));
         }
 
         use std::time::Duration;
@@ -1135,6 +1177,39 @@ mod tests {
         let (ok, out) = run(&server, "echo first ; echo second", Some(30), None).await;
         assert!(!ok, "the chain should have been refused, got: {}", out);
         assert!(out.contains("&&"), "the refusal must name the fix, got: {}", out);
+    }
+
+    #[test]
+    fn only_a_lone_trailing_ampersand_asks_for_the_background() {
+        use crate::tools::shell::backgrounds_with_ampersand;
+
+        // The line that was actually sent, and its plainer relatives.
+        assert!(backgrounds_with_ampersand(
+            "cd \".\" && cargo run --example smoke > \"G:\\Temp\\smoke.out\" 2>&1 &"
+        ));
+        assert!(backgrounds_with_ampersand("cargo run &"));
+        assert!(backgrounds_with_ampersand("cargo run&  "));
+
+        // Chains, redirections and escapes, which must still run.
+        assert!(!backgrounds_with_ampersand("cargo build && cargo test"));
+        assert!(!backgrounds_with_ampersand("cargo build & cargo test"));
+        assert!(!backgrounds_with_ampersand("cargo test 2>&1"));
+        assert!(!backgrounds_with_ampersand("cargo build &&"));
+        let escaped = if cfg!(windows) { "echo a ^&" } else { "echo a \\&" };
+        assert!(!backgrounds_with_ampersand(escaped));
+        assert!(!backgrounds_with_ampersand("echo \"fish &\""));
+        assert!(!backgrounds_with_ampersand("cargo run"));
+        assert!(!backgrounds_with_ampersand(""));
+    }
+
+    #[tokio::test]
+    async fn run_command_refuses_to_background_and_names_run_background() {
+        let server = test_server();
+        let started = std::time::Instant::now();
+        let (ok, out) = run(&server, "echo started &", Some(30), None).await;
+        assert!(!ok, "the command should have been refused, got: {}", out);
+        assert!(out.contains("run_background"), "the refusal must name the fix, got: {}", out);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "it ran instead of being refused");
     }
 
 }
