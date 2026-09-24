@@ -123,6 +123,8 @@ pub(crate) struct Config {
     pub(crate) prompt: Option<String>,
     // Append every model call to this file as JSON lines — see `src/trace.rs`.
     pub(crate) trace: Option<PathBuf>,
+    // The directory to work in, entered by `main` before anything else happens.
+    pub(crate) dir: Option<PathBuf>,
     // Which renderer to use. Not model-dependent, so it never goes through
     // `resolve_settings` — it is decided once, before the first thing is drawn.
     pub(crate) tui: Tui,
@@ -151,6 +153,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
     opts.optopt("p", "prompt", "Run this task unattended in auto mode, then exit", "TASK");
     opts.optopt("", "trace", "Append every model call to FILE as JSON lines, for training data", "FILE");
+    opts.optopt("d", "dir", "Work in DIR instead of the current directory", "DIR");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("", "gui", "Open a window instead of using the terminal");
     opts.optflag("h", "help", "Print this help message");
@@ -298,7 +301,14 @@ pub(crate) fn parse_config() -> Result<Config> {
         // A blank task is treated as none, rather than starting a run with nothing to do
         // that the model would fill by inventing a task of its own.
         prompt: matches.opt_str("p").filter(|task| !task.trim().is_empty()),
-        trace: matches.opt_str("trace").map(PathBuf::from),
+        // Made absolute here, while the current directory is still the one the command was
+        // typed in: `--dir` moves the process before the trace is opened, and a script that
+        // says `--trace runs.jsonl` means the runs.jsonl beside it, not one inside every
+        // project it visits. `--system-prompt` gets this for free by being read above.
+        trace: matches.opt_str("trace").map(|path| {
+            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
+        }),
+        dir: matches.opt_str("d").map(PathBuf::from),
         // The environment wins so a terminal that cannot cope with the alternate screen
         // can be worked around without editing the config file.
         tui: match env::var("HAICO_TUI").ok().as_deref().map(str::trim) {
@@ -790,6 +800,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  {} --resume                       # Continue this directory's last conversation", program);
     println!("  {} -p \"Update dependencies and commit\"  # Run one task unattended, then exit", program);
     println!("  {} -p \"Fix the build\" --trace runs.jsonl  # ...and record every model call", program);
+    println!("  {} -d ../other-project -p \"Update dependencies\"  # ...in another directory", program);
 }
 
 // Run haico as an stdio MCP server. stdout/stdin carry the JSON-RPC protocol, so this
@@ -830,6 +841,7 @@ mod tests {
             resume: false,
             prompt: None,
             trace: None,
+            dir: None,
             tui: crate::config::Tui::Inline,
             mouse: crate::config::Mouse::Scroll,
         }

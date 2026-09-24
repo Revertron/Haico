@@ -560,6 +560,18 @@ async fn main() -> Result<()> {
     // Parse configuration first so we know the mode before any stdout output.
     let config = parse_config()?;
 
+    // The process moves, rather than the directory being handed to whatever needs it:
+    // the project's instructions, memory, skills, the workspace, the session path, the
+    // trace's `cwd` and every shell command's starting point each ask for the current
+    // directory on their own, and a path passed down would have to reach all of them —
+    // and the next one added. A directory that is not there stops the run rather than
+    // leaving it to work wherever it was started, which for `-p "... and commit"` is
+    // the wrong repository.
+    if let Some(dir) = &config.dir {
+        env::set_current_dir(dir)
+            .with_context(|| format!("cannot work in {}", dir.display()))?;
+    }
+
     // Before anything talks to the model, so the `start` line opens the run, and for
     // every entry path — the MCP server's `web_fetch` summarizer is a model call too. A
     // trace that cannot be opened stops the run: asked to record it and not recording it
