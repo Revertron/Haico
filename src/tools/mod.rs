@@ -502,16 +502,62 @@ pub(crate) fn mcp_tools_to_openai_format(server: &MyMcpServer) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
+            let mut parameters = Value::Object((*tool.input_schema).clone());
+            simplify_schema(&mut parameters);
             json!({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description.as_deref().unwrap_or(""),
-                    "parameters": tool.input_schema
+                    "parameters": parameters
                 }
             })
         })
         .collect()
+}
+
+/// The schema as the model reads it: schemars writes for validators, and three of its habits
+/// cost a small model something and tell it nothing.
+///
+/// - `"type": ["integer", "null"]` for every `Option` field. Optional is already said by the
+///   field's absence from `required`; the union only adds "you may send an explicit null",
+///   which haico never needs (an omitted argument and a null one parse the same). Small models
+///   copy it back as the string `"null"`, and the mixed shapes (`path` is `["string", "null"]`
+///   in `grep` but `"string"` in `ls`) are also what made a dataset built from these schemas
+///   unreadable by Arrow, which wants one type per column.
+/// - `"format": "uint64"` and friends: Rust type names, not JSON Schema formats. `minimum: 0`,
+///   which schemars writes alongside, already says unsigned.
+/// - `"$schema"`: a dialect URL, 50 characters of nothing in every tool.
+///
+/// Only the copy sent to the model is simplified. MCP server mode hands the host rmcp's own
+/// schema, since validating arguments is the host's business.
+pub(crate) fn simplify_schema(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            map.remove("$schema");
+            if map.get("format").and_then(Value::as_str).is_some_and(is_rust_number_format) {
+                map.remove("format");
+            }
+            if let Some(Value::Array(types)) = map.get("type") {
+                let kept: Vec<Value> = types.iter().filter(|t| t.as_str() != Some("null")).cloned().collect();
+                // A field that is *only* null has nothing else to say; leave it alone.
+                if !kept.is_empty() && kept.len() < types.len() {
+                    let simple = if kept.len() == 1 { kept[0].clone() } else { Value::Array(kept) };
+                    map.insert("type".to_string(), simple);
+                }
+            }
+            map.values_mut().for_each(simplify_schema);
+        }
+        Value::Array(items) => items.iter_mut().for_each(simplify_schema),
+        _ => {}
+    }
+}
+
+fn is_rust_number_format(format: &str) -> bool {
+    matches!(
+        format,
+        "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "float" | "double"
+    )
 }
 
 // Pull the arguments out of a tool call, tolerating the shapes local models actually emit.
@@ -561,6 +607,60 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[test]
+    fn simplify_schema_drops_nullability_rust_formats_and_the_dialect() {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "limit": {"type": ["integer", "null"], "format": "uint", "minimum": 0},
+                "ratio": {"type": "number", "format": "double"},
+                "url": {"type": "string", "format": "uri"},
+                // A field named like a keyword is a field, not the keyword.
+                "format": {"type": ["string", "null"]},
+                "either": {"type": ["string", "integer", "null"]},
+                "nothing": {"type": ["null"]},
+                "items": {"type": "array", "items": {"$ref": "#/$defs/Item"}}
+            },
+            "required": ["url"],
+            "$defs": {"Item": {"type": "object", "properties": {"n": {"type": ["integer", "null"], "format": "int64"}}}}
+        });
+        simplify_schema(&mut schema);
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 0},
+                    "ratio": {"type": "number"},
+                    "url": {"type": "string", "format": "uri"},
+                    "format": {"type": "string"},
+                    "either": {"type": ["string", "integer"]},
+                    "nothing": {"type": ["null"]},
+                    "items": {"type": "array", "items": {"$ref": "#/$defs/Item"}}
+                },
+                "required": ["url"],
+                "$defs": {"Item": {"type": "object", "properties": {"n": {"type": "integer"}}}}
+            })
+        );
+    }
+
+    #[test]
+    fn the_model_is_sent_simple_schemas_with_optionality_intact() {
+        let server = test_server();
+        let tools = mcp_tools_to_openai_format(&server);
+        let text = serde_json::to_string(&tools).unwrap();
+        assert!(!text.contains("\"null\""), "a null type reached the model");
+        assert!(!text.contains("$schema") && !text.contains("\"uint"), "schemars noise reached the model");
+        // Optional is still said by `required`, which the simplification doesn't touch.
+        let read = tools.iter().find(|t| t["function"]["name"] == "read").unwrap();
+        assert_eq!(read["function"]["parameters"]["required"], json!(["file_path"]));
+        assert_eq!(read["function"]["parameters"]["properties"]["limit"]["type"], "integer");
+        // MCP hosts still get rmcp's own schema.
+        let raw = server.tool_router.list_all().into_iter().find(|t| t.name == "read").unwrap();
+        assert!(serde_json::to_string(&raw.input_schema).unwrap().contains("\"null\""));
+    }
 
     #[tokio::test]
     async fn undo_reverts_edits_creations_and_overwrites() {
