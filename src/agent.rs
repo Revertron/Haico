@@ -1342,9 +1342,17 @@ pub(crate) async fn run_turn(
                     // nobody was there to answer. Refusing costs little — the model is told
                     // why and can find another way or stop and say what it needed.
                     //
-                    // An unreadable reply or a review the user interrupted still reaches
-                    // the prompt with the reason attached: neither is a judgment, and the
-                    // second means the user is right there.
+                    // A review with no verdict (cut off at its token cap, an unreadable
+                    // reply, a server error) is not a judgment either way, and for the same
+                    // reason it no longer falls through to the prompt: nobody may be there.
+                    // The model is told it was a temporary error and to make the call again.
+                    // Worded as a refusal, it was taken as final: an unattended model whose
+                    // `write_file` met a review cut off at its cap spent the next forty
+                    // minutes writing files through `echo` and PowerShell. If the reviewer
+                    // keeps failing, the identical-call loop guard bounds the retries.
+                    //
+                    // Only a review the user interrupted with Esc still reaches the prompt:
+                    // that is the one outcome that proves somebody is there.
                     // Why the call is running unasked, and what to add to the prompt when
                     // it still has to be asked. Only one is ever set.
                     let mut auto_note: Option<String> = None;
@@ -1402,7 +1410,26 @@ pub(crate) async fn run_turn(
                                 continue;
                             }
                             Some(Err(e)) => {
-                                review_note = Some(ReviewNote::Failed(format!("{:#}", e)));
+                                let detail = format!("{:#}", e);
+                                let _ = tx.send(
+                                    Notice::ReviewFailed {
+                                        tool: tool_name.to_string(),
+                                        arguments: arguments.clone(),
+                                        detail,
+                                    }
+                                    .into(),
+                                );
+                                agent.messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": format!(
+                                        "Temporary error while evaluating the '{}' call, so it \
+                                         was not run. Nothing is known to be wrong with the call \
+                                         itself: make the same call again.",
+                                        tool_name
+                                    )
+                                }));
+                                continue;
                             }
                             None => {
                                 review_note = Some(ReviewNote::Interrupted);

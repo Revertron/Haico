@@ -2179,6 +2179,57 @@ mod turn_tests {
         assert!(notices(&seen).iter().any(|n| matches!(n, Notice::Repeating { retrying: false, .. })));
     }
 
+    /// A review that ends without a verdict is reported to the model as a
+    /// temporary failure to retry, and the user is not asked: auto mode is for
+    /// walking away. Worded as a refusal it was taken as final — an unattended
+    /// model whose `write_file` met a review cut off at its token cap wrote its
+    /// files through `echo` for the rest of the run — and sent to the prompt, it
+    /// parked the run on a dialog nobody was there to answer.
+    #[tokio::test]
+    async fn a_review_without_a_verdict_is_a_temporary_error_to_retry() {
+        let _capture = out::capture_guard();
+        const CALL: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"cargo --version\"}"}}]}}]}"#;
+        // What a review cut off at its cap comes back as: all reasoning, no answer.
+        const CUT_OFF: &str = r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+        let (url, served) = serve_sequence(&[CALL, CUT_OFF, FINAL]).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        let link = TurnLink::new(agent.mode);
+        // A frontend that is there but never answers, like a REPL whose user went
+        // for coffee: a prompt sent to it would wait forever, so the timeout is
+        // what turns "it asked" into a failure rather than a hung suite.
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        let turn = run_turn(&mut agent, "check the toolchain", false, &tx, &link);
+        tokio::time::timeout(std::time::Duration::from_secs(10), turn)
+            .await
+            .expect("the turn waited on a prompt nobody answered");
+
+        assert_eq!(*served.lock().unwrap(), 3, "call, review, then the reply to the retry note");
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(!seen.iter().any(|e| matches!(e, AgentEvent::Ask(_))), "the user was asked");
+        assert!(
+            notices(&seen).iter().any(|n| matches!(n, Notice::ReviewFailed { tool, .. } if tool == "run_command")),
+            "notices: {:?}",
+            notices(&seen)
+        );
+        let replies = tool_replies(&agent.messages);
+        assert_eq!(replies.len(), 1);
+        let (id, content) = &replies[0];
+        assert_eq!(id, "c1");
+        assert!(
+            content.starts_with("Temporary error while evaluating the 'run_command' call")
+                && content.contains("make the same call again"),
+            "{content}"
+        );
+    }
+
     /// The turn narrates itself, and this is the assertion that could not be
     /// written before: driven with no frontend at all, what it *said* is checked
     /// directly rather than inferred from terminal output.

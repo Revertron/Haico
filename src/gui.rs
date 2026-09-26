@@ -822,6 +822,10 @@ fn describe(notice: Notice) -> (String, Tone) {
             let summary = crate::render::tool_call_summary(&tool, &arguments);
             (format!("refused by review: {tool} {summary} — {reason}"), Tone::Error)
         }
+        Notice::ReviewFailed { tool, arguments, detail } => {
+            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            (format!("review gave no verdict: {tool} {summary} — {detail}; the model will retry"), Tone::Warning)
+        }
         Notice::PermissionAllowed => ("allowed".into(), Tone::Muted),
         Notice::PermissionAllowedAll(label) => (label, Tone::Muted),
         Notice::PermissionDenied { alternative } => {
@@ -2342,6 +2346,7 @@ mod tests {
             Notice::AskFailed { what: "w", detail: "d".into() },
             Notice::Refused("r".into()),
             Notice::ReviewDenied { tool: "t".into(), arguments: json!({}), reason: "r".into() },
+            Notice::ReviewFailed { tool: "t".into(), arguments: json!({}), detail: "d".into() },
             Notice::PermissionAllowed,
             Notice::PermissionAllowedAll("l".into()),
             Notice::PermissionDenied { alternative: "a".into() },

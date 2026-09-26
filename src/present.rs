@@ -308,6 +308,10 @@ impl Presenter {
                 outln!("{}", tool_call_line(&tool, &arguments, None));
                 outln!("⛔ Refused by review: {}\n", reason)
             }
+            Notice::ReviewFailed { tool, arguments, detail } => {
+                outln!("{}", tool_call_line(&tool, &arguments, None));
+                outln!("⚠ Review gave no verdict ({}): not run, the model will retry\n", detail)
+            }
             Notice::PermissionAllowed => outln!("✓ Permission granted for this request\n"),
             Notice::PermissionAllowedAll(label) => outln!("✓ {}\n", label),
             Notice::PermissionDenied { alternative } => {
@@ -432,7 +436,6 @@ pub(crate) fn permission_description(
     // line of its own: it is the reason this prompt is being shown at all.
     if let Some(review) = review {
         let line = match review {
-            ReviewNote::Failed(detail) => format!("🤖 Review failed: {}", detail),
             ReviewNote::Interrupted => "🤖 Review interrupted.".to_string(),
         };
         description.push_str(&format!("\n\n{}", line));

@@ -261,15 +261,27 @@ pub(crate) struct Verdict {
     pub(crate) cached: bool,
 }
 
+/// Output cap for one review, reasoning included (see its use in `judge_tool_call`).
+const REVIEW_MAX_TOKENS: u64 = 32768;
+
 // The reviewer is deliberately given no conversation history.
 //
 // That is the whole value of it: the model that just decided it wanted to run something is
 // under pressure to finish the task, and a fresh reader of the same call is not. It is a
 // filter against drift and accidents, not a security boundary — same weights, and content
 // fetched from the web can end up inside the arguments it is asked to bless.
+//
+// It says what *not* to judge as well, because a reviewer shown the diff of new code reads
+// it the way a code reviewer would: Whittle spent its whole review budget hunting for hangs
+// in a mio server it was only asked to let be written, and ran out before any verdict.
 const JUDGE_PROMPT: &str = "You are reviewing one action a coding agent wants to take on a \
-developer's machine. You are shown only the action itself, with no conversation history — \
-judge it on what is in front of you.\n\n\
+developer's machine, for safety only. You are shown only the action itself, with no \
+conversation history — judge it on what is in front of you.\n\n\
+You are not reviewing the code. Whether it is correct, compiles, is well designed or has \
+bugs is not your concern and never a reason to deny. Writing source code into the project \
+is ordinary even when that code opens network sockets, spawns processes or deletes files: \
+it does nothing until it is built and run. Judge what the action itself does to the \
+machine. Most actions are routine; decide quickly.\n\n\
 Allow ordinary development work: reading and editing files inside the project, building, \
 running tests, formatting, git status and diff and commit, starting a local dev server, \
 installing declared project dependencies.\n\n\
@@ -527,12 +539,15 @@ pub(crate) async fn judge_tool_call(
     // Generous for a two-field answer, because the answer is not all that gets generated:
     // a reasoning model thinks first, and a cap that cuts it off mid-thought yields a reply
     // with no JSON in it at all. That surfaced as "Review failed: no JSON object" on a
-    // perfectly ordinary `cargo build`.
+    // perfectly ordinary `cargo build` with a 2000 cap, and again on an unattended run where
+    // one review in six hit that cap. The cap costs nothing on the reviews that stay short,
+    // while one cut off costs the whole tool call: unattended, a model that took the refusal
+    // as final spent the next forty minutes writing files through `echo` instead.
     // Through a sub-agent copy: the reviewer answers two fields about one tool call, and
     // the main conversation's effort is no more relevant to that than its temperature is.
     let reply = client
         .for_sub_agent()
-        .chat_completion_plain(Caller::Reviewer, messages, Some(2000))
+        .chat_completion_plain(Caller::Reviewer, messages, Some(REVIEW_MAX_TOKENS))
         .await?;
 
     // The reply is already in the log, written by the client. This adds only which end of

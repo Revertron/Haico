@@ -212,13 +212,13 @@ pub(crate) enum Ask {
 /// Why a gated call reached the user despite auto mode being on.
 ///
 /// A reviewer's no never gets here — it refuses the call on its own (see
-/// [`Notice::ReviewDenied`]). What is left is the reviewer giving no verdict at
-/// all, and each of these means the same thing to the turn — ask the user — and
-/// different things to the person reading the prompt, which is why they stay apart.
+/// [`Notice::ReviewDenied`]) — and neither does a review that failed to produce a
+/// verdict, which is reported to the model as a temporary error to retry (see
+/// [`Notice::ReviewFailed`]): auto mode is for walking away, and a prompt nobody is
+/// there to answer parks the whole run. What is left is the user pressing Esc
+/// during a review, which is the one case that proves somebody is there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewNote {
-    /// The reviewer could not be asked at all.
-    Failed(String),
     /// Esc arrived while the review was running.
     Interrupted,
 }
@@ -279,6 +279,10 @@ pub(crate) enum Notice {
     /// asking. The call travels with the reason, because the user reading back
     /// through an unattended run needs to see what was stopped, not only why.
     ReviewDenied { tool: String, arguments: Value, reason: String },
+    /// The auto-mode reviewer gave no verdict (cut off at its token cap, an
+    /// unreadable reply, a server error). The call was not run, and the model was
+    /// told to make it again rather than the user being asked.
+    ReviewFailed { tool: String, arguments: Value, detail: String },
     PermissionAllowed,
     /// Allowed for the rest of the session, under the narrow key it resolved to.
     /// Carries the label so the frontend says what was actually granted.
