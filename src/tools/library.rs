@@ -1,11 +1,20 @@
 //! The `library` sub-agent: a question goes in, an answer from the library's articles comes
 //! out, and the articles read to get there never touch the main conversation.
 //!
-//! The same shape as `research`, for the same reason — an article is thousands of tokens,
-//! and three of them in the main history push a 32k model's own working memory out of the
-//! window. The differences are what it reads and how cheaply: the articles are local
-//! markdown (`crate::library`), so a lookup is a file read rather than a fetch, and the
-//! round trips are the whole cost.
+//! The same shape as `research`, for the same reason — an article is thousands of tokens, and
+//! once in the main history it stays there: re-sent with every later request, re-prefilled
+//! whenever the server's cache is lost, and competing for a small model's attention long after
+//! the question it answered. The differences are what it reads and how cheaply: the articles
+//! are local markdown (`crate::library`), so a lookup is a file read rather than a fetch, and
+//! the model's own round trips are the whole cost.
+//!
+//! **It is bounded by time, not by how much it reads.** The windows haico runs against are
+//! 128k–262k, so a librarian could read every article on a crate and still fit; what it cannot
+//! do is take a minute over it, because the main model — and on an unattended run, the whole
+//! task — waits for the answer. So lookups stop at `TIME_BUDGET`, and the round still running
+//! at that moment is dropped (which also stops the server generating it) — except the first
+//! round, which always runs whole: a librarian cut off before its first lookup has nothing to
+//! answer from.
 //!
 //! **Its two tools are not router tools.** `library_search` and `library_read` exist only
 //! inside this loop, defined here as JSON and dispatched here, so the main model never sees
@@ -25,17 +34,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const SEARCH: &str = "library_search";
 const READ: &str = "library_read";
 
-// Searches and section reads together. Fewer than research's ten: a section is chosen from
-// a ranked list with its heading already visible, so there is much less reading of the
-// wrong thing to budget for.
-const LOOKUP_BUDGET: usize = 8;
+// How long the librarian may spend looking things up. The answer that follows is not
+// timed: it is one request with no tools, and cutting it off would throw away everything read.
+pub(crate) const TIME_BUDGET: Duration = Duration::from_secs(20);
+
+// Not the budget — time is — but the backstop under it. Searches and reads are instant, so a
+// model that loops on them could otherwise fit dozens into the time, each round re-sending all
+// the ones before.
+const MAX_LOOKUPS: usize = 24;
 
 // The round that calls no tool and says nothing either — see research's MAX_ROUNDS.
-const MAX_ROUNDS: usize = LOOKUP_BUDGET + 2;
+const MAX_ROUNDS: usize = MAX_LOOKUPS + 2;
 
 // Longer than research's answer may be, because what comes back from here is usually code
 // the model is about to copy, and a cut-off example is worse than none.
@@ -104,8 +118,9 @@ fn library_prompt(catalog: &str) -> String {
          - If an article above is plainly about the question, read its outline with {read} \
            and then the sections you need. Otherwise start with {search}.\n\
          - Read the sections that answer the question, not whole articles.\n\
-         - Stop as soon as you can answer. You have at most {budget} lookups (searches and \
-           reads together); when they run out you must answer from what you have read.\n\n\
+         - Stop as soon as you can answer. Your time for lookups is short: prefer reading the \
+           one section that answers over searching again. When you are told to stop, answer \
+           from what you have read.\n\n\
          When you have the answer, reply with text and no tool call:\n\
          - Answer the question directly.\n\
          - Copy code, signatures and names exactly as the article gives them — the person \
@@ -119,7 +134,6 @@ fn library_prompt(catalog: &str) -> String {
         search = SEARCH,
         read = READ,
         catalog = catalog,
-        budget = LOOKUP_BUDGET,
     )
 }
 
@@ -171,6 +185,11 @@ impl MyMcpServer {
     // The loop. Never returns an error, for research's reason: what went wrong is still
     // something to tell the model in words it can act on.
     pub(crate) async fn run_library(&self, root: &Path, question: &str) -> String {
+        self.run_library_within(root, question, TIME_BUDGET).await
+    }
+
+    // The loop, with the budget as a parameter so a test can spend it without waiting for it.
+    async fn run_library_within(&self, root: &Path, question: &str, budget: Duration) -> String {
         self.library_note(&format!(
             "Library lookup for: {}",
             truncate_at_boundary(question, MAX_ECHOED_QUESTION)
@@ -196,18 +215,32 @@ impl MyMcpServer {
         // model, or the person reading the transcript, can check it against the article.
         let mut sources: Vec<String> = Vec::new();
         let mut spent = 0usize;
+        let deadline = Instant::now() + budget;
 
-        for _ in 0..MAX_ROUNDS {
-            if spent >= LOOKUP_BUDGET {
+        for round in 0..MAX_ROUNDS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // The first round always runs whole: until it has, there is nothing to answer from.
+            // By round, not by lookups made, so a first call that fails does not leave every
+            // later round exempt from the clock too.
+            if spent >= MAX_LOOKUPS || (round > 0 && remaining.is_zero()) {
                 break;
             }
 
-            let message = match client
-                .chat_completion_streaming(Caller::Library, messages.clone(), tools.clone(), |_| {})
-                .await
-            {
-                Ok(message) => message,
-                Err(e) => {
+            let request = client.chat_completion_streaming(Caller::Library, messages.clone(), tools.clone(), |_| {});
+            let reply = if round == 0 {
+                Ok(request.await)
+            } else {
+                tokio::time::timeout(remaining, request).await
+            };
+            let message = match reply {
+                // Out of time mid-round: the half-generated reply is dropped, and with it the
+                // stream, which is what stops the server spending more on it.
+                Err(_) => {
+                    self.library_note("  Out of time for lookups");
+                    break;
+                }
+                Ok(Ok(message)) => message,
+                Ok(Err(e)) => {
                     crate::debug::log("library failed", &format!("{:#}", e));
                     return format!(
                         "The librarian could not be reached: {}. Nothing was looked up. Try \
@@ -240,12 +273,10 @@ impl MyMcpServer {
                          and {}.",
                         name, SEARCH, READ
                     )
-                } else if spent >= LOOKUP_BUDGET {
-                    format!(
-                        "The budget of {} lookups is spent. Answer the question now, from what \
-                         you have already read.",
-                        LOOKUP_BUDGET
-                    )
+                } else if spent >= MAX_LOOKUPS {
+                    "That is enough lookups. Answer the question now, from what you have \
+                     already read."
+                        .to_string()
                 } else {
                     match super::parse_tool_arguments(&call["function"]) {
                         Ok(arguments) => {
@@ -264,8 +295,8 @@ impl MyMcpServer {
             }
         }
 
-        // Out of budget, or stalled: one more request with no tools at all, so there is
-        // nothing left to call — research's ending, for research's reason.
+        // Out of time or lookups, or stalled: one more request with no tools at all, so there
+        // is nothing left to call — research's ending, for research's reason.
         messages.push(json!({
             "role": "user",
             "content": format!(
@@ -409,14 +440,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_lookup_budget_stops_a_librarian_that_never_answers() {
+    async fn the_lookup_backstop_stops_a_librarian_that_loops_on_instant_lookups() {
         let dir = library_with_select("library-tool-budget");
         let (url, served) = serve_sequence(&[SEARCHES]).await;
         let answer = server_at(url, dir.path()).run_library(dir.path(), "q").await;
 
+        // A local server answers in milliseconds, so time never runs out here: the count does.
         // One request per lookup, then the forced answer asked with no tools.
-        assert_eq!(*served.lock().unwrap(), LOOKUP_BUDGET + 1);
+        assert_eq!(*served.lock().unwrap(), MAX_LOOKUPS + 1);
         assert!(answer.contains("could not produce an answer"), "{}", answer);
+    }
+
+    #[tokio::test]
+    async fn out_of_time_the_librarian_answers_after_its_first_lookup() {
+        let dir = library_with_select("library-tool-time");
+        let (url, served) = serve_sequence(&[SEARCHES, ANSWERS]).await;
+        let answer = server_at(url, dir.path())
+            .run_library_within(dir.path(), "q", Duration::ZERO)
+            .await;
+
+        // No time at all still buys the first lookup — without it there is nothing to answer
+        // from — and then the forced answer, and nothing else.
+        assert_eq!(*served.lock().unwrap(), 2);
+        assert!(answer.contains("tokio::pin!"), "{}", answer);
     }
 
     #[tokio::test]

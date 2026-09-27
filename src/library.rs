@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 
 /// A section is what the sub-agent reads in one call. Articles are written to be read a
 /// section at a time, so this only bites on a section that should have been split; the cap
-/// is `research`'s page cap, for the same reason — ten of these must fit in a 32k window.
+/// is `research`'s page cap, for the same reason — every round re-sends every section read so
+/// far, and the librarian works against a clock.
 pub(crate) const MAX_SECTION_CHARS: usize = 8000;
 
 /// How many sections one search returns.

@@ -8,8 +8,10 @@
 //! search, and then the paragraph that actually answers it.
 //!
 //! Doing that in the main conversation costs the main conversation. Every search result
-//! block and every 60 KB page stays in the history for the rest of the session, and three
-//! or four of them are enough to push a 32k model's own working memory out of the window.
+//! block and every 60 KB page stays in the history for the rest of the session. On the
+//! 128k–262k windows haico runs against they would fit; the cost is everything after — each
+//! later request carries them, a lost prefix cache re-prefills them, compaction comes sooner,
+//! and a small model's attention is spread over pages about a question settled long ago.
 //! Here they land in a message list that is thrown away when the call returns; what the
 //! model gets back is the answer and the URLs it came from, a few hundred tokens at most.
 //!
@@ -46,8 +48,8 @@ const MAX_ROUNDS: usize = LOOKUP_BUDGET + 2;
 
 // How much of one page the sub-agent is shown. `web_get` already caps a page at 64 KB,
 // which is right for the main model reading one page deliberately and far too much here:
-// ten of them would fill a 32k window on their own and the loop would die of the very
-// thing it exists to prevent.
+// every round re-sends every page read so far, so ten full pages make each round slower than
+// the last, on a question that usually turns on one paragraph.
 const MAX_PAGE_CHARS: usize = 8000;
 
 // How long the returned answer may be. A research call that hands back three pages of prose
