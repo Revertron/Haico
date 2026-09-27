@@ -63,6 +63,11 @@ pub(crate) struct Article {
     /// They are how a build is pointed at an article when no crate is involved at all: a
     /// borrow-checker error names no crate and depends on none, so nothing else could.
     pub(crate) codes: Vec<String>,
+    /// Phrases from error headlines the article explains, from the frontmatter's `matches`
+    /// (separated by `;`), compared case-insensitively. For the errors a code can't pick out:
+    /// "cannot be sent between threads safely" is E0277, which is also every other unsatisfied
+    /// trait bound, and "lifetime may not live long enough" has no code at all.
+    pub(crate) matches: Vec<String>,
     pub(crate) versions: Option<String>,
     pub(crate) summary: String,
     pub(crate) sections: Vec<Section>,
@@ -124,11 +129,16 @@ impl Library {
     }
 
     /// The names of the articles' subjects (crate, else topic) that explain any of these error
-    /// codes, deduplicated, in library order.
-    pub(crate) fn subjects_for_codes(&self, codes: &[String]) -> Vec<String> {
+    /// headlines — by one of the article's codes, or one of its phrases — deduplicated, in
+    /// library order.
+    pub(crate) fn subjects_for_errors(&self, errors: &[String]) -> Vec<String> {
+        let codes = error_codes(&errors.join("\n"));
+        let lowered: Vec<String> = errors.iter().map(|e| e.to_lowercase()).collect();
         let mut out: Vec<String> = Vec::new();
         for article in &self.articles {
-            if article.codes.iter().any(|c| codes.contains(c)) {
+            let by_code = article.codes.iter().any(|c| codes.contains(c));
+            let by_phrase = article.matches.iter().any(|m| lowered.iter().any(|e| e.contains(m.as_str())));
+            if by_code || by_phrase {
                 let name = article.subject();
                 if !name.is_empty() && !out.contains(&name) {
                     out.push(name);
@@ -435,6 +445,11 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
         None => id.rsplit_once('/').map(|(dir, _)| dir.split('/').next().unwrap_or(dir).to_string()).unwrap_or_default(),
     };
     let codes = front_value(front, "codes").map(|list| error_codes(&list)).unwrap_or_default();
+    let matches = front_value(front, "matches")
+        .map(|list| {
+            list.split(';').map(|m| m.trim().to_lowercase()).filter(|m| !m.is_empty()).collect()
+        })
+        .unwrap_or_default();
 
     let summary = front_value(front, "summary")
         .or_else(|| front_value(front, "description"))
@@ -456,6 +471,7 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
         crate_name,
         topic,
         codes,
+        matches,
         versions: front_value(front, "versions").filter(|v| !v.is_empty()),
         summary,
         sections,
@@ -1018,8 +1034,9 @@ mod tests {
         write(dir.path(), "mio/poll", "# Polling\n\nx\n");
         let library = Library::load(dir.path());
 
-        assert_eq!(library.subjects_for_codes(&["E0502".into()]), ["Rust ownership and borrowing"]);
-        assert!(library.subjects_for_codes(&["E0308".into()]).is_empty());
+        let errors = |e: &str| vec![e.to_string()];
+        assert_eq!(library.subjects_for_errors(&errors("error[E0502]: cannot borrow")), ["Rust ownership and borrowing"]);
+        assert!(library.subjects_for_errors(&errors("error[E0308]: mismatched types")).is_empty());
         // A topic is not a crate: nothing goes looking for it in Cargo.toml or in paths.
         assert_eq!(library.crates(), ["mio"]);
 
@@ -1032,6 +1049,24 @@ mod tests {
             error_codes("error[E0502]: cannot borrow\nerror[E0502]: again\nerror[e0499]: x E123 E12345"),
             ["E0502", "E0499"]
         );
+    }
+
+    #[test]
+    fn a_phrase_picks_out_an_error_its_code_cannot() {
+        let dir = TempDir::new("library-matches");
+        write(
+            dir.path(),
+            "rust/threads",
+            "---\ntopic: Rust threads\nmatches: cannot be sent between threads safely; Cannot be shared between threads safely\n---\n# Threads\n\nx\n",
+        );
+        let library = Library::load(dir.path());
+        let send = vec!["error[E0277]: `Rc<i32>` cannot be sent between threads safely".to_string()];
+        let shared = vec!["error[E0277]: `RefCell<u8>` CANNOT be shared between threads safely".to_string()];
+        let other = vec!["error[E0277]: the trait bound `Foo: Display` is not satisfied".to_string()];
+        assert_eq!(library.subjects_for_errors(&send), ["Rust threads"]);
+        assert_eq!(library.subjects_for_errors(&shared), ["Rust threads"]);
+        // The same code, a different error: not this article's.
+        assert!(library.subjects_for_errors(&other).is_empty());
     }
 
     #[test]

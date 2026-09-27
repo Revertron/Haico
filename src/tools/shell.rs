@@ -587,7 +587,7 @@ impl MyMcpServer {
             // Articles that explain these error codes first: a code is the most direct evidence
             // there is, and for the language itself (a borrow error names no crate and depends
             // on none) it is the only evidence there is.
-            let mut subjects = library.subjects_for_codes(&crate::library::error_codes(&errors.join("\n")));
+            let mut subjects = library.subjects_for_errors(&errors);
             for name in crates {
                 if !subjects.contains(&name) {
                     subjects.push(name);
