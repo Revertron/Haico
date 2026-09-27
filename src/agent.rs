@@ -121,6 +121,10 @@ pub(crate) struct Agent {
     /// at exactly the points `memory_index` is and for its reason: a skill dropped in
     /// mid-turn is not worth re-prefilling the whole conversation for.
     pub(crate) skill_index: Option<String>,
+    /// The library index — one line per crate — refreshed with the other two. The library
+    /// lives in haico's store rather than the project, but that changes nothing about when
+    /// rewriting the system message is affordable.
+    pub(crate) library_index: Option<String>,
     pub(crate) session_path: Option<PathBuf>,
     /// Approvals for this session only, never persisted, so resuming never
     /// silently carries over permission to run something.
@@ -164,6 +168,7 @@ impl Agent {
         let user_context = load_user_context();
         let memory_index = memory::index_block(cwd);
         let skill_index = skills::index_block(&skills::roots(cwd));
+        let library_index = server.library_root.as_deref().and_then(crate::library::index_block);
 
         // Before the prompt, not after: the prompt names the scratch directory, and the
         // file tools can only write there because the workspace was told about it.
@@ -179,6 +184,7 @@ impl Agent {
             user_context.as_deref(),
             project_context.as_ref(),
             skill_index.as_deref(),
+            library_index.as_deref(),
             memory_index.as_deref(),
             &workspace,
         );
@@ -203,6 +209,7 @@ impl Agent {
             user_context,
             memory_index,
             skill_index,
+            library_index,
             // Never in a test binary. `run_turn` saves after every turn, so an agent
             // built by a test wrote a session named for whatever directory the suite
             // was run in straight into the user's own store, among their real saved
@@ -291,6 +298,7 @@ impl Agent {
         // the last conversation remembered is about to be the only trace of it left.
         self.memory_index = memory::index_for_cwd();
         self.skill_index = skills::index_for_cwd();
+        self.library_index = self.server.library_root.as_deref().and_then(crate::library::index_block);
         self.recompose_system_prompt();
 
         self.messages.clear();
@@ -312,6 +320,7 @@ impl Agent {
             self.user_context.as_deref(),
             self.project_context.as_ref(),
             self.skill_index.as_deref(),
+            self.library_index.as_deref(),
             self.memory_index.as_deref(),
             &self.workspace,
         );
@@ -371,6 +380,7 @@ impl Agent {
         self.project_context = load_project_context();
         self.memory_index = memory::index_for_cwd();
         self.skill_index = skills::index_for_cwd();
+        self.library_index = self.server.library_root.as_deref().and_then(crate::library::index_block);
         self.rebuild_system_prompt();
         Ok(target)
     }
@@ -398,6 +408,7 @@ impl Agent {
     pub(crate) fn refresh_memory(&mut self) {
         self.memory_index = memory::index_for_cwd();
         self.skill_index = skills::index_for_cwd();
+        self.library_index = self.server.library_root.as_deref().and_then(crate::library::index_block);
         self.rebuild_system_prompt();
     }
 
@@ -1607,10 +1618,10 @@ pub(crate) async fn run_turn(
                     // line of the result, cut to fit. The result itself is kept behind it
                     // now rather than thrown away, and Ctrl+O opens it.
                     //
-                    // research is the exception: it has already printed its progress and
-                    // its whole answer while it ran, so a summary here would repeat the
-                    // answer's first line immediately underneath the answer.
-                    if tool_name != "research" {
+                    // research and library are the exception: each has already printed its
+                    // progress and its whole answer while it ran, so a summary here would
+                    // repeat the answer's first line immediately underneath the answer.
+                    if tool_name != "research" && tool_name != "library" {
                         let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
                     }
 
@@ -1734,6 +1745,7 @@ pub(crate) async fn run_turn(
                     agent.user_context.as_deref(),
                     agent.project_context.as_ref(),
                     agent.skill_index.as_deref(),
+                    agent.library_index.as_deref(),
                     agent.memory_index.as_deref(),
                     &agent.workspace,
                 );

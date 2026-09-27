@@ -55,6 +55,8 @@ pub(crate) enum Caller {
     Main,
     /// The `research` tool's own loop.
     Research,
+    /// The `library` tool's own loop.
+    Library,
     /// Auto mode judging a gated call.
     Reviewer,
     /// The reasoning policy compressing a chain of thought.
@@ -70,6 +72,7 @@ impl Caller {
         match self {
             Caller::Main => "main",
             Caller::Research => "research",
+            Caller::Library => "library",
             Caller::Reviewer => "reviewer",
             Caller::Compressor => "compressor",
             Caller::Compactor => "compactor",

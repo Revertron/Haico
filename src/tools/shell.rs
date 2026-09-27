@@ -516,12 +516,57 @@ impl MyMcpServer {
         if status.success() {
             Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
         } else {
-            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            let mut text = format!(
                 "Command failed with exit code: {}\n\n{}",
                 status.code().unwrap_or(-1),
                 result_text
-            ))]))
+            );
+            // Taken from the untruncated output: the middle cut above can remove the very
+            // lines that name the crate.
+            let full = format!("{}\n{}", stdout, stderr);
+            if let Some(note) = self.library_note_for_build(&command, &full, params.0.cwd.as_deref()) {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
+            Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
         }
+    }
+
+    // The library note for a failed build, if this failure deserves one.
+    //
+    // Last in the result, where a model reads it straight after the errors it is about. The
+    // library's own index in the system prompt already says what it covers; this is the
+    // moment that index is for, and a small model mid-build does not make the connection
+    // itself — it goes back to editing from the same wrong idea of the API that caused the
+    // errors.
+    fn library_note_for_build(&self, command: &str, output: &str, cwd: Option<&str>) -> Option<String> {
+        let root = self.library_root.as_ref()?;
+        if !crate::library::is_cargo_build(command) {
+            return None;
+        }
+        let errors = crate::library::compile_errors(output);
+        if errors.is_empty() {
+            return None;
+        }
+
+        let library = crate::library::Library::load(root);
+        let dir = match cwd.filter(|c| !c.trim().is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::current_dir().ok()?,
+        };
+        let dependencies = std::fs::read_to_string(dir.join("Cargo.toml"))
+            .map(|manifest| crate::library::cargo_dependencies(&manifest))
+            .unwrap_or_default();
+        let crates = crate::library::involved_crates(&library.crates(), output, &dependencies);
+        let note = crate::library::build_failure_note(&crates, &errors)?;
+
+        // Recorded only once there is a note to give, so an error set that got none (no
+        // covered crate involved) does not use up the one it would get later.
+        let fingerprint = super::content_hash(errors.join("\n").as_bytes());
+        if !self.library_nudged.lock().unwrap().insert(fingerprint) {
+            return None;
+        }
+        Some(note)
     }
 
     #[tool(
@@ -818,6 +863,54 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[test]
+    fn a_failed_build_is_pointed_at_the_library_once_per_set_of_errors() {
+        let library = TempDir::new("shell-library-note");
+        std::fs::create_dir_all(library.join("mio")).unwrap();
+        std::fs::write(library.join("mio/poll.md"), "# Polling
+
+x
+").unwrap();
+        let project = TempDir::new("shell-library-project");
+        std::fs::write(project.join("Cargo.toml"), "[dependencies]
+mio = \"1\"
+").unwrap();
+        let cwd = project.path().to_str();
+
+        let mut server = test_server();
+        let output = "error[E0599]: no method named `poll` found for struct `Poll`
+error: could not compile `x`";
+        // No library in this session: nothing to point at.
+        assert!(server.library_note_for_build("cargo build", output, cwd).is_none());
+
+        server.library_root = Some(library.path().to_path_buf());
+        // Not a build, or a build that failed without compile errors: no note.
+        assert!(server.library_note_for_build("cargo fmt --check", output, cwd).is_none());
+        assert!(server
+            .library_note_for_build("cargo test", "error: test failed, to rerun pass", cwd)
+            .is_none());
+
+        // mio is only a dependency here, never named in the error — that is enough.
+        let note = server.library_note_for_build("cargo build", output, cwd).unwrap();
+        assert!(note.contains("articles on mio"), "{}", note);
+        assert!(note.contains("E0599"), "{}", note);
+
+        // The same errors again get no second note; different ones do.
+        assert!(server.library_note_for_build("cargo check", output, cwd).is_none());
+        let other = "error[E0425]: cannot find value `events` in this scope";
+        assert!(server.library_note_for_build("cargo build", other, cwd).is_some());
+
+        // A project that does not use mio, with errors that do not name it, gets nothing.
+        let unrelated = TempDir::new("shell-library-unrelated");
+        std::fs::write(unrelated.join("Cargo.toml"), "[dependencies]
+serde = \"1\"
+").unwrap();
+        let third = "error[E0308]: mismatched types";
+        assert!(server
+            .library_note_for_build("cargo build", third, unrelated.path().to_str())
+            .is_none());
+    }
 
     async fn run(
         server: &crate::MyMcpServer,

@@ -27,6 +27,11 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     // the path is never the model's to choose. Whatever the skill then says to run still
     // goes through run_command's own gate, so loading one grants nothing.
     "skill",
+    // Reads articles from haico's own store, found by id among the ones loaded — never a
+    // path the model chose — and sends nothing off the machine; its librarian is the same
+    // model on the same server. Unlike research, there is nothing here to ask about, and
+    // being asked would be the one thing that stops a model reaching for it mid-build.
+    "library",
     // A write, and the only one on this list. It is here because the flow it exists for
     // is the user saying "remember this" — prompting for permission to do the thing that
     // was just asked for is the question-about-a-question `ask_user` is exempted for. It

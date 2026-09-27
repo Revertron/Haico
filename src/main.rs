@@ -18,6 +18,7 @@ mod debug;
 mod gui;
 mod headless;
 mod input;
+mod library;
 mod llm;
 #[cfg(feature = "gui")]
 mod markdown;

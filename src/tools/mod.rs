@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 mod basics;
 mod crates;
 mod files;
+mod library;
 mod memory;
 mod research;
 mod shell;
@@ -28,6 +29,7 @@ mod web;
 pub(crate) use basics::*;
 pub(crate) use crates::*;
 pub(crate) use files::*;
+pub(crate) use library::*;
 pub(crate) use memory::*;
 pub(crate) use research::*;
 pub(crate) use shell::*;
@@ -59,6 +61,15 @@ pub(crate) struct MyMcpServer {
     // True in the REPL, false in MCP server mode. Gates progress output: run_command echoes
     // a long command's output as it arrives, which is noise for an MCP host.
     pub(crate) interactive: bool,
+    // The library the `library` tool reads, or None when that tool is off — no LLM to run
+    // its librarian, or no articles to read. `run_command` checks it too: a failed build is
+    // only pointed at the library when there is one to point at.
+    pub(crate) library_root: Option<PathBuf>,
+    // Fingerprints of the error sets a failed build has already been told to look up.
+    // Once per distinct set of errors: a model rebuilding against the same errors has
+    // either asked already or decided not to, and the same note under every rebuild is how
+    // a model learns to skip notes.
+    pub(crate) library_nudged: Arc<Mutex<std::collections::HashSet<u64>>>,
 }
 
 // A file's contents immediately before a tool changed it.
@@ -131,6 +142,7 @@ impl MyMcpServer {
             + Self::memory_router()
             + Self::skills_router()
             + Self::research_router()
+            + Self::library_router()
             + Self::web_router()
             + Self::shell_router()
             + Self::crates_router();
@@ -147,6 +159,15 @@ impl MyMcpServer {
         if !interactive {
             tool_router.remove_route("skill");
         }
+        // The library needs a model to run its librarian and articles for it to read. Off
+        // in tests unless a test sets it, like `Agent::new`'s session path: a suite that read
+        // the user's own store would pass or fail by what happens to be in it.
+        let library_root = crate::library::user_dir()
+            .filter(|_| expose_web_fetch && !cfg!(test))
+            .filter(|root| !crate::library::Library::load(root).is_empty());
+        if library_root.is_none() {
+            tool_router.remove_route("library");
+        }
         Self {
             tool_router,
             llm_client,
@@ -157,6 +178,8 @@ impl MyMcpServer {
             checkpoints: Arc::new(Mutex::new(Vec::new())),
             background: Arc::new(Mutex::new(BackgroundJobs::default())),
             interactive,
+            library_root,
+            library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -380,6 +403,10 @@ impl MyMcpServer {
             "research" => {
                 let params: ResearchParams = serde_json::from_value(arguments)?;
                 self.research(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "library" => {
+                let params: LibraryParams = serde_json::from_value(arguments)?;
+                self.library(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "remember" => {
                 let params: RememberParams = serde_json::from_value(arguments)?;

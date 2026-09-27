@@ -207,7 +207,7 @@ pub(crate) fn invocation(skill: &Skill, body: &str, args: Option<&str>) -> Strin
 }
 
 /// Split `---`-fenced frontmatter from the body. No frontmatter is an empty one.
-fn split_frontmatter(text: &str) -> (&str, &str) {
+pub(crate) fn split_frontmatter(text: &str) -> (&str, &str) {
     let text = text.trim_start_matches('\u{feff}');
     if let Some(rest) = text.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
@@ -226,7 +226,7 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
 /// Not a YAML parser, and not trying to be: it covers what `SKILL.md` files actually contain —
 /// a plain value, a quoted one, or a `>`/`|` block with its lines indented beneath. Pulling in
 /// a YAML dependency for two keys would be the bigger risk of the two.
-fn front_value(front: &str, key: &str) -> Option<String> {
+pub(crate) fn front_value(front: &str, key: &str) -> Option<String> {
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
         let Some((k, v)) = line.split_once(':') else {

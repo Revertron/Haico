@@ -145,6 +145,7 @@ pub(crate) fn compose_system_prompt(
     user_context: Option<&str>,
     project_context: Option<&(String, String)>,
     skills: Option<&str>,
+    library: Option<&str>,
     memory: Option<&str>,
     workspace: &Workspace,
 ) -> Option<String> {
@@ -188,6 +189,19 @@ pub(crate) fn compose_system_prompt(
             "# Skills",
             "Instructions for particular kinds of task, one line each saying when it applies.              When the user's request matches one, call `skill` with its name before starting              and follow what it returns.",
             skills,
+        );
+    }
+
+    // Next to skills and for the same reason claiming no precedence: it says what the
+    // `library` tool knows about, not what to do. It is the half of the library's nudge
+    // that works before anything has gone wrong — a model that sees "tokio" listed here
+    // can ask before writing the code, rather than only after the build fails.
+    if let Some(library) = library {
+        append_section(
+            &mut content,
+            "# Library",
+            "Articles on these crates are in haico's library, one line per crate. When you              write code against one of them and are not certain of its API, or a build fails              with errors involving one, call `library` with a specific question before              guessing.",
+            library,
         );
     }
 
@@ -542,6 +556,7 @@ mod tests {
             Some("USER RULES"),
             Some(&project),
             Some("- a-skill - SKILLFUL"),
+            Some("- tokio: LIBRARIAN"),
             Some("- a-remembered-fact - REMEMBERED"),
             &ws(),
         )
@@ -570,6 +585,11 @@ mod tests {
         // either: a skill is how to do one kind of task, not a rule that outranks the user's.
         let skills = both.find("SKILLFUL").unwrap();
         assert!(proj < skills && skills < memory, "skills out of place: {}", both);
+        // The library sits between skills and memory, claiming no precedence either.
+        let library = both.find("LIBRARIAN").unwrap();
+        assert!(skills < library && library < memory, "library out of place: {}", both);
+        let section = &both[both.find("# Library").unwrap()..both.find("# Project memory").unwrap()];
+        assert!(!section.contains("takes precedence"), "got: {}", section);
         let section = &both[both.find("# Skills").unwrap()..both.find("# Project memory").unwrap()];
         assert!(!section.contains("takes precedence"), "got: {}", section);
         let section = &both[both.find("# Project memory").unwrap()..];
@@ -578,7 +598,7 @@ mod tests {
         // Alone it is still a system message, and without anything above it the sentence
         // about taking precedence is left out.
         let alone =
-            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, None, None, &ws())
+            compose_system_prompt(None, "some-model", false, Some("USER RULES"), None, None, None, None, &ws())
                 .expect("the user's own file is enough on its own");
         assert!(alone.starts_with("# User instructions"), "got: {}", alone);
         assert!(!alone.contains("takes precedence"), "got: {}", alone);

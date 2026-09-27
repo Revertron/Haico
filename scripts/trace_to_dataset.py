@@ -54,7 +54,7 @@ import sys
 from collections import Counter, OrderedDict
 from datetime import datetime
 
-CALLERS = ["main", "research", "reviewer", "compressor", "compactor", "summarizer"]
+CALLERS = ["main", "research", "library", "reviewer", "compressor", "compactor", "summarizer"]
 
 
 # --------------------------------------------------------------------------- reading
