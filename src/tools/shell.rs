@@ -508,27 +508,32 @@ impl MyMcpServer {
             );
         }
 
+        // Decided from the output, not the exit status. Models pipe builds through a filter
+        // (`cargo test 2>&1 | tail -50`), and a pipeline's status is its last command's: the
+        // first run this note was built for piped every build through `tail`, came back
+        // "successful" with a screen of compile errors each time, and never saw the note once.
+        // Taken from the untruncated output: the middle cut below can remove the very lines
+        // that name the crate.
+        let full = format!("{}\n{}", stdout, stderr);
+        let note = self.library_note_for_build(&command, &full, params.0.cwd.as_deref());
+
         // Cut in the middle, not at the end: a build says what went wrong last.
         if result_text.len() > MAX_OUTPUT {
             result_text = truncate_middle(&result_text, MAX_OUTPUT);
+        }
+        if let Some(note) = note {
+            result_text.push_str("\n\n");
+            result_text.push_str(&note);
         }
 
         if status.success() {
             Ok(CallToolResult::success(vec![ContentBlock::text(result_text)]))
         } else {
-            let mut text = format!(
+            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Command failed with exit code: {}\n\n{}",
                 status.code().unwrap_or(-1),
                 result_text
-            );
-            // Taken from the untruncated output: the middle cut above can remove the very
-            // lines that name the crate.
-            let full = format!("{}\n{}", stdout, stderr);
-            if let Some(note) = self.library_note_for_build(&command, &full, params.0.cwd.as_deref()) {
-                text.push_str("\n\n");
-                text.push_str(&note);
-            }
-            Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+            ))]))
         }
     }
 
@@ -550,9 +555,14 @@ impl MyMcpServer {
         }
 
         let library = crate::library::Library::load(root);
+        // The explicit cwd, then a leading `cd <dir> &&` — which is how models usually say
+        // where to build — then the process's own directory.
         let dir = match cwd.filter(|c| !c.trim().is_empty()) {
             Some(dir) => PathBuf::from(dir),
-            None => std::env::current_dir().ok()?,
+            None => match crate::library::leading_cd(command) {
+                Some(dir) => dir,
+                None => std::env::current_dir().ok()?,
+            },
         };
         let dependencies = std::fs::read_to_string(dir.join("Cargo.toml"))
             .map(|manifest| crate::library::cargo_dependencies(&manifest))
@@ -863,6 +873,24 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_build_piped_through_a_filter_still_gets_the_note() {
+        // `cargo test 2>&1 | tail` exits 0 whatever cargo said. The stand-in prints a compile
+        // error and ends in a successful command whose words make it look like a cargo build.
+        let library = TempDir::new("shell-library-piped");
+        std::fs::create_dir_all(library.join("mio")).unwrap();
+        std::fs::write(library.join("mio/poll.md"), "# Polling
+
+x
+").unwrap();
+        let mut server = test_server();
+        server.library_root = Some(library.path().to_path_buf());
+
+        let (ok, out) = run(&server, "echo error[E0599]: no method on mio::Poll && echo cargo build", None, None).await;
+        assert!(ok, "the stand-in should exit 0: {}", out);
+        assert!(out.contains("articles on mio"), "got: {}", out);
+    }
 
     #[test]
     fn a_failed_build_is_pointed_at_the_library_once_per_set_of_errors() {

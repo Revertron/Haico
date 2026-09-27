@@ -689,6 +689,16 @@ pub(crate) fn is_cargo_build(command: &str) -> bool {
     })
 }
 
+/// The directory a command starts by moving into: `cd app && cargo build`, `cd /d "C:\x y" && ..`.
+/// Only a leading `cd` joined by `&&` or `;`, since that is the one whose effect reaches the
+/// rest of the line.
+pub(crate) fn leading_cd(command: &str) -> Option<PathBuf> {
+    let re = regex::Regex::new(r#"^\s*cd\s+(?:/d\s+)?(?:"([^"]+)"|'([^']+)'|([^\s&;|]+))\s*(?:&&|;)"#).ok()?;
+    let caps = re.captures(command)?;
+    let dir = caps.get(1).or(caps.get(2)).or(caps.get(3))?.as_str();
+    Some(PathBuf::from(dir))
+}
+
 /// The library's crates that a failed build involves: named in the errors, or depended on
 /// by the project being built. Errors first, because a crate named in the error itself is
 /// the likelier culprit.
@@ -897,6 +907,16 @@ error: could not compile `x` (bin \"x\")\n";
         assert!(!is_cargo_build("cargo fmt"));
         assert!(!is_cargo_build("echo cargo"));
         assert!(!is_cargo_build("cargo add tokio"));
+    }
+
+    #[test]
+    fn a_leading_cd_names_the_build_directory() {
+        assert_eq!(leading_cd("cd app && cargo build"), Some(PathBuf::from("app")));
+        assert_eq!(leading_cd(r#"cd /d "C:\my dir" && cargo test"#), Some(PathBuf::from(r"C:\my dir")));
+        assert_eq!(leading_cd(r"  cd E:\x\y; cargo test"), Some(PathBuf::from(r"E:\x\y")));
+        assert_eq!(leading_cd("cargo build"), None);
+        assert_eq!(leading_cd("cd app"), None);
+        assert_eq!(leading_cd("echo cd app && cargo build"), None);
     }
 
     #[test]
