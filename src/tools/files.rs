@@ -486,7 +486,7 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use to create a brand-new file or completely replace an existing file's contents; to change only part of a file, prefer Edit instead. Writes a file to the filesystem, overwriting existing files (Read first for existing files). Prefer editing over creating new files. Don't proactively create docs/READMEs. No emojis unless requested.")]
+    #[tool(description = "Use to create a brand-new file or completely replace an existing file's contents; to change only part of a file, prefer Edit instead. Writes a file to the filesystem, overwriting existing files. An existing file must be read first. Prefer editing over creating new files. Don't proactively create docs/READMEs. No emojis unless requested.")]
     pub(crate) async fn write_file(&self, params: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
@@ -565,7 +565,7 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use to change part of an existing file — fixing a line, renaming a symbol, or adjusting a value — without rewriting the whole file. Performs exact string replacement. Must Read file first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
+    #[tool(description = "Use to change part of an existing file — fixing a line, renaming a symbol, or adjusting a value — without rewriting the whole file. Performs exact string replacement. An existing file must be read first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
     pub(crate) async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
         let file_path = PathBuf::from(&params.0.file_path);
 
