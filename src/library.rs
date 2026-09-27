@@ -706,31 +706,65 @@ pub(crate) fn is_cargo_build(command: &str) -> bool {
     })
 }
 
-/// What a test run that compiled says went wrong: tests that failed, and tests libtest reported
-/// as still running after a minute.
+/// What a test run that compiled says went wrong: tests that failed, tests libtest reported as
+/// still running after a minute, and the panic that best says why.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct TestTrouble {
     pub(crate) failed: Vec<String>,
     pub(crate) hung: Vec<String>,
+    pub(crate) panic: Option<String>,
 }
 
+/// Read from every part of libtest's output that survives a `| tail`: the per-test
+/// `test name ... FAILED` lines scroll off first, so the closing `failures:` list is read too —
+/// the second run this was built for piped its tests through `tail -40`, and the only failing
+/// run it had was reported by that list alone.
 pub(crate) fn test_trouble(output: &str) -> TestTrouble {
     let mut trouble = TestTrouble::default();
-    for line in output.lines() {
-        let line = line.trim();
+    let add = |list: &mut Vec<String>, name: &str| {
+        let name = name.trim().to_string();
+        if !name.is_empty() && !list.contains(&name) {
+            list.push(name);
+        }
+    };
+    let mut in_list = false;
+    let mut panics: Vec<(bool, String)> = Vec::new();
+    let mut lines = output.lines().peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if in_list {
+            // The list is bare names, four spaces in, ending at a blank line.
+            if raw.starts_with("    ") && !line.is_empty() && !line.contains(' ') {
+                add(&mut trouble.failed, line);
+                continue;
+            }
+            in_list = false;
+        }
+        if line == "failures:" {
+            in_list = true;
+            continue;
+        }
+        if let Some((_, place)) = line.split_once(" panicked at ") {
+            // The message is the next line. A panic in the code under test says more than one in
+            // the test that noticed it (`client thread panicked: Any { .. }`), so those come first.
+            if let Some(message) = lines.peek().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                let in_tests = place.starts_with("tests") || place.contains("/tests/") || place.contains("\\tests\\");
+                panics.push((in_tests, message.to_string()));
+            }
+            continue;
+        }
         let Some(rest) = line.strip_prefix("test ") else { continue };
         if let Some(name) = rest.strip_suffix(" ... FAILED") {
-            let name = name.trim().to_string();
-            if !trouble.failed.contains(&name) {
-                trouble.failed.push(name);
-            }
+            add(&mut trouble.failed, name);
         } else if let Some((name, _)) = rest.split_once(" has been running for over") {
-            let name = name.trim().to_string();
-            if !trouble.hung.contains(&name) {
-                trouble.hung.push(name);
-            }
+            add(&mut trouble.hung, name);
         }
     }
+    trouble.panic = panics
+        .iter()
+        .find(|(in_tests, _)| !in_tests)
+        .or_else(|| panics.first())
+        .map(|(_, message)| one_line(message, 200));
     trouble
 }
 
@@ -762,7 +796,13 @@ pub(crate) fn runtime_failure_note(crates: &[String], trouble: &TestTrouble, tim
         let which = if trouble.hung.is_empty() { String::new() } else { format!(": {}", listed(&trouble.hung)) };
         (format!("Something hangs{}", which), "a test hangs and never finishes".to_string())
     } else {
-        (format!("Tests fail: {}", listed(&trouble.failed)), format!("test {} fails", trouble.failed[0]))
+        let symptom = match &trouble.panic {
+            // The panic is the searchable part: "I/O source already registered with a Registry"
+            // finds the section on registration rules, a test's name finds nothing.
+            Some(panic) => format!("test {} fails with: {}", trouble.failed[0], panic),
+            None => format!("test {} fails", trouble.failed[0]),
+        };
+        (format!("Tests fail: {}", listed(&trouble.failed)), symptom)
     };
     Some(format!(
         "[haico] {what}, in a project that uses {names}. The library's articles on {names} cover \
@@ -1056,9 +1096,37 @@ test burst ... FAILED\n";
     }
 
     #[test]
+    fn the_tail_of_a_failing_run_still_names_its_tests_and_its_panic() {
+        // Exactly what `cargo test 2>&1 | tail -40` left of a real run: no `... FAILED` lines.
+        let tail = "thread 'quit' (33684) panicked at tests\\server.rs:55:18:\n\
+client thread panicked: Any { .. }\n\
+\n\
+---- line_sent_one_byte_at_a_time stdout ----\n\
+\n\
+thread '<unnamed>' (17664) panicked at src\\lib.rs:102:10:\n\
+failed to register listener: Custom { kind: AlreadyExists, error: \"I/O source already registered with a `Registry`\" }\n\
+\n\
+failures:\n    large_reply_burst\n    line_sent_one_byte_at_a_time\n\
+\n\
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
+        let trouble = test_trouble(tail);
+        assert_eq!(trouble.failed, ["large_reply_burst", "line_sent_one_byte_at_a_time"]);
+        // The panic in src/ wins over the test's own "client thread panicked".
+        let panic = trouble.panic.clone().unwrap();
+        assert!(panic.starts_with("failed to register listener"), "{}", panic);
+
+        let note = runtime_failure_note(&["mio".to_string()], &trouble, false).unwrap();
+        assert!(note.contains("already registered with a `Registry`"), "{}", note);
+
+        // The first `failures:` block holds `---- name stdout ----` sections, not names.
+        let details = "failures:\n\n---- a stdout ----\nboom\n";
+        assert!(test_trouble(details).failed.is_empty());
+    }
+
+    #[test]
     fn the_runtime_note_names_the_symptom() {
         let mio = vec!["mio".to_string()];
-        let hung = TestTrouble { failed: vec![], hung: vec!["oversized".into()] };
+        let hung = TestTrouble { hung: vec!["oversized".into()], ..Default::default() };
         let note = runtime_failure_note(&mio, &hung, false).unwrap();
         assert!(note.contains("Something hangs: oversized"), "{}", note);
         assert!(note.contains("mio: a test hangs and never finishes"), "{}", note);
@@ -1067,7 +1135,7 @@ test burst ... FAILED\n";
         let note = runtime_failure_note(&mio, &TestTrouble::default(), true).unwrap();
         assert!(note.contains("Something hangs, in a project"), "{}", note);
 
-        let failed = TestTrouble { failed: vec!["burst".into()], hung: vec![] };
+        let failed = TestTrouble { failed: vec!["burst".into()], ..Default::default() };
         let note = runtime_failure_note(&mio, &failed, false).unwrap();
         assert!(note.contains("Tests fail: burst"), "{}", note);
         assert!(note.contains("mio: test burst fails"), "{}", note);
