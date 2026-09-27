@@ -942,6 +942,35 @@ pub(crate) fn involved_crates(library_crates: &[String], output: &str, dependenc
     out
 }
 
+/// The subjects a failed build's note names, in the order it names them: whatever explains the
+/// first error, then whatever explains the others, then the crates the other errors name, then
+/// the crates the build merely depends on.
+///
+/// The order matters because the note's example question pairs its first subject with the
+/// first error. Ordered by the library instead, it once suggested asking "ed25519-dalek — how
+/// do I fix: unresolved imports `tokio::sync..`": both crates were involved, and ed25519-dalek
+/// sorts first. Within each group, error codes and phrases come before crate names — a code is
+/// the most direct evidence there is, and for the language itself (a borrow error names no crate
+/// and depends on none) it is the only evidence there is.
+pub(crate) fn subjects_for_build(library: &Library, errors: &[String], crates: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |names: Vec<String>| {
+        for name in names {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    };
+    if let Some(first) = errors.first() {
+        add(library.subjects_for_errors(std::slice::from_ref(first)));
+        add(involved_crates(crates, first, &[]));
+    }
+    add(library.subjects_for_errors(errors));
+    add(involved_crates(crates, &errors.join("\n"), &[]));
+    add(crates.to_vec());
+    out
+}
+
 /// The note added under a failed build's output, or `None` when there is nothing to say.
 ///
 /// It names the crates and quotes the first error as a ready-made question, because a small
@@ -1178,6 +1207,30 @@ Tags: a"), None);
         let empty = TempDir::new("library-empty");
         assert!(index_block(empty.path()).is_none());
         assert!(index_block(&empty.join("missing")).is_none());
+    }
+
+    #[test]
+    fn the_note_leads_with_what_explains_the_first_error() {
+        let dir = TempDir::new("library-first-error");
+        write(dir.path(), "ed25519-dalek/basics", "# Ed25519\n\nx\n");
+        write(dir.path(), "tokio/basics", "# Tokio\n\nx\n");
+        write(dir.path(), "rust/ownership", "---\ntopic: Rust ownership\ncodes: E0382\n---\n# Ownership\n\nx\n");
+        let library = Library::load(dir.path());
+        // The case that was wrong: two crates involved, and the one that sorts first is not the
+        // one the first error is about.
+        let errors = vec![
+            "error[E0432]: unresolved imports `tokio::sync::Mutex`".to_string(),
+            "error[E0382]: borrow of moved value: `key`".to_string(),
+        ];
+        let crates = vec!["ed25519-dalek".to_string(), "tokio".to_string()];
+        let subjects = subjects_for_build(&library, &errors, &crates);
+        assert_eq!(subjects, ["tokio", "Rust ownership", "ed25519-dalek"]);
+        let note = build_failure_note(&subjects, &errors).unwrap();
+        assert!(note.contains("library(question: \"tokio — how do I fix: error[E0432]"), "{}", note);
+
+        // A first error explained by its code leads with the article for that code.
+        let errors = vec![errors[1].clone(), errors[0].clone()];
+        assert_eq!(subjects_for_build(&library, &errors, &crates), ["Rust ownership", "tokio", "ed25519-dalek"]);
     }
 
     #[test]

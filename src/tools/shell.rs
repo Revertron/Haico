@@ -584,15 +584,7 @@ impl MyMcpServer {
             let key = if hanging { "runtime:hang".to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
             (note, key)
         } else {
-            // Articles that explain these error codes first: a code is the most direct evidence
-            // there is, and for the language itself (a borrow error names no crate and depends
-            // on none) it is the only evidence there is.
-            let mut subjects = library.subjects_for_errors(&errors);
-            for name in crates {
-                if !subjects.contains(&name) {
-                    subjects.push(name);
-                }
-            }
+            let subjects = crate::library::subjects_for_build(&library, &errors, &crates);
             (crate::library::build_failure_note(&subjects, &errors)?, errors.join("\n"))
         };
 
