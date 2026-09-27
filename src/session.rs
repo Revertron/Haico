@@ -8,6 +8,7 @@ use crate::util::truncate_at_boundary;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -364,8 +365,18 @@ const REASONING_KEY: &str = "reasoning_content";
 // pronouns that carried the other voice are named rather than left to be inferred from
 // "first person".
 
-const COMPRESS_PROMPT: &str = "The text you are given is your own chain of thought from a \
-     moment ago — not a question, not a request, and nobody is waiting on an answer to it. \
+//
+// The trace goes inside `<trace>` tags, and the prompt names them, because a bare trace as the
+// whole user turn was read as part of the instruction instead. At temperature 0 and on a trace
+// no different from the ones before it, the compressor concluded "there's no actual chain of
+// thought provided ... the entire content IS the instruction itself" and refused: "There's no
+// prior chain of thought here to condense". Twice in 53 compressions, in two separate runs, and
+// the refusal was stored as the model's thinking both times. The tags leave nothing to decide
+// about where the instruction ends and the text begins.
+
+const COMPRESS_PROMPT: &str = "The text inside <trace> tags in the next message is your own \
+     chain of thought from a moment ago — not a question, not a request, and nobody is waiting \
+     on an answer to it. \
      Rewrite it shorter so you can carry on from it without re-reading it. Do not solve the \
      problem it is about, do not propose a fix, do not address anyone. Keep only: approaches \
      you tried or considered and then rejected, and why; facts you established along the \
@@ -514,7 +525,10 @@ pub(crate) async fn apply_reasoning(
                     Caller::Compressor,
                     vec![
                         json!({"role": "system", "content": COMPRESS_PROMPT}),
-                        json!({"role": "user", "content": original.clone()}),
+                        json!({"role": "user", "content": format!(
+                            "The chain of thought to shorten:\n\n<trace>\n{}\n</trace>",
+                            original
+                        )}),
                     ],
                     None,
                 )
@@ -535,11 +549,45 @@ pub(crate) async fn apply_reasoning(
             if summary.is_empty() || after >= before {
                 return None;
             }
+            if !reads_as_a_summary(&original, &summary) {
+                crate::debug::log("reasoning compression rejected, not a summary of the trace", &summary);
+                return None;
+            }
 
             message[REASONING_KEY] = json!(summary);
             Some(ReasoningOutcome::Compressed { before, after })
         }
     }
+}
+
+// Whether a compressor's reply is a summary of the trace rather than something else — a
+// refusal, an answer to a question the trace was mistaken for, a reply to somebody.
+//
+// Judged by vocabulary: a summary is made of the trace's own words, so nearly all of its
+// longer words appear in the trace, while a reply about the request is made of words about
+// requests. Measured over every compression recorded so far (53, several runs): real summaries
+// share at least 63% of their distinct words of four or more characters with their trace, the
+// two refusals 34% and 42%. Identifiers need no special treatment — `bound_addr` or `E0308`
+// in a summary are exactly the words that come from the trace. A reply too short to carry
+// evidence either way is let through; the length guard above has already seen it.
+
+const MIN_SHARED_WORDS: f64 = 0.5;
+const MIN_WORDS_TO_JUDGE: usize = 8;
+
+fn reads_as_a_summary(original: &str, summary: &str) -> bool {
+    fn words(text: &str) -> HashSet<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| w.chars().count() >= 4)
+            .map(str::to_lowercase)
+            .collect()
+    }
+    let summary_words = words(summary);
+    if summary_words.len() < MIN_WORDS_TO_JUDGE {
+        return true;
+    }
+    let original_words = words(original);
+    let shared = summary_words.iter().filter(|w| original_words.contains(*w)).count();
+    shared as f64 / summary_words.len() as f64 >= MIN_SHARED_WORDS
 }
 
 // The same chars/4 estimate `estimate_tokens` uses, applied to one string rather than to a
@@ -669,13 +717,23 @@ mod tests {
         Box::leak(body.to_string().into_boxed_str())
     }
 
-    // A reply carrying `long` tokens of chain of thought, as the assembler would build it.
+    // A reply carrying `chars` characters of chain of thought, as the assembler would build it.
+    // Words rather than filler: a compression is checked against the trace's vocabulary, and a
+    // trace of one repeated letter has none for a summary to share.
     fn thought(chars: usize) -> serde_json::Value {
         json!({
             "role": "assistant",
             "content": "Done.",
-            "reasoning_content": "z".repeat(chars),
+            "reasoning_content": thinking(chars),
         })
+    }
+
+    fn thinking(chars: usize) -> String {
+        "Tried the regex path first, but it was too slow on long inputs, so the parser has to be          written by hand. "
+            .chars()
+            .cycle()
+            .take(chars)
+            .collect()
     }
 
 
@@ -746,7 +804,10 @@ mod tests {
         // The trace itself is what the compressor was asked about, not a summary of the
         // conversation around it: this request has no history in it at all.
         let sent = sent.lock().unwrap().clone();
-        assert!(sent.contains(&"z".repeat(100)), "the trace was not sent");
+        assert!(sent.contains(&thinking(300)), "the trace was not sent");
+        // Inside the tags the prompt names, so it cannot be taken for part of the instruction.
+        // (The body is JSON, so the newline arrives escaped.)
+        assert!(sent.contains(r"<trace>\nTried the regex path"), "the trace was not in its tags");
 
         let stored = message["reasoning_content"].as_str().unwrap();
         assert_eq!(stored, "Tried the regex path, too slow.");
@@ -755,7 +816,7 @@ mod tests {
         assert_eq!(message["content"], "Done.");
         // Both figures come back, not a sentence: the transcript line and the session
         // totals want different things out of the same result.
-        let before = crate::estimate_reasoning_tokens(&"z".repeat(8_000));
+        let before = crate::estimate_reasoning_tokens(&thinking(8_000));
         let after = crate::estimate_reasoning_tokens("Tried the regex path, too slow.");
         assert_eq!(note, Some(ReasoningOutcome::Compressed { before, after }));
     }
@@ -778,6 +839,46 @@ mod tests {
         assert_eq!(message["reasoning_content"].as_str().unwrap().len(), 8_000);
     }
 
+
+    // The trace and the reply of the compression that went wrong, cut down: the compressor took
+    // the trace for part of its instruction and refused, and the refusal was stored as thinking.
+    const REFUSED_TRACE: &str = "Now I have all the API details. Let me also verify HKDF 0.13 API         quickly, and confirm getrandom 0.4 fill API.
+
+HKDF 0.13: `Hkdf::<Sha256>::new(Some(salt),         ikm)`, `.expand(info, &mut okm)`. Also `.prk()`.
+
+getrandom 0.4: `getrandom::fill(&mut buf)`         returns Result. Let me verify quickly but I'm fairly confident. Actually getrandom 0.4 API —         `getrandom::fill` exists. Let me just write the code and let cargo check tell me.
+
+Now,         design decisions to finalize:
+
+**Keygen**: Ed25519 identity key. Secret stored as raw 32         bytes (seed). Public key = verifying_key. The binary writes secret key file — I'll store the         32-byte seed in the file. Then `--key <file>` reads 32 bytes and constructs         SigningKey::from_bytes. That's clean.
+
+Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. Good.
+
+**Node**:
+- `new(identity: SigningKey, trusted:         HashSet<VerifyingKey>, listen_addr: SocketAddr) -> Node`
+- The task says a node is created         from those two plus a listen address. Should Node own the SigningKey? Yes.";
+    const REFUSAL: &str = "There's no prior chain of thought here to condense — this is the first         turn in the conversation, so nothing preceded it for me to shorten. I'm not going to invent         a reasoning trace (e.g., about an Ed25519/X25519 P2P handshake) and rewrite that as if it         were mine; there's no such text supplied. If you paste the actual trace you want         shortened, I'll compress it per your rules.";
+
+    #[test]
+    fn a_refusal_is_not_a_summary_and_a_summary_is() {
+        assert!(!reads_as_a_summary(REFUSED_TRACE, REFUSAL));
+        let summary = "I'll store the identity as the raw 32-byte seed and rebuild it with             SigningKey::from_bytes; keygen prints the verifying key in hex. HKDF 0.13 is             Hkdf::<Sha256>::new(Some(salt), ikm) then expand, and getrandom 0.4 is getrandom::fill,             which cargo check will confirm. Node owns the SigningKey, the trusted HashSet and the             listen address.";
+        assert!(reads_as_a_summary(REFUSED_TRACE, summary));
+        // Too short to judge either way: let through, the length guard has already seen it.
+        assert!(reads_as_a_summary(REFUSED_TRACE, "Going with raw seeds."));
+    }
+
+    #[tokio::test]
+    async fn a_compression_that_is_not_a_summary_keeps_the_original_thought() {
+        let (url, _sent) = serve_once_capturing(reply(REFUSAL), "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+
+        let mut message = json!({"role": "assistant", "content": "Done.", "reasoning_content": REFUSED_TRACE});
+        let note = apply_reasoning(&client, &mut message, Reasoning::Compress, 100).await;
+
+        assert!(note.is_none());
+        assert_eq!(message["reasoning_content"], REFUSED_TRACE);
+    }
 
     #[tokio::test]
     async fn a_compression_that_grew_the_thought_is_rejected() {
