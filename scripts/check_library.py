@@ -5,8 +5,9 @@ article is a compiler error handed out with authority. This checks each block th
 checks doc examples:
 
 - ```rust                      must compile.
-- ```rust,compile_fail,E0599   must FAIL to compile, with that error code. This is how an
-                               article shows the error a model will actually see, and proves it.
+- ```rust,compile_fail,E0599   must FAIL to compile, with that error code (with several, as in
+                               `compile_fail,E0499,E0503`, all of them). This is how an article
+                               shows the error a model will actually see, and proves it.
 - ```rust,ignore / ```text     are not checked (fragments, output, pseudo-code).
 
 Blocks are compiled as edition 2024, what `cargo new` produces. A block without `fn main` is
@@ -58,15 +59,14 @@ def blocks(text: str):
 
 
 def kind(info: str):
-    """('pass'|'fail'|None, expected error code or None)."""
+    """('pass'|'fail'|None, the error codes a compile_fail block must produce)."""
     parts = [p.strip() for p in info.split(",")]
     if not parts or parts[0] != "rust":
         return None, None
     if "ignore" in parts:
         return None, None
     if "compile_fail" in parts:
-        code = next((p for p in parts if re.fullmatch(r"E\d{4}", p)), None)
-        return "fail", code
+        return "fail", [p for p in parts if re.fullmatch(r"E\d{4}", p)]
     return "pass", None
 
 
@@ -131,10 +131,10 @@ def check_article(article: Path, library: Path, work_root: Path) -> list:
         result = cargo(work, "build", "--example", f"line_{line}")
         if result.returncode == 0:
             problems.append(f"{rel}.md:{line}: marked compile_fail but compiles")
-        elif code_expected and code_expected not in headline_codes(result.stderr):
+        elif code_expected and not set(code_expected) <= headline_codes(result.stderr):
             found = sorted(headline_codes(result.stderr)) or ["no error code"]
             problems.append(
-                f"{rel}.md:{line}: expected {code_expected}, got {', '.join(found)}\n{indent(result.stderr)}"
+                f"{rel}.md:{line}: expected {', '.join(code_expected)}, got {', '.join(found)}\n{indent(result.stderr)}"
             )
 
     print(f"{rel}: {len(checked)} block(s), {len(problems)} problem(s)")
