@@ -355,22 +355,26 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
     let (front, body) = split_frontmatter(text);
     let mut sections = split_sections(body);
 
-    // The title is the frontmatter's, then the article's own top heading, then its name.
-    // A top heading taken as the title is dropped from its section's heading, where it
-    // would only repeat the title in front of every section under it.
-    let title = match front_value(front, "title").filter(|t| !t.is_empty()) {
-        Some(title) => title,
-        None => match sections.iter().find(|s| !s.heading.is_empty()) {
-            Some(first) if first.heading.split(" > ").count() == 1 && top_level(body) => {
-                let title = first.heading.clone();
-                for section in &mut sections {
-                    section.heading = strip_title(&section.heading, &title);
-                }
-                title
-            }
-            _ => id.rsplit('/').next().unwrap_or(&id).to_string(),
-        },
-    };
+    // A body that opens with a single `#` heading has that heading as its document title.
+    // It is dropped from every section's heading path whether or not the frontmatter also
+    // names a title, because under it every section would read "Title > Imports", repeating
+    // the article's name in each search hit and in the headings the ranking weights up.
+    let top = sections
+        .iter()
+        .find(|s| !s.heading.is_empty())
+        .filter(|_| top_level(body))
+        .map(|first| first.heading.split(" > ").next().unwrap_or_default().to_string());
+    if let Some(top) = &top {
+        for section in &mut sections {
+            section.heading = strip_title(&section.heading, top);
+        }
+    }
+
+    // The title is the frontmatter's, then that top heading, then the article's name.
+    let title = front_value(front, "title")
+        .filter(|t| !t.is_empty())
+        .or(top)
+        .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(&id).to_string());
     // A title heading with nothing under it is now a section with no heading and no text:
     // nothing to read, and a search hit on it would be a read spent on an empty page.
     if sections.len() > 1 {
@@ -782,6 +786,17 @@ mod tests {
         assert_eq!(article.title, "Routing");
         assert_eq!(article.crate_name, "actix-web");
         assert_eq!(article.summary, "text");
+    }
+
+    #[test]
+    fn a_title_heading_is_not_repeated_in_front_of_every_section_even_with_a_frontmatter_title() {
+        let article = parse_article(
+            "mio/basics".into(),
+            "---\ntitle: \"mio: basics\"\n---\n# mio: the basics\n\nIntro.\n\n## Imports\n\nx\n\n### Read\n\ny\n",
+        );
+        assert_eq!(article.title, "mio: basics");
+        let headings: Vec<&str> = article.sections.iter().map(|s| s.heading.as_str()).collect();
+        assert_eq!(headings, ["", "Imports", "Imports > Read"]);
     }
 
     #[test]
