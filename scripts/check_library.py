@@ -9,7 +9,8 @@ checks doc examples:
                                article shows the error a model will actually see, and proves it.
 - ```rust,ignore / ```text     are not checked (fragments, output, pseudo-code).
 
-A block without `fn main` is compiled as items, with an empty `main` added. Every block must
+Blocks are compiled as edition 2024, what `cargo new` produces. A block without `fn main` is
+compiled as items, with an empty `main` added. Every block must
 carry its own `use` lines: it is read on its own, and so is it compiled.
 
 Dependencies come from `check.toml` in the article's directory (a `[dependencies]` table), so
@@ -101,7 +102,7 @@ def check_article(article: Path, library: Path, work_root: Path) -> list:
     (work / "src").mkdir(exist_ok=True)
     (work / "src" / "lib.rs").write_text("", encoding="utf-8")
     (work / "Cargo.toml").write_text(
-        '[package]\nname = "library_check"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n'
+        '[package]\nname = "library_check"\nversion = "0.0.0"\nedition = "2024"\npublish = false\n\n'
         + dependencies,
         encoding="utf-8",
     )
