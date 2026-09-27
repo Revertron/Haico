@@ -41,7 +41,7 @@ const READ: &str = "library_read";
 
 // How long the librarian may spend looking things up. The answer that follows is not
 // timed: it is one request with no tools, and cutting it off would throw away everything read.
-pub(crate) const TIME_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const TIME_BUDGET: Duration = Duration::from_secs(120);
 
 // Not the budget — time is — but the backstop under it. Searches and reads are instant, so a
 // model that loops on them could otherwise fit dozens into the time, each round re-sending all
