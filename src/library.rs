@@ -880,10 +880,13 @@ pub(crate) fn runtime_failure_note(crates: &[String], trouble: &TestTrouble, tim
         };
         (format!("Tests fail: {}", listed(&trouble.failed)), symptom)
     };
+    // Says what the articles are, not what they contain: the first wording promised "hangs, lost
+    // replies, resets and busy loops", true of mio and tokio and false of a web framework, and
+    // was handed to a model whose failing test was a path assertion in an actix-files server.
     Some(format!(
-        "[haico] {what}, in a project that uses {names}. The library's articles on {names} cover \
-         the usual causes of hangs, lost replies, resets and busy loops, by symptom. Before \
-         debugging further, call library and describe the symptom — for example: \
+        "[haico] {what}, in a project that uses {names}. The library has articles on {names}, \
+         written from how code using them actually behaves and fails. Before debugging \
+         further, call library and describe the symptom — for example: \
          library(question: \"{krate}: {symptom}. What are the usual causes?\").",
         what = what,
         names = names,
