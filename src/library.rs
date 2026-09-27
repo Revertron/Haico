@@ -56,6 +56,13 @@ pub(crate) struct Article {
     /// The crate the article is about, as written in `Cargo.toml` (`actix-web`), or empty
     /// for an article that is about Rust itself rather than one crate.
     pub(crate) crate_name: String,
+    /// What an article that is not about a crate is about: "Rust ownership and borrowing".
+    /// Set by the frontmatter's `topic`, and what the index and the notes call it.
+    pub(crate) topic: String,
+    /// Compiler error codes the article explains (`E0502`), from the frontmatter's `codes`.
+    /// They are how a build is pointed at an article when no crate is involved at all: a
+    /// borrow-checker error names no crate and depends on none, so nothing else could.
+    pub(crate) codes: Vec<String>,
     pub(crate) versions: Option<String>,
     pub(crate) summary: String,
     pub(crate) sections: Vec<Section>,
@@ -113,6 +120,21 @@ impl Library {
             }
         }
         out.sort();
+        out
+    }
+
+    /// The names of the articles' subjects (crate, else topic) that explain any of these error
+    /// codes, deduplicated, in library order.
+    pub(crate) fn subjects_for_codes(&self, codes: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for article in &self.articles {
+            if article.codes.iter().any(|c| codes.contains(c)) {
+                let name = article.subject();
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
         out
     }
 
@@ -281,6 +303,9 @@ impl Library {
             if let Some(versions) = &article.versions {
                 out.push_str(&format!(" ({})", versions));
             }
+            if !article.codes.is_empty() {
+                out.push_str(&format!(" [errors {}]", article.codes.join(", ")));
+            }
             if !article.summary.is_empty() {
                 out.push_str(&format!(": {}", article.summary));
             }
@@ -290,7 +315,15 @@ impl Library {
     }
 }
 
-/// The index as the system prompt carries it: one line per crate, naming its articles.
+impl Article {
+    /// What the article is about, as the index and the notes name it: its crate, else its topic.
+    pub(crate) fn subject(&self) -> String {
+        if !self.crate_name.is_empty() { self.crate_name.clone() } else { self.topic.clone() }
+    }
+}
+
+/// The index as the system prompt carries it: one line per crate or topic, naming its articles
+/// and the compiler errors they explain.
 ///
 /// Per crate rather than per article, because what the main model needs from it is "the
 /// library knows about mio", not a table of contents — the sub-agent has the table of
@@ -303,10 +336,9 @@ pub(crate) fn index_block(root: &Path) -> Option<String> {
     }
     let mut groups: Vec<(String, Vec<&Article>)> = Vec::new();
     for article in &library.articles {
-        let key = if article.crate_name.is_empty() {
-            "general".to_string()
-        } else {
-            article.crate_name.clone()
+        let key = match article.subject() {
+            subject if subject.is_empty() => "general".to_string(),
+            subject => subject,
         };
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, list)) => list.push(article),
@@ -318,7 +350,14 @@ pub(crate) fn index_block(root: &Path) -> Option<String> {
     let mut out = String::new();
     for (name, articles) in groups {
         let titles: Vec<&str> = articles.iter().map(|a| a.title.as_str()).collect();
-        out.push_str(&format!("- {}: {}\n", name, titles.join("; ")));
+        out.push_str(&format!("- {}: {}", name, titles.join("; ")));
+        let mut codes: Vec<&str> = articles.iter().flat_map(|a| a.codes.iter().map(String::as_str)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        if !codes.is_empty() {
+            out.push_str(&format!(" (compiler errors {})", codes.join(", ")));
+        }
+        out.push('\n');
     }
     Some(out)
 }
@@ -386,10 +425,16 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
     }
 
     // The directory is the crate unless the frontmatter says otherwise; an article at the
-    // top of the library is about no crate in particular.
-    let crate_name = front_value(front, "crate")
-        .or_else(|| id.rsplit_once('/').map(|(dir, _)| dir.split('/').next().unwrap_or(dir).to_string()))
-        .unwrap_or_default();
+    // top of the library is about no crate in particular, and neither is one with a `topic` —
+    // `library/rust/ownership.md` is not about a crate called "rust", and treating it as one
+    // would have the notes looking for `rust::` in compiler output.
+    let topic = front_value(front, "topic").unwrap_or_default();
+    let crate_name = match front_value(front, "crate") {
+        Some(name) => name,
+        None if !topic.is_empty() => String::new(),
+        None => id.rsplit_once('/').map(|(dir, _)| dir.split('/').next().unwrap_or(dir).to_string()).unwrap_or_default(),
+    };
+    let codes = front_value(front, "codes").map(|list| error_codes(&list)).unwrap_or_default();
 
     let summary = front_value(front, "summary")
         .or_else(|| front_value(front, "description"))
@@ -409,6 +454,8 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
         id,
         title,
         crate_name,
+        topic,
+        codes,
         versions: front_value(front, "versions").filter(|v| !v.is_empty()),
         summary,
         sections,
@@ -686,6 +733,19 @@ pub(crate) fn compile_errors(output: &str) -> Vec<String> {
     out
 }
 
+/// The distinct error codes (`E0502`) in some text, in order of appearance, uppercased.
+pub(crate) fn error_codes(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let upper = word.to_ascii_uppercase();
+        let is_code = upper.len() == 5 && upper.starts_with('E') && upper[1..].chars().all(|c| c.is_ascii_digit());
+        if is_code && !out.contains(&upper) {
+            out.push(upper);
+        }
+    }
+    out
+}
+
 /// Whether a shell command is a cargo build of some kind — the commands whose failures are
 /// compile errors worth looking up.
 pub(crate) fn is_cargo_build(command: &str) -> bool {
@@ -861,11 +921,11 @@ pub(crate) fn involved_crates(library_crates: &[String], output: &str, dependenc
 /// It names the crates and quotes the first error as a ready-made question, because a small
 /// model told only "you could use the library" rarely works out what to ask — and one that
 /// is handed the question usually does ask it.
-pub(crate) fn build_failure_note(crates: &[String], errors: &[String]) -> Option<String> {
-    if crates.is_empty() || errors.is_empty() {
+pub(crate) fn build_failure_note(subjects: &[String], errors: &[String]) -> Option<String> {
+    if subjects.is_empty() || errors.is_empty() {
         return None;
     }
-    let names = match crates {
+    let names = match subjects {
         [one] => one.clone(),
         [init @ .., last] => format!("{} and {}", init.join(", "), last),
         [] => unreachable!(),
@@ -878,7 +938,7 @@ pub(crate) fn build_failure_note(crates: &[String], errors: &[String]) -> Option
          from documentation written for exactly this, which is more reliable than guessing \
          at the API.",
         names = names,
-        crate = crates[0],
+        crate = subjects[0],
         first = first.replace('"', "'"),
     ))
 }
@@ -934,6 +994,44 @@ mod tests {
         assert_eq!(article.title, "mio: basics");
         let headings: Vec<&str> = article.sections.iter().map(|s| s.heading.as_str()).collect();
         assert_eq!(headings, ["", "Imports", "Imports > Read"]);
+    }
+
+    #[test]
+    fn a_topic_article_has_no_crate_and_declares_its_error_codes() {
+        let article = parse_article(
+            "rust/ownership".into(),
+            "---\ntopic: Rust ownership and borrowing\ncodes: E0499, e0502 E0505,E0597, not-a-code\n---\n# Borrowing\n\nx\n",
+        );
+        assert_eq!(article.crate_name, "");
+        assert_eq!(article.subject(), "Rust ownership and borrowing");
+        assert_eq!(article.codes, ["E0499", "E0502", "E0505", "E0597"]);
+
+        // A crate named outright still wins over the topic.
+        let both = parse_article("x/y".into(), "---\ncrate: mio\ntopic: T\n---\nx\n");
+        assert_eq!(both.subject(), "mio");
+    }
+
+    #[test]
+    fn topics_are_found_by_error_code_and_indexed_with_their_codes() {
+        let dir = TempDir::new("library-codes");
+        write(dir.path(), "rust/ownership", "---\ntopic: Rust ownership and borrowing\ncodes: E0502, E0499\n---\n# Borrowing\n\nx\n");
+        write(dir.path(), "mio/poll", "# Polling\n\nx\n");
+        let library = Library::load(dir.path());
+
+        assert_eq!(library.subjects_for_codes(&["E0502".into()]), ["Rust ownership and borrowing"]);
+        assert!(library.subjects_for_codes(&["E0308".into()]).is_empty());
+        // A topic is not a crate: nothing goes looking for it in Cargo.toml or in paths.
+        assert_eq!(library.crates(), ["mio"]);
+
+        let index = index_block(dir.path()).unwrap();
+        assert!(index.contains("- Rust ownership and borrowing: Borrowing (compiler errors E0499, E0502)"), "{}", index);
+        assert!(index.contains("- mio: Polling\n"), "{}", index);
+        assert!(library.catalog().contains("[errors E0502, E0499]"), "{}", library.catalog());
+
+        assert_eq!(
+            error_codes("error[E0502]: cannot borrow\nerror[E0502]: again\nerror[e0499]: x E123 E12345"),
+            ["E0502", "E0499"]
+        );
     }
 
     #[test]

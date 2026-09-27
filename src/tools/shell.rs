@@ -584,7 +584,16 @@ impl MyMcpServer {
             let key = if hanging { "runtime:hang".to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
             (note, key)
         } else {
-            (crate::library::build_failure_note(&crates, &errors)?, errors.join("\n"))
+            // Articles that explain these error codes first: a code is the most direct evidence
+            // there is, and for the language itself (a borrow error names no crate and depends
+            // on none) it is the only evidence there is.
+            let mut subjects = library.subjects_for_codes(&crate::library::error_codes(&errors.join("\n")));
+            for name in crates {
+                if !subjects.contains(&name) {
+                    subjects.push(name);
+                }
+            }
+            (crate::library::build_failure_note(&subjects, &errors)?, errors.join("\n"))
         };
 
         // Recorded only once there is a note to give, so an error set that got none (no
@@ -955,6 +964,20 @@ error: could not compile `x`";
         let failed = "test burst ... FAILED\ntest result: FAILED. 8 passed; 1 failed";
         let note = server.library_note_for_build("cargo test", failed, cwd, false).unwrap();
         assert!(note.contains("Tests fail: burst"), "{}", note);
+
+        // An error code a topic article explains is enough on its own, in a project that uses
+        // no covered crate at all.
+        std::fs::create_dir_all(library.join("rust")).unwrap();
+        std::fs::write(
+            library.join("rust/ownership.md"),
+            "---\ntopic: Rust ownership and borrowing\ncodes: E0502\n---\n# Borrowing\n\nx\n",
+        )
+        .unwrap();
+        let plain = TempDir::new("shell-library-plain");
+        std::fs::write(plain.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        let borrow = "error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable";
+        let note = server.library_note_for_build("cargo build", borrow, plain.path().to_str(), false).unwrap();
+        assert!(note.contains("articles on Rust ownership and borrowing"), "{}", note);
 
         // A project that does not use mio, with errors that do not name it, gets nothing.
         let unrelated = TempDir::new("shell-library-unrelated");

@@ -202,10 +202,10 @@ pub(crate) fn compose_system_prompt(
         append_section(
             &mut content,
             "# Library",
-            "Articles on these crates are in haico's library, one line per crate. When you \
-             write code against one of them and are not certain of its API, or a build fails \
-             with errors involving one, call `library` with a specific question before \
-             guessing.",
+            "Articles on these crates and topics are in haico's library, one line each. When \
+             you write code against one of them and are not certain of its API, or a build \
+             fails with errors involving one or with one of the compiler errors listed, call \
+             `library` with a specific question before guessing.",
             library,
         );
     }
