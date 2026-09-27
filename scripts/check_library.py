@@ -9,10 +9,18 @@ checks doc examples:
                                `compile_fail,E0499,E0503`, all of them). This is how an article
                                shows the error a model will actually see, and proves it.
 - ```rust,ignore / ```text     are not checked (fragments, output, pseudo-code).
+- ```rust,no_run               compiles but is not run with --run (a server that serves forever).
 
-Blocks are compiled as edition 2024, what `cargo new` produces. A block without `fn main` is
-compiled as items, with an empty `main` added. Every block must
-carry its own `use` lines: it is read on its own, and so is it compiled.
+With `--run`, each compiling block is also run, the way rustdoc runs doc examples: its `main`,
+then its `#[test]` functions if it has any, each with a timeout. Compiling proves the API; it does
+not prove that an article's claims about behavior (a status code, an order, a message) are true,
+and those are the claims a model acts on. Write runnable blocks with `assert!`s for exactly that.
+
+Blocks are compiled as edition 2024, what `cargo new` produces, and in test mode
+(`cargo test --no-run`): a plain build strips `#[test]` and `#[tokio::test]` functions before
+type checking, so an article's example tests would otherwise never be checked at all. A block
+without `fn main` is compiled as items, with an empty `main` added. Every block must carry its own
+`use` lines: it is read on its own, and so is it compiled.
 
 Dependencies come from `check.toml` in the article's directory (a `[dependencies]` table), so
 the crate version the article is checked against is written down next to it.
@@ -24,6 +32,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -58,6 +67,10 @@ def blocks(text: str):
     return out
 
 
+def runnable(info: str) -> bool:
+    return "no_run" not in [p.strip() for p in info.split(",")]
+
+
 def kind(info: str):
     """('pass'|'fail'|None, the error codes a compile_fail block must produce)."""
     parts = [p.strip() for p in info.split(",")]
@@ -78,18 +91,67 @@ def program(code: str) -> str:
 
 def cargo(work: Path, *args) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["cargo", *args, "--quiet", "--color", "never"],
+        ["cargo", "test", "--no-run", *args, "--quiet", "--color", "never"],
         cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
 
 
-def check_article(article: Path, library: Path, work_root: Path) -> list:
+def run_binary(path: Path, timeout: float) -> str | None:
+    """None when it exits 0; otherwise what went wrong, with the end of its output."""
+    try:
+        result = subprocess.run([str(path)], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # What it printed before the timeout; bytes on some platforms whatever `text` says.
+        tail = "".join(p.decode("utf-8", "replace") if isinstance(p, bytes) else p
+                       for p in (e.stdout, e.stderr) if p)
+        return f"timed out after {timeout:.0f} s (mark it no_run if it serves forever)\n{indent(tail)}"
+    if result.returncode != 0:
+        return f"exited with {result.returncode}\n{indent(result.stdout + result.stderr)}"
+    return None
+
+
+def built_executables(work: Path, *args) -> dict:
+    """{example name: executable} for a build with --message-format=json."""
+    result = subprocess.run(
+        ["cargo", *args, "--quiet", "--message-format=json"],
+        cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    found = {}
+    for line in result.stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        message = json.loads(line)
+        if message.get("reason") == "compiler-artifact" and message.get("executable"):
+            found[message["target"]["name"]] = Path(message["executable"])
+    return found
+
+
+def run_blocks(work: Path, rel: str, runs: list, timeout: float) -> list:
+    """Run each (line, name, has_tests) block's main, then its tests."""
+    problems = []
+    mains = built_executables(work, "build", "--examples")
+    tests = built_executables(work, "test", "--no-run", "--examples") if any(t for _, _, t in runs) else {}
+    for line, name, has_tests in runs:
+        if name in mains and (why := run_binary(mains[name], timeout)):
+            problems.append(f"{rel}.md:{line}: main {why}")
+        if has_tests and name in tests and (why := run_binary(tests[name], timeout)):
+            problems.append(f"{rel}.md:{line}: tests {why}")
+    return problems
+
+
+TEST_ATTRIBUTE = re.compile(r"#\[(\w+::)?test(\(.*\))?\]")
+
+
+def check_article(article: Path, library: Path, work_root: Path, run: bool = False, timeout: float = 60) -> list:
     rel = article.relative_to(library).with_suffix("").as_posix()
     manifest = article.parent / "check.toml"
     dependencies = manifest.read_text(encoding="utf-8") if manifest.exists() else "[dependencies]\n"
 
-    checked = [(line, *kind(info), code) for line, info, code in blocks(article.read_text(encoding="utf-8"))]
+    all_blocks = blocks(article.read_text(encoding="utf-8"))
+    checked = [(line, *kind(info), code) for line, info, code in all_blocks]
     checked = [c for c in checked if c[1] is not None]
+    no_run = {line for line, info, _ in all_blocks if not runnable(info)}
     if not checked:
         return []
 
@@ -117,18 +179,23 @@ def check_article(article: Path, library: Path, work_root: Path) -> list:
 
     # The passing blocks together first: one build, and any failure names its example.
     if passing:
-        result = cargo(work, "build", "--examples")
+        result = cargo(work, "--examples")
         if result.returncode != 0:
             # Rebuild one by one to say exactly which blocks are broken.
             for line, name in passing:
-                single = cargo(work, "build", "--example", name)
+                single = cargo(work, "--example", name)
                 if single.returncode != 0:
                     problems.append(f"{rel}.md:{line}: does not compile\n{indent(single.stderr)}")
+        if run and not problems:
+            codes = {line: code for line, expect, _, code in checked if expect == "pass"}
+            runs = [(line, name, bool(TEST_ATTRIBUTE.search(codes[line])))
+                    for line, name in passing if line not in no_run]
+            problems += run_blocks(work, rel, runs, timeout)
 
     for line, expect, code_expected, _ in checked:
         if expect != "fail":
             continue
-        result = cargo(work, "build", "--example", f"line_{line}")
+        result = cargo(work, "--example", f"line_{line}")
         if result.returncode == 0:
             problems.append(f"{rel}.md:{line}: marked compile_fail but compiles")
         elif code_expected and not set(code_expected) <= headline_codes(result.stderr):
@@ -161,20 +228,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("library", nargs="?", type=Path, default=None)
     parser.add_argument("--work", type=Path, default=Path(os.environ.get("TEMP", "/tmp")) / "library-check")
-    parser.add_argument("--only", help="check one article, by id (mio/basics)")
+    parser.add_argument("--only", help="check one article, by id (mio/basics), or a directory (mio)")
+    parser.add_argument("--run", action="store_true", help="also run every block not marked no_run")
+    parser.add_argument("--timeout", type=float, default=60, help="seconds per run (default 60)")
     args = parser.parse_args()
 
     library = (args.library or default_library()).resolve()
     articles = sorted(library.rglob("*.md"))
     if args.only:
-        articles = [a for a in articles if a.relative_to(library).with_suffix("").as_posix() == args.only]
+        ids = {a: a.relative_to(library).with_suffix("").as_posix() for a in articles}
+        articles = [a for a in articles if ids[a] == args.only or ids[a].startswith(args.only.rstrip("/") + "/")]
     if not articles:
         print(f"no articles found under {library}", file=sys.stderr)
         return 1
 
     problems = []
     for article in articles:
-        problems += check_article(article, library, args.work)
+        problems += check_article(article, library, args.work, args.run, args.timeout)
     for problem in problems:
         print(problem, file=sys.stderr)
     return 1 if problems else 0
