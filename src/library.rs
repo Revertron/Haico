@@ -134,7 +134,10 @@ impl Library {
             header.extend(tokens(&article.crate_name));
             for (s, section) in article.sections.iter().enumerate() {
                 let mut all = header.clone();
-                let heading = tokens(&section.heading);
+                // Tags count as much as the heading: they are the author saying what the
+                // section is for, in the words someone with the problem would use.
+                let mut heading = tokens(&section.heading);
+                heading.extend(tokens(section_tags(&section.text).unwrap_or("")));
                 for _ in 0..HEADING_WEIGHT {
                     all.extend(heading.iter().cloned());
                 }
@@ -522,6 +525,19 @@ fn section_list(article: &Article) -> String {
         .collect()
 }
 
+/// A section's tags: its first non-empty line, when that line starts with `Tags:`.
+///
+/// They exist for the gap between how a problem is described and how it is explained. A model
+/// with a stuck server asks about "hangs" and "never answers"; the section that fixes it is
+/// titled "Draining readiness" and talks about `WouldBlock`, and no stemmer joins those words.
+/// Kept in the text rather than hidden, because the librarian reading the section benefits
+/// from the same line: it says what the section is the answer to.
+pub(crate) fn section_tags(text: &str) -> Option<&str> {
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (key, rest) = first.split_once(':')?;
+    key.trim().eq_ignore_ascii_case("tags").then_some(rest.trim())
+}
+
 /// Words for ranking: lowercase runs of letters, digits and underscores, plus the parts of
 /// a snake_case name, so `spawn_blocking` is found by "spawn blocking" and by itself.
 ///
@@ -689,6 +705,76 @@ pub(crate) fn is_cargo_build(command: &str) -> bool {
     })
 }
 
+/// What a test run that compiled says went wrong: tests that failed, and tests libtest reported
+/// as still running after a minute.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct TestTrouble {
+    pub(crate) failed: Vec<String>,
+    pub(crate) hung: Vec<String>,
+}
+
+pub(crate) fn test_trouble(output: &str) -> TestTrouble {
+    let mut trouble = TestTrouble::default();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("test ") else { continue };
+        if let Some(name) = rest.strip_suffix(" ... FAILED") {
+            let name = name.trim().to_string();
+            if !trouble.failed.contains(&name) {
+                trouble.failed.push(name);
+            }
+        } else if let Some((name, _)) = rest.split_once(" has been running for over") {
+            let name = name.trim().to_string();
+            if !trouble.hung.contains(&name) {
+                trouble.hung.push(name);
+            }
+        }
+    }
+    trouble
+}
+
+/// The note for a build that compiled and then failed at runtime — tests failing, tests hanging,
+/// or the whole command killed at its timeout.
+///
+/// A compile error names the API it is about; a runtime failure names nothing, and that is where
+/// a model stops asking and starts guessing. The first run this was built for compiled its mio
+/// server and then spent forty minutes splitting the test suite by hand to find a hang, with the
+/// causes (EOF ignored, a connection dropped before its last reply was flushed) written up in the
+/// library the whole time. So the note names the symptom, and hands over a question phrased the
+/// way the articles' tags are: by what went wrong, not by what caused it.
+pub(crate) fn runtime_failure_note(crates: &[String], trouble: &TestTrouble, timed_out: bool) -> Option<String> {
+    if crates.is_empty() || (trouble.failed.is_empty() && trouble.hung.is_empty() && !timed_out) {
+        return None;
+    }
+    let names = match crates {
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {}", init.join(", "), last),
+        [] => unreachable!(),
+    };
+    let listed = |tests: &[String]| {
+        let shown: Vec<&str> = tests.iter().take(3).map(String::as_str).collect();
+        let more = tests.len().saturating_sub(3);
+        if more > 0 { format!("{} (and {} more)", shown.join(", "), more) } else { shown.join(", ") }
+    };
+    let hanging = timed_out || !trouble.hung.is_empty();
+    let (what, symptom) = if hanging {
+        let which = if trouble.hung.is_empty() { String::new() } else { format!(": {}", listed(&trouble.hung)) };
+        (format!("Something hangs{}", which), "a test hangs and never finishes".to_string())
+    } else {
+        (format!("Tests fail: {}", listed(&trouble.failed)), format!("test {} fails", trouble.failed[0]))
+    };
+    Some(format!(
+        "[haico] {what}, in a project that uses {names}. The library's articles on {names} cover \
+         the usual causes of hangs, lost replies, resets and busy loops, by symptom. Before \
+         debugging further, call library and describe the symptom — for example: \
+         library(question: \"{krate}: {symptom}. What are the usual causes?\").",
+        what = what,
+        names = names,
+        krate = crates[0],
+        symptom = symptom.replace('"', "'"),
+    ))
+}
+
 /// The directory a command starts by moving into: `cd app && cargo build`, `cd /d "C:\x y" && ..`.
 /// Only a leading `cd` joined by `&&` or `;`, since that is the one whose effect reaches the
 /// rest of the line.
@@ -842,6 +928,42 @@ mod tests {
     }
 
     #[test]
+    fn tags_under_a_heading_rank_a_section_for_words_its_text_never_uses() {
+        let dir = TempDir::new("library-tags");
+        write(
+            dir.path(),
+            "mio/loop",
+            "# Loop
+
+## Draining readiness
+
+Tags: hangs, stalls, never answered
+
+Read until WouldBlock.
+
+## Hangs in general
+
+A server can stop for many reasons.
+",
+        );
+        let library = Library::load(dir.path());
+        // "stalls" appears only in the tags, so without them this section could not match at all.
+        assert_eq!(library.search("server stalls")[0].id, "mio/loop#0");
+        // Weighted like the heading, the tag outranks a section that merely says "hangs" once
+        // in its heading and body.
+        let hits = library.search("never answered hangs");
+        assert_eq!(hits[0].id, "mio/loop#0", "{:?}", hits.iter().map(|h| &h.id).collect::<Vec<_>>());
+
+        assert_eq!(section_tags("
+  Tags: a, b
+text"), Some("a, b"));
+        assert_eq!(section_tags("tags:x"), Some("x"));
+        assert_eq!(section_tags("Text first.
+Tags: a"), None);
+        assert_eq!(section_tags("Contags: a"), None);
+    }
+
+    #[test]
     fn read_returns_a_section_or_an_outline_and_refuses_what_is_not_there() {
         let dir = TempDir::new("library-read");
         write(dir.path(), "tokio/select", SELECT);
@@ -917,6 +1039,40 @@ error: could not compile `x` (bin \"x\")\n";
         assert_eq!(leading_cd("cargo build"), None);
         assert_eq!(leading_cd("cd app"), None);
         assert_eq!(leading_cd("echo cd app && cargo build"), None);
+    }
+
+    #[test]
+    fn failing_and_hanging_tests_are_read_from_libtest_output() {
+        let output = "running 3 tests\n\
+test reverses_a_line ... ok\n\
+test burst ... FAILED\n\
+test oversized has been running for over 60 seconds\n\
+test burst ... FAILED\n";
+        let trouble = test_trouble(output);
+        assert_eq!(trouble.failed, ["burst"]);
+        assert_eq!(trouble.hung, ["oversized"]);
+        assert_eq!(test_trouble("test result: ok. 3 passed"), TestTrouble::default());
+    }
+
+    #[test]
+    fn the_runtime_note_names_the_symptom() {
+        let mio = vec!["mio".to_string()];
+        let hung = TestTrouble { failed: vec![], hung: vec!["oversized".into()] };
+        let note = runtime_failure_note(&mio, &hung, false).unwrap();
+        assert!(note.contains("Something hangs: oversized"), "{}", note);
+        assert!(note.contains("mio: a test hangs and never finishes"), "{}", note);
+
+        // A command killed at its timeout is a hang even when libtest never said so.
+        let note = runtime_failure_note(&mio, &TestTrouble::default(), true).unwrap();
+        assert!(note.contains("Something hangs, in a project"), "{}", note);
+
+        let failed = TestTrouble { failed: vec!["burst".into()], hung: vec![] };
+        let note = runtime_failure_note(&mio, &failed, false).unwrap();
+        assert!(note.contains("Tests fail: burst"), "{}", note);
+        assert!(note.contains("mio: test burst fails"), "{}", note);
+
+        assert!(runtime_failure_note(&mio, &TestTrouble::default(), false).is_none());
+        assert!(runtime_failure_note(&[], &hung, true).is_none());
     }
 
     #[test]

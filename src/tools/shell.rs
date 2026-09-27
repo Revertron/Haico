@@ -495,10 +495,14 @@ impl MyMcpServer {
                     truncate_middle(&result_text, MAX_OUTPUT)
                 )
             };
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Command timed out after {} seconds and was killed.{}",
-                timeout_secs, detail
-            ))]));
+            let mut text = format!("Command timed out after {} seconds and was killed.{}", timeout_secs, detail);
+            // A test run killed at its timeout is the commonest way a hang shows up at all.
+            let full = format!("{}\n{}", stdout, stderr);
+            if let Some(note) = self.library_note_for_build(&command, &full, params.0.cwd.as_deref(), true) {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
+            return Ok(CallToolResult::error(vec![ContentBlock::text(text)]));
         };
 
         if result_text.is_empty() {
@@ -515,7 +519,7 @@ impl MyMcpServer {
         // Taken from the untruncated output: the middle cut below can remove the very lines
         // that name the crate.
         let full = format!("{}\n{}", stdout, stderr);
-        let note = self.library_note_for_build(&command, &full, params.0.cwd.as_deref());
+        let note = self.library_note_for_build(&command, &full, params.0.cwd.as_deref(), false);
 
         // Cut in the middle, not at the end: a build says what went wrong last.
         if result_text.len() > MAX_OUTPUT {
@@ -544,13 +548,17 @@ impl MyMcpServer {
     // moment that index is for, and a small model mid-build does not make the connection
     // itself — it goes back to editing from the same wrong idea of the API that caused the
     // errors.
-    fn library_note_for_build(&self, command: &str, output: &str, cwd: Option<&str>) -> Option<String> {
+    //
+    // Compile errors get the note that quotes the first error; a build that compiled and then
+    // failed its tests, hung, or was killed at the timeout gets the one that names the symptom.
+    fn library_note_for_build(&self, command: &str, output: &str, cwd: Option<&str>, timed_out: bool) -> Option<String> {
         let root = self.library_root.as_ref()?;
         if !crate::library::is_cargo_build(command) {
             return None;
         }
         let errors = crate::library::compile_errors(output);
-        if errors.is_empty() {
+        let trouble = crate::library::test_trouble(output);
+        if errors.is_empty() && trouble.failed.is_empty() && trouble.hung.is_empty() && !timed_out {
             return None;
         }
 
@@ -568,11 +576,20 @@ impl MyMcpServer {
             .map(|manifest| crate::library::cargo_dependencies(&manifest))
             .unwrap_or_default();
         let crates = crate::library::involved_crates(&library.crates(), output, &dependencies);
-        let note = crate::library::build_failure_note(&crates, &errors)?;
+        let (note, key) = if errors.is_empty() {
+            let note = crate::library::runtime_failure_note(&crates, &trouble, timed_out)?;
+            // A hang is one symptom however it was caught — a timeout or libtest's warning —
+            // so it is fingerprinted as one; each set of failing tests is another.
+            let hanging = timed_out || !trouble.hung.is_empty();
+            let key = if hanging { "runtime:hang".to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
+            (note, key)
+        } else {
+            (crate::library::build_failure_note(&crates, &errors)?, errors.join("\n"))
+        };
 
         // Recorded only once there is a note to give, so an error set that got none (no
         // covered crate involved) does not use up the one it would get later.
-        let fingerprint = super::content_hash(errors.join("\n").as_bytes());
+        let fingerprint = super::content_hash(key.as_bytes());
         if !self.library_nudged.lock().unwrap().insert(fingerprint) {
             return None;
         }
@@ -910,24 +927,34 @@ mio = \"1\"
         let output = "error[E0599]: no method named `poll` found for struct `Poll`
 error: could not compile `x`";
         // No library in this session: nothing to point at.
-        assert!(server.library_note_for_build("cargo build", output, cwd).is_none());
+        assert!(server.library_note_for_build("cargo build", output, cwd, false).is_none());
 
         server.library_root = Some(library.path().to_path_buf());
         // Not a build, or a build that failed without compile errors: no note.
-        assert!(server.library_note_for_build("cargo fmt --check", output, cwd).is_none());
+        assert!(server.library_note_for_build("cargo fmt --check", output, cwd, false).is_none());
         assert!(server
-            .library_note_for_build("cargo test", "error: test failed, to rerun pass", cwd)
+            .library_note_for_build("cargo test", "error: test failed, to rerun pass", cwd, false)
             .is_none());
 
         // mio is only a dependency here, never named in the error — that is enough.
-        let note = server.library_note_for_build("cargo build", output, cwd).unwrap();
+        let note = server.library_note_for_build("cargo build", output, cwd, false).unwrap();
         assert!(note.contains("articles on mio"), "{}", note);
         assert!(note.contains("E0599"), "{}", note);
 
         // The same errors again get no second note; different ones do.
-        assert!(server.library_note_for_build("cargo check", output, cwd).is_none());
+        assert!(server.library_note_for_build("cargo check", output, cwd, false).is_none());
         let other = "error[E0425]: cannot find value `events` in this scope";
-        assert!(server.library_note_for_build("cargo build", other, cwd).is_some());
+        assert!(server.library_note_for_build("cargo build", other, cwd, false).is_some());
+
+        // A build that compiled and then hung gets the symptom note, once, however the hang
+        // was caught; a different set of failing tests gets its own.
+        let note = server.library_note_for_build("cargo test", "running 9 tests\n", cwd, true).unwrap();
+        assert!(note.contains("Something hangs"), "{}", note);
+        let libtest = "test oversized has been running for over 60 seconds";
+        assert!(server.library_note_for_build("cargo test", libtest, cwd, false).is_none());
+        let failed = "test burst ... FAILED\ntest result: FAILED. 8 passed; 1 failed";
+        let note = server.library_note_for_build("cargo test", failed, cwd, false).unwrap();
+        assert!(note.contains("Tests fail: burst"), "{}", note);
 
         // A project that does not use mio, with errors that do not name it, gets nothing.
         let unrelated = TempDir::new("shell-library-unrelated");
@@ -936,7 +963,7 @@ serde = \"1\"
 ").unwrap();
         let third = "error[E0308]: mismatched types";
         assert!(server
-            .library_note_for_build("cargo build", third, unrelated.path().to_str())
+            .library_note_for_build("cargo build", third, unrelated.path().to_str(), false)
             .is_none());
     }
 
