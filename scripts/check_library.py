@@ -131,14 +131,24 @@ def check_article(article: Path, library: Path, work_root: Path) -> list:
         result = cargo(work, "build", "--example", f"line_{line}")
         if result.returncode == 0:
             problems.append(f"{rel}.md:{line}: marked compile_fail but compiles")
-        elif code_expected and f"error[{code_expected}]" not in result.stderr:
-            found = sorted(set(re.findall(r"error\[E\d{4}\]", result.stderr))) or ["no error code"]
+        elif code_expected and code_expected not in headline_codes(result.stderr):
+            found = sorted(headline_codes(result.stderr)) or ["no error code"]
             problems.append(
                 f"{rel}.md:{line}: expected {code_expected}, got {', '.join(found)}\n{indent(result.stderr)}"
             )
 
     print(f"{rel}: {len(checked)} block(s), {len(problems)} problem(s)")
     return problems
+
+
+def headline_codes(stderr: str) -> set:
+    """The codes of the errors rustc reported: only lines that *start* with `error[E....]`.
+
+    Searching the whole output is wrong: rustc echoes the offending source line, and an example
+    that quotes its expected error in a comment would then "find" that code in its own quotation.
+    That happened: a block claiming E0594 passed while rustc actually reported E0596.
+    """
+    return set(re.findall(r"(?m)^error\[(E\d{4})\]", stderr))
 
 
 def indent(text: str, limit: int = 40) -> str:
