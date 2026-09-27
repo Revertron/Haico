@@ -187,7 +187,9 @@ pub(crate) fn compose_system_prompt(
         append_section(
             &mut content,
             "# Skills",
-            "Instructions for particular kinds of task, one line each saying when it applies.              When the user's request matches one, call `skill` with its name before starting              and follow what it returns.",
+            "Instructions for particular kinds of task, one line each saying when it applies. \
+             When the user's request matches one, call `skill` with its name before starting \
+             and follow what it returns.",
             skills,
         );
     }
@@ -200,7 +202,10 @@ pub(crate) fn compose_system_prompt(
         append_section(
             &mut content,
             "# Library",
-            "Articles on these crates are in haico's library, one line per crate. When you              write code against one of them and are not certain of its API, or a build fails              with errors involving one, call `library` with a specific question before              guessing.",
+            "Articles on these crates are in haico's library, one line per crate. When you \
+             write code against one of them and are not certain of its API, or a build fails \
+             with errors involving one, call `library` with a specific question before \
+             guessing.",
             library,
         );
     }
@@ -590,6 +595,9 @@ mod tests {
         assert!(skills < library && library < memory, "library out of place: {}", both);
         let section = &both[both.find("# Library").unwrap()..both.find("# Project memory").unwrap()];
         assert!(!section.contains("takes precedence"), "got: {}", section);
+        // A string continued without its trailing backslash keeps the next line's indentation,
+        // and the model reads sentences with runs of spaces in the middle of them.
+        assert!(!both.contains("   "), "a run of spaces in the prompt:\n{}", both);
         let section = &both[both.find("# Skills").unwrap()..both.find("# Project memory").unwrap()];
         assert!(!section.contains("takes precedence"), "got: {}", section);
         let section = &both[both.find("# Project memory").unwrap()..];
