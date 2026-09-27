@@ -99,8 +99,9 @@ def cargo(work: Path, *args) -> subprocess.CompletedProcess:
 def run_binary(path: Path, timeout: float) -> str | None:
     """None when it exits 0; otherwise what went wrong, with the end of its output."""
     try:
+        # An empty stdin: a block that reads input must see its end, not wait on the checker's.
         result = subprocess.run([str(path)], capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=timeout)
+                                errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as e:
         # What it printed before the timeout; bytes on some platforms whatever `text` says.
         tail = "".join(p.decode("utf-8", "replace") if isinstance(p, bytes) else p
