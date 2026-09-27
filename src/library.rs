@@ -53,9 +53,12 @@ pub(crate) struct Article {
     /// The path under the library root, `/`-separated, without `.md`: `tokio/select`.
     pub(crate) id: String,
     pub(crate) title: String,
-    /// The crate the article is about, as written in `Cargo.toml` (`actix-web`), or empty
-    /// for an article that is about Rust itself rather than one crate.
-    pub(crate) crate_name: String,
+    /// The crates the article is about, as written in `Cargo.toml` (`actix-web`), or none
+    /// for an article that is about Rust itself. Usually one; several for an article about a
+    /// trait crate and the crates implementing it (`aead, aes-gcm, chacha20poly1305`), since a
+    /// project depends on `aes-gcm` and never names `aead`, and one article per implementation
+    /// would repeat the whole trait in each.
+    pub(crate) crates: Vec<String>,
     /// What an article that is not about a crate is about: "Rust ownership and borrowing".
     /// Set by the frontmatter's `topic`, and what the index and the notes call it.
     pub(crate) topic: String,
@@ -120,8 +123,10 @@ impl Library {
     pub(crate) fn crates(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for article in &self.articles {
-            if !article.crate_name.is_empty() && !out.contains(&article.crate_name) {
-                out.push(article.crate_name.clone());
+            for name in &article.crates {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
         }
         out.sort();
@@ -164,7 +169,9 @@ impl Library {
         let mut docs: Vec<(usize, usize, HashMap<String, usize>, usize)> = Vec::new();
         for (a, article) in self.articles.iter().enumerate() {
             let mut header = tokens(&article.title);
-            header.extend(tokens(&article.crate_name));
+            for name in &article.crates {
+                header.extend(tokens(name));
+            }
             for (s, section) in article.sections.iter().enumerate() {
                 let mut all = header.clone();
                 // Tags count as much as the heading: they are the author saying what the
@@ -326,9 +333,9 @@ impl Library {
 }
 
 impl Article {
-    /// What the article is about, as the index and the notes name it: its crate, else its topic.
+    /// What the article is about, as the index and the notes name it: its crates, else its topic.
     pub(crate) fn subject(&self) -> String {
-        if !self.crate_name.is_empty() { self.crate_name.clone() } else { self.topic.clone() }
+        if !self.crates.is_empty() { self.crates.join(", ") } else { self.topic.clone() }
     }
 }
 
@@ -439,10 +446,10 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
     // `library/rust/ownership.md` is not about a crate called "rust", and treating it as one
     // would have the notes looking for `rust::` in compiler output.
     let topic = front_value(front, "topic").unwrap_or_default();
-    let crate_name = match front_value(front, "crate") {
-        Some(name) => name,
-        None if !topic.is_empty() => String::new(),
-        None => id.rsplit_once('/').map(|(dir, _)| dir.split('/').next().unwrap_or(dir).to_string()).unwrap_or_default(),
+    let crates: Vec<String> = match front_value(front, "crate") {
+        Some(list) => list.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect(),
+        None if !topic.is_empty() => Vec::new(),
+        None => id.rsplit_once('/').map(|(dir, _)| vec![dir.split('/').next().unwrap_or(dir).to_string()]).unwrap_or_default(),
     };
     let codes = front_value(front, "codes").map(|list| error_codes(&list)).unwrap_or_default();
     let matches = front_value(front, "matches")
@@ -468,7 +475,7 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
     Article {
         id,
         title,
-        crate_name,
+        crates,
         topic,
         codes,
         matches,
@@ -982,7 +989,7 @@ mod tests {
     fn an_article_is_split_at_its_headings_and_not_inside_code() {
         let article = parse_article("tokio/select".into(), SELECT);
         assert_eq!(article.title, "tokio::select!");
-        assert_eq!(article.crate_name, "tokio");
+        assert_eq!(article.crates, ["tokio"]);
         assert_eq!(article.versions.as_deref(), Some("1.x"));
         assert_eq!(article.summary, "Waiting on several futures at once.");
 
@@ -1000,7 +1007,7 @@ mod tests {
             "---\ntitle: Routing\ncrate: actix-web\n---\n## Scopes\n\ntext\n",
         );
         assert_eq!(article.title, "Routing");
-        assert_eq!(article.crate_name, "actix-web");
+        assert_eq!(article.crates, ["actix-web"]);
         assert_eq!(article.summary, "text");
     }
 
@@ -1021,7 +1028,7 @@ mod tests {
             "rust/ownership".into(),
             "---\ntopic: Rust ownership and borrowing\ncodes: E0499, e0502 E0505,E0597, not-a-code\n---\n# Borrowing\n\nx\n",
         );
-        assert_eq!(article.crate_name, "");
+        assert!(article.crates.is_empty());
         assert_eq!(article.subject(), "Rust ownership and borrowing");
         assert_eq!(article.codes, ["E0499", "E0502", "E0505", "E0597"]);
 
@@ -1075,7 +1082,7 @@ mod tests {
     #[test]
     fn a_top_level_article_has_no_crate() {
         let article = parse_article("lifetimes".into(), "Borrowing rules.\n");
-        assert_eq!(article.crate_name, "");
+        assert!(article.crates.is_empty());
         assert_eq!(article.title, "lifetimes");
         assert_eq!(article.sections.len(), 1);
     }
@@ -1171,6 +1178,21 @@ Tags: a"), None);
         let empty = TempDir::new("library-empty");
         assert!(index_block(empty.path()).is_none());
         assert!(index_block(&empty.join("missing")).is_none());
+    }
+
+    #[test]
+    fn an_article_can_cover_a_trait_crate_and_its_implementations() {
+        let dir = TempDir::new("library-crates");
+        write(dir.path(), "aead/basics", "---\ncrate: aead, aes-gcm , chacha20poly1305\n---\n# AEAD\n\n## Nonces\n\nNever reuse one.\n");
+        let library = Library::load(dir.path());
+        assert_eq!(library.articles[0].crates, ["aead", "aes-gcm", "chacha20poly1305"]);
+        assert_eq!(library.crates(), ["aead", "aes-gcm", "chacha20poly1305"]);
+        assert_eq!(index_block(dir.path()).unwrap(), "- aead, aes-gcm, chacha20poly1305: AEAD\n");
+        // A project that depends on one implementation is pointed at the article.
+        let deps = ["aes-gcm".to_string()];
+        assert_eq!(involved_crates(&library.crates(), "error[E0599]: x", &deps), ["aes-gcm"]);
+        // And every crate's name finds its sections, though the text names none of them.
+        assert_eq!(library.search("chacha20poly1305 nonce")[0].id, "aead/basics#0");
     }
 
     #[test]
