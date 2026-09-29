@@ -565,6 +565,8 @@ async fn choose_model(config: &Config, keys: Option<&mut Keys>) -> Result<String
 async fn main() -> Result<()> {
     // Parse configuration first so we know the mode before any stdout output.
     let config = parse_config()?;
+    // Before anything is rendered: NO_COLOR is haico's to apply, not crossterm's.
+    out::own_colors();
 
     // The process moves, rather than the directory being handed to whatever needs it:
     // the project's instructions, memory, skills, the workspace, the session path, the

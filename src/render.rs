@@ -1230,6 +1230,7 @@ mod diff_tests {
 
     #[test]
     fn only_the_lines_with_a_background_are_written_in_black() {
+        crate::out::own_colors();
         let black = SetForegroundColor(Color::Black).to_string();
         let diff = generate_diff("a.txt", "keep\none\n", "keep\ntwo\n").unwrap();
 
@@ -1672,6 +1673,7 @@ mod markdown_tests {
 
     #[test]
     fn a_fence_opened_in_one_chunk_still_closes_in_another() {
+        crate::out::own_colors();
         let mut stream = MarkdownStream::new();
         let mut rendered = stream.push("```rust\nlet x = 1;\n");
         rendered.push_str(&stream.push("```\nafter\n"));

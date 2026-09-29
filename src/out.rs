@@ -280,7 +280,7 @@ impl Out {
         } else if self.plain {
             let _ = io::stdout().write_all(without_escapes(text).as_bytes());
         } else {
-            let _ = io::stdout().write_all(text.as_bytes());
+            let _ = io::stdout().write_all(for_the_terminal(text).as_bytes());
         }
     }
 
@@ -989,7 +989,7 @@ impl Screen {
             buffer.push_str(&frame);
         } else {
             let mut stdout = io::stdout();
-            let _ = stdout.write_all(frame.as_bytes());
+            let _ = stdout.write_all(for_the_terminal(&frame).as_bytes());
             let _ = stdout.flush();
         }
 
@@ -1537,6 +1537,86 @@ pub(crate) fn set_plain(plain: bool) {
     lock().plain = plain;
 }
 
+// NO_COLOR (no-color.org), honored here rather than left to crossterm.
+//
+// crossterm honors it too, but only by writing nothing between `ESC[` and `m` — and an empty
+// SGR is not "no color", it is a full reset. Every color change in the output became a reset
+// that also switched off bold, italics and reverse video in the middle of a line, and the
+// rendered text itself changed with the environment: the render tests failed whenever the
+// suite was run from a shell that set NO_COLOR. So crossterm is told to always write its
+// colors (`own_colors`), everything is rendered the same everywhere, and the colors are taken
+// out here, on the way to the terminal, with every other attribute left alone. Captured
+// output is what was rendered, never filtered, so no test depends on the environment.
+fn no_color() -> bool {
+    static NO_COLOR: OnceLock<bool> = OnceLock::new();
+    // Set and not empty, as the convention says.
+    *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()))
+}
+
+// Take crossterm's NO_COLOR handling away from it; see `no_color`. Called before anything is
+// rendered, and by the tests that compare colors, since the switch is crossterm's global.
+pub(crate) fn own_colors() {
+    crossterm::style::force_color_output(true);
+}
+
+fn for_the_terminal(text: &str) -> std::borrow::Cow<'_, str> {
+    if no_color() { without_color(text) } else { std::borrow::Cow::Borrowed(text) }
+}
+
+// Every SGR sequence with its color parameters removed: foreground, background and underline
+// color, in the basic, bright, 256-color and truecolor forms. What remains — bold, dim,
+// italic, underline, reverse and the resets — is kept, and a sequence left with nothing to
+// say is dropped rather than written as `ESC[m`, which would be a reset of its own.
+fn without_color(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            kept.push(ch);
+            continue;
+        }
+        let escape = take_escape(&mut chars);
+        let Some(params) = escape.strip_prefix("\u{1b}[").and_then(|rest| rest.strip_suffix('m'))
+        else {
+            kept.push_str(&escape);
+            continue;
+        };
+        // A reset stays a reset: it is what turns bold back off.
+        if params.split(';').all(|param| param.is_empty() || param == "0") {
+            kept.push_str(&escape);
+            continue;
+        }
+        let mut left = Vec::new();
+        let mut params = params.split(';');
+        while let Some(param) = params.next() {
+            match param.parse::<u16>().unwrap_or(0) {
+                // Extended colors carry their value in the parameters after them:
+                // `5;n` for the 256-color palette, `2;r;g;b` for truecolor.
+                38 | 48 | 58 => match params.next() {
+                    Some("5") => {
+                        params.next();
+                    }
+                    Some("2") => {
+                        params.nth(2);
+                    }
+                    _ => {}
+                },
+                30..=37 | 39 | 40..=47 | 49 | 59 | 90..=97 | 100..=107 => {}
+                _ => left.push(param),
+            }
+        }
+        if !left.is_empty() {
+            kept.push_str("\u{1b}[");
+            kept.push_str(&left.join(";"));
+            kept.push('m');
+        }
+    }
+    std::borrow::Cow::Owned(kept)
+}
+
 fn without_escapes(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\u{1b}') {
         return std::borrow::Cow::Borrowed(text);
@@ -1906,6 +1986,22 @@ mod tests {
         let colored = "\u{1b}[38;5;8m✻ Whirred for 2s\u{1b}[0m\n\u{1b}[2K\u{1b}[1Gnext";
         assert_eq!(super::without_escapes(colored), "✻ Whirred for 2s\nnext");
         assert!(matches!(super::without_escapes("as is"), std::borrow::Cow::Borrowed(_)));
+    }
+
+    // NO_COLOR takes the colors and nothing else. In particular a color change must not turn
+    // into `ESC[m`, which is a reset and would switch bold off in the middle of a heading.
+    #[test]
+    fn no_color_keeps_every_attribute_but_the_colors() {
+        use super::without_color;
+        // A color alone disappears whole; a reset stays.
+        assert_eq!(without_color("\u{1b}[38;5;12mcode\u{1b}[0m"), "code\u{1b}[0m");
+        assert_eq!(without_color("\u{1b}[31mred\u{1b}[m"), "red\u{1b}[m");
+        // Bold survives the color it was combined with, in every color form.
+        assert_eq!(without_color("\u{1b}[1;38;2;10;20;30mhead"), "\u{1b}[1mhead");
+        assert_eq!(without_color("\u{1b}[48;5;22;1;97mx"), "\u{1b}[1mx");
+        assert_eq!(without_color("\u{1b}[7;42;4mx"), "\u{1b}[7;4mx");
+        // Escapes that are not SGR are none of this function's business.
+        assert_eq!(without_color("\u{1b}[2K\u{1b}[1Gx"), "\u{1b}[2K\u{1b}[1Gx");
     }
 
     #[test]
