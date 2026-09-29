@@ -433,6 +433,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         repeat_penalty_arg: None,
         file: Default::default(),
         config_path: None,
+        config_created: false,
         resume: false,
         prompt: None,
         trace: None,

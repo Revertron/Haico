@@ -484,6 +484,10 @@ async fn answer_or_show(
 // and code; treat it as an order of magnitude, not a budget.
 async fn run_mcp_server(config: Config) -> Result<()> {
     eprintln!("[haico] starting MCP server (stdio)...");
+    // stderr, like every diagnostic here: stdout carries the protocol.
+    if let Some(notice) = starter_config_notice(&config) {
+        eprintln!("[haico] {}", notice);
+    }
 
     // web_fetch summarizes pages via the LLM, so it is only exposed when --url (or LLM_URL)
     // says explicitly where that LLM lives. Otherwise it is hidden and only web_get (raw
@@ -636,7 +640,9 @@ async fn main() -> Result<()> {
 
     outln!("          Welcome to Haico!");
     outln!("=====================================\n");
-    if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
+    if let Some(notice) = starter_config_notice(&config) {
+        outln!("{}", notice);
+    } else if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
         outln!("Config: {}", path.display());
     }
     outln!("Connecting to LLM server at: {}", config.llm_url);
@@ -2358,6 +2364,9 @@ mod turn_tests {
 /// terminal — there is no terminal to take.
 #[cfg(feature = "gui")]
 fn run_gui(config: Config) -> Result<()> {
+    if let Some(notice) = starter_config_notice(&config) {
+        eprintln!("{}", notice);
+    }
     let Some(model) = config.model.clone().filter(|m| !m.is_empty()) else {
         eprintln!(
             "--gui needs --model for now: choosing a model is a conversation, and the window \

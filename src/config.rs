@@ -117,6 +117,9 @@ pub(crate) struct Config {
     // The parsed config file, consulted again whenever the model changes.
     pub(crate) file: FileConfig,
     pub(crate) config_path: Option<PathBuf>,
+    // The starter config was written by this run, because there was none — said once at
+    // startup with its path, since a file nobody knows about is a file nobody edits.
+    pub(crate) config_created: bool,
     // Continue this directory's previous conversation instead of starting fresh.
     pub(crate) resume: bool,
     // A task to run unattended in auto mode, exiting when it is done. `None` is the REPL.
@@ -176,6 +179,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     // is a bare `haico`. Read before anything else resolves, since it sits under the command
     // line and the environment but above the built-in defaults.
     let config_path = config_file_path();
+    let config_created = config_path.as_deref().is_some_and(write_starter_config);
     let file_config = load_file_config(config_path.as_deref());
 
     // Parse LLM URL
@@ -297,6 +301,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         repeat_penalty_arg,
         file: file_config,
         config_path,
+        config_created,
         resume: matches.opt_present("r"),
         // A blank task is treated as none, rather than starting a run with nothing to do
         // that the model would fill by inventing a task of its own.
@@ -418,6 +423,100 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
     crate::store::path("config.toml")
 }
 
+// The config written on first start.
+//
+// Every top-level key is commented out, so a fresh file changes nothing: `url` in particular
+// must stay unset, because a supplied URL is what turns on `web_fetch`'s summarizer, and a
+// starter that set it would switch that on for a server the user never named. The one live
+// section is a model's own, which only applies when that model is the one in use. What the
+// file is for is being read — a user who never opens it has no way to learn that `[models]`
+// exists, or which keys it takes, short of reading this source.
+//
+// Examples are written `# key = value`, one space after the hash, and prose never starts that
+// way: the test that uncomments every example and parses the result depends on it, and that
+// test is what keeps a key renamed here from being handed to users as a typo that
+// `deny_unknown_fields` then refuses.
+pub(crate) const STARTER_CONFIG: &str = r#"# haico's config. Everything here is optional; the command line and the environment
+# outrank it, and a model's own [models."<name>"] section outranks the top level.
+# /model and /set context write their choices back into this file, leaving the rest alone.
+
+# The OpenAI-compatible server: Ollama (11434), LM Studio (1234), llama-server (8080).
+# url = "http://127.0.0.1:11434"
+# token = "..."
+
+# The model to start with, skipping the picker.
+# model = "qwen2.5:14b"
+
+# Search through a SearxNG instance instead of DuckDuckGo.
+# searxng = "http://127.0.0.1:8888"
+
+# Replaces haico's own system prompt: the text itself, or a path to a file holding it.
+# system_prompt = "path/to/prompt.txt"
+
+# Directories the file tools may read but never write, besides the working directory.
+# read_paths = ["C:/src/shared-lib"]
+
+# "fullscreen" or "inline", and whether the mouse wheel scrolls ("scroll") or not ("off").
+# tui = "fullscreen"
+# mouse = "scroll"
+
+# Fallbacks for every model without a section of its own. The sampling settings are left
+# to the server unless given.
+# context = 131072
+# temperature = 0.7
+# max_tokens = 8192
+# top_p = 0.95
+# top_k = 40
+# min_p = 0.05
+# repeat_penalty = 1.1
+# reasoning_effort = "medium"
+# What happens to a thinking model's chain of thought after its turn: "keep", "compress"
+# (summarized, once longer than reasoning_threshold tokens) or "drop".
+# reasoning = "keep"
+# reasoning_threshold = 800
+
+# Per-model settings, keyed by the name the server reports. Takes every setting above
+# except url, token, model, searxng, system_prompt, read_paths, tui and mouse, plus:
+#   use_system_prompt = false     for a model trained with instructions of its own
+#   sub_agent_effort = "low"      reasoning_effort for research, review and summaries
+[models."tiel-coder-35b-a3b-mtp"]
+context = 131072
+temperature = 0.3
+reasoning = "keep"
+"#;
+
+// What each entry path prints when this run wrote the starter config. One wording for all
+// of them; where it goes (the REPL's screen, a log, stderr under MCP) is theirs to decide.
+pub(crate) fn starter_config_notice(config: &Config) -> Option<String> {
+    let path = config.config_path.as_deref().filter(|_| config.config_created)?;
+    Some(format!(
+        "Created a starter config at {} — every setting in it is described there.",
+        crate::util::display_path(path)
+    ))
+}
+
+// Write the starter config if there is no config at all. `true` only when it was written
+// just now, so the caller can say where it went. Anything else — a file already there, no
+// home directory, a directory that cannot be created — is `false` and silent: the config is
+// optional, and failing to write an example is no reason to stop haico starting.
+fn write_starter_config(path: &Path) -> bool {
+    if path.exists() {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    // `create_new`, so a second haico starting at the same moment cannot have its file
+    // replaced by this one's.
+    let Ok(mut file) = fs::OpenOptions::new().write(true).create_new(true).open(path) else {
+        return false;
+    };
+    use std::io::Write;
+    file.write_all(STARTER_CONFIG.as_bytes()).is_ok()
+}
+
 // Read the config file. A missing file is normal; a malformed one is reported and then
 // ignored, so a stray character cannot stop haico starting.
 
@@ -477,9 +576,67 @@ fn edit_config_file(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(
 
 pub(crate) fn save_default_model(path: &Path, model: &str) -> Result<()> {
     edit_config_file(path, |doc| {
+        uncomment_example(doc, "model");
         doc["model"] = toml_edit::value(model);
         Ok(())
     })
+}
+
+// Turn a commented `# key = ...` example at the top of the file into the key itself, so a
+// value saved there lands under the comment describing it.
+//
+// Without this, saving into the starter config put the key above the file's header: its
+// top level holds only comments, which toml_edit keeps as the prefix of the first section's
+// header, and a new top-level key is rendered before all of it. Splitting that prefix at the
+// example gives the key everything above the example and the header everything below.
+// Only when the key is absent and the top level holds no keys at all — otherwise a new key
+// goes after the existing ones, which is already somewhere sensible.
+fn uncomment_example(doc: &mut DocumentMut, key: &str) {
+    if doc.contains_key(key) || doc.iter().any(|(_, item)| !item.is_table()) {
+        return;
+    }
+    // The first header in the file, which holds the comments above it. An implicit
+    // `[models]` has no header of its own; the text sits on its first real subsection.
+    fn first_header(table: &mut Table) -> Option<&mut Table> {
+        let mut first: Option<&mut Table> = None;
+        for (_, item) in table.iter_mut() {
+            let Some(sub) = item.as_table_mut() else { continue };
+            let sub = if sub.is_implicit() {
+                match first_header(sub) {
+                    Some(sub) => sub,
+                    None => continue,
+                }
+            } else {
+                sub
+            };
+            if first.as_ref().is_none_or(|f| sub.position() < f.position()) {
+                first = Some(sub);
+            }
+        }
+        first
+    }
+    let Some(header) = first_header(doc.as_table_mut()) else { return };
+    let Some(prefix) = header.decor().prefix().and_then(|p| p.as_str()).map(str::to_string) else {
+        return;
+    };
+
+    let example = format!("# {key} = ");
+    let Some(start) = prefix.lines().scan(0, |at, line| {
+        let here = *at;
+        *at += line.len() + 1;
+        Some((here, line))
+    })
+    .find(|(_, line)| line.starts_with(&example))
+    .map(|(at, _)| at) else {
+        return;
+    };
+    let end = prefix[start..].find('\n').map_or(prefix.len(), |n| start + n + 1);
+
+    header.decor_mut().set_prefix(prefix[end..].to_string());
+    doc[key] = toml_edit::value("");
+    if let Some(mut k) = doc.as_table_mut().key_mut(key) {
+        k.leaf_decor_mut().set_prefix(prefix[..start].to_string());
+    }
 }
 
 // Record a model's context window in that model's own section, or take it back out
@@ -838,6 +995,7 @@ mod tests {
             repeat_penalty_arg: None,
             file: toml::from_str(toml_text).expect("test config should parse"),
             config_path: None,
+            config_created: false,
             resume: false,
             prompt: None,
             trace: None,
@@ -1189,6 +1347,87 @@ mod tests {
         assert!(save_default_model(&path, "m").is_err());
         assert!(save_model_context(&path, "m", Some(8192)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // As written, the starter changes nothing but its one model section. `url` above all:
+    // a supplied URL turns on web_fetch's summarizer.
+    #[test]
+    fn the_starter_config_sets_nothing_but_its_example_model() {
+        let parsed: FileConfig = toml::from_str(STARTER_CONFIG).expect("starter must parse");
+        assert!(parsed.url.is_none() && parsed.model.is_none() && parsed.token.is_none());
+        assert!(parsed.context.is_none() && parsed.temperature.is_none());
+        assert!(parsed.read_paths.is_empty() && parsed.tui.is_none());
+        assert_eq!(parsed.models.len(), 1);
+
+        let tiel = &parsed.models["tiel-coder-35b-a3b-mtp"];
+        assert_eq!(tiel.context, Some(131072));
+        assert_eq!(tiel.temperature, Some(0.3));
+        assert_eq!(tiel.reasoning, Some(Reasoning::Keep));
+    }
+
+    // Every commented example, uncommented, must still be a config haico accepts — a key
+    // renamed in `FileConfig` and not here would be handed to users as a typo that
+    // `deny_unknown_fields` then refuses.
+    #[test]
+    fn every_example_in_the_starter_config_is_a_real_setting() {
+        let example = regex::Regex::new(r"^# ([a-z_]+ = .*)$").unwrap();
+        let mut uncommented = 0;
+        let text: String = STARTER_CONFIG
+            .lines()
+            .map(|line| match example.captures(line) {
+                Some(caps) => {
+                    uncommented += 1;
+                    format!("{}\n", &caps[1])
+                }
+                None => format!("{line}\n"),
+            })
+            .collect();
+        assert!(uncommented >= 15, "the pattern stopped matching the examples: {uncommented}");
+
+        let parsed: FileConfig = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("uncommented starter does not parse: {e}\n{text}"));
+        assert!(parsed.url.is_some() && parsed.reasoning_threshold.is_some());
+    }
+
+    #[test]
+    fn the_starter_config_is_written_once_and_never_over_a_file() {
+        let path = scratch("starter-config.toml", "");
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(write_starter_config(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), STARTER_CONFIG);
+
+        std::fs::write(&path, "url = \"http://mine\"\n").unwrap();
+        assert!(!write_starter_config(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "url = \"http://mine\"\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // /model writes into the starter like into any other file: its comments stay, and the
+    // model lands at the top level rather than inside the example's section.
+    #[test]
+    fn saving_into_the_starter_config_keeps_its_comments() {
+        let path = scratch("starter-then-save.toml", STARTER_CONFIG);
+
+        save_default_model(&path, "qwen2.5:14b").unwrap();
+        save_model_context(&path, "qwen2.5:14b", Some(32768)).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# Per-model settings, keyed by"), "comment lost:\n{raw}");
+        // In place of its own example, under the comment describing it — not above the
+        // file's header, where toml_edit puts a new key when the top level has none.
+        assert!(
+            raw.contains("# The model to start with, skipping the picker.\nmodel = \"qwen2.5:14b\"\n"),
+            "model landed elsewhere:\n{raw}"
+        );
+        assert!(!raw.contains("# model ="), "the example was left beside the value:\n{raw}");
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.model.as_deref(), Some("qwen2.5:14b"));
+        assert_eq!(parsed.models["qwen2.5:14b"].context, Some(32768));
+        assert_eq!(parsed.models["tiel-coder-35b-a3b-mtp"].context, Some(131072));
 
         let _ = std::fs::remove_file(&path);
     }
