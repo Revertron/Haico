@@ -438,6 +438,8 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         prompt: None,
         trace: None,
         trace_lib: None,
+        trace_research: None,
+        trace_gaps: None,
         dir: None,
         tui: crate::Tui::Inline,
         mouse: Default::default(),

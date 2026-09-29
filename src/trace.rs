@@ -200,7 +200,8 @@ pub(crate) fn end(exit_code: Option<i32>) {
     }
 }
 
-/// The `--trace-lib` file, and the pairs already written to it by this process.
+/// One of the question-and-answer files (`--trace-lib`, `--trace-research`,
+/// `--trace-gaps`), and the pairs already written to it by this process.
 struct QaFile {
     inner: Mutex<(File, HashSet<(String, String)>)>,
 }
@@ -215,35 +216,37 @@ impl QaFile {
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("could not open the library trace file {}", path.display()))?;
+            .with_context(|| format!("could not open the trace file {}", path.display()))?;
         Ok(QaFile { inner: Mutex::new((file, HashSet::new())) })
     }
 
-    /// One example, unless the answer is one that only makes sense with the articles open
-    /// (`qa_rejection`) or this exact pair was written already — a model stuck on one error
-    /// asks the same thing again and gets the same answer, and a dataset of forty copies of
-    /// it teaches that one answer forty times over. Failures swallowed, as for `write`.
-    fn record(&self, question: &str, answer: &str) {
+    /// One line for this question and answer, unless the exact pair was written already — a
+    /// model stuck on one error asks the same thing again and gets the same answer, and a
+    /// dataset of forty copies of it teaches that one answer forty times over. Failures
+    /// swallowed, as for `write`.
+    fn record(&self, question: &str, answer: &str, line: impl FnOnce(&str, &str) -> Value) {
         let (question, answer) = (question.trim(), answer.trim());
-        if question.is_empty() {
-            return;
-        }
-        if let Some(reason) = qa_rejection(answer) {
-            crate::debug::log("library answer not traced", reason);
+        if question.is_empty() || answer.is_empty() {
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if !inner.1.insert((question.to_string(), answer.to_string())) {
             return;
         }
-        let line = json!({"messages": [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ]});
-        let Ok(mut text) = serde_json::to_string(&line) else { return };
+        let Ok(mut text) = serde_json::to_string(&line(question, answer)) else { return };
         text.push('\n');
         let _ = inner.0.write_all(text.as_bytes());
         let _ = inner.0.flush();
+    }
+
+    /// As an SFT example: the question from the user, the answer from the assistant.
+    fn record_example(&self, question: &str, answer: &str) {
+        self.record(question, answer, |question, answer| {
+            json!({"messages": [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ]})
+        });
     }
 }
 
@@ -275,6 +278,8 @@ fn qa_rejection(answer: &str) -> Option<&'static str> {
 }
 
 static LIBRARY_QA: OnceLock<QaFile> = OnceLock::new();
+static RESEARCH_QA: OnceLock<QaFile> = OnceLock::new();
+static LIBRARY_GAPS: OnceLock<QaFile> = OnceLock::new();
 
 /// Start recording library answers into `path`, appending. Once per process.
 pub(crate) fn init_library(path: &Path) -> Result<()> {
@@ -282,10 +287,69 @@ pub(crate) fn init_library(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Start recording research answers into `path`, appending. Once per process.
+pub(crate) fn init_research(path: &Path) -> Result<()> {
+    let _ = RESEARCH_QA.set(QaFile::open(path)?);
+    Ok(())
+}
+
+/// Start recording the questions the library could not answer into `path`. Once per process.
+pub(crate) fn init_gaps(path: &Path) -> Result<()> {
+    let _ = LIBRARY_GAPS.set(QaFile::open(path)?);
+    Ok(())
+}
+
 /// One finished library lookup: the question as asked and the librarian's whole answer.
+///
+/// An answer saying the library had nothing is not an example, but it is the most useful
+/// thing the librarian says for whoever writes the articles: a question a model really had
+/// in the middle of real work, that the shelves could not answer. That goes to the gaps
+/// file, with the answer, since "covers X but not Y" says which half is missing.
 pub(crate) fn library_answer(question: &str, answer: &str) {
-    if let Some(file) = LIBRARY_QA.get() {
-        file.record(question, answer);
+    record_library_answer(LIBRARY_QA.get(), LIBRARY_GAPS.get(), question, answer);
+}
+
+// The files as arguments, so a test can hand in its own: the statics are set once per
+// process, and the tests share one.
+fn record_library_answer(examples: Option<&QaFile>, gaps: Option<&QaFile>, question: &str, answer: &str) {
+    if crate::tools::library::says_not_covered(answer) {
+        if let Some(file) = gaps {
+            file.record(question, answer, |question, answer| {
+                json!({
+                    "time": chrono::Local::now().to_rfc3339(),
+                    "cwd": std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+                    "question": question,
+                    "answer": answer,
+                })
+            });
+        }
+    }
+    if let Some(file) = examples {
+        match qa_rejection(answer.trim()) {
+            Some(reason) => crate::debug::log("library answer not traced", reason),
+            None => file.record_example(question, answer),
+        }
+    }
+}
+
+/// One finished research call: the question and the answer the sub-agent gave.
+///
+/// Unfiltered, unlike the library's: what a page on the web said is not checked the way an
+/// article is, so this file is raw material for someone to curate — which also means there
+/// is no pattern here that could know what to leave out. The answer is the sub-agent's own
+/// words only; the pages it read go beside the messages as `sources`, for whoever checks the
+/// answer against them — a key trainers ignore, and one to strip once it is checked.
+pub(crate) fn research_answer(question: &str, answer: &str, sources: &[String]) {
+    if let Some(file) = RESEARCH_QA.get() {
+        file.record(question, answer, |question, answer| {
+            json!({
+                "messages": [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                ],
+                "sources": sources,
+            })
+        });
     }
 }
 
@@ -351,20 +415,27 @@ mod tests {
     #[test]
     fn library_answers_are_written_as_sft_pairs_once_each() {
         let dir = temp_dir("trace_lib");
-        let path = dir.join("lib.jsonl");
-        let file = QaFile::open(&path).unwrap();
-        file.record("  tokio: select in a loop?  ", "Pin it with `tokio::pin!` first.");
-        file.record("tokio: select in a loop?", "Pin it with `tokio::pin!` first.");
-        file.record("mio: Registry?", "The library does not cover mio's Registry.");
-        file.record("mio: Registry?", "The article shows `registry.register`.");
-        file.record("mio: Registry?", "See mio/net#1 for `register`.");
-        file.record("mio: Registry?", "");
-        file.record("", "An answer to nothing.");
+        let (path, gaps_path) = (dir.join("lib.jsonl"), dir.join("gaps.jsonl"));
+        let (file, gaps) = (QaFile::open(&path).unwrap(), QaFile::open(&gaps_path).unwrap());
+        let answer = |q: &str, a: &str| record_library_answer(Some(&file), Some(&gaps), q, a);
+        answer("  tokio: select in a loop?  ", "Pin it with `tokio::pin!` first.");
+        answer("tokio: select in a loop?", "Pin it with `tokio::pin!` first.");
+        answer("mio: Registry?", "The library does not cover mio's Registry.");
+        answer("mio: Registry?", "The library does not cover mio's Registry.");
+        answer("mio: Registry?", "The article shows `registry.register`.");
+        answer("mio: Registry?", "See mio/net#1 for `register`.");
+        answer("mio: Registry?", "");
+        answer("", "An answer to nothing.");
 
-        let seen = lines(&path);
-        assert_eq!(seen, vec![json!({"messages": [
+        assert_eq!(lines(&path), vec![json!({"messages": [
             {"role": "user", "content": "tokio: select in a loop?"},
             {"role": "assistant", "content": "Pin it with `tokio::pin!` first."},
         ]})]);
+
+        // The one question the library had nothing on, once, and nothing else.
+        let gaps = lines(&gaps_path);
+        assert_eq!(gaps.len(), 1, "{:?}", gaps);
+        assert_eq!(gaps[0]["question"], "mio: Registry?");
+        assert_eq!(gaps[0]["answer"], "The library does not cover mio's Registry.");
     }
 }

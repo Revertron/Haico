@@ -351,6 +351,8 @@ impl MyMcpServer {
 
     // Show the answer, and shape the text the main model receives.
     fn finish(&self, question: &str, answer: &str, sources: &[String]) -> String {
+        // Whole, before the cut below — the library's reason.
+        crate::trace::research_answer(question, answer, sources);
         let answer = truncate_at_boundary(answer.trim(), MAX_ANSWER_CHARS);
         crate::debug::log("research answer", answer);
 
