@@ -51,10 +51,6 @@ const MAX_LOOKUPS: usize = 24;
 // The round that calls no tool and says nothing either — see research's MAX_ROUNDS.
 const MAX_ROUNDS: usize = MAX_LOOKUPS + 2;
 
-// Longer than research's answer may be, because what comes back from here is usually code
-// the model is about to copy, and a cut-off example is worse than none.
-const MAX_ANSWER_CHARS: usize = 6000;
-
 const MAX_ECHOED_QUESTION: usize = 200;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -374,10 +370,13 @@ impl MyMcpServer {
     }
 
     fn finish_library(&self, question: &str, answer: &str, sources: &[String]) -> String {
-        // Whole, before the cut below: that cut is about the main model's context, and a
-        // training example stopped mid-sentence would teach stopping mid-sentence.
+        // Never cut. What comes back from here is usually code the model is about to copy,
+        // and an example stopped mid-block is worse than none: the model compiles the half it
+        // got. The length is already bounded by whatever caps the librarian's generation
+        // (max_tokens, or the server's own limit), and against a 128k window a long answer
+        // is still far cheaper than the articles it saves reading.
+        let answer = answer.trim();
         crate::trace::library_answer(question, answer);
-        let answer = truncate_at_boundary(answer.trim(), MAX_ANSWER_CHARS);
         crate::debug::log("library answer", answer);
 
         if self.interactive {
