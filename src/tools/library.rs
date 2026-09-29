@@ -137,6 +137,20 @@ fn library_prompt(catalog: &str) -> String {
     )
 }
 
+/// Whether an answer is the librarian saying the library had nothing on (part of) the
+/// question. Kept in step with `NOT_COVERED` in `scripts/trace_to_dataset.py`.
+pub(crate) fn says_not_covered(answer: &str) -> bool {
+    static NOT_COVERED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    NOT_COVERED
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)\b(?:library|articles?)\b[^.\n]{0,40}\b(?:does not|doesn't|do not|don't)\b[^.\n]{0,20}\b(?:cover|mention|say|describe|answer|include)",
+            )
+            .unwrap()
+        })
+        .is_match(answer)
+}
+
 #[tool_router(router = library_router, vis = "pub(crate)")]
 impl MyMcpServer {
     #[tool(
@@ -382,6 +396,15 @@ impl MyMcpServer {
                 result.push_str(&format!("- {}\n", id));
             }
         }
+        // The prompt tells the librarian to say plainly when the library has nothing, so the
+        // reader goes elsewhere rather than guessing — but a small model handed "not covered"
+        // and nothing more tends to guess anyway, from memory, which is the one thing the
+        // answer was meant to prevent. Naming where to go next is what makes it act on it.
+        if says_not_covered(answer) {
+            result.push_str(
+                "\n\nThe library does not cover this. Look it up with research to get needed info.",
+            );
+        }
         result
     }
 }
@@ -431,6 +454,19 @@ mod tests {
         assert!(answer.starts_with("Library answer for:"), "{}", answer);
         assert!(answer.contains("tokio::pin!"), "{}", answer);
         assert!(answer.contains("Sections read:\n- tokio/select#0"), "{}", answer);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_library_does_not_cover_points_to_research() {
+        const NOT_COVERED: &str = r#"{"choices":[{"message":{"role":"assistant","content":"The library does not cover mio's Registry."}}]}"#;
+        let dir = library_with_select("library-tool-uncovered");
+        let (url, _) = serve_sequence(&[NOT_COVERED]).await;
+        let answer = server_at(url, dir.path()).run_library(dir.path(), "q").await;
+        assert!(answer.ends_with("Look it up with research to get needed info."), "{}", answer);
+
+        let (url, _) = serve_sequence(&[ANSWERS]).await;
+        let answer = server_at(url, dir.path()).run_library(dir.path(), "q").await;
+        assert!(!answer.contains("research"), "{}", answer);
     }
 
     #[tokio::test]

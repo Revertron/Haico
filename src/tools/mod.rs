@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 mod basics;
 mod crates;
 mod files;
-mod library;
+pub(crate) mod library;
 mod memory;
 mod research;
 mod shell;

@@ -253,16 +253,10 @@ impl QaFile {
 /// learned on its own. An answer pointing at its source — "the article", "I read", a section
 /// id like `tokio/select#2` — teaches citing something the model never had. "the library" is
 /// in there although a crate is a library too: the librarian says it of its own shelves far
-/// more often than of a crate. Kept in step with `scripts/trace_to_dataset.py`.
+/// more often than of a crate. Both patterns are kept in step with `scripts/trace_to_dataset.py`;
+/// the first lives with the librarian, which uses it too.
 fn qa_rejection(answer: &str) -> Option<&'static str> {
-    static NOT_COVERED: OnceLock<regex::Regex> = OnceLock::new();
     static REFERS_TO_SOURCE: OnceLock<regex::Regex> = OnceLock::new();
-    let not_covered = NOT_COVERED.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b(?:library|articles?)\b[^.\n]{0,40}\b(?:does not|doesn't|do not|don't)\b[^.\n]{0,20}\b(?:cover|mention|say|describe|answer|include)",
-        )
-        .unwrap()
-    });
     let refers_to_source = REFERS_TO_SOURCE.get_or_init(|| {
         regex::Regex::new(
             r"(?i)\bthe articles?\b|\bthis article\b|\bthe library\b|\b(?:I|we) (?:have )?read\b|\bsections? (?:I|you) read\b|\b[\w.-]+/[\w.-]+#\d+\b",
@@ -271,7 +265,7 @@ fn qa_rejection(answer: &str) -> Option<&'static str> {
     });
     if answer.is_empty() {
         Some("empty")
-    } else if not_covered.is_match(answer) {
+    } else if crate::tools::library::says_not_covered(answer) {
         Some("the library did not cover it")
     } else if refers_to_source.is_match(answer) {
         Some("it refers to the articles")
