@@ -107,6 +107,32 @@ class Conversion(unittest.TestCase):
         self.assertEqual(kept("--top", "1"), ["ok"])
         self.assertEqual(sorted(kept("--any-exit")), ["failed", "killed", "long", "ok", "wordy"])
 
+    def test_qa_keeps_the_question_and_final_answer_only(self):
+        lines = one_task("r", turns=2)
+        librarian = [SYSTEM, {"role": "user", "content": "mio: register a TcpListener?"}]
+        lookup = {"role": "assistant", "content": "", "reasoning_content": "search it",
+                  "tool_calls": [tool_call("l0", '{"query": "register"}')]}
+        answer = {"role": "assistant", "content": "<think>x</think>Call `registry.register`.",
+                  "reasoning_content": "from mio/net#1"}
+        history = librarian + [lookup, {"role": "tool", "tool_call_id": "l0", "content": "section"}]
+        lines[2:2] = [dict(call("library", librarian, lookup), run="r"),
+                      dict(call("library", history, answer), run="r")]
+        [example] = convert(lines, "--qa")
+        self.assertEqual(example, {"messages": [
+            {"role": "user", "content": "mio: register a TcpListener?"},
+            {"role": "assistant", "content": "Call `registry.register`."}]})
+
+    def test_qa_drops_answers_that_lean_on_the_articles(self):
+        answers = ["The library does not cover mio's Registry.",
+                   "The article shows `registry.register`.",
+                   "See mio/net#1: call `register`.",
+                   "Call `register`.", "Call `register`."]
+        lines = one_task("r", turns=2)
+        lines[2:2] = [dict(call("library", [SYSTEM, {"role": "user", "content": "q"}],
+                                {"role": "assistant", "content": a}), run="r") for a in answers]
+        examples = convert(lines, "--qa")
+        self.assertEqual([e["messages"][1]["content"] for e in examples], ["Call `register`."])
+
     def test_anonymizing_replaces_machine_paths(self):
         value = {"a": "in C:\\proj\\src and C:/proj, scratch G:\\Temp\\haico-0a1b2c3d, C:\\Users\\alice\\.cargo"}
         clean = ttd.anonymize(value, "C:\\proj", "/workspace/project")["a"]

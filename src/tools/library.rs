@@ -360,6 +360,9 @@ impl MyMcpServer {
     }
 
     fn finish_library(&self, question: &str, answer: &str, sources: &[String]) -> String {
+        // Whole, before the cut below: that cut is about the main model's context, and a
+        // training example stopped mid-sentence would teach stopping mid-sentence.
+        crate::trace::library_answer(question, answer);
         let answer = truncate_at_boundary(answer.trim(), MAX_ANSWER_CHARS);
         crate::debug::log("library answer", answer);
 

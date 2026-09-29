@@ -588,6 +588,9 @@ async fn main() -> Result<()> {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         trace::init(path, &cwd, config.prompt.as_deref())?;
     }
+    if let Some(path) = &config.trace_lib {
+        trace::init_library(path)?;
+    }
 
     // Server mode: hand off to the MCP stdio server and return (no banner, no REPL).
     if config.server {

@@ -126,6 +126,8 @@ pub(crate) struct Config {
     pub(crate) prompt: Option<String>,
     // Append every model call to this file as JSON lines — see `src/trace.rs`.
     pub(crate) trace: Option<PathBuf>,
+    // Append each library lookup to this file as a question-and-answer SFT example.
+    pub(crate) trace_lib: Option<PathBuf>,
     // The directory to work in, entered by `main` before anything else happens.
     pub(crate) dir: Option<PathBuf>,
     // Which renderer to use. Not model-dependent, so it never goes through
@@ -156,6 +158,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
     opts.optopt("p", "prompt", "Run this task unattended in auto mode, then exit", "TASK");
     opts.optopt("", "trace", "Append every model call to FILE as JSON lines, for training data", "FILE");
+    opts.optopt("", "trace-lib", "Append each library question and answer to FILE, ready for fine-tuning", "FILE");
     opts.optopt("d", "dir", "Work in DIR instead of the current directory", "DIR");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("", "gui", "Open a window instead of using the terminal");
@@ -311,6 +314,9 @@ pub(crate) fn parse_config() -> Result<Config> {
         // says `--trace runs.jsonl` means the runs.jsonl beside it, not one inside every
         // project it visits. `--system-prompt` gets this for free by being read above.
         trace: matches.opt_str("trace").map(|path| {
+            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
+        }),
+        trace_lib: matches.opt_str("trace-lib").map(|path| {
             env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
         }),
         dir: matches.opt_str("d").map(PathBuf::from),
@@ -939,6 +945,11 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("compactor, summarizer), then an 'end' line carrying the exit code of a --prompt");
     println!("run. Nothing is ever rewritten, so a compaction mid-run loses nothing. Use");
     println!("reasoning = \"keep\" if the earlier replies' thinking should stay in later requests.");
+    println!("
+--trace-lib appends each library lookup as one fine-tuning example: the question");
+    println!("and the librarian's answer, {{\"messages\": [user, assistant]}}, nothing else. Answers");
+    println!("that lean on the articles (\"the library does not cover\", \"the article shows\") are");
+    println!("left out, and so is a pair already written by the same run.");
     println!("\nAnything left out is omitted from the request, so the server's own setting");
     println!("for that model still applies. top_k, min_p and repeat_penalty are extensions");
     println!("that llama.cpp, Ollama, LM Studio and vLLM understand, not OpenAI API fields.");
@@ -957,6 +968,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  {} --resume                       # Continue this directory's last conversation", program);
     println!("  {} -p \"Update dependencies and commit\"  # Run one task unattended, then exit", program);
     println!("  {} -p \"Fix the build\" --trace runs.jsonl  # ...and record every model call", program);
+    println!("  {} --trace-lib library-qa.jsonl  # Collect library answers for fine-tuning", program);
     println!("  {} -d ../other-project -p \"Update dependencies\"  # ...in another directory", program);
 }
 
@@ -999,6 +1011,7 @@ mod tests {
             resume: false,
             prompt: None,
             trace: None,
+            trace_lib: None,
             dir: None,
             tui: crate::config::Tui::Inline,
             mouse: crate::config::Mouse::Scroll,

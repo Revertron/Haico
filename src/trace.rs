@@ -28,12 +28,20 @@
 //! client is cloned into the tool server, copied for every sub-agent and rebuilt by
 //! `/model`, and a trace that one of those copies forgot would be a trace with a hole in
 //! it that nothing reports.
+//!
+//! `--trace-lib <file>` is the other recording, and a much narrower one: each library
+//! lookup as the question and the librarian's final answer, two messages and nothing else,
+//! already in the shape a fine-tuning run reads. It exists for teaching a model what the
+//! library says so it stops needing to ask, which the whole trace can also give — through
+//! `scripts/trace_to_dataset.py --qa`, after keeping every request of every run. The
+//! filters are the same ones that script applies, and the two sets of patterns must agree.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -192,6 +200,101 @@ pub(crate) fn end(exit_code: Option<i32>) {
     }
 }
 
+/// The `--trace-lib` file, and the pairs already written to it by this process.
+struct QaFile {
+    inner: Mutex<(File, HashSet<(String, String)>)>,
+}
+
+impl QaFile {
+    fn open(path: &Path) -> Result<QaFile> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("could not create {}", dir.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("could not open the library trace file {}", path.display()))?;
+        Ok(QaFile { inner: Mutex::new((file, HashSet::new())) })
+    }
+
+    /// One example, unless the answer is one that only makes sense with the articles open
+    /// (`qa_rejection`) or this exact pair was written already — a model stuck on one error
+    /// asks the same thing again and gets the same answer, and a dataset of forty copies of
+    /// it teaches that one answer forty times over. Failures swallowed, as for `write`.
+    fn record(&self, question: &str, answer: &str) {
+        let (question, answer) = (question.trim(), answer.trim());
+        if question.is_empty() {
+            return;
+        }
+        if let Some(reason) = qa_rejection(answer) {
+            crate::debug::log("library answer not traced", reason);
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.1.insert((question.to_string(), answer.to_string())) {
+            return;
+        }
+        let line = json!({"messages": [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]});
+        let Ok(mut text) = serde_json::to_string(&line) else { return };
+        text.push('\n');
+        let _ = inner.0.write_all(text.as_bytes());
+        let _ = inner.0.flush();
+    }
+}
+
+/// Why a librarian's answer is no use as something to say from memory, if it is not.
+///
+/// "The library does not cover this" is right with the library behind it and exactly wrong
+/// learned on its own. An answer pointing at its source — "the article", "I read", a section
+/// id like `tokio/select#2` — teaches citing something the model never had. "the library" is
+/// in there although a crate is a library too: the librarian says it of its own shelves far
+/// more often than of a crate. Kept in step with `scripts/trace_to_dataset.py`.
+fn qa_rejection(answer: &str) -> Option<&'static str> {
+    static NOT_COVERED: OnceLock<regex::Regex> = OnceLock::new();
+    static REFERS_TO_SOURCE: OnceLock<regex::Regex> = OnceLock::new();
+    let not_covered = NOT_COVERED.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:library|articles?)\b[^.\n]{0,40}\b(?:does not|doesn't|do not|don't)\b[^.\n]{0,20}\b(?:cover|mention|say|describe|answer|include)",
+        )
+        .unwrap()
+    });
+    let refers_to_source = REFERS_TO_SOURCE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\bthe articles?\b|\bthis article\b|\bthe library\b|\b(?:I|we) (?:have )?read\b|\bsections? (?:I|you) read\b|\b[\w.-]+/[\w.-]+#\d+\b",
+        )
+        .unwrap()
+    });
+    if answer.is_empty() {
+        Some("empty")
+    } else if not_covered.is_match(answer) {
+        Some("the library did not cover it")
+    } else if refers_to_source.is_match(answer) {
+        Some("it refers to the articles")
+    } else {
+        None
+    }
+}
+
+static LIBRARY_QA: OnceLock<QaFile> = OnceLock::new();
+
+/// Start recording library answers into `path`, appending. Once per process.
+pub(crate) fn init_library(path: &Path) -> Result<()> {
+    let _ = LIBRARY_QA.set(QaFile::open(path)?);
+    Ok(())
+}
+
+/// One finished library lookup: the question as asked and the librarian's whole answer.
+pub(crate) fn library_answer(question: &str, answer: &str) {
+    if let Some(file) = LIBRARY_QA.get() {
+        file.record(question, answer);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +352,25 @@ mod tests {
         Trace::open(&path).unwrap().end(None);
         Trace::open(&path).unwrap().end(None);
         assert_eq!(lines(&path).len(), 2);
+    }
+
+    #[test]
+    fn library_answers_are_written_as_sft_pairs_once_each() {
+        let dir = temp_dir("trace_lib");
+        let path = dir.join("lib.jsonl");
+        let file = QaFile::open(&path).unwrap();
+        file.record("  tokio: select in a loop?  ", "Pin it with `tokio::pin!` first.");
+        file.record("tokio: select in a loop?", "Pin it with `tokio::pin!` first.");
+        file.record("mio: Registry?", "The library does not cover mio's Registry.");
+        file.record("mio: Registry?", "The article shows `registry.register`.");
+        file.record("mio: Registry?", "See mio/net#1 for `register`.");
+        file.record("mio: Registry?", "");
+        file.record("", "An answer to nothing.");
+
+        let seen = lines(&path);
+        assert_eq!(seen, vec![json!({"messages": [
+            {"role": "user", "content": "tokio: select in a loop?"},
+            {"role": "assistant", "content": "Pin it with `tokio::pin!` first."},
+        ]})]);
     }
 }

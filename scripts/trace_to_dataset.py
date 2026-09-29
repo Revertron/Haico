@@ -36,12 +36,24 @@ Examples are dropped when a reply in them was cut off by max_tokens (finish_reas
 running them; the model should not learn to write them), and when they carry images,
 unless --keep-images.
 
+Questions and answers
+---------------------
+--qa exports each library lookup as two messages: the question the librarian was asked
+and its final answer, with nothing between — no system prompt, tools, articles or
+reasoning. That is the shape for teaching a model what the library says, so it stops
+needing to ask. Answers that only make sense with the articles at hand are dropped: "the
+library does not cover this", and anything citing its source ("the article", a section
+id). So are exact repeats of a question and answer seen earlier. haico --trace-lib writes
+the same examples as it goes, with the same filters — keep the patterns in step with
+qa_rejection in src/trace.rs.
+
 Usage
 -----
     python scripts/trace_to_dataset.py runs.jsonl -o dataset.jsonl
     python scripts/trace_to_dataset.py nightly/*.jsonl --max-turns 12 --max-turn-tokens 4000 --top 50
     python scripts/trace_to_dataset.py runs.jsonl --caller reviewer -o reviewer.jsonl
     python scripts/trace_to_dataset.py runs.jsonl --anonymize --reasoning drop --meta
+    python scripts/trace_to_dataset.py traces/*.jsonl --qa --any-exit -o library-qa.jsonl
 
 A summary of what was kept and why the rest was not goes to stderr.
 """
@@ -253,6 +265,53 @@ def build_example(stretch, args):
     return example, None
 
 
+# --------------------------------------------------------------------------- question and answer
+
+THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
+
+# The librarian telling the reader the articles had nothing. Right with the library behind
+# it, and exactly wrong as a thing to learn to say from memory.
+NOT_COVERED = re.compile(
+    r"\b(?:library|articles?)\b[^.\n]{0,40}\b(?:does not|doesn't|do not|don't)\b[^.\n]{0,20}"
+    r"\b(?:cover|mention|say|describe|answer|include)", re.I)
+
+# An answer pointing at what it was read from: "the article shows", "as I read", a section
+# id like tokio/select#2. Trained without the lookup, that teaches citing a source the model
+# never had. "the library" is included although a crate is a library too — the librarian
+# says it of its own shelves far more often than of a crate.
+REFERS_TO_SOURCE = re.compile(
+    r"\bthe articles?\b|\bthis article\b|\bthe library\b|\b(?:I|we) (?:have )?read\b"
+    r"|\bsections? (?:I|you) read\b|\b[\w.-]+/[\w.-]+#\d+\b", re.I)
+
+
+def build_qa(stretch):
+    """The stretch's question and final answer as one two-message example, or (None, reason).
+
+    For putting what the library knows into the weights: the question as the user asked it,
+    the answer as if known outright — no system prompt, no tools, no articles, no reasoning
+    (which was done with the articles in view and talks about them)."""
+    first = stretch[0]["request"].get("messages", [])
+    question = next((m.get("content") for m in first if m.get("role") == "user"), None)
+    if not isinstance(question, str) or not question.strip():
+        return None, "qa: no question"
+
+    last = stretch[-1]
+    if last.get("finish_reason") == "length":
+        return None, "qa: the answer was cut off (finish_reason length)"
+    if last["response"].get("tool_calls"):
+        return None, "qa: ended on a lookup, not an answer"
+    answer = THINK_BLOCK.sub("", last["response"].get("content") or "").strip()
+    if not answer:
+        return None, "qa: empty answer"
+    if NOT_COVERED.search(answer):
+        return None, "qa: the library did not cover it"
+    if REFERS_TO_SOURCE.search(answer):
+        return None, "qa: the answer refers to the articles"
+
+    return {"messages": [{"role": "user", "content": question.strip()},
+                         {"role": "assistant", "content": answer}]}, None
+
+
 # --------------------------------------------------------------------------- anonymizing
 
 USER_DIRS = [
@@ -292,8 +351,10 @@ def main(argv=None):
     )
     parser.add_argument("traces", nargs="+", help="trace files written by haico --trace")
     parser.add_argument("-o", "--output", help="dataset file to write (default: stdout)")
-    parser.add_argument("--caller", choices=CALLERS, default="main",
-                        help="which conversation to export (default: main)")
+    parser.add_argument("--caller", choices=CALLERS,
+                        help="which conversation to export (default: main, or library with --qa)")
+    parser.add_argument("--qa", action="store_true",
+                        help="export each library lookup as just its question and final answer")
 
     runs = parser.add_argument_group("choosing runs")
     runs.add_argument("--exit-code", type=int, action="append",
@@ -319,6 +380,10 @@ def main(argv=None):
     shape.add_argument("--meta", action="store_true",
                        help="add a 'meta' object (run, caller, exit code, turns, tokens) to each example")
     args = parser.parse_args(argv)
+    if args.caller is None:
+        args.caller = "library" if args.qa else "main"
+    elif args.qa and args.caller != "library":
+        parser.error("--qa works on the librarian's conversation only (--caller library)")
     if args.exit_code is None:
         args.exit_code = [0]
 
@@ -327,13 +392,21 @@ def main(argv=None):
     kept_runs = select_runs(all_runs, args, dropped)
 
     examples = []
+    seen_qa = set()
     for run_id, run in kept_runs:
         calls = [c for c in run["calls"] if c.get("caller") == args.caller]
         for stretch in stretches(calls):
-            example, reason = build_example(stretch, args)
+            example, reason = build_qa(stretch) if args.qa else build_example(stretch, args)
             if example is None:
                 dropped[reason] += 1
                 continue
+            if args.qa:
+                # A model stuck on one error asks the same thing again and gets the same answer.
+                pair = tuple(m["content"] for m in example["messages"])
+                if pair in seen_qa:
+                    dropped["qa: same question and answer as an earlier one"] += 1
+                    continue
+                seen_qa.add(pair)
             if args.anonymize:
                 cwd = (run["start"] or {}).get("cwd")
                 example = anonymize(example, cwd, args.project_path)
