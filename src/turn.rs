@@ -310,6 +310,9 @@ pub(crate) enum Notice {
     FileNotAttached { path: String, reason: String },
     /// Text typed while the model was working, now joining the conversation.
     QueuedSent(String),
+    /// Timers the model set came due and their prompts were sent to it — mid-turn at a
+    /// round boundary, or at the idle prompt as a turn of their own.
+    TimersFired(Vec<crate::timers::Fired>),
     /// `/init` wrote the project's instructions and they were re-read.
     ProjectContextReloaded(String),
 }

@@ -106,6 +106,9 @@ pub(crate) enum Input {
     // writer rather than here, so unlike the two above this carries nothing — the caller
     // just tells `out` to flip it.
     ToggleExpand,
+    // Nothing was typed: the deadline `read_command` was given came round, so a timer may
+    // be due. The half-typed line stays in the editor for when the prompt comes back.
+    Wake,
 }
 
 // How much of the plan the panel shows, cycled with Ctrl+T.
@@ -1027,7 +1030,16 @@ pub(crate) async fn read_command(
     last: Option<&str>,
     todos: &[TodoItem],
     plan: &mut PlanView,
+    wake: Option<std::time::Instant>,
 ) -> Input {
+    // Made once rather than per keystroke: typing must not keep pushing the deadline back.
+    let deadline = async {
+        match wake {
+            Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(deadline);
     loop {
         draw(
             editor,
@@ -1043,7 +1055,11 @@ pub(crate) async fn read_command(
                 plan: *plan,
             },
         );
-        let Some(event) = keys.next().await else {
+        let event = tokio::select! {
+            event = keys.next() => event,
+            _ = &mut deadline => return Input::Wake,
+        };
+        let Some(event) = event else {
             return Input::Eof;
         };
         if let Some(delta) = scroll_rows(&event) {
@@ -1123,7 +1139,8 @@ pub(crate) fn while_working(
                     WhileWorking::Nothing
                 }
                 // Ctrl+D is for leaving, and leaving mid-turn is what Esc is for.
-                Some(Input::Eof) | None => WhileWorking::Nothing,
+                // The editor never produces a wake; only `read_command`'s deadline does.
+                Some(Input::Eof) | Some(Input::Wake) | None => WhileWorking::Nothing,
             }
         }
         Event::Paste(text) => {

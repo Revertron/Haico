@@ -37,6 +37,7 @@ mod skills;
 mod store;
 #[cfg(test)]
 mod testutil;
+mod timers;
 mod tools;
 mod trace;
 mod turn;
@@ -82,6 +83,7 @@ fn print_repl_help() {
     outln!("                     and '/set reasoning_effort'. All last for the session");
     outln!("                     except 'context', which is saved for this model.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
+    outln!("  /timers [cancel]   List the timers the model set, or cancel one (by id) or all");
     outln!("  /undo              Revert the last file change made by a tool");
     outln!("  /todo              Show the current plan, if the model made one");
     outln!("  /context           Show how much context the conversation is using");
@@ -757,9 +759,22 @@ async fn main() -> Result<()> {
                         io.last_activity.as_deref(),
                         &plan,
                         &mut io.plan_view,
+                        agent.server.next_timer_wake(),
                     )
                     .await
                     {
+                        // A timer's prompt runs as a turn of its own, straight through: it
+                        // is the model's message to itself, not a line the user typed, so
+                        // it is neither a command nor a skill nor history.
+                        Input::Wake => {
+                            let fired = agent.server.take_due_timers();
+                            if !fired.is_empty() {
+                                outln!("{}", timers_fired(&fired));
+                                let message = timers::message_for(&fired);
+                                drive_turn(&mut agent, &mut io, &message, false).await;
+                            }
+                            continue;
+                        }
                         // The finished entry becomes a plain line of the transcript, so
                         // the conversation reads as one when scrolled back.
                         Input::Text(text) => {
@@ -1221,6 +1236,26 @@ In force for '{}':", agent.client.model);
                 }
             } else {
                 outln!("Usage: /bg, /bg stop <id>, /bg stop\n");
+            }
+            continue;
+        }
+
+        if input == "/timers" || input.starts_with("/timers ") {
+            let argument = input.strip_prefix("/timers").unwrap_or("").trim();
+            if argument.is_empty() {
+                outln!("{}\n", agent.server.describe_timers());
+            } else if argument == "cancel" {
+                let cancelled = agent.server.timers.lock().unwrap().clear();
+                outln!("Cancelled {} timer(s).\n", cancelled);
+            } else if let Some(id) = argument.strip_prefix("cancel ").and_then(|n| n.trim().parse::<u32>().ok()) {
+                // The model is not told: it finds out from the reminder never arriving, or
+                // from `timer list` if it asks — the same as a background job stopped by /bg.
+                match agent.server.timers.lock().unwrap().cancel(id) {
+                    Some(timer) => outln!("Cancelled timer {} ({}).\n", id, timer.schedule.describe()),
+                    None => outln!("There is no timer {}.\n", id),
+                }
+            } else {
+                outln!("Usage: /timers, /timers cancel <id>, /timers cancel\n");
             }
             continue;
         }
@@ -1727,6 +1762,54 @@ mod turn_tests {
             let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
             assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, expected, "for {bodies:?}");
         }
+    }
+
+    /// A timer that comes due while a turn is working joins at the round boundary,
+    /// after the tool replies — the only place a user message may go mid-turn — and
+    /// says it came from a timer. One that is not due yet stays armed.
+    #[tokio::test]
+    async fn a_due_timer_joins_the_turn_after_the_tool_replies() {
+        let _capture = out::capture_guard();
+        let (url, served) = serve_sequence(&[
+            r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"get_date","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"checked"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        {
+            use crate::timers::Schedule;
+            use std::time::{Duration, Instant};
+            let mut timers = agent.server.timers.lock().unwrap();
+            // Set two minutes ago for one minute: due now.
+            let past = Instant::now() - Duration::from_secs(120);
+            timers.add(Schedule::Once(Duration::from_secs(60)), "check the tests", past, chrono::Local::now()).unwrap();
+            timers.add(Schedule::Once(Duration::from_secs(3600)), "much later", Instant::now(), chrono::Local::now()).unwrap();
+        }
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        assert_eq!(*served.lock().unwrap(), 2);
+
+        let roles: Vec<&str> = agent.messages.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user", "assistant"]);
+        let note = agent.messages[4]["content"].as_str().unwrap();
+        assert!(note.starts_with("[Timer 1 fired"), "{note}");
+        assert!(note.ends_with("check the tests"), "{note}");
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(notices(&seen).iter().any(|n| matches!(n, Notice::TimersFired(f) if f.len() == 1 && f[0].id == 1)));
+        let left: Vec<u32> = agent.server.timers.lock().unwrap().list().iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![2]);
+
+        // And they go with the conversation.
+        agent.clear();
+        assert!(agent.server.timers.lock().unwrap().is_empty());
     }
 
     /// The invariant that costs the most when it breaks, and shows nothing when

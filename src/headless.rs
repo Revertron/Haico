@@ -46,7 +46,8 @@ const MAX_FOLLOW_UPS: usize = 3;
 /// progress, handing a decision back.
 const UNATTENDED_NOTE: &str = "This task is running unattended: nobody will answer a \
 question, review a plan or approve anything, and the run ends as soon as you reply \
-without calling a tool. Work until the task is completely done and verified, deciding \
+without calling a tool — unless a timer you set is still armed, in which case it waits \
+for it, so cancel any you no longer need. Work until the task is completely done and verified, deciding \
 anything ambiguous yourself. Then finish with a short summary of what you did.";
 
 /// Run `task` in the current directory and return the process's exit code.
@@ -93,10 +94,10 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     let mut input = first_message(&cwd, &task);
     // The echo shows the task as given rather than with the note appended: the note
     // is the same paragraph on every run, and the log is read for what was asked.
-    let mut echoed = task.trim().to_string();
+    let mut echoed = crate::input::echo(crate::input::PROMPT, task.trim());
     let mut follow_ups = 0;
     let code = loop {
-        outln!("{}", crate::input::echo(crate::input::PROMPT, &echoed));
+        outln!("{}", echoed);
         match drive(&mut agent, &input).await {
             TurnEnd::Answered => {}
             TurnEnd::Interrupted => break EXIT_INTERRUPTED,
@@ -106,7 +107,19 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
             }
         }
         let Some(follow_up) = follow_up(&agent.plan(), last_reply(&agent.messages)) else {
-            break EXIT_DONE;
+            // Finished — unless the model left itself a timer, which is a statement that
+            // it is not finished yet, only waiting. Its firing is a fresh piece of work,
+            // so it gets a fresh set of follow-ups.
+            match wait_for_timers(&agent).await {
+                Waited::Fired(fired) => {
+                    follow_ups = 0;
+                    echoed = crate::present::timers_fired(&fired);
+                    input = crate::timers::message_for(&fired);
+                    continue;
+                }
+                Waited::Nothing => break EXIT_DONE,
+                Waited::Interrupted => break EXIT_INTERRUPTED,
+            }
         };
         if follow_ups == MAX_FOLLOW_UPS {
             outln!(
@@ -116,7 +129,7 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
             break EXIT_UNFINISHED;
         }
         follow_ups += 1;
-        echoed = follow_up.clone();
+        echoed = crate::input::echo(crate::input::PROMPT, &follow_up);
         input = follow_up;
     };
 
@@ -195,6 +208,39 @@ fn show(presenter: &mut Presenter, event: AgentEvent) {
         // gave no verdict on is refused. Never consent — the same rule as a REPL
         // with no terminal.
         Ask::User { .. } | Ask::Permission { .. } => {}
+    }
+}
+
+enum Waited {
+    Fired(Vec<crate::timers::Fired>),
+    /// No timer is armed, so there is nothing to wait for.
+    Nothing,
+    Interrupted,
+}
+
+/// Sleep until an armed timer fires, or return at once when none is.
+///
+/// A recurring timer keeps the run alive for as long as it is armed. That is the point
+/// of setting one in an unattended run — "poll CI every ten minutes until it is green" —
+/// and the model was told the run waits on it, so cancelling it is how it says it is
+/// done. Ctrl+C still ends the wait, and the log says what it is waiting for.
+async fn wait_for_timers(agent: &Agent) -> Waited {
+    if agent.server.next_timer_wake().is_none() {
+        return Waited::Nothing;
+    }
+    outln!("\nWaiting for timers (Ctrl+C to stop):\n{}", agent.server.describe_timers());
+    loop {
+        let Some(wake) = agent.server.next_timer_wake() else {
+            return Waited::Nothing;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
+            _ = tokio::signal::ctrl_c() => return Waited::Interrupted,
+        }
+        let fired = agent.server.take_due_timers();
+        if !fired.is_empty() {
+            return Waited::Fired(fired);
+        }
     }
 }
 

@@ -24,6 +24,7 @@ mod memory;
 mod research;
 mod shell;
 mod skills;
+mod timers;
 mod web;
 
 pub(crate) use basics::*;
@@ -34,6 +35,7 @@ pub(crate) use memory::*;
 pub(crate) use research::*;
 pub(crate) use shell::*;
 pub(crate) use skills::*;
+pub(crate) use timers::*;
 pub(crate) use web::*;
 
 #[derive(Clone)]
@@ -70,6 +72,10 @@ pub(crate) struct MyMcpServer {
     // either asked already or decided not to, and the same note under every rebuild is how
     // a model learns to skip notes.
     pub(crate) library_nudged: Arc<Mutex<std::collections::HashSet<u64>>>,
+    // Timers the model has set on itself (`crate::timers`). Here rather than on the agent
+    // because the tool that arms them runs on this struct; the agent and the frontends
+    // reach them through `take_due_timers` and `next_timer_wake`.
+    pub(crate) timers: Arc<Mutex<crate::timers::Timers>>,
 }
 
 // A file's contents immediately before a tool changed it.
@@ -145,7 +151,8 @@ impl MyMcpServer {
             + Self::library_router()
             + Self::web_router()
             + Self::shell_router()
-            + Self::crates_router();
+            + Self::crates_router()
+            + Self::timers_router();
         // web_get (raw page text) is always available. web_fetch summarizes a page through
         // the LLM and research drives a whole loop through it, so both are exposed only when
         // we know where the LLM lives.
@@ -158,6 +165,9 @@ impl MyMcpServer {
         // one question.
         if !interactive {
             tool_router.remove_route("skill");
+            // A timer fires by putting a message into our own conversation loop, and an
+            // MCP host has no loop of ours to put it into.
+            tool_router.remove_route("timer");
         }
         // The library needs a model to run its librarian and articles for it to read. Off
         // in tests unless a test sets it, like `Agent::new`'s session path: a suite that read
@@ -180,6 +190,7 @@ impl MyMcpServer {
             interactive,
             library_root,
             library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
         }
     }
 
@@ -466,6 +477,10 @@ impl MyMcpServer {
             "crate_search" => {
                 let params: CrateSearchParams = serde_json::from_value(arguments)?;
                 self.crate_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "timer" => {
+                let params: TimerParams = serde_json::from_value(arguments)?;
+                self.timer(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "crate_api" => {
                 let params: CrateApiParams = serde_json::from_value(arguments)?;

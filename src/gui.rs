@@ -334,18 +334,47 @@ async fn converse(
         show(&handle, move |ui| add_model_menu(ui, &models, &current));
     }
 
-    while let Ok(command) = input_rx.recv() {
+    loop {
+        // Waiting for the window is also waiting for the next timer: whichever comes
+        // first. A blocking wait, like the one it replaces — this thread is the
+        // conversation's and has nothing else to do while idle.
+        let command = match agent.server.next_timer_wake() {
+            Some(wake) => {
+                match input_rx.recv_timeout(wake.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(command) => Some(command),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match input_rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            },
+        };
         let input = match command {
-            Command::Send(input) => input,
-            other => {
+            Some(Command::Send(input)) => {
+                let echoed = input.clone();
+                show(&handle, move |ui| user(ui, &echoed));
+                input
+            }
+            Some(other) => {
                 if !obey(&mut agent, &handle, &tx, &models, other) {
                     break;
                 }
                 continue;
             }
+            // A timer's prompt is the model's note to itself, shown as what it is rather
+            // than as something the user said.
+            None => {
+                let fired = agent.server.take_due_timers();
+                if fired.is_empty() {
+                    continue;
+                }
+                let (text, tone) = describe(Notice::TimersFired(fired.clone()));
+                show(&handle, move |ui| line(ui, &text, tone));
+                crate::timers::message_for(&fired)
+            }
         };
-        let echoed = input.clone();
-        show(&handle, move |ui| user(ui, &echoed));
 
         let link = TurnLink::new(agent.mode);
         // Published so a closing window can cancel it, and cleared below so a
@@ -871,6 +900,7 @@ fn describe(notice: Notice) -> (String, Tone) {
             Tone::Warning,
         ),
         Notice::QueuedSent(text) => (text, Tone::Normal),
+        Notice::TimersFired(fired) => (crate::present::timers_fired(&fired), Tone::Muted),
         Notice::ProjectContextReloaded(name) => {
             (format!("reloaded project context from {name}"), Tone::Muted)
         }
@@ -2361,6 +2391,12 @@ mod tests {
             Notice::FileNotAttached { path: "p".into(), reason: "r".into() },
             Notice::ImagesStripped("400 bad request".into()),
             Notice::QueuedSent("q".into()),
+            Notice::TimersFired(vec![crate::timers::Fired {
+                id: 1,
+                schedule: crate::timers::Schedule::Once(std::time::Duration::from_secs(60)),
+                prompt: "p".into(),
+                count: 1,
+            }]),
             Notice::ProjectContextReloaded("CLAUDE.md".into()),
         ];
         for notice in all {

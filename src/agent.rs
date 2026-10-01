@@ -305,6 +305,9 @@ impl Agent {
         self.seed_system_message();
         self.review_cache.clear();
         self.server.todos.lock().unwrap().clear();
+        // The timers go with the conversation that set them: a reminder to "check the
+        // test run" arriving in a conversation that never started one is a riddle.
+        self.server.timers.lock().unwrap().clear();
         self.reasoning_stats = ReasoningStats::default();
         outcome
     }
@@ -1709,6 +1712,18 @@ pub(crate) async fn run_turn(
                     let _ = tx.send(Notice::QueuedSent(text.clone()).into());
                     let content = attach_mentions(agent, &text, tx).await;
                     agent.messages.push(json!({"role": "user", "content": content}));
+                }
+                // Timers that came due while this round ran join at the same boundary and
+                // for the same reason. Not sooner — and not by interrupting the round
+                // either: a timer is a reminder, and the work in progress may well be the
+                // thing it was set to check on.
+                let fired = agent.server.take_due_timers();
+                if !fired.is_empty() {
+                    let _ = tx.send(Notice::TimersFired(fired.clone()).into());
+                    agent.messages.push(json!({
+                        "role": "user",
+                        "content": crate::timers::message_for(&fired)
+                    }));
                 }
 
                 // Continue the loop to get next response (might be more tool calls or final answer)

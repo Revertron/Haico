@@ -371,6 +371,7 @@ impl Presenter {
                 );
             }
             Notice::QueuedSent(text) => outln!("{}", echo(PROMPT, &text)),
+            Notice::TimersFired(fired) => outln!("{}", timers_fired(&fired)),
             Notice::ProjectContextReloaded(name) => {
                 outln!("\nLoaded project context from {}", name)
             }
@@ -441,4 +442,18 @@ pub(crate) fn permission_description(
         description.push_str(&format!("\n\n{}", line));
     }
     description
+}
+
+/// The line a timer firing leaves in the transcript, in place of the echo a typed
+/// message gets. Shared by the notice and the idle prompt, which fires timers without a
+/// turn running to send one.
+pub(crate) fn timers_fired(fired: &[crate::timers::Fired]) -> String {
+    fired
+        .iter()
+        .map(|f| {
+            let head = format!("⏰ Timer {} ({}): ", f.id, f.schedule.describe());
+            echo(&head, &f.prompt)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

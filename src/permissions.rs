@@ -47,6 +47,10 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     // about a question. Listed here rather than special-cased because plan mode reads the
     // same list, and planning is where the model is least sure of anything.
     "ask_user",
+    // Changes nothing on this machine: arming a timer only schedules a message to the model
+    // itself, and whatever that message leads it to do meets every gate when it does it.
+    // Asking would also defeat the use it exists for — the user who walked away.
+    "timer",
 ];
 
 // Programs where the bare name says almost nothing about what is about to happen, so the
