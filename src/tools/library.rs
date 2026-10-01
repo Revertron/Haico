@@ -25,7 +25,6 @@ use super::MyMcpServer;
 use crate::library::Library;
 use crate::session::without_think_block;
 use crate::trace::Caller;
-use crate::util::truncate_at_boundary;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -50,8 +49,6 @@ const MAX_LOOKUPS: usize = 24;
 
 // The round that calls no tool and says nothing either — see research's MAX_ROUNDS.
 const MAX_ROUNDS: usize = MAX_LOOKUPS + 2;
-
-const MAX_ECHOED_QUESTION: usize = 200;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct LibraryParams {
@@ -200,10 +197,10 @@ impl MyMcpServer {
 
     // The loop, with the budget as a parameter so a test can spend it without waiting for it.
     async fn run_library_within(&self, root: &Path, question: &str, budget: Duration) -> String {
-        self.library_note(&format!(
-            "Library lookup for: {}",
-            truncate_at_boundary(question, MAX_ECHOED_QUESTION)
-        ));
+        // No line announcing the question: the call line above says it (`tool_call_summary`).
+        // A line printed from here raced that one — the tool starts the moment its call is
+        // sent to the frontend, often before the frontend has closed the reasoning fold — and
+        // landed inside the fold, hidden under "(thinking)".
         crate::debug::log("library question", question);
 
         // Loaded per call, so an article added mid-session is there for the next question.

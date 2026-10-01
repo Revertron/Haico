@@ -980,6 +980,7 @@ pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
         "run_command" | "run_background" => strip_project_prefix(&text("command")),
         "web_fetch" | "web_get" => text("url"),
         "web_search" | "crate_search" => text("query"),
+        "library" | "research" => text("question"),
         "crate_info" | "crate_api" => text("name"),
         "background_output" | "background_stop" => match arguments["id"].as_u64() {
             Some(id) => format!("job {}", id),
@@ -1272,6 +1273,7 @@ mod log_tests {
         );
         assert_eq!(s("grep", json!({"pattern": "fn main"})), "fn main");
         assert_eq!(s("web_search", json!({"query": "axum routing"})), "axum routing");
+        assert_eq!(s("library", json!({"question": "mio: register a listener?"})), "mio: register a listener?");
         assert_eq!(s("background_stop", json!({"id": 3})), "job 3");
         assert_eq!(s("background_stop", json!({})), "all");
         // Either word counts: the arguments have not been through the tool's normalizer.

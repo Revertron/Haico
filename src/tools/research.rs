@@ -56,9 +56,6 @@ const MAX_PAGE_CHARS: usize = 8000;
 // has just moved the context problem rather than solved it.
 const MAX_ANSWER_CHARS: usize = 4000;
 
-// How much of the question is echoed to the terminal. The full text still goes to the model.
-const MAX_ECHOED_QUESTION: usize = 200;
-
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ResearchParams {
     #[schemars(
@@ -154,10 +151,7 @@ impl MyMcpServer {
     // model about in words it can act on, and an `Err` here would surface as a tool failure
     // that says nothing about whether to try a different question or give up on the web.
     async fn run_research(&self, question: &str) -> String {
-        self.research_note(&format!(
-            "Research for: {}",
-            truncate_at_boundary(question, MAX_ECHOED_QUESTION)
-        ));
+        // Named on the call line instead, for the library's reason (see `run_library_within`).
         crate::debug::log("research question", question);
 
         // One sub-agent copy for the whole loop, so the main conversation's thinking level
