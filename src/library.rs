@@ -133,9 +133,13 @@ impl Library {
         out
     }
 
-    /// The names of the articles' subjects (crate, else topic) that explain any of these error
-    /// headlines — by one of the article's codes, or one of its phrases — deduplicated, in
-    /// library order.
+    /// The names of the articles' subjects (each crate, else the topic) that explain any of
+    /// these error headlines — by one of the article's codes, or one of its phrases —
+    /// deduplicated, in library order.
+    ///
+    /// One name per crate, never `subject()`'s joined list: the note merges these with the
+    /// crates the build depends on, and a joined "ed25519-dalek, x25519-dalek, ed25519" is not
+    /// equal to any of them, so the note named each of those crates twice.
     pub(crate) fn subjects_for_errors(&self, errors: &[String]) -> Vec<String> {
         let codes = error_codes(&errors.join("\n"));
         let lowered: Vec<String> = errors.iter().map(|e| e.to_lowercase()).collect();
@@ -144,9 +148,11 @@ impl Library {
             let by_code = article.codes.iter().any(|c| codes.contains(c));
             let by_phrase = article.matches.iter().any(|m| lowered.iter().any(|e| e.contains(m.as_str())));
             if by_code || by_phrase {
-                let name = article.subject();
-                if !name.is_empty() && !out.contains(&name) {
-                    out.push(name);
+                let names = if article.crates.is_empty() { vec![article.topic.clone()] } else { article.crates.clone() };
+                for name in names {
+                    if !name.is_empty() && !out.contains(&name) {
+                        out.push(name);
+                    }
                 }
             }
         }
@@ -1106,6 +1112,29 @@ mod tests {
         assert_eq!(library.subjects_for_errors(&shared), ["Rust threads"]);
         // The same code, a different error: not this article's.
         assert!(library.subjects_for_errors(&other).is_empty());
+    }
+
+    #[test]
+    fn a_note_names_each_crate_of_a_matched_article_once() {
+        // Observed on a p2p_auth run: an article on several crates, matched by a phrase, was
+        // named by its joined crate list, which the dependencies did not dedupe against, so
+        // the note read "ed25519-dalek, x25519-dalek, ed25519, ..., x25519-dalek, ed25519-dalek".
+        let dir = TempDir::new("library-multi-crate-note");
+        write(
+            dir.path(),
+            "crypto/ed25519",
+            "---\ncrate: ed25519-dalek, x25519-dalek, ed25519\nmatches: signature::Signer<\n---\n# Signing\n\nx\n",
+        );
+        let library = Library::load(dir.path());
+        let errors = vec!["error[E0599]: the trait bound `SigningKey: signature::Signer<Sig>` is not satisfied".to_string()];
+        assert_eq!(library.subjects_for_errors(&errors), ["ed25519-dalek", "x25519-dalek", "ed25519"]);
+
+        let crates = vec!["tokio".to_string(), "x25519-dalek".to_string(), "ed25519-dalek".to_string()];
+        let subjects = subjects_for_build(&library, &errors, &crates);
+        let mut unique = subjects.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(subjects.len(), unique.len(), "{subjects:?}");
     }
 
     #[test]
