@@ -73,6 +73,10 @@ pub(crate) struct MyMcpServer {
     // either asked already or decided not to, and the same note under every rebuild is how
     // a model learns to skip notes.
     pub(crate) library_nudged: Arc<Mutex<std::collections::HashSet<u64>>>,
+    // Cargo runs in a row that hung (killed at the timeout, or reported by libtest as running
+    // for over a minute) since tests last ran to the end. The full hang note is given once; this
+    // count is what the short reminders after it carry, and a run of tests that finishes resets it.
+    pub(crate) hang_count: Arc<Mutex<usize>>,
     // Timers the model has set on itself (`crate::timers`). Here rather than on the agent
     // because the tool that arms them runs on this struct; the agent and the frontends
     // reach them through `take_due_timers` and `next_timer_wake`.
@@ -191,6 +195,7 @@ impl MyMcpServer {
             interactive,
             library_root,
             library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            hang_count: Arc::new(Mutex::new(0)),
             timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
         }
     }

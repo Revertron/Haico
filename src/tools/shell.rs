@@ -229,6 +229,10 @@ const BACKGROUND_OUTPUT_CAP: usize = 256 * 1024;
 // rather than at the end — see truncate_middle for why.
 const MAX_OUTPUT: usize = 30000;
 
+// The fingerprint every hang shares in `library_nudged`, so the full hang note goes out once per
+// hang however it was caught, and finished tests can clear it for the next one.
+const HANG_KEY: &str = "runtime:hang";
+
 // Build the shell invocation for a command line.
 //
 // On Windows this is deliberately not the obvious `Command::new("cmd").arg("/C").arg(command)`.
@@ -569,8 +573,23 @@ impl MyMcpServer {
         let errors = crate::library::compile_errors(output);
         let trouble = crate::library::test_trouble(output);
         if errors.is_empty() && trouble.failed.is_empty() && trouble.hung.is_empty() && !timed_out {
+            // Tests that ran to the end mean the hang is solved, so a later one is a new
+            // problem: the count starts over and it gets the full note again. Only a test run
+            // counts — a `cargo check` passing between two hanging test runs solves nothing.
+            if output.contains("test result:") {
+                *self.hang_count.lock().unwrap() = 0;
+                self.library_nudged.lock().unwrap().remove(&super::content_hash(HANG_KEY.as_bytes()));
+            }
             return None;
         }
+        let hanging = errors.is_empty() && (timed_out || !trouble.hung.is_empty());
+        let hangs = if hanging {
+            let mut count = self.hang_count.lock().unwrap();
+            *count += 1;
+            *count
+        } else {
+            0
+        };
 
         let library = crate::library::Library::load(root);
         // The explicit cwd, then a leading `cd <dir> &&` — which is how models usually say
@@ -590,8 +609,7 @@ impl MyMcpServer {
             let note = crate::library::runtime_failure_note(&crates, &trouble, timed_out)?;
             // A hang is one symptom however it was caught — a timeout or libtest's warning —
             // so it is fingerprinted as one; each set of failing tests is another.
-            let hanging = timed_out || !trouble.hung.is_empty();
-            let key = if hanging { "runtime:hang".to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
+            let key = if hanging { HANG_KEY.to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
             (note, key)
         } else {
             let subjects = crate::library::subjects_for_build(&library, &errors, &crates);
@@ -602,6 +620,12 @@ impl MyMcpServer {
         // covered crate involved) does not use up the one it would get later.
         let fingerprint = super::content_hash(key.as_bytes());
         if !self.library_nudged.lock().unwrap().insert(fingerprint) {
+            // The full note went out already. A hang alone gets a reminder after it, a line
+            // with the count, on every second hang: often enough not to leave a stuck model
+            // alone for half an hour, rarely enough not to hound one making progress.
+            if hanging && hangs >= 2 && hangs % 2 == 0 {
+                return crate::library::hang_reminder(&crates, hangs);
+            }
             return None;
         }
         Some(note)
@@ -921,6 +945,49 @@ x
     }
 
     #[test]
+    fn hangs_after_the_first_get_a_counted_reminder_every_second_time() {
+        let library = TempDir::new("shell-hang-library");
+        std::fs::create_dir_all(library.join("tokio")).unwrap();
+        std::fs::write(library.join("tokio/net.md"), "# Testing servers\n\nx\n").unwrap();
+        std::fs::create_dir_all(library.join("anyhow")).unwrap();
+        std::fs::write(library.join("anyhow/basics.md"), "# Context\n\nx\n").unwrap();
+        let project = TempDir::new("shell-hang-project");
+        std::fs::write(project.join("Cargo.toml"), "[dependencies]\nanyhow = \"1\"\ntokio = \"1\"\n").unwrap();
+        let cwd = project.path().to_str();
+        let mut server = test_server();
+        server.library_root = Some(library.path().to_path_buf());
+
+        // Run five's pattern: test after test killed at the timeout.
+        let notes: Vec<Option<String>> = (0..6)
+            .map(|_| server.library_note_for_build("cargo test", "running 6 tests\n", cwd, true))
+            .collect();
+        assert!(notes[0].as_deref().is_some_and(|n| n.contains("Something hangs") && n.contains("uses tokio.")));
+        for (i, note) in notes.iter().enumerate().skip(1) {
+            let hangs = i + 1;
+            if hangs % 2 == 0 {
+                let note = note.as_deref().unwrap_or_else(|| panic!("no reminder on hang {hangs}"));
+                assert!(note.contains(&format!("the {}", if hangs == 2 { "2nd".into() } else { format!("{hangs}th") })), "{note}");
+                assert!(note.contains("library(question: \"tokio: a test hangs"), "{note}");
+            } else {
+                assert!(note.is_none(), "hang {hangs} should be quiet: {note:?}");
+            }
+        }
+
+        // A `cargo check` passing in between solves nothing: the count goes on.
+        assert!(server.library_note_for_build("cargo check", "    Finished `dev` profile\n", cwd, false).is_none());
+        let seventh = server.library_note_for_build("cargo test", "running 6 tests\n", cwd, true);
+        assert!(seventh.is_none(), "{seventh:?}");
+        let eighth = server.library_note_for_build("cargo test", "running 6 tests\n", cwd, true).unwrap();
+        assert!(eighth.contains("the 8th time"), "{eighth}");
+
+        // Tests that finish mean that hang is over: the next one is new and gets the full note.
+        let passed = "running 6 tests\ntest result: ok. 6 passed; 0 failed\n";
+        assert!(server.library_note_for_build("cargo test", passed, cwd, false).is_none());
+        let fresh = server.library_note_for_build("cargo test", "running 6 tests\n", cwd, true).unwrap();
+        assert!(fresh.contains("Something hangs"), "{fresh}");
+    }
+
+    #[test]
     fn a_failed_build_is_pointed_at_the_library_once_per_set_of_errors() {
         let library = TempDir::new("shell-library-note");
         std::fs::create_dir_all(library.join("mio")).unwrap();
@@ -961,8 +1028,10 @@ error: could not compile `x`";
         // was caught; a different set of failing tests gets its own.
         let note = server.library_note_for_build("cargo test", "running 9 tests\n", cwd, true).unwrap();
         assert!(note.contains("Something hangs"), "{}", note);
+        // The second hang is the same symptom, so it gets the one-line reminder, not the note.
         let libtest = "test oversized has been running for over 60 seconds";
-        assert!(server.library_note_for_build("cargo test", libtest, cwd, false).is_none());
+        let reminder = server.library_note_for_build("cargo test", libtest, cwd, false).unwrap();
+        assert!(reminder.starts_with("[haico] Hung again, the 2nd time"), "{}", reminder);
         let failed = "test burst ... FAILED\ntest result: FAILED. 8 passed; 1 failed";
         let note = server.library_note_for_build("cargo test", failed, cwd, false).unwrap();
         assert!(note.contains("Tests fail: burst"), "{}", note);

@@ -868,6 +868,38 @@ pub(crate) fn test_trouble(output: &str) -> TestTrouble {
 const HANG_SUSPECTS: &[&str] =
     &["tokio", "mio", "tokio-util", "futures", "hyper", "axum", "actix-web", "reqwest", "tonic", "async-std", "smol"];
 
+/// The one line that follows the hang note on later hangs: every second one from the second on,
+/// since the full note went out with the first (see `MyMcpServer::hang_count`).
+///
+/// A line rather than the note again, and with the count in it, so that it says something new
+/// each time: "4th time" is what tells a model the approach it keeps retrying is not working.
+/// Once only was the rule before, and on a p2p_auth run it meant one note and then ten silent
+/// timeouts over 29 minutes, the model rewriting its tests without once asking the library,
+/// which had the cause (a listener converted with `from_std` and never made non-blocking).
+pub(crate) fn hang_reminder(crates: &[String], times: usize) -> Option<String> {
+    let narrowed = hang_suspects(crates);
+    let crates: &[String] = if narrowed.is_empty() { crates } else { &narrowed };
+    let first = crates.first()?;
+    Some(format!(
+        "[haico] Hung again, the {} time this session. The usual causes of a hang are written up \
+         in the library; ask before trying the same approach again: library(question: \
+         \"{}: a test hangs and never finishes. What are the usual causes?\").",
+        ordinal(times),
+        first
+    ))
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 fn hang_suspects(crates: &[String]) -> Vec<String> {
     HANG_SUSPECTS
         .iter()
