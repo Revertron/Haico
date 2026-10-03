@@ -359,7 +359,7 @@ pub(crate) fn backgrounds_with_ampersand(command: &str) -> bool {
 
 #[tool_router(router = shell_router, vis = "pub(crate)")]
 impl MyMcpServer {
-    #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Never end a command with & to background it: this call always waits for it to finish, so start servers and other long-running processes with run_background instead. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
+    #[tool(description = "Use to run shell commands and CLIs when no dedicated tool fits — building, testing, running scripts, or git/gh operations. Execute a shell command (cmd on Windows, sh elsewhere). Output is streamed to the terminal as it arrives, so long builds show progress. Pass cwd to choose the working directory instead of a leading \"cd\", whose effect ends with the call. Verify parent dirs with LS before creating files. Quote paths with spaces. Timeout: 120s default, 600s max; on timeout the command and everything it spawned are killed. AVOID: find/grep (use Grep/Glob), cat/head/tail/ls (use Read/LS). Chain with && (avoid ;, which does not chain in Windows cmd), no newlines. Cargo output is shortened for you (progress lines, passing tests, and warning details while a build has errors are left out, and the result says so), so run cargo build/check/test/clippy without | head or | tail: those cut off the errors at the end. Never end a command with & to background it: this call always waits for it to finish, so start servers and other long-running processes with run_background instead. Prefer absolute paths over cd.\n\nGit commits: 1) Run parallel: git status/diff/log 2) Draft message (why not what), check secrets 3) Add files, commit using repeated -m flags for multi-line messages (e.g. git commit -m \"summary\" -m \"details\"), check status 4) Retry once if pre-commit modifies files. Never update config or use -i flag. Don't push unless requested.\n\nPull requests: 1) Parallel: git status/diff, check remote, git log 2) Analyze all commits, draft summary 3) Create branch, push, gh pr create with the body passed via --body-file (a temp file), since heredocs don't work in cmd.\n\nGitHub: Use gh for issues/PRs/checks/releases.")]
     pub(crate) async fn run_command(&self, params: Parameters<RunCommandParams>) -> Result<CallToolResult, McpError> {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(600);
@@ -484,6 +484,16 @@ impl MyMcpServer {
                 result_text.push_str("\n--- stderr ---\n");
             }
             result_text.push_str(&stderr);
+        }
+
+        // Cargo's progress lines, passing tests and (in a failed build) warning bodies, left out
+        // before anything is stored; see `cargo_output`. The library note below is decided from
+        // the raw `stdout`/`stderr`, not from this.
+        let (condensed, shortened) = super::cargo_output::condense(&command, &result_text);
+        result_text = condensed;
+        if let Some(shortened) = &shortened {
+            result_text.push_str("\n\n");
+            result_text.push_str(shortened);
         }
 
         let Some(status) = status else {
@@ -1139,6 +1149,22 @@ serde = \"1\"
         assert_eq!(server.stop_all_background().await, 0);
         let listing = bg_output(&server, None).await;
         assert!(listing.contains("stopped"), "got: {}", listing);
+    }
+
+    #[tokio::test]
+    async fn cargo_output_is_shortened_before_it_is_returned() {
+        let server = test_server();
+        // Any word `cargo` makes it a cargo command; echo stands in for the build.
+        let (ok, out) = run(&server, "echo Compiling serde v1.0.0 && echo test a ... ok && echo done && echo cargo", None, None).await;
+        assert!(ok, "got: {}", out);
+        assert!(!out.contains("Compiling serde"), "got: {}", out);
+        assert!(!out.contains("test a ... ok"), "got: {}", out);
+        assert!(out.contains("done"), "got: {}", out);
+        assert!(out.contains("[haico] Shortened this cargo output: left out 1 progress line"), "got: {}", out);
+
+        // Anything else is returned as printed.
+        let (_, out) = run(&server, "echo Compiling serde v1.0.0", None, None).await;
+        assert!(out.contains("Compiling serde v1.0.0") && !out.contains("[haico]"), "got: {}", out);
     }
 
     #[tokio::test]

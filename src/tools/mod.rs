@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod basics;
+mod cargo_output;
 mod crates;
 mod files;
 pub(crate) mod library;
