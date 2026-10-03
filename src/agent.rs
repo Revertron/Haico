@@ -79,6 +79,14 @@ pub(crate) enum ContextReload {
     Gone,
 }
 
+/// A request's size as the server counted it, and haico's estimate of the history it was
+/// sent with — the second is what lets `Agent::context_used` add only what came after.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Measured {
+    pub(crate) prompt_tokens: usize,
+    pub(crate) estimate: usize,
+}
+
 pub(crate) struct Agent {
     pub(crate) config: Config,
     pub(crate) client: LMStudioClient,
@@ -98,6 +106,9 @@ pub(crate) struct Agent {
     /// conversation, so the savings still stand.
     pub(crate) reasoning_stats: ReasoningStats,
     pub(crate) messages: Vec<Value>,
+    /// What the server last said the request cost, for `context_used`. `None` until a reply
+    /// reports usage, and forgotten when the model changes (another tokenizer).
+    pub(crate) measured: Option<Measured>,
     /// `None` when the model is configured without haico's prompt and neither
     /// instruction file exists — then the conversation carries no system message.
     pub(crate) system_prompt: Option<String>,
@@ -204,6 +215,7 @@ impl Agent {
             reasoning_threshold,
             reasoning_stats: ReasoningStats::default(),
             messages: Vec::new(),
+            measured: None,
             system_prompt,
             project_context,
             user_context,
@@ -466,6 +478,8 @@ impl Agent {
 
         // The reviewer is this model too, so its verdicts leave with it.
         self.review_cache.clear();
+        // Counted by the old model's tokenizer.
+        self.measured = None;
         self.rebuild_system_prompt();
 
         self.keep(|path| save_default_model(path, &model))
@@ -489,6 +503,32 @@ impl Agent {
     }
 
     /// The model currently in use.
+    /// How many tokens the next request will take, as nearly as can be known: what the
+    /// server counted for the last one, plus an estimate of only what has been added since.
+    ///
+    /// The estimate alone (characters over four, messages only) was what this used to be,
+    /// and it ran 20% low on a p2p_auth run — Rust and JSON-escaped tool output tokenize
+    /// nearer 3.3 characters to the token, and the tools array, sent with every request,
+    /// was not counted at all. Auto mode compacts at 90% of the window by this number, so
+    /// the history grew to 130,820 of 131,072 tokens with the estimate still at 107k: the
+    /// reply was cut off mid-tool-call and the next request was refused outright.
+    ///
+    /// The measurement is trusted only while the history has grown since it was taken. A
+    /// history that shrank (compaction, `/clear`) is a different history, and falls back to
+    /// the estimate, with the tools array counted, until the next reply measures it again.
+    pub(crate) fn context_used(&self) -> usize {
+        let estimate = estimate_tokens(&self.messages);
+        match self.measured {
+            Some(Measured { prompt_tokens, estimate: then }) if estimate >= then => prompt_tokens + (estimate - then),
+            _ => estimate + estimate_tokens(&self.tools),
+        }
+    }
+
+    /// Whether `context_used` rests on a measurement right now, for saying so.
+    pub(crate) fn context_is_measured(&self) -> bool {
+        self.measured.is_some_and(|m| estimate_tokens(&self.messages) >= m.estimate)
+    }
+
     pub(crate) fn model(&self) -> &str {
         &self.client.model
     }
@@ -663,6 +703,12 @@ async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Valu
 /// tool results — it is a message of its own, as the loop nudge is. The last
 /// message is the tail of the prefix the server caches, so extending it
 /// invalidates nothing that was not about to be re-sent anyway.
+// Said once, to a reply that called nothing straight after an auto-compaction (see
+// `just_compacted` in `run_turn`).
+const AFTER_COMPACTION: &str = "You replied without calling a tool, right after your context was \
+     compacted in the middle of the task. The work is not finished: carry on from the notes above \
+     by calling a tool now.";
+
 fn push_user_note(messages: &mut Vec<Value>, note: &str) {
     if let Some(last) = messages.last_mut().filter(|m| m["role"] == "user") {
         match &mut last["content"] {
@@ -796,6 +842,14 @@ pub(crate) async fn run_turn(
         // the turn runs on instead and lets the server error be the honest end of it.
         let mut autocompact = true;
 
+        // Set by an auto-compaction and cleared by the next reply that calls a tool. While it
+        // is set, a reply that calls nothing does not end the turn: the task was mid-flight
+        // when the history was replaced, and the loop has just said so. On a p2p_auth run the
+        // first reply after a compaction was one sentence of intent ("Let me check the current
+        // state of the codebase") with no tool call, the turn ended on it, and the unattended
+        // run exited as finished with 19 compile errors in its tests.
+        let mut just_compacted = false;
+
         // Set once the recovery below has run, so a failure that has nothing to do with
         // images cannot make the turn retry forever.
         let mut stripped_images = false;
@@ -815,7 +869,7 @@ pub(crate) async fn run_turn(
             // the bar is and what goes where is the frontend's business.
             let _ = tx.send(AgentEvent::Status {
                 model: agent.client.model.clone(),
-                used_tokens: estimate_tokens(&agent.messages),
+                used_tokens: agent.context_used(),
                 context_tokens: agent.context_tokens,
                 effort: agent.reasoning_effort().map(str::to_string),
             });
@@ -836,13 +890,14 @@ pub(crate) async fn run_turn(
             // cannot orphan a tool_call_id, which is not true further down.
             if link.mode() == Mode::Auto
                 && autocompact
-                && estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens)
+                && agent.context_used() > autocompact_threshold(agent.context_tokens)
             {
+                let (context_tokens, before) = (agent.context_tokens, agent.context_used());
                 let compacted = interruptible(
                     tx,
                     link,
                     Waiting::Compacting,
-                    compact_history(&agent.client, &mut agent.messages),
+                    compact_history(&agent.client, &mut agent.messages, context_tokens, before),
                 )
                 .await;
 
@@ -858,6 +913,7 @@ pub(crate) async fn run_turn(
                         // the model to talk past itself. This says the one thing the notes
                         // cannot: the task was mid-flight when the summarizer ran, and it
                         // is the same task that continues.
+                        just_compacted = true;
                         agent.messages.push(json!({
                             "role": "user",
                             "content": "Your context was compacted mid-task. Continue the \
@@ -865,7 +921,7 @@ pub(crate) async fn run_turn(
                                         off; do not start over."
                         }));
 
-                        if estimate_tokens(&agent.messages) > autocompact_threshold(agent.context_tokens) {
+                        if agent.context_used() > autocompact_threshold(agent.context_tokens) {
                             autocompact = false;
                             let _ = tx.send(
                                 Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize)
@@ -903,6 +959,9 @@ pub(crate) async fn run_turn(
             // mode mid-turn, and the very next request has to carry the full tool list.
             let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
             let request_tools = tools_for_mode(link.mode(), &agent.tools);
+            // Of the history as it stands, not of `request_messages`: the mode note is not
+            // kept, and `context_used` compares against the history it will be looking at.
+            let estimate_sent = estimate_tokens(&agent.messages);
 
             // Esc abandons the turn instead of killing the process. It arrives at
             // the pump as a keystroke rather than as a signal, because raw mode is
@@ -913,7 +972,7 @@ pub(crate) async fn run_turn(
                 tx,
                 link,
                 Waiting::Model,
-                agent.client.chat_completion_streaming(
+                agent.client.chat_completion_measured(
                     Caller::Main,
                     request_messages,
                     request_tools,
@@ -947,8 +1006,11 @@ pub(crate) async fn run_turn(
             };
 
             let mut message = match result {
-                Ok(message) => {
+                Ok((message, ending)) => {
                     repeating_replies = 0;
+                    if let Some(prompt_tokens) = ending.usage.as_ref().and_then(|u| u["prompt_tokens"].as_u64()) {
+                        agent.measured = Some(Measured { prompt_tokens: prompt_tokens as usize, estimate: estimate_sent });
+                    }
                     message
                 }
                 Err(e) => {
@@ -1083,8 +1145,13 @@ pub(crate) async fn run_turn(
                 if tool_calls_array.is_empty() {
                     // No actual tool calls, this is the final response — already streamed.
                     agent.messages.push(message.clone());
+                    if std::mem::take(&mut just_compacted) {
+                        push_user_note(&mut agent.messages, AFTER_COMPACTION);
+                        continue;
+                    }
                     break TurnEnd::Answered;
                 }
+                just_compacted = false;
 
                 // Add assistant message with tool call first
                 agent.messages.push(message.clone());
@@ -1749,6 +1816,10 @@ pub(crate) async fn run_turn(
             } else {
                 // No tool call, this is the final response — already streamed above.
                 agent.messages.push(message.clone());
+                if std::mem::take(&mut just_compacted) {
+                    push_user_note(&mut agent.messages, AFTER_COMPACTION);
+                    continue;
+                }
                 break TurnEnd::Answered;
             }
         };

@@ -334,6 +334,20 @@ impl LMStudioClient {
         tools: Vec<Value>,
         on_chunk: impl FnMut(Chunk),
     ) -> Result<Value> {
+        self.chat_completion_measured(caller, messages, tools, on_chunk).await.map(|(message, _)| message)
+    }
+
+    // The same, also handing back how the reply ended and what the server says it cost.
+    // `usage.prompt_tokens` is what the main loop sizes the history by (`Agent::context_used`):
+    // haico's own estimate ran 20% low on a p2p_auth run, so the history reached the
+    // window's last token while the estimate still put it under the compaction line.
+    pub(crate) async fn chat_completion_measured(
+        &self,
+        caller: Caller,
+        messages: Vec<Value>,
+        tools: Vec<Value>,
+        on_chunk: impl FnMut(Chunk),
+    ) -> Result<(Value, Ending)> {
         let mut body = json!({
             "messages": messages,
             "tools": tools,
@@ -347,12 +361,12 @@ impl LMStudioClient {
         // what the model produced, whereas the fragments are only how it travelled. A
         // stream dropped by an interrupt never gets here — the future is dropped with it.
         let tracing = trace::enabled();
-        if tracing {
-            // Asked for only while tracing, so an untraced request stays what it always
-            // was; every server this targets accepts it, and the one that did not would
-            // show up as a failed call in the trace rather than as a silent change.
-            body["stream_options"] = json!({ "include_usage": true });
-        }
+        // Asked for on every request now, not only while tracing as it once was: the count
+        // is what decides when an unattended run compacts, and an estimate is what let one
+        // run into the end of its window. Every server this targets accepts it (OpenAI's own
+        // field; LM Studio, llama.cpp and Ollama send the final usage chunk), and one that
+        // ignores it just leaves the count to the estimate.
+        body["stream_options"] = json!({ "include_usage": true });
         let started = std::time::Instant::now();
         let reply = self.stream_chat(&body, on_chunk).await;
         if tracing {
@@ -362,7 +376,7 @@ impl LMStudioClient {
             };
             trace::call(caller, &body, outcome, started.elapsed());
         }
-        reply.map(|(message, _)| message)
+        reply
     }
 
     async fn stream_chat(
@@ -621,14 +635,14 @@ pub(crate) struct StreamAssembler {
     pub(crate) tool_calls: Vec<StreamToolCall>,
     // How the reply ended and what it cost, as far as the server says. Kept out of the
     // message because the message goes back into the history, and neither is part of
-    // what the model said; only the trace wants them. A stream that hit `max_tokens`
-    // mid-thought looks exactly like a finished one without `finish_reason` — the one
-    // thing a dataset built from the trace most needs to be able to tell.
+    // what the model said; the trace and the context count want them. A stream that hit
+    // `max_tokens` mid-thought looks exactly like a finished one without `finish_reason` —
+    // the one thing a dataset built from the trace most needs to be able to tell.
     pub(crate) ending: Ending,
 }
 
 /// The two things about a reply that are not the reply. `usage` only arrives on a stream
-/// when asked for (`stream_options.include_usage`), which is done while tracing.
+/// when asked for (`stream_options.include_usage`), which the main stream always does.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(crate) struct Ending {
     pub(crate) finish_reason: Option<String>,

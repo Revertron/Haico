@@ -15,13 +15,33 @@ pub(crate) async fn serve_once(body: &'static str, content_type: &'static str) -
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
 
-        // Consume the request head so the client is never left blocked on a write.
+        // Consume the whole request, head and body, so the client is never left blocked on a
+        // write. The body matters too: closing a socket with unread bytes in it makes Windows
+        // reset the connection, and a request body of a few KB (a compaction transcript) then
+        // failed with "connection error" before the reply could be read.
         let mut request = Vec::new();
         let mut buf = [0u8; 4096];
-        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        let head_end = loop {
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break Some(pos + 4);
+            }
             match socket.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => break None,
                 Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+        };
+        if let Some(head_end) = head_end {
+            let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < head_end + length {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
             }
         }
 

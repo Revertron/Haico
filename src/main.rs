@@ -224,7 +224,7 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
     let mut status = status_line(
         agent.model(),
         agent.reasoning_effort(),
-        estimate_tokens(&agent.messages),
+        agent.context_used(),
         agent.context_tokens,
     );
     let mut busy = get_thinking_message().to_string();
@@ -747,7 +747,7 @@ async fn main() -> Result<()> {
                     let status = status_line(
                         agent.model(),
                         agent.reasoning_effort(),
-                        estimate_tokens(&agent.messages),
+                        agent.context_used(),
                         agent.context_tokens,
                     );
                     let plan = agent.plan();
@@ -1288,7 +1288,13 @@ In force for '{}':", agent.client.model);
         }
 
         if input == "/context" {
-            report_context(&agent.messages, agent.context_tokens, &agent.reasoning_stats);
+            report_context(
+                &agent.messages,
+                agent.context_used(),
+                agent.context_is_measured(),
+                agent.context_tokens,
+                &agent.reasoning_stats,
+            );
             continue;
         }
 
@@ -1326,7 +1332,8 @@ In force for '{}':", agent.client.model);
         }
 
         if input == "/compact" {
-            match compact_history(&agent.client, &mut agent.messages).await {
+            let (context_tokens, before) = (agent.context_tokens, agent.context_used());
+            match compact_history(&agent.client, &mut agent.messages, context_tokens, before).await {
                 // The same reclaim as /clear, on the one path that actually shrank the
                 // session. A compaction that failed freed nothing to go with it.
                 Ok(summary) => {
@@ -1955,6 +1962,77 @@ mod turn_tests {
             estimate < 2000,
             "a 300 KB image is being counted as {estimate} tokens of text"
         );
+    }
+
+    /// The first reply after an auto-compaction may not end the turn by calling nothing: on a
+    /// p2p_auth run it was one sentence of intent, and the unattended run exited as finished.
+    #[tokio::test]
+    async fn a_reply_that_calls_nothing_right_after_a_compaction_does_not_end_the_turn() {
+        let _capture = out::capture_guard();
+        let bodies: &'static [&'static str] = &[
+            // The compactor's notes.
+            r#"{"choices":[{"message":{"role":"assistant","content":"Task: x\nCurrent state: tests not run\nNext step: run the tests"}}]}"#,
+            // Intent, and nothing called.
+            r#"{"choices":[{"message":{"role":"assistant","content":"Let me check the current state."}}]}"#,
+            // Sent back, it answers properly.
+            r#"{"choices":[{"message":{"role":"assistant","content":"All tests pass."}}]}"#,
+        ];
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        // Tiny, so the history is over the compaction line on the first round; and a history
+        // with something in it, since one message is nothing to compact.
+        agent.context_tokens = 100;
+        agent.messages.push(serde_json::json!({"role": "user", "content": "build it"}));
+        agent.messages.push(serde_json::json!({"role": "assistant", "content": "Built half of it."}));
+
+        let link = TurnLink::new(Mode::Auto);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        assert_eq!(*served.lock().unwrap(), 3);
+
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last["content"], "All tests pass.");
+        assert!(
+            agent.messages.iter().any(|m| m["role"] == "user"
+                && m["content"].as_str().is_some_and(|c| c.contains("You replied without calling a tool"))),
+            "the note is missing"
+        );
+    }
+
+    /// The size of the history comes from the server's count once one has arrived, plus an
+    /// estimate of only what was added after it; a history that shrank since falls back to
+    /// the estimate with the tools array counted. A p2p_auth run reached 130,820 of 131,072
+    /// tokens on an estimate that still read 107k, so compaction never started.
+    #[tokio::test]
+    async fn the_context_is_sized_by_the_servers_count() {
+        let _capture = out::capture_guard();
+        let (mut agent, _) = run_one(
+            &[r#"{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":50000,"completion_tokens":3,"total_tokens":50003}}"#],
+            "hi",
+        )
+        .await;
+        let measured = agent.measured.expect("the reply's usage was not recorded");
+        assert_eq!(measured.prompt_tokens, 50000);
+        assert!(agent.context_is_measured());
+
+        // Everything after the measured request is estimated on top of the count.
+        let grown = estimate_tokens(&agent.messages) - measured.estimate;
+        assert_eq!(agent.context_used(), 50000 + grown);
+        agent.messages.push(serde_json::json!({"role": "user", "content": "x".repeat(4000)}));
+        assert_eq!(agent.context_used(), 50000 + grown + estimate_tokens(&agent.messages[agent.messages.len() - 1..]));
+
+        // A history that shrank is not the one that was counted.
+        agent.messages.truncate(1);
+        assert!(!agent.context_is_measured());
+        assert_eq!(agent.context_used(), estimate_tokens(&agent.messages) + estimate_tokens(&agent.tools));
+
+        // A server that reports no usage leaves the estimate in charge.
+        let (agent, _) = run_one(&[r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#], "hi").await;
+        assert!(agent.measured.is_none());
+        assert_eq!(agent.context_used(), estimate_tokens(&agent.messages) + estimate_tokens(&agent.tools));
     }
 
     /// The edit from the p2p_auth trace: `new_string` carrying a second copy of `old_string`
