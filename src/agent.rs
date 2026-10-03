@@ -52,7 +52,7 @@ use crate::session::{
     reasoning_needs_a_request, reasoning_text, save_session, session_file_path,
     set_system_message, ReasoningOutcome, ReasoningStats,
 };
-use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, MyMcpServer, ReadParams};
+use crate::tools::{mcp_tools_to_openai_format, parse_tool_arguments, repair_leaked_arguments, MyMcpServer, ReadParams};
 use crate::turn::*;
 use crate::util::{absolute_path, display_path, truncate_at_boundary};
 use crate::workspace::{expand_home, Workspace};
@@ -1156,7 +1156,7 @@ pub(crate) async fn run_turn(
                         nudged_at = 0;
                     }
 
-                    let arguments = match parsed {
+                    let mut arguments = match parsed {
                         Ok(arguments) => arguments,
                         Err(detail) => {
                             let _ = tx.send(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
@@ -1171,6 +1171,13 @@ pub(crate) async fn run_turn(
                             continue;
                         }
                     };
+
+                    // Before anything looks at the arguments, so the gate, the diff preview
+                    // and the tool all see what the model meant rather than what it typed
+                    // (see `repair_leaked_arguments`). Said in the tool's reply: a model
+                    // that is never told keeps making the same slip, and this one made it
+                    // in half the edits of a run.
+                    let repaired = repair_leaked_arguments(&mut arguments);
 
                     // The model can put itself into plan mode, for when the user asked for
                     // a plan rather than for the work. Nothing to approve: this only ever
@@ -1627,6 +1634,17 @@ pub(crate) async fn run_turn(
                     if tool_name != "research" && tool_name != "library" {
                         let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
                     }
+
+                    let tool_result = if repaired.is_empty() {
+                        tool_result
+                    } else {
+                        format!(
+                            "{tool_result}
+
+[haico] Your `{names}` argument ended with a second copy of                              this call's other arguments written inside its text (`\", \"old_string\": \"...`).                              That copy was cut off before the tool ran, so only the text before it                              was used. End each string argument where its own text ends.",
+                            names = repaired.join("`, `"),
+                        )
+                    };
 
                     // Add tool result
                     agent.messages.push(json!({

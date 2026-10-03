@@ -1957,6 +1957,62 @@ mod turn_tests {
         );
     }
 
+    /// The edit from the p2p_auth trace: `new_string` carrying a second copy of `old_string`
+    /// after an escaped quote. The file must get only the intended text, and the reply must
+    /// say what was cut, or the model goes on making the same slip.
+    #[tokio::test]
+    async fn an_edit_with_its_old_string_leaked_into_new_string_is_repaired_and_said_to_be() {
+        let _capture = out::capture_guard();
+
+        let dir = testutil::TempDir::new("leaked-edit");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "let (tx, mut rx) = channel(64);\nlet node = 1;\n").unwrap();
+        let path = file.display().to_string();
+
+        let call = |id: &str, name: &str, arguments: serde_json::Value| -> &'static str {
+            Box::leak(
+                format!(
+                    r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+                    "tool_calls":[{{"id":"{id}","type":"function","function":{{"name":"{name}","arguments":{}}}}}]}}}}]}}"#,
+                    serde_json::to_string(&arguments.to_string()).unwrap()
+                )
+                .into_boxed_str(),
+            )
+        };
+        let old = "let (tx, mut rx) = channel(64);";
+        let leaked = format!("let (tx, rx) = channel(64);\", \"old_string\": \"{}\"}}", old);
+        let edit = serde_json::json!({"file_path": path, "new_string": leaked, "old_string": old});
+        let bodies: &'static [&'static str] = Box::leak(Box::new([
+            call("c1", "read", serde_json::json!({"file_path": path})),
+            call("c2", "edit", edit.clone()),
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#,
+        ]));
+        let (url, requests) = serve_sequence(bodies).await;
+
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.workspace.add(dir.path()).unwrap();
+        // Approved up front: in a test nobody answers the prompt, which reads as a refusal.
+        if let permissions::Gate::Ask { keys, .. } = permissions::gate_for(&agent.workspace, "edit", &edit) {
+            agent.permissions.allow(&keys);
+        }
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "fix it", false, &tx, &link).await;
+        assert_eq!(*requests.lock().unwrap(), 3);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let (tx, rx) = channel(64);\nlet node = 1;\n");
+        let reply = agent
+            .messages
+            .iter()
+            .find(|m| m["tool_call_id"] == "c2")
+            .and_then(|m| m["content"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(reply.contains("Your `new_string` argument ended with a second copy"), "{reply}");
+    }
+
     /// `read` on an image returns the picture, and the picture cannot ride in
     /// the `role: "tool"` reply — that message may carry text and nothing else.
     /// So it arrives as a user message, and only once every tool call in the

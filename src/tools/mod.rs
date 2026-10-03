@@ -635,6 +635,60 @@ pub(crate) fn parse_tool_arguments(function: &Value) -> std::result::Result<Valu
     }
 }
 
+// Cut off a copy of a call's other arguments that a model wrote *inside* one of them, and
+// name each argument that was cut.
+//
+// Observed on a p2p_auth run (qwen3.8-35b-a3b-distill): 14 of its 29 `edit` calls had a
+// `new_string` ending in `", "old_string": "<the real old_string, escaped>"}` — the rest of the
+// argument object written a second time as text, before the real `old_string` followed. The
+// JSON was valid and `old_string` matched, so every one of them was applied, and the file got
+// a literal `", "old_string": "...\n..."`: the build failed on "unknown start of token: \" and
+// the model took it for the edit tool corrupting its files.
+//
+// Repaired rather than refused, because the evidence is exact: the leaked tail must decode to
+// precisely the value the other argument really has. Code that merely contains such a string
+// would have to end with an escaped copy of the call's own `old_string` to be touched, and
+// what is left after the cut is what the model meant to write. The caller says it was done.
+// Top-level string arguments only; that is where it has been seen.
+pub(crate) fn repair_leaked_arguments(arguments: &mut Value) -> Vec<String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut cuts: Vec<(String, usize)> = Vec::new();
+    for (key, value) in object.iter() {
+        let Some(text) = value.as_str() else { continue };
+        for (other, other_value) in object.iter() {
+            let Some(other_text) = other_value.as_str() else { continue };
+            if other == key || other_text.is_empty() {
+                continue;
+            }
+            let leak = regex::Regex::new(&format!(r#""\s*,\s*"{}"\s*:\s*""#, regex::escape(other))).unwrap();
+            let found = leak.find_iter(text).find(|m| leaked_copy(&text[m.end()..]).as_deref() == Some(other_text));
+            if let Some(found) = found {
+                cuts.push((key.clone(), found.start()));
+                break;
+            }
+        }
+    }
+    for (key, at) in &cuts {
+        if let Some(Value::String(text)) = object.get_mut(key) {
+            text.truncate(*at);
+        }
+    }
+    let mut repaired: Vec<String> = cuts.into_iter().map(|(key, _)| key).collect();
+    repaired.sort();
+    repaired
+}
+
+// The value a leaked tail spells, if it is one: an escaped string body, its closing quote,
+// and at most the object's closing brace after it.
+fn leaked_copy(tail: &str) -> Option<String> {
+    let tail = tail.trim_end();
+    let tail = tail.strip_suffix('}').unwrap_or(tail).trim_end();
+    let body = tail.strip_suffix('"')?;
+    serde_json::from_str::<String>(&format!("\"{}\"", body)).ok()
+}
+
 // Fetch available models from LLM server
 
 #[cfg(test)]
@@ -798,6 +852,37 @@ mod tests {
         // Genuinely broken input is reported, not silently dropped.
         assert!(parse_tool_arguments(&json!({"arguments": "{oops"})).is_err());
         assert!(parse_tool_arguments(&json!({"arguments": 42})).is_err());
+    }
+
+    #[test]
+    fn a_copy_of_the_other_arguments_inside_one_is_cut_off() {
+        // The shape from the p2p_auth trace, as the server delivered it.
+        let raw = r#"{"file_path":"src/lib.rs","new_string":"        let (out_tx, out_rx) = channel(64);\n        insert(out_tx);\", \"old_string\": \"        let (out_tx, mut out_rx) = channel(64);\\n        insert(out_tx);\"}","old_string":"        let (out_tx, mut out_rx) = channel(64);\n        insert(out_tx);"}"#;
+        let mut arguments = parse_tool_arguments(&json!({ "arguments": raw })).unwrap();
+        assert_eq!(repair_leaked_arguments(&mut arguments), ["new_string"]);
+        assert_eq!(arguments["new_string"], "        let (out_tx, out_rx) = channel(64);\n        insert(out_tx);");
+        assert_eq!(arguments["old_string"], "        let (out_tx, mut out_rx) = channel(64);\n        insert(out_tx);");
+
+        // Without the closing brace, and with spaces the model may or may not write.
+        let mut arguments = json!({"new_string": "b\" ,  \"old_string\" : \"a\\nz\"", "old_string": "a\nz"});
+        assert_eq!(repair_leaked_arguments(&mut arguments), ["new_string"]);
+        assert_eq!(arguments["new_string"], "b");
+
+        // Code that contains such text is left alone unless the tail is exactly the other
+        // argument's value: here it spells something else.
+        let json_in_code = r#"let body = "{\"new_string\": \"x\", \"old_string\": \"y\"}";"#;
+        let mut arguments = json!({"new_string": json_in_code, "old_string": "let body = 1;"});
+        assert!(repair_leaked_arguments(&mut arguments).is_empty());
+        assert_eq!(arguments["new_string"], json_in_code);
+        let spelled_out = r#"x", "old_string": "y"}"#;
+        let mut arguments = json!({"new_string": spelled_out, "old_string": "z"});
+        assert!(repair_leaked_arguments(&mut arguments).is_empty());
+        assert_eq!(arguments["new_string"], spelled_out);
+
+        // Non-object and non-string arguments are not touched.
+        assert!(repair_leaked_arguments(&mut json!([1, 2])).is_empty());
+        let mut arguments = json!({"command": "ls", "timeout": 5});
+        assert!(repair_leaked_arguments(&mut arguments).is_empty());
     }
 
 }
