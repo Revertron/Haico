@@ -25,7 +25,7 @@ use crate::trace::Caller;
 use super::MyMcpServer;
 use crate::session::without_think_block;
 use crate::util::truncate_at_boundary;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -141,7 +141,7 @@ impl MyMcpServer {
     // it is a parse error at the host rather than a cosmetic problem.
     fn research_note(&self, line: &str) {
         if self.interactive {
-            outln!("{}{}{}", SetForegroundColor(Color::DarkGrey), line, ResetColor);
+            outln!("{}{}{}", SetForegroundColor(crate::out::DIM), line, ResetColor);
         }
     }
 
@@ -353,7 +353,7 @@ impl MyMcpServer {
         if self.interactive {
             outln!(
                 "{}Got answer:{} {}",
-                SetForegroundColor(Color::DarkGrey),
+                SetForegroundColor(crate::out::DIM),
                 ResetColor,
                 answer
             );

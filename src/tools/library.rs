@@ -25,7 +25,7 @@ use super::MyMcpServer;
 use crate::library::Library;
 use crate::session::without_think_block;
 use crate::trace::Caller;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::{ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -185,7 +185,7 @@ impl MyMcpServer {
 impl MyMcpServer {
     fn library_note(&self, line: &str) {
         if self.interactive {
-            outln!("{}{}{}", SetForegroundColor(Color::DarkGrey), line, ResetColor);
+            outln!("{}{}{}", SetForegroundColor(crate::out::DIM), line, ResetColor);
         }
     }
 
@@ -379,7 +379,7 @@ impl MyMcpServer {
         if self.interactive {
             outln!(
                 "{}Library answer:{} {}",
-                SetForegroundColor(Color::DarkGrey),
+                SetForegroundColor(crate::out::DIM),
                 ResetColor,
                 answer
             );

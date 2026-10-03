@@ -210,7 +210,7 @@ pub(crate) fn dialog_rows(
     for row in wrap(&hint, width, "  ", "  ") {
         rows.push(format!(
             "{}{}{}",
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(crate::out::DIM),
             row,
             ResetColor
         ));

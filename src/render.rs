@@ -120,7 +120,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
             match change.tag {
                 ChangeTag::Delete => {
                     if let Some(line_num) = change.old_line {
-                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
                         write!(&mut output, "{:6}", line_num)?;
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
@@ -132,7 +132,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
                 }
                 ChangeTag::Insert => {
                     if let Some(line_num) = change.new_line {
-                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
                         write!(&mut output, "{:6}", line_num)?;
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
@@ -144,7 +144,7 @@ pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &st
                 }
                 ChangeTag::Equal => {
                     if let Some(line_num) = change.old_line {
-                        execute!(&mut output, SetForegroundColor(Color::DarkGrey))?;
+                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
                         write!(&mut output, "{:6}", line_num)?;
                         execute!(&mut output, ResetColor)?;
                         write!(&mut output, " ")?;
@@ -586,7 +586,7 @@ fn layout_table(rows: &[String], available: usize) -> String {
 
 fn table_rule(left: &str, joint: &str, right: &str, widths: &[usize]) -> String {
     let mut rule = String::new();
-    let _ = write!(rule, "{}{}", SetForegroundColor(Color::DarkGrey), left);
+    let _ = write!(rule, "{}{}", SetForegroundColor(crate::out::DIM), left);
     for (index, width) in widths.iter().enumerate() {
         if index > 0 {
             rule.push_str(joint);
@@ -611,7 +611,7 @@ fn table_row(cells: &[String], widths: &[usize], aligns: &[Align], header: bool)
 
     let mut rows = String::new();
     for row in 0..height {
-        let _ = write!(rows, "{}│", SetForegroundColor(Color::DarkGrey));
+        let _ = write!(rows, "{}│", SetForegroundColor(crate::out::DIM));
         for (column, cell) in wrapped.iter().enumerate() {
             let piece = cell.get(row).map(String::as_str).unwrap_or("");
             let pad = widths[column].saturating_sub(crate::out::visible_width(piece));
@@ -633,7 +633,7 @@ fn table_row(cells: &[String], widths: &[usize], aligns: &[Align], header: bool)
                 piece,
                 ResetColor,
                 " ".repeat(after),
-                SetForegroundColor(Color::DarkGrey)
+                SetForegroundColor(crate::out::DIM)
             );
         }
         let _ = write!(rows, "{}\n", ResetColor);
@@ -794,7 +794,7 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
                         let _ = write!(rendered, "{}", ResetColor);
 
                         // Render URL in dark grey
-                        let _ = write!(rendered, "{} (", SetForegroundColor(Color::DarkGrey));
+                        let _ = write!(rendered, "{} (", SetForegroundColor(crate::out::DIM));
                         for j in (close_bracket + 2)..close_paren {
                             rendered.push(chars[j]);
                         }
@@ -1033,12 +1033,12 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
     let _ = write!(
         line,
         "{}  → {}{}{}{}{}",
-        SetForegroundColor(Color::DarkGrey),
+        SetForegroundColor(crate::out::DIM),
         SetAttribute(Attribute::Bold),
         SetForegroundColor(Color::Cyan),
         tool_name,
         SetAttribute(Attribute::Reset),
-        SetForegroundColor(Color::DarkGrey)
+        SetForegroundColor(crate::out::DIM)
     );
     if !summary.is_empty() {
         // Not clipped. Cutting at 110 characters is harmless for a path, whose front says
@@ -1191,7 +1191,7 @@ pub(crate) fn change_preview(diff: &str) -> Option<String> {
         let _ = write!(
             preview,
             "{}    … {} more line(s){}\n",
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(crate::out::DIM),
             body.len() - MAX_LINES,
             ResetColor
         );
@@ -1219,7 +1219,7 @@ pub(crate) fn tool_result_line(text: &str) -> Option<String> {
     let first = strip_project_prefix(first);
     Some(format!(
         "{}    {}{}",
-        SetForegroundColor(Color::DarkGrey),
+        SetForegroundColor(crate::out::DIM),
         first,
         ResetColor
     ))

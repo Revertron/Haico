@@ -326,6 +326,14 @@ impl Out {
 // ---- The full-screen renderer ------------------------------------------------------
 
 // Taking and giving back the alternate screen.
+// The gray of everything that is not the answer: tool calls and results, the chain of
+// thought, the turn summary. A fixed 256-color gray rather than `DarkGrey`, which is palette
+// slot 8 ("bright black") and so the theme's to choose: several dark themes set it within a
+// shade of their own background, and every dim line on screen vanished — tool arguments,
+// results, the thinking — leaving only the cyan tool names. The grayscale ramp (232-255) is
+// not part of any theme, so 245 is a mid gray on a black screen and on a white one alike.
+pub(crate) const DIM: crossterm::style::Color = crossterm::style::Color::AnsiValue(245);
+
 const ENTER_ALT: &str = "\x1b[?1049h";
 const LEAVE_ALT: &str = "\x1b[?1049l";
 
@@ -485,7 +493,7 @@ fn held_back_row(below: usize, width: usize) -> String {
         if below == 1 { "" } else { "s" }
     );
     let text: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("\x1b[90m{}\x1b[0m", text)
+    format!("\x1b[38;5;245m{}\x1b[0m", text)
 }
 
 // How many logical lines of transcript are kept. The buffer has to be bounded — the
@@ -2708,7 +2716,7 @@ mod tests {
         assert!(painted.contains("held back"), "{:?}", painted);
         // Eight rows of transcript area: seven of content and the row that says so.
         assert!(
-            painted.contains(&format!("{}\u{1b}[90m── held back", super::MoveTo(0, 7))),
+            painted.contains(&format!("{}\u{1b}[38;5;245m── held back", super::MoveTo(0, 7))),
             "the notice should be the last row above the region: {:?}",
             painted
         );

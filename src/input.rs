@@ -820,7 +820,7 @@ pub(crate) fn fit(text: &str, columns: usize) -> String {
 }
 
 fn dim(text: String) -> String {
-    format!("{}{}{}", SetForegroundColor(Color::DarkGrey), text, ResetColor)
+    format!("{}{}{}", SetForegroundColor(crate::out::DIM), text, ResetColor)
 }
 
 // `room` is how many rows the panel may take at most — what the box and the bars leave.

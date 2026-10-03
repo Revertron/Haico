@@ -5,7 +5,7 @@
 //! side of the seam and never from the core, so terminal knowledge cannot follow
 //! the loop when the loop moves.
 
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, ResetColor, SetAttribute, SetForegroundColor};
 
 use crate::input::{echo, PROMPT};
 use crate::render::{change_preview, tool_call_line, tool_result_line, MarkdownStream};
@@ -84,13 +84,13 @@ impl Presenter {
                     crate::out::begin_fold(&format!(
                         "{}{}○ (thinking){}",
                         SetAttribute(Attribute::Italic),
-                        SetForegroundColor(Color::DarkGrey),
+                        SetForegroundColor(crate::out::DIM),
                         ResetColor
                     ));
                     out!(
                         "{}{}○ {}",
                         SetAttribute(Attribute::Italic),
-                        SetForegroundColor(Color::DarkGrey),
+                        SetForegroundColor(crate::out::DIM),
                         ResetColor
                     );
                 }
@@ -106,7 +106,7 @@ impl Presenter {
                 out!(
                     "{}{}{}{}",
                     SetAttribute(Attribute::Italic),
-                    SetForegroundColor(Color::DarkGrey),
+                    SetForegroundColor(crate::out::DIM),
                     text,
                     ResetColor
                 );
@@ -166,7 +166,7 @@ impl Presenter {
                 // is the display's job, not the turn's.
                 outln!(
                     "\n{}{}{}\n",
-                    SetForegroundColor(Color::DarkGrey),
+                    SetForegroundColor(crate::out::DIM),
                     crate::turn_summary(crate::get_done_verb(), elapsed, chrono::Local::now()),
                     ResetColor
                 );
@@ -259,14 +259,14 @@ impl Presenter {
                     crate::out::begin_fold(&format!(
                         "{}{}○ (compressed reasoning){}",
                         SetAttribute(Attribute::Italic),
-                        SetForegroundColor(Color::DarkGrey),
+                        SetForegroundColor(crate::out::DIM),
                         ResetColor
                     ));
                     for line in summary.lines() {
                         outln!(
                             "{}{}      {}{}",
                             SetAttribute(Attribute::Italic),
-                            SetForegroundColor(Color::DarkGrey),
+                            SetForegroundColor(crate::out::DIM),
                             line,
                             ResetColor
                         );

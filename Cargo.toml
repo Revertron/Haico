@@ -1,8 +1,8 @@
 [package]
 name = "haico"
-version = "0.2.21"
+version = "0.2.22"
 edition = "2021"
-description = "Interactive CLI coding assistant for local LLMs (via LM Studio) with a custom “MCP” tool router."
+description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
 # The GUI frontend is opt-in: it pulls winit, glutin, image and resvg, which is a
 # lot of dependency for a tool whose first job is a terminal. `cargo build
