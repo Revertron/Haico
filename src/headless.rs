@@ -287,6 +287,14 @@ fn follow_up(plan: &[TodoItem], reply: Option<&str>) -> Option<String> {
                 .to_string(),
         );
     }
+    if announces_a_next_step(reply) {
+        return Some(
+            "You said what you would do next, but stopped without doing it. Nobody is watching \
+             this run, so nothing will happen until you call a tool. Do it now, and carry on \
+             until the task is done."
+                .to_string(),
+        );
+    }
     let last_line = reply.lines().last().unwrap_or_default().trim();
     if last_line.ends_with('?') {
         return Some(
@@ -297,6 +305,35 @@ fn follow_up(plan: &[TodoItem], reply: Option<&str>) -> Option<String> {
         );
     }
     None
+}
+
+/// Whether a short reply ends by announcing what it will do instead of having done it — the
+/// habit the module doc names first ("Now I will run the tests."). Short, because a summary of
+/// finished work runs longer and may well end on a plan for later; "Let me know" is a
+/// sign-off, not a plan. Measured case: a p2p_auth run's turn ended on "Let me check the
+/// current state of the codebase and see what errors remain." and the run exited as finished.
+const ANNOUNCEMENT_MAX: usize = 400;
+
+fn announces_a_next_step(reply: &str) -> bool {
+    static ANNOUNCES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(?:(?:now|next|first|then|ok|okay|alright|great)[,.!]?\s+)?(?:let me|let's|i'll|i will|i'm going to|i am going to|i need to|going to)\b",
+        )
+        .unwrap()
+    });
+    if reply.len() > ANNOUNCEMENT_MAX {
+        return false;
+    }
+    // The last sentence: after the last ". ", "! " or line break. Not after every '.', which
+    // would cut "tests/integration.rs." at the file extension.
+    let text = reply.trim();
+    let start = [text.rfind(". "), text.rfind("! "), text.rfind('\n')]
+        .into_iter()
+        .flatten()
+        .max()
+        .map_or(0, |at| at + 1);
+    let last = text[start..].trim();
+    ANNOUNCES.is_match(last) && !last.to_lowercase().starts_with("let me know")
 }
 
 #[cfg(test)]
@@ -330,6 +367,27 @@ mod tests {
         assert!(follow_up(&[], None).is_some());
         // A question in the middle of a summary is not one waiting for an answer.
         assert_eq!(follow_up(&[], Some("Why was it pinned? An old bug. Unpinned it.")), None);
+    }
+
+    #[test]
+    fn an_announced_next_step_is_not_a_finish() {
+        for stopped in [
+            "Let me check the current state of the codebase and see what errors remain.",
+            "The handshake compiles. Now I will run the tests.",
+            "Next, I'll fix the remaining two errors in tests/integration.rs.",
+            "I need to update the imports first.",
+        ] {
+            let nudge = follow_up(&[], Some(stopped));
+            assert!(nudge.is_some_and(|n| n.contains("stopped without doing it")), "{stopped}");
+        }
+        for finished in [
+            "Done: all 6 tests pass three times in a row and clippy is clean.",
+            "Fixed the parser. Let me know if you want the error messages changed.",
+            // A long summary may end on a plan for later; it is still a summary.
+            &format!("{} I'll leave the TLS support for a later version.", "Implemented the node. ".repeat(30)),
+        ] {
+            assert_eq!(follow_up(&[], Some(finished)), None, "{finished}");
+        }
     }
 
     #[test]
