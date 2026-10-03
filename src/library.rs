@@ -857,6 +857,25 @@ pub(crate) fn test_trouble(output: &str) -> TestTrouble {
     trouble
 }
 
+/// The crates a hang is worth asking about, runtime first, out of those a project involves.
+///
+/// A hang is almost always in whatever schedules the I/O: a blocked runtime thread, a read that
+/// waits on a reply nobody sends, an accept loop on a blocking socket. Listing every covered crate
+/// the project depends on said nothing about where to look: a p2p_auth run's note named nine
+/// (anyhow, chacha20poly1305, clap, ed25519-dalek, ...) for a tokio test that hung because a
+/// listener built with `from_std` was never made non-blocking, and its example question began
+/// with "anyhow". Empty when none of them is involved, and then the note names them all.
+const HANG_SUSPECTS: &[&str] =
+    &["tokio", "mio", "tokio-util", "futures", "hyper", "axum", "actix-web", "reqwest", "tonic", "async-std", "smol"];
+
+fn hang_suspects(crates: &[String]) -> Vec<String> {
+    HANG_SUSPECTS
+        .iter()
+        .filter(|suspect| crates.iter().any(|c| c == *suspect))
+        .map(|suspect| suspect.to_string())
+        .collect()
+}
+
 /// The note for a build that compiled and then failed at runtime — tests failing, tests hanging,
 /// or the whole command killed at its timeout.
 ///
@@ -870,6 +889,9 @@ pub(crate) fn runtime_failure_note(crates: &[String], trouble: &TestTrouble, tim
     if crates.is_empty() || (trouble.failed.is_empty() && trouble.hung.is_empty() && !timed_out) {
         return None;
     }
+    let hanging = timed_out || !trouble.hung.is_empty();
+    let narrowed = if hanging { hang_suspects(crates) } else { Vec::new() };
+    let crates: &[String] = if narrowed.is_empty() { crates } else { &narrowed };
     let names = match crates {
         [one] => one.clone(),
         [init @ .., last] => format!("{} and {}", init.join(", "), last),
@@ -880,7 +902,6 @@ pub(crate) fn runtime_failure_note(crates: &[String], trouble: &TestTrouble, tim
         let more = tests.len().saturating_sub(3);
         if more > 0 { format!("{} (and {} more)", shown.join(", "), more) } else { shown.join(", ") }
     };
-    let hanging = timed_out || !trouble.hung.is_empty();
     let (what, symptom) = if hanging {
         let which = if trouble.hung.is_empty() { String::new() } else { format!(": {}", listed(&trouble.hung)) };
         (format!("Something hangs{}", which), "a test hangs and never finishes".to_string())
@@ -1361,6 +1382,31 @@ test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; 
         // The first `failures:` block holds `---- name stdout ----` sections, not names.
         let details = "failures:\n\n---- a stdout ----\nboom\n";
         assert!(test_trouble(details).failed.is_empty());
+    }
+
+    #[test]
+    fn a_hang_note_names_the_runtime_not_every_dependency() {
+        // The p2p_auth run's crates, in the order the note listed them.
+        let crates: Vec<String> = ["anyhow", "chacha20poly1305", "clap", "ed25519-dalek", "hkdf", "rand", "sha2", "tokio", "x25519-dalek"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let hung = TestTrouble { hung: vec!["test_two_nodes_exchange_messages".into()], ..Default::default() };
+        let note = runtime_failure_note(&crates, &hung, false).unwrap();
+        assert!(note.contains("in a project that uses tokio. The library has articles on tokio,"), "{note}");
+        assert!(note.contains("library(question: \"tokio: a test hangs"), "{note}");
+        assert!(!note.contains("anyhow"), "{note}");
+        // Killed at the timeout is the same symptom.
+        let note = runtime_failure_note(&crates, &TestTrouble::default(), true).unwrap();
+        assert!(note.contains("uses tokio.") && !note.contains("clap"), "{note}");
+
+        // A failing (not hanging) test still names them all: an assertion can be about anything.
+        let failed = TestTrouble { failed: vec!["roundtrip".into()], ..Default::default() };
+        assert!(runtime_failure_note(&crates, &failed, false).unwrap().contains("anyhow"));
+        // No runtime involved: nothing to narrow to, so nothing is dropped.
+        let sync_only = vec!["rayon".to_string(), "crossbeam-channel".to_string()];
+        let note = runtime_failure_note(&sync_only, &hung, false).unwrap();
+        assert!(note.contains("rayon and crossbeam-channel"), "{note}");
     }
 
     #[test]
