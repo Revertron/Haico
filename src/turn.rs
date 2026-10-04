@@ -293,6 +293,10 @@ pub(crate) enum Notice {
     LoopNudge { tool: String, count: usize },
     /// …and this is where the turn gave up on it.
     LoopBroken { tool: String, count: usize },
+    /// The sub-agent is about to run one of its own calls, which has cleared every
+    /// gate. Its own kind rather than `ToolStarted`, because it is one step inside
+    /// a call that is already on screen, not a call of the conversation's.
+    SubAgentStep { tool: String, arguments: Value },
     /// A reply was cut off mid-stream for going round in a loop, and dropped.
     /// `retrying` says whether the model has been told and asked again, or the
     /// turn has given up; `passage` is a line of what kept coming back.

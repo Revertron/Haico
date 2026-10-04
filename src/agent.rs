@@ -21,6 +21,8 @@
 //! reads — the flavor text on the activity bar and in the turn summary is picked
 //! by the frontend from a `Waiting` kind and an elapsed time.
 
+use crate::subagent::run_sub_agent;
+use crate::tools::SUB_AGENT;
 use crate::trace::Caller;
 use anyhow::{anyhow, Result};
 use rmcp::handler::server::wrapper::Parameters;
@@ -709,7 +711,7 @@ const AFTER_COMPACTION: &str = "You replied without calling a tool, right after 
      compacted in the middle of the task. The work is not finished: carry on from the notes above \
      by calling a tool now.";
 
-fn push_user_note(messages: &mut Vec<Value>, note: &str) {
+pub(crate) fn push_user_note(messages: &mut Vec<Value>, note: &str) {
     if let Some(last) = messages.last_mut().filter(|m| m["role"] == "user") {
         match &mut last["content"] {
             Value::String(text) => {
@@ -779,6 +781,207 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
+// A stuck model gives itself away by calling the same tool with the same arguments over and
+// over with nothing in between, which can happen on the tenth round or the fiftieth. The first
+// threshold says so in the conversation; the second gives up on the turn. Shared with the
+// sub-agent's loop, which gets stuck the same way.
+pub(crate) const LOOP_NUDGE: usize = 3;
+pub(crate) const LOOP_BREAK: usize = 5;
+
+// ---------------------------------------------------------------------------
+// Clearing one call
+// ---------------------------------------------------------------------------
+
+/// What a call that may run carries with it to the call line.
+pub(crate) struct Cleared {
+    /// Why it runs unasked, when the auto-mode reviewer is the one who said yes.
+    pub(crate) auto_note: Option<String>,
+    /// The user was prompted, and the prompt has already shown the diff.
+    pub(crate) prompted: bool,
+}
+
+/// Every gate one call has to pass before it runs: the mode, the workspace, the
+/// permission rules, the auto-mode reviewer and the user, in that order.
+///
+/// `Err` carries the reply the call's `tool_call_id` is owed instead of a result;
+/// the caller pushes it, because the caller knows which message list it belongs
+/// in. A function rather than a block of `run_turn` because the sub-agent
+/// (`crate::subagent`) makes calls too, and a call made one level down is still a
+/// call on this machine: the same boundary, the same prompt, the same reviewer.
+/// Two copies of this would be two answers to "may this run".
+pub(crate) async fn authorize(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    tool_name: &str,
+    arguments: &Value,
+) -> std::result::Result<Cleared, String> {
+    // Decide what this specific call needs: nothing (read-only), the user's consent under
+    // a narrowly scoped key, or an outright refusal. The mode has the first word — plan
+    // mode refuses anything that changes the machine, whatever the call would normally be
+    // entitled to.
+    let gate = gate_for_mode(link.mode(), &agent.workspace, tool_name, arguments);
+
+    if let Gate::Deny(reason) = &gate {
+        let _ = tx.send(Notice::Refused(reason.clone()).into());
+        return Err(reason.clone());
+    }
+
+    let mut ask = match &gate {
+        Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
+            Some((keys.clone(), label.clone()))
+        }
+        _ => None,
+    };
+
+    // Auto mode: the reviewer answers the routine yeses so the user does not have to.
+    // Only a call that was going to interrupt is reviewed — an already-approved one costs
+    // nothing and should stay free.
+    //
+    // An allow runs the call unasked, and a deny refuses it unasked. The deny used to fall
+    // through to the prompt instead, which made auto mode useless for the one thing it is
+    // for: handing over a task and walking away. A single suspicious call parked the whole
+    // run on a dialog nobody was there to answer. Refusing costs little — the model is
+    // told why and can find another way or stop and say what it needed.
+    //
+    // A review with no verdict (cut off at its token cap, an unreadable reply, a server
+    // error) is not a judgment either way, and for the same reason it no longer falls
+    // through to the prompt: nobody may be there. The model is told it was a temporary
+    // error and to make the call again. Worded as a refusal, it was taken as final: an
+    // unattended model whose `write_file` met a review cut off at its cap spent the next
+    // forty minutes writing files through `echo` and PowerShell. If the reviewer keeps
+    // failing, the identical-call loop guard bounds the retries.
+    //
+    // Only a review the user interrupted with Esc still reaches the prompt: that is the
+    // one outcome that proves somebody is there.
+    // Why the call is running unasked, and what to add to the prompt when it still has to
+    // be asked. Only one is ever set.
+    let mut auto_note: Option<String> = None;
+    let mut review_note: Option<ReviewNote> = None;
+    if link.mode() == Mode::Auto && ask.is_some() {
+        // Transient: a review takes seconds, and a silent pause reads as a hang. Erased
+        // once it lands, because the outcome belongs on the call line below — left
+        // standing, every single call would cost two lines of log to say one thing.
+        let verdict = interruptible(
+            tx,
+            link,
+            Waiting::ReviewingCall,
+            judge_tool_call(
+                &agent.client,
+                &mut agent.review_cache,
+                &agent.workspace,
+                tool_name,
+                arguments,
+            ),
+        )
+        .await;
+
+        match verdict {
+            Some(Ok(Verdict { allow: true, reason, cached })) => {
+                // Marked, so reading back through a run still tells apart a call the
+                // reviewer weighed from one it merely recognized.
+                auto_note = Some(match cached {
+                    true => format!("cached — {}", reason),
+                    false => reason,
+                });
+                ask = None;
+            }
+            Some(Ok(Verdict { allow: false, reason, .. })) => {
+                let _ = tx.send(
+                    Notice::ReviewDenied {
+                        tool: tool_name.to_string(),
+                        arguments: arguments.clone(),
+                        reason: reason.clone(),
+                    }
+                    .into(),
+                );
+                return Err(format!(
+                    "Permission denied: this call was refused as unsafe ({}). It was not run. \
+                     Do not retry it as is. Reach the goal a safer way if there is one; \
+                     otherwise finish and tell the user what you needed done and why.",
+                    reason
+                ));
+            }
+            Some(Err(e)) => {
+                let detail = format!("{:#}", e);
+                let _ = tx.send(
+                    Notice::ReviewFailed {
+                        tool: tool_name.to_string(),
+                        arguments: arguments.clone(),
+                        detail,
+                    }
+                    .into(),
+                );
+                return Err(format!(
+                    "Temporary error while evaluating the '{}' call, so it was not run. \
+                     Nothing is known to be wrong with the call itself: make the same call \
+                     again.",
+                    tool_name
+                ));
+            }
+            None => {
+                review_note = Some(ReviewNote::Interrupted);
+            }
+        }
+    }
+
+    // Captured before the prompt consumes it: the diff under the call line is skipped
+    // only when the prompt has already shown it.
+    let prompted = ask.is_some();
+
+    if let Some((gate_keys, allow_all_label)) = ask {
+        let diff_content: Option<String> = file_change_diff(tool_name, arguments);
+
+        // The call itself goes to the frontend, not a sentence about it: how much of a
+        // command to show and where the reviewer's objection belongs are rendering
+        // decisions.
+        //
+        // A terminal we cannot read from (piped stdin, no TTY) must not end the session,
+        // and must never be taken as consent: refuse the call and tell the model.
+        let answered = ask_frontend(tx, |reply| Ask::Permission {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+            review: review_note.clone(),
+            allow_all_label: allow_all_label.clone(),
+            diff: diff_content.clone(),
+            reply,
+        })
+        .await;
+        let Some(response) = answered else {
+            let _ = tx.send(
+                Notice::AskFailed {
+                    what: "for permission",
+                    detail: "no interactive terminal".to_string(),
+                }
+                .into(),
+            );
+            return Err(format!(
+                "Permission for '{}' could not be requested (no interactive terminal), so it \
+                 was not run.",
+                tool_name
+            ));
+        };
+
+        match response {
+            PermissionResponse::Allow => {
+                let _ = tx.send(Notice::PermissionAllowed.into());
+            }
+            PermissionResponse::AllowAll => {
+                // Remembered under the narrow keys this call resolved to, not under the
+                // tool name.
+                agent.permissions.allow(&gate_keys);
+                let _ = tx.send(Notice::PermissionAllowedAll(allow_all_label.clone()).into());
+            }
+            PermissionResponse::Reject(alternative) => {
+                let _ = tx.send(Notice::PermissionDenied { alternative: alternative.clone() }.into());
+                return Err(format!("Permission denied by user. User suggests: {}", alternative));
+            }
+        }
+    }
+
+    Ok(Cleared { auto_note, prompted })
+}
+
 // ---------------------------------------------------------------------------
 // One turn
 // ---------------------------------------------------------------------------
@@ -817,12 +1020,6 @@ pub(crate) async fn run_turn(
         // going nowhere", and a long job that hits it unattended has nobody to say
         // "continue". Repetition is the better signal, and it is what guards auto mode.
         const MAX_TOOL_ROUNDS: usize = 50;
-        // A stuck model gives itself away by calling the same tool with the same arguments
-        // over and over with nothing in between, which can happen on the tenth round or
-        // the fiftieth. The first threshold says so in the conversation; the second gives
-        // up on the turn.
-        const LOOP_NUDGE: usize = 3;
-        const LOOP_BREAK: usize = 5;
         let mut round = 0usize;
 
         // The (tool, arguments) pair called last, and how long the unbroken run of it is.
@@ -1396,207 +1593,58 @@ pub(crate) async fn run_turn(
                         continue;
                     }
 
-                    // Decide what this specific call needs: nothing (read-only), the user's
-                    // consent under a narrowly scoped key, or an outright refusal. The mode
-                    // has the first word — plan mode refuses anything that changes the
-                    // machine, whatever the call would normally be entitled to.
-                    let gate = gate_for_mode(link.mode(), &agent.workspace, tool_name, &arguments);
-
-                    if let Gate::Deny(reason) = &gate {
-                        let _ = tx.send(Notice::Refused(reason.clone()).into());
+                    // Run out here rather than in the tool, because every call the helper
+                    // makes is cleared through `authorize` — and that needs the agent.
+                    // The call itself needs no clearing: it does nothing that its own
+                    // calls do not each answer for.
+                    if tool_name == SUB_AGENT {
+                        let task = arguments["task"].as_str().unwrap_or_default().trim().to_string();
+                        let content = if task.is_empty() {
+                            "The task was empty. Put the whole task in the 'task' field and                              call sub_agent again."
+                                .to_string()
+                        } else {
+                            let _ = tx.send(AgentEvent::ToolStarted {
+                                name: tool_name.to_string(),
+                                arguments: arguments.clone(),
+                                auto_note: None,
+                            });
+                            let Some(report) = run_sub_agent(agent, &task, tx, link).await else {
+                                let _ = tx.send(Notice::Interrupted.into());
+                                agent.messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": "Interrupted by the user before the sub-agent finished."
+                                }));
+                                interrupted = true;
+                                break;
+                            };
+                            let _ = tx.send(AgentEvent::DidTool {
+                                name: tool_name.to_string(),
+                                arguments: arguments.clone(),
+                            });
+                            let _ = tx.send(AgentEvent::ToolResult(report.clone()));
+                            report
+                        };
                         agent.messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
-                            "content": reason
+                            "content": content
                         }));
                         continue;
                     }
 
-                    let mut ask = match &gate {
-                        Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
-                            Some((keys.clone(), label.clone()))
-                        }
-                        _ => None,
-                    };
-
-                    // Auto mode: the reviewer answers the routine yeses so the user does
-                    // not have to. Only a call that was going to interrupt is reviewed —
-                    // an already-approved one costs nothing and should stay free.
-                    //
-                    // An allow runs the call unasked, and a deny refuses it unasked. The
-                    // deny used to fall through to the prompt instead, which made auto mode
-                    // useless for the one thing it is for: handing over a task and walking
-                    // away. A single suspicious call parked the whole run on a dialog
-                    // nobody was there to answer. Refusing costs little — the model is told
-                    // why and can find another way or stop and say what it needed.
-                    //
-                    // A review with no verdict (cut off at its token cap, an unreadable
-                    // reply, a server error) is not a judgment either way, and for the same
-                    // reason it no longer falls through to the prompt: nobody may be there.
-                    // The model is told it was a temporary error and to make the call again.
-                    // Worded as a refusal, it was taken as final: an unattended model whose
-                    // `write_file` met a review cut off at its cap spent the next forty
-                    // minutes writing files through `echo` and PowerShell. If the reviewer
-                    // keeps failing, the identical-call loop guard bounds the retries.
-                    //
-                    // Only a review the user interrupted with Esc still reaches the prompt:
-                    // that is the one outcome that proves somebody is there.
-                    // Why the call is running unasked, and what to add to the prompt when
-                    // it still has to be asked. Only one is ever set.
-                    let mut auto_note: Option<String> = None;
-                    let mut review_note: Option<ReviewNote> = None;
-                    if link.mode() == Mode::Auto && ask.is_some() {
-                        // Transient: a review takes seconds, and a silent pause reads as a
-                        // hang. Erased once it lands, because the outcome belongs on the
-                        // call line below — left standing, every single call would cost two
-                        // lines of log to say one thing.
-                        let verdict = interruptible(
-                            tx,
-                            link,
-                            Waiting::ReviewingCall,
-                            judge_tool_call(
-                                &agent.client,
-                                &mut agent.review_cache,
-                                &agent.workspace,
-                                tool_name,
-                                &arguments,
-                            ),
-                        )
-                        .await;
-
-                        match verdict {
-                            Some(Ok(Verdict { allow: true, reason, cached })) => {
-                                // Marked, so reading back through a run still tells apart
-                                // a call the reviewer weighed from one it merely
-                                // recognized.
-                                auto_note = Some(match cached {
-                                    true => format!("cached — {}", reason),
-                                    false => reason,
-                                });
-                                ask = None;
-                            }
-                            Some(Ok(Verdict { allow: false, reason, .. })) => {
-                                let _ = tx.send(
-                                    Notice::ReviewDenied {
-                                        tool: tool_name.to_string(),
-                                        arguments: arguments.clone(),
-                                        reason: reason.clone(),
-                                    }
-                                    .into(),
-                                );
+                    let Cleared { auto_note, prompted } =
+                        match authorize(agent, tx, link, tool_name, &arguments).await {
+                            Ok(cleared) => cleared,
+                            Err(content) => {
                                 agent.messages.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
-                                    "content": format!(
-                                        "Permission denied: this call was refused as unsafe ({}). \
-                                         It was not run. Do not retry it as is. Reach the goal \
-                                         a safer way if there is one; otherwise finish and tell \
-                                         the user what you needed done and why.",
-                                        reason
-                                    )
-                                }));
-                                continue;
-                            }
-                            Some(Err(e)) => {
-                                let detail = format!("{:#}", e);
-                                let _ = tx.send(
-                                    Notice::ReviewFailed {
-                                        tool: tool_name.to_string(),
-                                        arguments: arguments.clone(),
-                                        detail,
-                                    }
-                                    .into(),
-                                );
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": format!(
-                                        "Temporary error while evaluating the '{}' call, so it \
-                                         was not run. Nothing is known to be wrong with the call \
-                                         itself: make the same call again.",
-                                        tool_name
-                                    )
-                                }));
-                                continue;
-                            }
-                            None => {
-                                review_note = Some(ReviewNote::Interrupted);
-                            }
-                        }
-                    }
-
-                    // Captured before the prompt consumes it: the diff below is skipped only
-                    // when the prompt has already shown it.
-                    let prompted = ask.is_some();
-
-                    if let Some((gate_keys, allow_all_label)) = ask {
-                        // Generate diff if needed
-                        let diff_content: Option<String> = file_change_diff(tool_name, &arguments);
-
-                        // The call itself goes to the frontend, not a sentence
-                        // about it: how much of a command to show and where the
-                        // reviewer's objection belongs are rendering decisions.
-                        //
-                        // A terminal we cannot read from (piped stdin, no TTY) must
-                        // not end the session, and must never be taken as consent:
-                        // refuse the call and tell the model.
-                        let answered = ask_frontend(tx, |reply| Ask::Permission {
-                            tool_name: tool_name.to_string(),
-                            arguments: arguments.clone(),
-                            review: review_note.clone(),
-                            allow_all_label: allow_all_label.clone(),
-                            diff: diff_content.clone(),
-                            reply,
-                        })
-                        .await;
-                        let response = match answered {
-                            Some(response) => response,
-                            None => {
-                                let _ = tx.send(
-                                    Notice::AskFailed {
-                                        what: "for permission",
-                                        detail: "no interactive terminal".to_string(),
-                                    }
-                                    .into(),
-                                );
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": format!(
-                                        "Permission for '{}' could not be requested (no \
-                                         interactive terminal), so it was not run.",
-                                        tool_name
-                                    )
+                                    "content": content
                                 }));
                                 continue;
                             }
                         };
-
-                        match response {
-                            PermissionResponse::Allow => {
-                                // Allow once, proceed with execution
-                                let _ = tx.send(Notice::PermissionAllowed.into());
-                            }
-                            PermissionResponse::AllowAll => {
-                                // Remembered under the narrow keys this call resolved to,
-                                // not under the tool name.
-                                agent.permissions.allow(&gate_keys);
-                                let _ = tx.send(Notice::PermissionAllowedAll(allow_all_label.clone()).into());
-                            }
-                            PermissionResponse::Reject(alternative) => {
-                                // User rejected, send alternative to LLM
-                                let _ = tx.send(Notice::PermissionDenied { alternative: alternative.clone() }.into());
-
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": format!("Permission denied by user. User suggests: {}", alternative)
-                                }));
-                                continue;
-                            }
-                        }
-                    }
-
                     // Execute the tool
                     // A slow tool (a big fetch, a long build) is interruptible too. The
                     // tool_call_id is still answered before breaking out — an unanswered one

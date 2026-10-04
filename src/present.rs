@@ -329,6 +329,15 @@ impl Presenter {
                 }
                 outln!("  \"{}\"\n", passage);
             }
+            // Indented under the sub_agent call line, and dim like research's own
+            // progress: these are the steps of one call, not calls of their own.
+            Notice::SubAgentStep { tool, arguments } => outln!(
+                "{}  ↳ {} {}{}",
+                SetForegroundColor(crate::out::DIM),
+                tool,
+                crate::render::tool_call_summary(&tool, &arguments),
+                ResetColor
+            ),
             Notice::LoopNudge { tool, count } => outln!(
                 "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
                 tool, count

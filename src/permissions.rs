@@ -51,6 +51,11 @@ pub(crate) const AUTO_ALLOWED_TOOLS: &[&str] = &[
     // itself, and whatever that message leads it to do meets every gate when it does it.
     // Asking would also defeat the use it exists for — the user who walked away.
     "timer",
+    // Does nothing itself: every call its helper makes is cleared one at a time through
+    // `authorize`, the same gates the main model's calls meet, so a sub-agent cannot reach
+    // what the model could not. Asking here as well would ask twice for a run_command and
+    // once for a read nobody needs asked about.
+    "sub_agent",
 ];
 
 // Programs where the bare name says almost nothing about what is about to happen, so the

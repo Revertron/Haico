@@ -65,6 +65,8 @@ pub(crate) enum Caller {
     Research,
     /// The `library` tool's own loop.
     Library,
+    /// The `sub_agent` tool's own loop.
+    SubAgent,
     /// Auto mode judging a gated call.
     Reviewer,
     /// The reasoning policy compressing a chain of thought.
@@ -81,6 +83,7 @@ impl Caller {
             Caller::Main => "main",
             Caller::Research => "research",
             Caller::Library => "library",
+            Caller::SubAgent => "sub_agent",
             Caller::Reviewer => "reviewer",
             Caller::Compressor => "compressor",
             Caller::Compactor => "compactor",

@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
+// What the `sub_agent` tool's helper is told. Its own file, with the same `$` variables as
+// the main prompt, because the helper runs commands and reads paths on the same machine and
+// needs the same facts to do it — which shell, which directory, where temp is.
+pub(crate) const SUB_AGENT_PROMPT: &str = include_str!("sub_agent_prompt.txt");
+
 
 pub(crate) fn get_main_branch() -> String {
     // Try to get the default branch from the remote
@@ -38,6 +43,17 @@ pub(crate) fn get_main_branch() -> String {
 
 
 pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String {
+    fill_prompt(SYSTEM_PROMPT, model, workspace)
+}
+
+// The sub-agent's system message. No instruction files and no memory: its task arrives
+// written out in full by a model that has read them, and every token of a sub-agent's
+// context is one it could have spent on the log it was sent to read.
+pub(crate) fn build_sub_agent_prompt(model: &str, workspace: &Workspace) -> String {
+    fill_prompt(SUB_AGENT_PROMPT, model, workspace)
+}
+
+fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
     let pwd = env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
@@ -68,7 +84,8 @@ pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String 
 
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let (branch, git_status, last_5_commits) = if is_repo {
+    // Five git commands, so asked only by a template that shows their answers.
+    let (branch, git_status, last_5_commits) = if is_repo && template.contains("$branch") {
         let branch = run_git_command(&["rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -83,7 +100,7 @@ pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String 
         ("N/A".to_string(), "".to_string(), "".to_string())
     };
 
-    let main_branch = get_main_branch();
+    let main_branch = if template.contains("$main_branch") { get_main_branch() } else { String::new() };
 
     // Named because it is otherwise unguessable. A model told to write a throwaway script
     // and given nowhere to put it picks "C:\Temp" or "/tmp" — a path the workspace then
@@ -106,7 +123,7 @@ pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String 
             .join(", ")
     };
 
-    SYSTEM_PROMPT
+    template
         .replace("$pwd", &pwd)
         .replace("$is_repo", &is_repo.to_string())
         .replace("$platform", platform)

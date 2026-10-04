@@ -35,6 +35,7 @@ mod scratch;
 mod session;
 mod skills;
 mod store;
+mod subagent;
 #[cfg(test)]
 mod testutil;
 mod timers;

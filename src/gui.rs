@@ -860,6 +860,10 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::PermissionDenied { alternative } => {
             (format!("denied — {alternative}"), Tone::Warning)
         }
+        Notice::SubAgentStep { tool, arguments } => {
+            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            (format!("↳ {tool} {summary}"), Tone::Muted)
+        }
         Notice::LoopNudge { tool, count } => {
             (format!("'{tool}' called {count} times in a row — telling the model"), Tone::Warning)
         }

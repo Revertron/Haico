@@ -25,6 +25,7 @@ mod memory;
 mod research;
 mod shell;
 mod skills;
+mod subagent;
 mod timers;
 mod web;
 
@@ -36,6 +37,7 @@ pub(crate) use memory::*;
 pub(crate) use research::*;
 pub(crate) use shell::*;
 pub(crate) use skills::*;
+pub(crate) use subagent::*;
 pub(crate) use timers::*;
 pub(crate) use web::*;
 
@@ -148,8 +150,11 @@ impl MyMcpServer {
         // separate files at all.
         // research before the web tools it wraps: a small model reads the list in order,
         // and the tool it should reach for first should not be the last one it sees.
+        // sub_agent right after the file tools for the same reason: reading a long log
+        // yourself is the habit it exists to replace, so it is met beside `read`.
         let mut tool_router = Self::basics_router()
             + Self::files_router()
+            + Self::subagent_router()
             + Self::memory_router()
             + Self::skills_router()
             + Self::research_router()
@@ -173,6 +178,10 @@ impl MyMcpServer {
             // A timer fires by putting a message into our own conversation loop, and an
             // MCP host has no loop of ours to put it into.
             tool_router.remove_route("timer");
+            // Its loop runs every inner call through the REPL's gates — workspace,
+            // permissions, reviewer — and in server mode there are none to run them
+            // through. The host has sub-agents of its own.
+            tool_router.remove_route(SUB_AGENT);
         }
         // The library needs a model to run its librarian and articles for it to read. Off
         // in tests unless a test sets it, like `Agent::new`'s session path: a suite that read
@@ -487,6 +496,10 @@ impl MyMcpServer {
             "timer" => {
                 let params: TimerParams = serde_json::from_value(arguments)?;
                 self.timer(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+            }
+            "sub_agent" => {
+                let params: SubAgentParams = serde_json::from_value(arguments)?;
+                self.sub_agent(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             "crate_api" => {
                 let params: CrateApiParams = serde_json::from_value(arguments)?;

@@ -981,6 +981,8 @@ pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
         "web_fetch" | "web_get" => text("url"),
         "web_search" | "crate_search" => text("query"),
         "library" | "research" => text("question"),
+        // The first line only: a task is written to be complete, so it runs long.
+        "sub_agent" => text("task").lines().next().unwrap_or_default().to_string(),
         "crate_info" | "crate_api" => text("name"),
         "background_output" | "background_stop" => match arguments["id"].as_u64() {
             Some(id) => format!("job {}", id),

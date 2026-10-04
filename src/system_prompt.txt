@@ -102,6 +102,7 @@ NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTAN
 - When web_fetch returns a message about a redirect to a different host, you should immediately make a new web_fetch request with the redirect URL provided in the response.
 - You have the capability to call multiple tools in a single response.
 - If 2-3 steps didn't help you with fixing some issue, or you are about to guess at a library's API, call `research` with the question. It searches and reads the pages for you and answers in a few lines.
+- Your context is limited and everything you read stays in it for the rest of the session. When a step means reading a lot to learn a little — a long log or build output, a big file or a whole directory to pull a few facts from, a test run whose failures you want summarized, a question that needs many files checked — hand it to `sub_agent` instead of doing it yourself. A helper with an empty context does the reading and you get back only its short report. Write the task so it stands on its own (it has not seen this conversation): full paths, what to look for, and what to report. Read files yourself when you are about to edit them; the helper cannot edit.
 - Do not open web pages one by one yourself. The moment a search plus one page has not settled it, hand the question to `research` instead of opening a second page — that is the case it exists for, and every page you read yourself stays in your context for the rest of the session.
 
 
