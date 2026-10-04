@@ -1048,7 +1048,21 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
         // it costs rows rather than legibility. Whitespace is still collapsed, so a
         // heredoc arrives as one wrapped paragraph rather than ten rows of its own.
         let summary: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-        let _ = write!(line, "  {}", summary);
+        if matches!(tool_name, "run_command" | "run_background") {
+            // A command in the plain text color, though, unlike a path or a pattern: it
+            // is the one summary that has to be read rather than recognized — whether
+            // the analyzer was right to let it through is decided from it — and in dim
+            // grey a long one was hard going. The analyzer's note after it stays dim.
+            let _ = write!(
+                line,
+                "  {}{}{}",
+                ResetColor,
+                summary,
+                SetForegroundColor(crate::out::DIM)
+            );
+        } else {
+            let _ = write!(line, "  {}", summary);
+        }
     }
     if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
         // Not clipped either, and for a sharper reason than the command: this is the whole
