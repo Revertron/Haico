@@ -936,8 +936,11 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("per reply. /reasoning switches it for one session.");
     println!("\nreasoning_effort is sent to the server verbatim, so the levels are whatever that");
     println!("model's chat template accepts — commonly low, medium and high. Left out, the");
-    println!("field is omitted and the model thinks as much as it thinks. /effort switches it");
-    println!("for one session.");
+    println!("field is omitted and the model thinks as much as it thinks. It is also handed to");
+    println!("the chat template in chat_template_kwargs, \"on\"/\"off\" as enable_thinking and any");
+    println!("other level as reasoning_effort, since a server may read the top-level field");
+    println!("itself (LM Studio checks it against the model's metadata) or not at all");
+    println!("(llama.cpp). /effort switches it for one session.");
     println!("\nsub_agent_effort is the same setting for haico's own sub-agents — research, the");
     println!("auto-mode reviewer and the reasoning compressor. Left out, nothing is sent and");
     println!("they think as much as the model thinks; the main conversation's level is never");

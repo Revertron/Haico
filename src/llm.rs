@@ -7,6 +7,7 @@ use crate::util::truncate_at_boundary;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelsResponse {
@@ -27,6 +28,16 @@ pub(crate) struct ModelInfo {
 // read/ls/grep/glob_search can reach outside the working directory. That is deliberate: a
 // coding agent legitimately reads ~/.cargo/config.toml, and confining reads would break more
 // than it protects. What they cannot do is change anything.
+
+// The template switch an effort of "on" or "off" also stands for; any other level has none.
+// See `apply_settings` for why both fields are sent.
+fn thinking_switch(effort: Option<&str>) -> Option<bool> {
+    match effort {
+        Some(e) if e.eq_ignore_ascii_case("off") => Some(false),
+        Some(e) if e.eq_ignore_ascii_case("on") => Some(true),
+        _ => None,
+    }
+}
 
 pub(crate) fn normalize_base_url(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
@@ -52,6 +63,118 @@ pub(crate) fn unauthorized_message(had_token: bool) -> String {
         "LLM server rejected the request (401 Unauthorized): it requires an API token, but \
          none was configured. Pass --token or set LM_API_TOKEN."
             .to_string()
+    }
+}
+
+// How long to wait before each retry of a request the server failed on its own account —
+// one entry per retry, so five retries after the first attempt, a minute of waiting in all.
+// Found on OpenRouter, where one faulty provider now and then answered with "JSON error
+// injected into SSE stream" halfway through a reply: an unattended `-p` run had no way to
+// ask again and failed the whole task on one bad request out of hundreds. Doubling, because
+// a provider that is down for a moment and one that is down for a minute should both be
+// waited out without hammering either.
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(32),
+];
+
+// The most a server's own Retry-After is believed. A rate limiter asking for an hour would
+// otherwise park an unattended run for that hour without a word.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// A failure worth asking again about: the server or the road to it had trouble, not the
+/// request. Carried as its own type so the decision is made where the facts are (the status,
+/// the error's code) rather than guessed later from the wording of a message.
+#[derive(Debug)]
+pub(crate) struct Transient {
+    message: String,
+    // The server's own Retry-After, when it gave one.
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Transient {}
+
+fn transient(message: String) -> anyhow::Error {
+    anyhow::Error::new(Transient { message, retry_after: None })
+}
+
+// Statuses that say "not now" rather than "not this": a timeout, a rate limit, and the
+// server-side family, including the 520s and 529 some proxies and providers use.
+fn status_is_transient(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
+// An error object a server put in a body or a stream. OpenRouter's carry a `code`, numeric
+// when it is a status; a 4xx one (bad request, context too long, no such model) would fail
+// again identically. Anything else — a string code, no code — is taken as trouble on the
+// server's side, since that is what an error that arrives after a 200 has nearly always been;
+// the retry count bounds the cost of being wrong.
+fn error_object_is_transient(error: &Value) -> bool {
+    match error.get("code").and_then(|c| c.as_u64()) {
+        Some(code) => status_is_transient(code as u16),
+        None => true,
+    }
+}
+
+fn error_object_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+// How long to wait before asking again after `error`, or None when asking again would get
+// the same answer. A loop cut off by the repetition guard is not here on purpose: it is the
+// model's failure, and `run_turn` answers it by telling the model, not by resending.
+fn retry_delay(error: &anyhow::Error, scheduled: Duration) -> Option<Duration> {
+    for cause in error.chain() {
+        if let Some(t) = cause.downcast_ref::<Transient>() {
+            return Some(t.retry_after.map_or(scheduled, |after| after.min(MAX_RETRY_AFTER).max(scheduled)));
+        }
+        // Never connected, timed out, or the connection broke while the reply was coming.
+        if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            if e.is_connect() || e.is_timeout() || e.is_request() || e.is_body() || e.is_decode() {
+                return Some(scheduled);
+            }
+        }
+    }
+    None
+}
+
+// The Retry-After header in its seconds form; the date form is rare enough from an API
+// that the schedule's own delay serves for it.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+// A non-success status, read into an error: transient or not, by the status.
+async fn status_error(response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let after = retry_after(&response);
+    let body = response.text().await.unwrap_or_default();
+    let message = format!("LLM server returned {}: {}", status, truncate_at_boundary(body.trim(), 1000));
+    if status_is_transient(status.as_u16()) {
+        anyhow::Error::new(Transient { message, retry_after: after })
+    } else {
+        anyhow::anyhow!(message)
     }
 }
 
@@ -82,14 +205,16 @@ pub(crate) struct LMStudioClient {
     // for the same reason: None leaves the field out, so the model's default survives.
     pub(crate) reasoning_effort: Option<String>,
     // Sent as chat_template_kwargs.enable_thinking, which is how a Qwen3-style template is
-    // told not to think at all — `reasoning_effort` cannot say it, because "off" is not one
-    // of the levels every model offers. Nothing sets it at the moment: `for_sub_agent` did,
-    // and that is the change this comment outlived. Kept because it is still the only way to
-    // say the thing, for the next model that needs it said.
+    // told whether to think — llama.cpp's way of saying what LM Studio reads from
+    // `reasoning_effort`. Set only by an effort of "on" or "off" (`apply_settings`), and
+    // never on a sub-agent's copy (`for_sub_agent`).
     pub(crate) enable_thinking: Option<bool>,
     // The level a sub-agent's own conversation asks for, straight from the config. Read
     // only by `for_sub_agent` — the main conversation never sends this one.
     pub(crate) sub_agent_effort: Option<String>,
+    // `RETRY_DELAYS`, except in tests: a test serving one failure wants to see that failure,
+    // not a minute of retries against a server that has gone. Tests of retrying set their own.
+    pub(crate) retry_delays: Vec<Duration>,
 }
 
 
@@ -109,6 +234,7 @@ impl LMStudioClient {
             reasoning_effort: None,
             enable_thinking: None,
             sub_agent_effort: None,
+            retry_delays: if cfg!(test) { Vec::new() } else { RETRY_DELAYS.to_vec() },
         }
     }
 
@@ -129,6 +255,10 @@ impl LMStudioClient {
     pub(crate) fn for_sub_agent(&self) -> Self {
         let mut client = self.clone();
         client.reasoning_effort = self.sub_agent_effort.clone();
+        // Nor does the main conversation's "off": a sub-agent forbidden to think is exactly
+        // the compressor failure described above. Its own level is read the same way as the
+        // main one, so an "off" the user wrote for sub-agents reaches both servers.
+        client.enable_thinking = thinking_switch(client.reasoning_effort.as_deref());
         client
     }
 
@@ -140,7 +270,18 @@ impl LMStudioClient {
         self.top_k = settings.top_k.value;
         self.min_p = settings.min_p.value;
         self.repeat_penalty = settings.repeat_penalty.value;
+        // The effort always goes out as typed. "on" and "off" are also sent as the template
+        // switch, because the two servers read different fields for the same thing: LM Studio
+        // takes them from `reasoning_effort` (for a Qwen3-style model it accepts exactly those
+        // two and logs "'medium' is not supported ... Falling back to 'on'" for anything
+        // else), while llama.cpp passes `reasoning_effort` to a template that ignores it and
+        // obeys only chat_template_kwargs.enable_thinking. Sending one field would leave the
+        // setting doing nothing on one of the two servers. A real level ("medium") goes into
+        // the kwargs as itself (`set_thinking`).
+        // Done here rather than in `set_knob` so the config file's `reasoning_effort = "off"`
+        // means the same as `/effort off`.
         self.reasoning_effort = settings.reasoning_effort.value.clone();
+        self.enable_thinking = thinking_switch(self.reasoning_effort.as_deref());
         // Not applied to this client's own requests — `for_sub_agent` is what reads it.
         self.sub_agent_effort = settings.sub_agent_effort.clone();
     }
@@ -155,8 +296,17 @@ impl LMStudioClient {
         if let Some(reasoning_effort) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(reasoning_effort);
         }
+        // The same choice again as template variables, because the server's own reading of
+        // `reasoning_effort` can stand between the user and the template: LM Studio checks
+        // the level against what the model's metadata declares, and a Qwen3.8 quant that
+        // declares only on/off had "medium" replaced by "on" before its template — which
+        // takes `reasoning_effort` low/medium/xhigh itself — ever saw it. On and off are
+        // `enable_thinking`; a level is `reasoning_effort`, never "on"/"off", which that
+        // template refuses with an exception.
         if let Some(enable_thinking) = self.enable_thinking {
             body["chat_template_kwargs"] = json!({ "enable_thinking": enable_thinking });
+        } else if let Some(reasoning_effort) = &self.reasoning_effort {
+            body["chat_template_kwargs"] = json!({ "reasoning_effort": reasoning_effort });
         }
     }
 
@@ -217,6 +367,11 @@ impl LMStudioClient {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             bail!("{}", unauthorized_message(self.token.is_some()));
         }
+        // Only the statuses worth retrying are turned into errors here; any other error
+        // status still has its JSON body read, whose `error.message` the callers report.
+        if status_is_transient(response.status().as_u16()) {
+            return Err(status_error(response).await);
+        }
 
         response
             .json::<Value>()
@@ -228,7 +383,38 @@ impl LMStudioClient {
     // assistant message rather than the whole envelope, so every `call` line in the trace
     // has the same shape whichever path produced it; a server error in a 200 body is
     // recorded as the error it is.
+    //
+    // Retried on the `retry_delays` schedule when the failure was the server's (`retry_delay`),
+    // quietly: every caller here is a sub-agent or a summarizer, inside a call whose own
+    // progress is already on screen. Each attempt is its own `call` line in the trace.
     async fn post_chat_traced(&self, caller: Caller, body: &Value) -> Result<Value> {
+        let mut attempt = 0;
+        loop {
+            let response = self.post_chat_once_traced(caller, body).await;
+            let delay = self.retry_delays.get(attempt).and_then(|&scheduled| match &response {
+                Err(e) => retry_delay(e, scheduled),
+                // An error object in a 200 body is how some servers report the same trouble.
+                Ok(reply) => reply
+                    .get("error")
+                    .filter(|e| !e.is_null() && error_object_is_transient(e))
+                    .map(|_| scheduled),
+            });
+            let Some(delay) = delay else {
+                return response;
+            };
+            attempt += 1;
+            if crate::debug::enabled() {
+                let why = match &response {
+                    Err(e) => format!("{:#}", e),
+                    Ok(reply) => error_object_message(&reply["error"]),
+                };
+                crate::debug::log("retrying a plain completion", &format!("retry {} in {:?}: {}", attempt, delay, why));
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    async fn post_chat_once_traced(&self, caller: Caller, body: &Value) -> Result<Value> {
         let started = std::time::Instant::now();
         let response = self.post_chat(body).await;
         if trace::enabled() {
@@ -346,7 +532,7 @@ impl LMStudioClient {
         caller: Caller,
         messages: Vec<Value>,
         tools: Vec<Value>,
-        on_chunk: impl FnMut(Chunk),
+        mut on_chunk: impl FnMut(Chunk),
     ) -> Result<(Value, Ending)> {
         let mut body = json!({
             "messages": messages,
@@ -367,16 +553,37 @@ impl LMStudioClient {
         // field; LM Studio, llama.cpp and Ollama send the final usage chunk), and one that
         // ignores it just leaves the count to the estimate.
         body["stream_options"] = json!({ "include_usage": true });
-        let started = std::time::Instant::now();
-        let reply = self.stream_chat(&body, on_chunk).await;
-        if tracing {
-            let outcome = match &reply {
-                Ok((message, ending)) => Ok(trace::Reply { message, ending }),
-                Err(e) => Err(format!("{:#}", e)),
+        // Asked again on the `retry_delays` schedule when the server failed (`retry_delay`),
+        // after a `Chunk::Retrying` that tells the caller to throw away whatever part of the
+        // failed reply it was handed: the next attempt starts from nothing, and its text must
+        // not be read as the rest of the last one. Each attempt is its own trace line.
+        let mut attempt = 0;
+        loop {
+            let started = std::time::Instant::now();
+            let reply = self.stream_chat(&body, &mut on_chunk).await;
+            if tracing {
+                let outcome = match &reply {
+                    Ok((message, ending)) => Ok(trace::Reply { message, ending }),
+                    Err(e) => Err(format!("{:#}", e)),
+                };
+                trace::call(caller, &body, outcome, started.elapsed());
+            }
+            let delay = match &reply {
+                Err(e) => self.retry_delays.get(attempt).and_then(|&scheduled| retry_delay(e, scheduled)),
+                Ok(_) => None,
             };
-            trace::call(caller, &body, outcome, started.elapsed());
+            let (Some(delay), Err(e)) = (delay, &reply) else {
+                return reply;
+            };
+            attempt += 1;
+            on_chunk(Chunk::Retrying {
+                error: format!("{:#}", e),
+                retry: attempt,
+                of: self.retry_delays.len(),
+                delay,
+            });
+            tokio::time::sleep(delay).await;
         }
-        reply
     }
 
     async fn stream_chat(
@@ -399,13 +606,7 @@ impl LMStudioClient {
         }
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "LLM server returned {}: {}",
-                status,
-                truncate_at_boundary(body.trim(), 1000)
-            );
+            return Err(status_error(response).await);
         }
 
         let mut assembler = StreamAssembler::default();
@@ -455,20 +656,18 @@ impl LMStudioClient {
                 };
 
                 if let Some(error) = parsed.get("error").filter(|e| !e.is_null()) {
-                    bail!(
-                        "LLM server returned an error mid-stream: {}",
-                        error
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or(&error.to_string())
-                    );
+                    let message = format!("LLM server returned an error mid-stream: {}", error_object_message(error));
+                    if error_object_is_transient(error) {
+                        return Err(transient(message));
+                    }
+                    bail!("{}", message);
                 }
 
                 for piece in assembler.push(&parsed) {
                     let looping = match &piece {
                         Chunk::Reasoning(text) => reasoning_guard.push(text),
                         Chunk::Content(text) => content_guard.push(text),
-                        Chunk::ToolFragment(_) => None,
+                        Chunk::ToolFragment(_) | Chunk::Retrying { .. } => None,
                     };
                     on_chunk(piece);
                     if let Some(repeating) = looping {
@@ -484,17 +683,18 @@ impl LMStudioClient {
 
         // The server ignored "stream": true and answered with an ordinary completion.
         if !saw_event {
-            let parsed: Value = serde_json::from_slice(&raw)
-                .context("LLM server sent neither a stream nor a parseable response")?;
+            // Taken for the server's trouble: a body that is neither is usually a proxy's
+            // error page sent with a 200, and the retry count bounds the cost if it is not.
+            let parsed: Value = serde_json::from_slice(&raw).map_err(|_| {
+                transient("LLM server sent neither a stream nor a parseable response".to_string())
+            })?;
 
             if let Some(error) = parsed.get("error").filter(|e| !e.is_null()) {
-                bail!(
-                    "LLM server returned an error: {}",
-                    error
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or(&error.to_string())
-                );
+                let message = format!("LLM server returned an error: {}", error_object_message(error));
+                if error_object_is_transient(error) {
+                    return Err(transient(message));
+                }
+                bail!("{}", message);
             }
 
             let message = parsed["choices"][0]
@@ -679,6 +879,11 @@ pub(crate) enum Chunk {
     /// activity bar: without it a model spending a minute writing one long
     /// argument looks exactly like one that has hung.
     ToolFragment(usize),
+    /// The request failed on the server's side and is about to be sent again, after
+    /// `delay`. Whatever came before this in the same call belonged to the failed reply and
+    /// is gone; what comes after is a new reply from its start. `retry` counts from 1, of
+    /// `of` at most.
+    Retrying { error: String, retry: usize, of: usize, delay: Duration },
 }
 
 impl StreamAssembler {
@@ -1027,6 +1232,7 @@ mod tests {
                     crate::Chunk::Content(text) => printed.push_str(&text),
                     crate::Chunk::Reasoning(text) => panic!("not thinking: {}", text),
                     crate::Chunk::ToolFragment(n) => panic!("not a call: {} chars", n),
+                    crate::Chunk::Retrying { .. } => panic!("the assembler never retries"),
                 }
             }
         }
@@ -1098,6 +1304,7 @@ mod tests {
                     crate::Chunk::Content(text) | crate::Chunk::Reasoning(text) => {
                         panic!("a call was handed over as text: {}", text)
                     }
+                    crate::Chunk::Retrying { .. } => panic!("the assembler never retries"),
                 }
             }
         };
@@ -1316,6 +1523,7 @@ mod tests {
                 crate::Chunk::Reasoning(text) => order.push(format!("think:{}", text)),
                 crate::Chunk::Content(text) => order.push(format!("say:{}", text)),
                 crate::Chunk::ToolFragment(n) => order.push(format!("call:{}", n)),
+                crate::Chunk::Retrying { .. } => order.push("retry".to_string()),
             })
             .await
             .unwrap();
@@ -1324,6 +1532,146 @@ mod tests {
         // And it is still echoed back to the model, which is what the chat templates read.
         assert_eq!(message["reasoning_content"], "Yes, wait…");
         assert_eq!(message["content"], "42");
+    }
+
+    // The OpenRouter failure the retries exist for: part of a reply, then an error event.
+    const STREAM_BROKEN: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hal\"}}]}\n\n",
+        "data: {\"error\":{\"message\":\"JSON error injected into SSE stream\"}}\n\n",
+    );
+    const STREAM_FINE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    fn retrying_client(url: String, retries: usize) -> crate::LMStudioClient {
+        let mut client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        client.retry_delays = vec![Duration::from_millis(1); retries];
+        client
+    }
+
+    /// An error in the middle of the stream is asked again, the caller is told to drop what
+    /// it was shown before the next attempt streams, and only the whole reply comes back.
+    #[tokio::test]
+    async fn a_reply_broken_mid_stream_is_asked_again() {
+        let (url, served) = crate::testutil::serve_sequence(&[STREAM_BROKEN, STREAM_FINE]).await;
+        let client = retrying_client(url, 3);
+        let mut order = Vec::new();
+        let message = client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| match chunk {
+                crate::Chunk::Content(text) => order.push(format!("say:{}", text)),
+                crate::Chunk::Retrying { error, retry, of, .. } => {
+                    assert!(error.contains("JSON error injected"), "{error}");
+                    order.push(format!("retry:{}/{}", retry, of))
+                }
+                _ => {}
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(order, ["say:Hal", "retry:1/3", "say:Hello"]);
+        assert_eq!(message["content"], "Hello", "nothing of the failed attempt is kept");
+        assert_eq!(*served.lock().unwrap(), 2);
+    }
+
+    /// The retries are bounded, and the error that is finally returned is the server's own.
+    #[tokio::test]
+    async fn retries_run_out_and_the_last_error_is_reported() {
+        let (url, served) = crate::testutil::serve_sequence(&[STREAM_BROKEN]).await;
+        let client = retrying_client(url, 2);
+        let error = client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", error).contains("JSON error injected"), "{error:#}");
+        assert_eq!(*served.lock().unwrap(), 3, "the first attempt and two retries");
+    }
+
+    /// An error carrying a 4xx code would fail identically again, so it is not retried.
+    #[tokio::test]
+    async fn a_client_error_mid_stream_is_not_retried() {
+        let (url, served) = crate::testutil::serve_sequence(&[
+            "data: {\"error\":{\"code\":400,\"message\":\"context length exceeded\"}}\n\n",
+        ])
+        .await;
+        let client = retrying_client(url, 3);
+        let error = client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", error).contains("context length exceeded"));
+        assert_eq!(*served.lock().unwrap(), 1);
+    }
+
+    /// A server that is not there at all is retried too, and gets nothing after the last try.
+    #[tokio::test]
+    async fn a_refused_connection_is_retried() {
+        // Bound and dropped: the port is closed for the length of the test.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let client = retrying_client(format!("http://127.0.0.1:{}", port), 2);
+        let mut retries = 0;
+        let result = client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| {
+                if let crate::Chunk::Retrying { .. } = chunk {
+                    retries += 1;
+                }
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(retries, 2);
+    }
+
+    /// The plain path retries quietly: a 5xx-coded error in a 200 body, then an answer.
+    #[tokio::test]
+    async fn a_plain_completion_is_asked_again_after_a_server_error() {
+        let (url, served) = crate::testutil::serve_sequence(&[
+            "{\"error\":{\"code\":502,\"message\":\"provider returned error\"}}",
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"fine\"},\"finish_reason\":\"stop\"}]}",
+        ])
+        .await;
+        let client = retrying_client(url, 3);
+        let reply = client
+            .chat_completion_plain(Caller::Reviewer, vec![json!({"role": "user", "content": "hi"})], None)
+            .await
+            .unwrap();
+        assert_eq!(reply, "fine");
+        assert_eq!(*served.lock().unwrap(), 2);
+
+        // …and a 4xx-coded one is reported at once.
+        let (url, served) = crate::testutil::serve_sequence(&[
+            "{\"error\":{\"code\":404,\"message\":\"no such model\"}}",
+        ])
+        .await;
+        let error = retrying_client(url, 3)
+            .chat_completion_plain(Caller::Reviewer, vec![json!({"role": "user", "content": "hi"})], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no such model"));
+        assert_eq!(*served.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn which_failures_are_worth_retrying() {
+        for status in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(status_is_transient(status), "{status}");
+        }
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(!status_is_transient(status), "{status}");
+        }
+        assert!(error_object_is_transient(&json!({"message": "x"})));
+        assert!(error_object_is_transient(&json!({"code": "server_error"})));
+        assert!(!error_object_is_transient(&json!({"code": 400})));
+
+        // A Retry-After longer than the schedule is waited out, up to the cap; never less
+        // than the schedule.
+        let scheduled = Duration::from_secs(4);
+        let after = |secs| anyhow::Error::new(Transient { message: String::new(), retry_after: Some(Duration::from_secs(secs)) });
+        assert_eq!(retry_delay(&after(10), scheduled), Some(Duration::from_secs(10)));
+        assert_eq!(retry_delay(&after(3600), scheduled), Some(MAX_RETRY_AFTER));
+        assert_eq!(retry_delay(&after(1), scheduled), Some(scheduled));
+        assert_eq!(retry_delay(&anyhow::anyhow!("no"), scheduled), None);
+        // Context on top does not hide the marker.
+        assert!(retry_delay(&transient("x".into()).context("outer"), scheduled).is_some());
     }
 
 
@@ -1444,22 +1792,69 @@ mod tests {
             "a sub-agent told not to think answers cold, which is what broke the compressor"
         );
 
-        // A level named in the config is sent instead, and then nothing is said about
-        // enable_thinking — asking for a level and forbidding thinking at once is the one
-        // request that cannot mean anything.
+        // A level named in the config is sent instead, in both places, and then nothing is
+        // said about enable_thinking — asking for a level and forbidding thinking at once is
+        // the one request that cannot mean anything.
         settings.sub_agent_effort = Some("low".to_string());
         client.apply_settings(&settings);
         let helper = client.for_sub_agent();
         let mut body = json!({"messages": []});
         helper.set_thinking(&mut body);
         assert_eq!(body["reasoning_effort"], "low");
-        assert!(body.get("chat_template_kwargs").is_none());
+        assert_eq!(body["chat_template_kwargs"], json!({"reasoning_effort": "low"}));
 
         // And the main client is untouched by any of it.
         let mut body = json!({"messages": []});
         client.set_thinking(&mut body);
         assert_eq!(body["reasoning_effort"], "high");
-        assert!(body.get("chat_template_kwargs").is_none());
+        assert_eq!(body["chat_template_kwargs"], json!({"reasoning_effort": "high"}));
+    }
+
+    /// "on" and "off" go out in both fields: LM Studio reads them from `reasoning_effort`
+    /// (and only them, for a Qwen3-style model), llama.cpp's template only from
+    /// chat_template_kwargs. A sub-agent's copy does not inherit the main "off", for the
+    /// compressor's sake above, but its own configured "off" is sent the same way, and any
+    /// other level clears the switch again.
+    #[test]
+    fn effort_on_and_off_are_sent_to_both_servers_fields() {
+        use crate::LMStudioClient;
+
+        let mut settings = settings_of(None, None, None, None, None, None);
+        settings.reasoning_effort = crate::Setting { value: Some("Off".to_string()), source: "test" };
+        let mut client = LMStudioClient::new("http://x".to_string(), "m".to_string(), None);
+        client.apply_settings(&settings);
+
+        let mut body = json!({"messages": []});
+        client.set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "Off", "LM Studio's field, as typed");
+        assert_eq!(body["chat_template_kwargs"], json!({"enable_thinking": false}));
+
+        let mut body = json!({"messages": []});
+        client.for_sub_agent().set_thinking(&mut body);
+        assert!(body.get("chat_template_kwargs").is_none(), "a sub-agent may still think");
+
+        settings.sub_agent_effort = Some("off".to_string());
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.for_sub_agent().set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "off");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false, "unless told so");
+
+        settings.reasoning_effort = crate::Setting { value: Some("on".to_string()), source: "test" };
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "on");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+
+        settings.reasoning_effort = crate::Setting { value: Some("low".to_string()), source: "test" };
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.set_thinking(&mut body);
+        // A level goes to the template as itself, and never with the switch beside it: a
+        // template taking low/medium/xhigh raises on "on".
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["chat_template_kwargs"], json!({"reasoning_effort": "low"}));
     }
 
     #[test]

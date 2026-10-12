@@ -81,8 +81,9 @@ fn print_repl_help() {
     outln!("                     repeat_penalty, max_tokens, reasoning_effort or");
     outln!("                     reasoning_threshold ('/set <name> unset' to undo).");
     outln!("                     '/temp' and '/effort' are short for '/set temperature'");
-    outln!("                     and '/set reasoning_effort'. All last for the session");
-    outln!("                     except 'context', which is saved for this model.");
+    outln!("                     and '/set reasoning_effort'; '/effort on|off' switch");
+    outln!("                     thinking itself. All last for the session except");
+    outln!("                     'context', which is saved for this model.");
     outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
     outln!("  /timers [cancel]   List the timers the model set, or cancel one (by id) or all");
     outln!("  /undo              Revert the last file change made by a tool");
@@ -195,6 +196,10 @@ fn status_line(model: &str, effort: Option<&str>, used: usize, context_tokens: u
     // and saying so on every model that has no such setting would be a word of chrome that
     // never changes — the bar is worth its row for what varies.
     match effort {
+        // "off effort" would read as a level called off; it is thinking that is off.
+        Some(effort) if effort.eq_ignore_ascii_case("off") => {
+            format!("{} • thinking off • ctx {:.0}%", model, percent)
+        }
         Some(effort) => format!("{} • {} effort • ctx {:.0}%", model, effort, percent),
         None => format!("{} • ctx {:.0}%", model, percent),
     }

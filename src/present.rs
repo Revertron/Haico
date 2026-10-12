@@ -329,6 +329,15 @@ impl Presenter {
                 }
                 outln!("  \"{}\"\n", passage);
             }
+            Notice::Retrying { error, retry, of, delay } => outln!(
+                "
+[server error: {} — retrying in {}s ({} of {})]
+",
+                error,
+                delay.as_secs(),
+                retry,
+                of
+            ),
             // Indented under the sub_agent call line, and dim like research's own
             // progress: these are the steps of one call, not calls of their own.
             Notice::SubAgentStep { tool, arguments } => outln!(

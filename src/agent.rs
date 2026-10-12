@@ -1187,6 +1187,16 @@ pub(crate) async fn run_turn(
                             Chunk::ToolFragment(characters) => {
                                 AgentEvent::ToolCallChunk(characters)
                             }
+                            // The failed attempt's reply is closed as one that ended, and
+                            // the next attempt opens a reply of its own, so what it streams
+                            // is never shown as the rest of the text the failure cut off.
+                            // Nothing of it reaches the history: only the reply that comes
+                            // back whole is returned.
+                            Chunk::Retrying { error, retry, of, delay } => {
+                                let _ = tx.send(AgentEvent::ReplyEnd);
+                                let _ = tx.send(Notice::Retrying { error, retry, of, delay }.into());
+                                AgentEvent::ReplyStart
+                            }
                         });
                     },
                 ),
@@ -2400,6 +2410,15 @@ mod knob_tests {
         assert_eq!(agent.knob_value(Knob::ReasoningEffort), None);
         assert_eq!(agent.reasoning_effort(), None);
         assert_eq!(agent.client.reasoning_effort, None, "the field is left out again");
+
+        // "off" is stored and sent as typed, and also becomes the template switch.
+        agent.set_knob(Knob::ReasoningEffort, Some("off")).unwrap();
+        assert_eq!(agent.reasoning_effort(), Some("off"));
+        assert_eq!(agent.client.reasoning_effort.as_deref(), Some("off"));
+        assert_eq!(agent.client.enable_thinking, Some(false));
+        assert_eq!(agent.server.llm_client.enable_thinking, Some(false));
+        agent.set_knob(Knob::ReasoningEffort, Some("unset")).unwrap();
+        assert_eq!(agent.client.enable_thinking, None, "unset lets the model think again");
     }
 
     /// Both clients get the sampling, because `web_fetch` summarizes through the

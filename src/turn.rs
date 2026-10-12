@@ -301,6 +301,12 @@ pub(crate) enum Notice {
     /// `retrying` says whether the model has been told and asked again, or the
     /// turn has given up; `passage` is a line of what kept coming back.
     Repeating { passage: String, retrying: bool },
+    /// The request failed on the server's side (a 5xx, a rate limit, an error in the
+    /// middle of the stream, a dropped connection) and will be sent again after `delay`.
+    /// Any part of the reply already shown belonged to the failed attempt and was dropped.
+    /// `retry` counts from 1, of `of` at most; once they run out the turn ends with
+    /// `RequestFailed` as before.
+    Retrying { error: String, retry: usize, of: usize, delay: std::time::Duration },
     /// A file the message named with `@` was read into it before the request
     /// went out. `outside` marks the ones that were beyond the workspace and
     /// widened it, which is the half worth reading twice.

@@ -877,6 +877,10 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::Repeating { passage, retrying: false } => {
             (format!("stopped: the model kept repeating itself: \"{passage}\""), Tone::Warning)
         }
+        Notice::Retrying { error, retry, of, delay } => (
+            format!("server error: {error} — retrying in {}s ({retry} of {of})", delay.as_secs()),
+            Tone::Warning,
+        ),
         Notice::FileAttached { path, lines, outside } => {
             let line = format!("attached {path} ({lines} lines)");
             if outside {
@@ -2388,6 +2392,7 @@ mod tests {
             Notice::LoopBroken { tool: "t".into(), count: 5 },
             Notice::Repeating { passage: "p".into(), retrying: true },
             Notice::Repeating { passage: "p".into(), retrying: false },
+            Notice::Retrying { error: "e".into(), retry: 1, of: 5, delay: std::time::Duration::from_secs(2) },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: false },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: true },
             Notice::ImageAttached { path: "p".into(), bytes: 2048, outside: false },
