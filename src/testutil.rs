@@ -454,6 +454,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         file: Default::default(),
         config_path: None,
         config_created: false,
+        config_error: None,
         resume: false,
         prompt: None,
         trace: None,

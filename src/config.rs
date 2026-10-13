@@ -120,6 +120,10 @@ pub(crate) struct Config {
     // The starter config was written by this run, because there was none — said once at
     // startup with its path, since a file nobody knows about is a file nobody edits.
     pub(crate) config_created: bool,
+    // Why the config file was not used, when it exists and could not be read or parsed.
+    // Said at startup by every entry path: the run goes on with the built-in defaults, and
+    // without it the first sign of a typo was a connection refused at the default URL.
+    pub(crate) config_error: Option<String>,
     // Continue this directory's previous conversation instead of starting fresh.
     pub(crate) resume: bool,
     // A task to run unattended in auto mode, exiting when it is done. `None` is the REPL.
@@ -189,7 +193,10 @@ pub(crate) fn parse_config() -> Result<Config> {
     // line and the environment but above the built-in defaults.
     let config_path = config_file_path();
     let config_created = config_path.as_deref().is_some_and(write_starter_config);
-    let file_config = load_file_config(config_path.as_deref());
+    let (file_config, config_error) = match read_file_config(config_path.as_deref()) {
+        Ok(file_config) => (file_config, None),
+        Err(why) => (FileConfig::default(), Some(why)),
+    };
 
     // Parse LLM URL
     // Priority: command-line arg > environment variable > config file > default
@@ -311,6 +318,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         file: file_config,
         config_path,
         config_created,
+        config_error,
         resume: matches.opt_present("r"),
         // A blank task is treated as none, rather than starting a run with nothing to do
         // that the model would fill by inventing a task of its own.
@@ -535,24 +543,36 @@ fn write_starter_config(path: &Path) -> bool {
     file.write_all(STARTER_CONFIG.as_bytes()).is_ok()
 }
 
-// Read the config file. A missing file is normal; a malformed one is reported and then
-// ignored, so a stray character cannot stop haico starting.
+// What each entry path prints when the config file was there and could not be used.
+pub(crate) fn config_error_notice(config: &Config) -> Option<String> {
+    let why = config.config_error.as_deref()?;
+    Some(format!("Error: {}
+The config file was not loaded; using the built-in defaults.", why))
+}
 
-pub(crate) fn load_file_config(path: Option<&std::path::Path>) -> FileConfig {
+// Read the config file. A missing file is normal; a malformed one is an `Err` carrying
+// what is wrong with it, which the caller reports and then goes on without, so a stray
+// character cannot stop haico starting. Not printed here: an `eprintln!` this early lands
+// on the screen the fullscreen renderer is about to take over, and was never seen.
+
+pub(crate) fn read_file_config(path: Option<&std::path::Path>) -> Result<FileConfig, String> {
     let Some(path) = path else {
-        return FileConfig::default();
+        return Ok(FileConfig::default());
     };
-    let Ok(raw) = fs::read_to_string(path) else {
-        return FileConfig::default();
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
+        Err(e) => return Err(format!("could not read {}: {}", path.display(), e)),
     };
+    toml::from_str(&raw).map_err(|e| format!("could not parse {}:
+{}", path.display(), e.to_string().trim_end()))
+}
 
-    match toml::from_str(&raw) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("[haico] ignoring {}: {}", path.display(), e);
-            FileConfig::default()
-        }
-    }
+// The file's settings, or the defaults when it cannot be used: what the tests read a
+// saved file back with.
+#[cfg(test)]
+pub(crate) fn load_file_config(path: Option<&std::path::Path>) -> FileConfig {
+    read_file_config(path).unwrap_or_default()
 }
 
 // Writing one setting back into the config file.
@@ -1026,6 +1046,7 @@ mod tests {
             file: toml::from_str(toml_text).expect("test config should parse"),
             config_path: None,
             config_created: false,
+            config_error: None,
             resume: false,
             prompt: None,
             trace: None,
@@ -1278,11 +1299,12 @@ mod tests {
 
     #[test]
     fn a_broken_config_file_does_not_stop_startup() {
-        use crate::load_file_config;
+        use crate::config::{load_file_config, read_file_config};
 
         let path = scratch("broken-config.toml", "this is not valid toml {{{");
-        // Reported on stderr, then ignored: a stray character must not make haico refuse
-        // to start.
+        // Reported, then ignored: a stray character must not make haico refuse to start.
+        let why = read_file_config(Some(&path)).unwrap_err();
+        assert!(why.contains("broken-config.toml"), "the path is not named: {why}");
         let config = load_file_config(Some(&path));
         assert!(config.url.is_none());
         assert!(config.models.is_empty());
@@ -1290,7 +1312,7 @@ mod tests {
         // A missing file is simply the no-config case.
         let absent = path.parent().unwrap().join("definitely-not-here.toml");
         let _ = std::fs::remove_file(&absent);
-        assert!(load_file_config(Some(&absent)).url.is_none());
+        assert!(read_file_config(Some(&absent)).unwrap().url.is_none());
         assert!(load_file_config(None).url.is_none());
 
         let _ = std::fs::remove_file(&path);

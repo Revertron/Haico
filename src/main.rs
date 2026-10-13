@@ -496,6 +496,9 @@ async fn run_mcp_server(config: Config) -> Result<()> {
     if let Some(notice) = starter_config_notice(&config) {
         eprintln!("[haico] {}", notice);
     }
+    if let Some(notice) = config_error_notice(&config) {
+        eprintln!("[haico] {}", notice);
+    }
 
     // web_fetch summarizes pages via the LLM, so it is only exposed when --url (or LLM_URL)
     // says explicitly where that LLM lives. Otherwise it is hidden and only web_get (raw
@@ -661,6 +664,9 @@ async fn main() -> Result<()> {
     outln!("=====================================\n");
     if let Some(notice) = starter_config_notice(&config) {
         outln!("{}", notice);
+    } else if let Some(notice) = config_error_notice(&config) {
+        outln!("{}
+", notice);
     } else if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
         outln!("Config: {}", path.display());
     }
@@ -2599,6 +2605,9 @@ mod turn_tests {
 #[cfg(feature = "gui")]
 fn run_gui(config: Config) -> Result<()> {
     if let Some(notice) = starter_config_notice(&config) {
+        eprintln!("{}", notice);
+    }
+    if let Some(notice) = config_error_notice(&config) {
         eprintln!("{}", notice);
     }
     let Some(model) = config.model.clone().filter(|m| !m.is_empty()) else {
