@@ -424,8 +424,12 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             };
             show(handle, move |ui| set_label(ui, BUSY, &text));
         }
-        AgentEvent::Status { model, used_tokens, context_tokens, effort } => {
+        AgentEvent::Status { provider, model, used_tokens, context_tokens, effort } => {
             let percent = (used_tokens as f64 / context_tokens.max(1) as f64) * 100.0;
+            let model = match provider {
+                Some(provider) => format!("{provider}    {model}"),
+                None => model,
+            };
             let text = match effort {
                 Some(effort) => format!("{model}    effort {effort}    ctx {percent:.0}%"),
                 None => format!("{model}    ctx {percent:.0}%"),
@@ -1698,6 +1702,7 @@ mod tests {
     fn a_whole_exchange_renders() {
         let events = vec![
             AgentEvent::Status {
+                provider: None,
                 model: "m".into(),
                 used_tokens: 900,
                 context_tokens: 32768,

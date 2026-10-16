@@ -386,6 +386,8 @@ pub(crate) enum AgentEvent {
     /// numbers rather than the line: the turn can count its own messages and
     /// tokens, but how wide the bar is and what it puts where is the frontend's.
     Status {
+        /// The configured provider the model is served by, when the config names one.
+        provider: Option<String>,
         model: String,
         used_tokens: usize,
         context_tokens: usize,

@@ -76,6 +76,8 @@ fn print_repl_help() {
     outln!("  /tools             List available tools and whether they prompt");
     outln!("  /model [name]      Switch model and save it as the default; with no name,");
     outln!("                     pick from the server's list");
+    outln!("  /provider [name]   Switch to another server from the config's providers and");
+    outln!("                     save it as the default; with no name, pick from the list");
     outln!("  /config            Show the settings in force and where each came from");
     outln!("  /set [name] [val]  Show or set context, temperature, top_p, top_k, min_p,");
     outln!("                     repeat_penalty, max_tokens, reasoning_effort or");
@@ -190,8 +192,24 @@ async fn ask_about_call(
 // The right-hand end of the status bar.
 // Takes the count rather than the history: during a turn the frontend draws this
 // while the turn owns the messages, so the number has to arrive as a number.
-fn status_line(model: &str, effort: Option<&str>, used: usize, context_tokens: usize) -> String {
+fn status_line(
+    provider: Option<&str>,
+    model: &str,
+    effort: Option<&str>,
+    used: usize,
+    context_tokens: usize,
+) -> String {
     let percent = (used as f64 / context_tokens.max(1) as f64) * 100.0;
+    // Before the model, as where it is served from: two providers can serve a model of
+    // the same name, and the bar is where the user looks to see which one is answering.
+    let named;
+    let model = match provider {
+        Some(provider) => {
+            named = format!("{provider} • {model}");
+            named.as_str()
+        }
+        None => model,
+    };
     // Only when one is set. An unset effort means the model thinks as much as it thinks,
     // and saying so on every model that has no such setting would be a word of chrome that
     // never changes — the bar is worth its row for what varies.
@@ -228,6 +246,7 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
     // given it back. The mode needs no event: the link is shared, so both sides
     // already see the same one.
     let mut status = status_line(
+        agent.provider(),
         agent.model(),
         agent.reasoning_effort(),
         agent.context_used(),
@@ -332,12 +351,14 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
                                     counting = matches!(waiting, Waiting::Model);
                                 }
                                 AgentEvent::Status {
+                                    provider,
                                     model,
                                     used_tokens,
                                     context_tokens,
                                     effort,
                                 } => {
                                     status = status_line(
+                                        provider.as_deref(),
                                         model,
                                         effort.as_deref(),
                                         *used_tokens,
@@ -544,6 +565,12 @@ async fn choose_model(config: &Config, keys: Option<&mut Keys>) -> Result<String
         outln!("Using specified model: {}\n", model_name);
         return Ok(model_name);
     }
+    find_model(&config.llm_url, config.token.as_deref(), keys).await
+}
+
+// The model to use on a server nobody named one for: the only one loaded, else the user's
+// pick. Shared by startup and by /provider switching to a provider with no `model`.
+async fn find_model(url: &str, token: Option<&str>, keys: Option<&mut Keys>) -> Result<String> {
     outln!("Looking for a model...");
 
     // Whatever is already in memory is almost always what was meant: the server was
@@ -551,13 +578,13 @@ async fn choose_model(config: &Config, keys: Option<&mut Keys>) -> Result<String
     // a question with a single answer. More than one and it is worth asking, but only
     // among those — the rest are downloads, not something that is running. The full
     // list is what the picker falls back to when nothing is loaded at all.
-    let loaded = fetch_loaded_models(&config.llm_url, config.token.as_deref()).await;
+    let loaded = fetch_loaded_models(url, token).await;
     if let [only] = loaded.as_slice() {
         outln!("Using the loaded model: {}\n", only);
         return Ok(only.clone());
     }
     let models = if loaded.is_empty() {
-        fetch_available_models(&config.llm_url, config.token.as_deref())
+        fetch_available_models(url, token)
             .await
             .map_err(|e| anyhow::anyhow!("Error connecting to LLM: {e}"))?
     } else {
@@ -670,7 +697,10 @@ async fn main() -> Result<()> {
     } else if let Some(path) = config.config_path.as_deref().filter(|p| p.exists()) {
         outln!("Config: {}", path.display());
     }
-    outln!("Connecting to LLM server at: {}", config.llm_url);
+    match &config.provider {
+        Some(provider) => outln!("Connecting to {} at: {}", provider, config.llm_url),
+        None => outln!("Connecting to LLM server at: {}", config.llm_url),
+    }
     if let Some(searxng) = &config.searxng {
         outln!("Searching through SearxNG at: {}", searxng);
     }
@@ -757,6 +787,7 @@ async fn main() -> Result<()> {
             match io.keys.as_mut() {
                 Some(keys) => {
                     let status = status_line(
+                        agent.provider(),
                         agent.model(),
                         agent.reasoning_effort(),
                         agent.context_used(),
@@ -1074,6 +1105,107 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        if input == "/provider" || input.starts_with("/provider ") {
+            let requested = input.strip_prefix("/provider").unwrap_or("").trim().to_string();
+            let providers = agent.providers().to_vec();
+            if providers.is_empty() {
+                // Said with the shape to write, since the file is the only way to add one.
+                let path = agent
+                    .config
+                    .config_path
+                    .as_deref()
+                    .map(display_path)
+                    .unwrap_or_else(|| "the config file".to_string());
+                outln!("No providers are configured. List them in {} like this:\n", path);
+                outln!("  version = 1");
+                outln!("  providers = [\"local\", \"lmstudio\"]\n");
+                outln!("  [local]");
+                outln!("  url = \"http://127.0.0.1:11434\"\n");
+                outln!("  [lmstudio]");
+                outln!("  url = \"http://127.0.0.1:1234\"");
+                outln!("  token = \"sk-lm-...\"");
+                outln!("  model = \"qwen2.5:14b\"\n");
+                continue;
+            }
+
+            let chosen = if requested.is_empty() {
+                // The caret starts on the provider in force, so Enter alone changes nothing.
+                let current = agent
+                    .provider()
+                    .and_then(|p| providers.iter().position(|name| name == p))
+                    .unwrap_or(0);
+                match io.keys.as_mut() {
+                    Some(keys) => match select_interactive(keys, "provider", providers, current).await {
+                        Ok(name) => Some(name),
+                        Err(e) => {
+                            outln!("{}\n", e);
+                            None
+                        }
+                    },
+                    None => {
+                        outln!("Choosing a provider needs an interactive terminal; give its name: /provider <name>\n");
+                        None
+                    }
+                }
+            } else if providers.contains(&requested) {
+                Some(requested)
+            } else {
+                outln!(
+                    "There is no provider named '{}'; configured: {}\n",
+                    requested,
+                    providers.join(", ")
+                );
+                None
+            };
+            let Some(name) = chosen else { continue };
+            if agent.provider() == Some(name.as_str()) {
+                outln!("Already using provider: {}\n", name);
+                continue;
+            }
+
+            let Some(section) = agent.provider_section(&name).cloned() else { continue };
+            let url = section.url.clone().unwrap_or_default();
+            let model = match section.model.clone() {
+                Some(model) => model,
+                None => {
+                    let token = section.token.clone().filter(|t| !t.trim().is_empty());
+                    match find_model(&url, token.as_deref(), io.keys.as_mut()).await {
+                        Ok(model) => model,
+                        Err(e) => {
+                            // Nothing has changed yet: the switch happens only with a model
+                            // to switch to, so a server that is down leaves the session on
+                            // the provider that works.
+                            outln!("{:#}\nStill using provider: {}\n", e, agent.provider().unwrap_or("-"));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // The conversation is kept, as with /model; the url, token, model and every
+            // per-model setting move with the switch.
+            let kept = agent.switch_provider(&name, model.clone());
+            outln!(
+                "Now using provider: {} at {}, model {}{}",
+                name,
+                url,
+                model,
+                match kept {
+                    Kept::Config => "  (saved as the default)",
+                    _ => "",
+                }
+            );
+            if let Kept::Failed(why) = &kept {
+                outln!("  [warning] not saved as the default: {}", why);
+            }
+            outln!(
+                "  context {} ({})\n",
+                agent.context_tokens,
+                agent.settings.context_source
+            );
+            continue;
+        }
+
         if input == "/config" {
             match agent.config.config_path.as_deref() {
                 Some(path) if path.exists() => outln!("Config file: {}", path.display()),
@@ -1082,6 +1214,7 @@ async fn main() -> Result<()> {
             }
             outln!("
 In force for '{}':", agent.client.model);
+            outln!("  provider          {}", agent.provider().unwrap_or("-"));
             outln!("  url               {}", agent.client.base_url);
             outln!(
                 "  token             {}",
@@ -1586,15 +1719,20 @@ mod tests {
     /// changes. The two-space gaps are the separator the bar is built from.
     #[test]
     fn the_status_bar_names_the_effort_only_when_one_is_set() {
-        assert_eq!(status_line("qwen3", None, 900, 32768), "qwen3 • ctx 3%");
+        assert_eq!(status_line(None, "qwen3", None, 900, 32768), "qwen3 • ctx 3%");
+        // The provider, when the config names one, goes before the model it serves.
         assert_eq!(
-            status_line("qwen3", Some("high"), 900, 32768),
+            status_line(Some("lmstudio"), "qwen3", None, 900, 32768),
+            "lmstudio • qwen3 • ctx 3%"
+        );
+        assert_eq!(
+            status_line(None, "qwen3", Some("high"), 900, 32768),
             "qwen3 • high effort • ctx 3%"
         );
         // Shown as given. A level haico does not know is a model it has not met, and the
         // bar is the one place the user can see which one was actually sent.
         assert_eq!(
-            status_line("m", Some("xhigh"), 0, 32768),
+            status_line(None, "m", Some("xhigh"), 0, 32768),
             "m • xhigh effort • ctx 0%"
         );
     }

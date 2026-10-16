@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    autocompact_threshold, resolve_settings, save_default_model, save_model_context, Config,
+    autocompact_threshold, resolve_settings, save_active_provider, save_default_model,
+    save_model_context, save_provider_model, Config,
     Reasoning, ResolvedSettings, Setting, AUTOCOMPACT_FRACTION, FROM_UNSET,
 };
 use crate::ask::{self, ASK_USER};
@@ -484,7 +485,70 @@ impl Agent {
         self.measured = None;
         self.rebuild_system_prompt();
 
-        self.keep(|path| save_default_model(path, &model))
+        // Into the provider's own section when there is one: the model is that server's,
+        // and the parsed file moves with the one on disk, as `set_context` keeps it.
+        match self.config.provider.clone() {
+            Some(provider) => {
+                if let Some(section) = self.config.file.provider_sections.get_mut(&provider) {
+                    section.model = Some(model.clone());
+                }
+                self.keep(|path| save_provider_model(path, &provider, &model))
+            }
+            None => self.keep(|path| save_default_model(path, &model)),
+        }
+    }
+
+    /// The provider in force, if the config names any.
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.config.provider.as_deref()
+    }
+
+    /// The providers the config file lists, in its order.
+    pub(crate) fn providers(&self) -> &[String] {
+        &self.config.file.providers
+    }
+
+    /// Where a configured provider is, how to authenticate to it, and the model it
+    /// starts with — what a frontend needs to choose a model there before switching.
+    pub(crate) fn provider_section(&self, name: &str) -> Option<&crate::config::ProviderFile> {
+        self.config.file.provider_sections.get(name)
+    }
+
+    /// Move the conversation to another configured provider and `model` on it, and
+    /// record both as the ones to start with next time.
+    ///
+    /// The model is chosen by the caller, because when the provider names none that is
+    /// a question for the user about the new server's list. The conversation is kept,
+    /// as `switch_model` keeps it: changing server is not starting over. The provider's
+    /// url and token replace whatever the command line said — switching is the user
+    /// saying where to go now.
+    pub(crate) fn switch_provider(&mut self, name: &str, model: String) -> Kept {
+        let Some(section) = self.config.file.provider_sections.get(name).cloned() else {
+            return Kept::Failed(format!("there is no provider named '{name}'"));
+        };
+        let url = section.url.unwrap_or_default();
+        let token = section.token.filter(|t| !t.trim().is_empty());
+
+        self.config.provider = Some(name.to_string());
+        self.config.llm_url = url.clone();
+        self.config.token = token.clone();
+        self.config.url_supplied = true;
+        self.config.file.provider = Some(name.to_string());
+        // Both copies, for the same reason as the model: `web_fetch` summarizes
+        // through the server's, and leaving it behind would send half the work to
+        // the old server.
+        let base_url = crate::llm::normalize_base_url(&url);
+        self.client.base_url = base_url.clone();
+        self.client.token = token.clone();
+        self.server.llm_client.base_url = base_url;
+        self.server.llm_client.token = token;
+
+        let model_kept = self.switch_model(model);
+        let provider_kept = self.keep(|path| save_active_provider(path, name));
+        match (model_kept, provider_kept) {
+            (Kept::Failed(why), _) | (_, Kept::Failed(why)) => Kept::Failed(why),
+            (kept, _) => kept,
+        }
     }
 
     /// Put a change in the config file, so it is still true next run.
@@ -1065,6 +1129,7 @@ pub(crate) async fn run_turn(
             // status bar is what reports it. The numbers, not the line: how wide
             // the bar is and what goes where is the frontend's business.
             let _ = tx.send(AgentEvent::Status {
+                provider: agent.provider().map(str::to_string),
                 model: agent.client.model.clone(),
                 used_tokens: agent.context_used(),
                 context_tokens: agent.context_tokens,
@@ -2269,6 +2334,49 @@ mod knob_tests {
             crate::config::load_file_config(Some(&path)).model.as_deref(),
             Some("qwen2.5:14b")
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Switching provider moves both clients to the new server and remembers the
+    /// provider, and the model chosen there goes into that provider's own section.
+    #[test]
+    fn switching_provider_moves_both_clients_and_records_it() {
+        let text = "version = 1\nproviders = [\"lm\", \"ollama\"]\n\n\
+            [lm]\nurl = \"http://lm:1234/v1\"\ntoken = \"sk\"\nmodel = \"m\"\n\n\
+            [ollama]\nurl = \"http://ollama:11434\"\n";
+        let path = crate::testutil::scratch("agent-switches-provider.toml", text);
+        let mut config = test_config("http://lm:1234");
+        config.file = crate::config::parse_file_config(text).unwrap();
+        config.provider = Some("lm".to_string());
+        config.token = Some("sk".to_string());
+        config.config_path = Some(path.clone());
+        let cwd = std::env::current_dir().unwrap();
+        let mut agent = Agent::new(config, "m".to_string(), &cwd);
+
+        assert_eq!(agent.switch_provider("ollama", "llama3.1:8b".to_string()), Kept::Config);
+        assert_eq!(agent.provider(), Some("ollama"));
+        assert_eq!(agent.model(), "llama3.1:8b");
+        for client in [&agent.client, &agent.server.llm_client] {
+            assert_eq!(client.base_url, "http://ollama:11434");
+            assert_eq!(client.token, None, "the old server's token went along");
+            assert_eq!(client.model, "llama3.1:8b");
+        }
+        let saved = crate::config::load_file_config(Some(&path));
+        assert_eq!(saved.provider.as_deref(), Some("ollama"));
+        assert_eq!(saved.provider_sections["ollama"].model.as_deref(), Some("llama3.1:8b"));
+        assert!(saved.model.is_none());
+
+        // And back: the token returns with its server, and /model on it saves there.
+        agent.switch_provider("lm", "m".to_string());
+        assert_eq!(agent.client.base_url, "http://lm:1234");
+        assert_eq!(agent.client.token.as_deref(), Some("sk"));
+        agent.switch_model("other".to_string());
+        let saved = crate::config::load_file_config(Some(&path));
+        assert_eq!(saved.provider_sections["lm"].model.as_deref(), Some("other"));
+
+        assert!(matches!(agent.switch_provider("absent", "x".to_string()), Kept::Failed(_)));
+        assert_eq!(agent.provider(), Some("lm"));
 
         let _ = std::fs::remove_file(&path);
     }

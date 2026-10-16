@@ -66,7 +66,10 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     if let Some(notice) = crate::config::config_error_notice(&config) {
         outln!("{}", notice);
     }
-    outln!("Connecting to LLM server at: {}", config.llm_url);
+    match &config.provider {
+        Some(provider) => outln!("Connecting to {} at: {}", provider, config.llm_url),
+        None => outln!("Connecting to LLM server at: {}", config.llm_url),
+    }
     let model = crate::choose_model(&config, None).await?;
 
     let cwd = std::env::current_dir()?;

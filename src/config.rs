@@ -93,6 +93,9 @@ impl Reasoning {
 pub(crate) struct Config {
     pub(crate) llm_url: String,
     pub(crate) token: Option<String>,
+    // The provider in force — named on the command line, remembered in the file, or the
+    // first one listed. `None` for a version-0 file, or one that lists none.
+    pub(crate) provider: Option<String>,
     pub(crate) system_prompt: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) server: bool,
@@ -151,6 +154,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     let program = args[0].clone();
 
     let mut opts = Options::new();
+    opts.optopt("", "provider", "Use this provider from the config file for this run", "NAME");
     opts.optopt("u", "url", "LLM server URL (default: http://127.0.0.1:11434 for Ollama)", "URL");
     opts.optopt("s", "system-prompt", "System prompt (string or path to text file)", "PROMPT");
     opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
@@ -198,11 +202,38 @@ pub(crate) fn parse_config() -> Result<Config> {
         Err(why) => (FileConfig::default(), Some(why)),
     };
 
+    // Which of the file's providers supplies the url, token and model. Asked for by name
+    // on the command line, it has to exist: falling back to another one would send the
+    // run's requests to a server the user did not pick. Not saved — /provider is what
+    // changes the one remembered in the file.
+    let provider = match matches.opt_str("provider").or_else(|| env::var("HAICO_PROVIDER").ok()) {
+        Some(name) => {
+            let name = name.trim().to_string();
+            if !file_config.provider_sections.contains_key(&name) {
+                let known = if file_config.providers.is_empty() {
+                    "the config lists none".to_string()
+                } else {
+                    format!("configured: {}", file_config.providers.join(", "))
+                };
+                let why = match &config_error {
+                    Some(why) => format!("\n(the config file was not loaded: {why})"),
+                    None => String::new(),
+                };
+                anyhow::bail!("there is no provider named '{name}'; {known}{why}");
+            }
+            Some(name)
+        }
+        None => file_config.active_provider().map(str::to_string),
+    };
+    let section = provider.as_deref().and_then(|name| file_config.provider_sections.get(name));
+
     // Parse LLM URL
-    // Priority: command-line arg > environment variable > config file > default
+    // Priority: command-line arg > environment variable > provider > config file > default
     let llm_url = if let Some(url) = matches.opt_str("u") {
         url
     } else if let Ok(url) = env::var("LLM_URL") {
+        url
+    } else if let Some(url) = section.and_then(|s| s.url.clone()) {
         url
     } else if let Some(url) = file_config.url.clone() {
         url
@@ -213,14 +244,17 @@ pub(crate) fn parse_config() -> Result<Config> {
 
     // Whether the URL was set explicitly (flag, env var or config) vs. falling back to the
     // default. web_fetch's LLM summarization requires the URL to be supplied, not defaulted.
-    let url_supplied =
-        matches.opt_present("u") || env::var("LLM_URL").is_ok() || file_config.url.is_some();
+    let url_supplied = matches.opt_present("u")
+        || env::var("LLM_URL").is_ok()
+        || section.is_some_and(|s| s.url.is_some())
+        || file_config.url.is_some();
 
     // Parse API token, for servers that have authentication enabled.
     // Priority: command-line arg > environment variable > config file > none.
     let token = matches
         .opt_str("t")
         .or_else(|| env::var("LM_API_TOKEN").ok())
+        .or_else(|| section.and_then(|s| s.token.clone()))
         .or_else(|| file_config.token.clone())
         .filter(|t| !t.trim().is_empty());
 
@@ -249,7 +283,10 @@ pub(crate) fn parse_config() -> Result<Config> {
     };
 
     // Parse model
-    let model = matches.opt_str("m").or_else(|| file_config.model.clone());
+    let model = matches
+        .opt_str("m")
+        .or_else(|| section.and_then(|s| s.model.clone()))
+        .or_else(|| file_config.model.clone());
 
     // Run as an stdio MCP server instead of the interactive REPL
     let server = matches.opt_present("server");
@@ -302,6 +339,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     Ok(Config {
         llm_url,
         token,
+        provider,
         system_prompt,
         model,
         server,
@@ -411,6 +449,21 @@ pub(crate) struct ModelSettingsFile {
 #[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileConfig {
+    // The layout of the file. 0, or absent, is the original: url, token and model at the
+    // top level. 1 adds `providers`, each name of which is a section of its own holding a
+    // server's url, token and default model, so that switching server is /provider rather
+    // than an edit to the file.
+    pub(crate) version: Option<u32>,
+    #[serde(default)]
+    pub(crate) providers: Vec<String>,
+    // The provider to start with, written back by /provider. Unset means the first listed.
+    pub(crate) provider: Option<String>,
+    // The named sections, by name. Never filled by serde — the names are the user's own
+    // and so cannot be fields — but lifted out by `parse_file_config` before the rest of
+    // the file is read, which is what lets everything else keep `deny_unknown_fields`.
+    #[serde(skip)]
+    pub(crate) provider_sections: std::collections::HashMap<String, ProviderFile>,
+
     pub(crate) url: Option<String>,
     pub(crate) token: Option<String>,
     pub(crate) model: Option<String>,
@@ -444,6 +497,123 @@ pub(crate) struct FileConfig {
     pub(crate) models: std::collections::HashMap<String, ModelSettingsFile>,
 }
 
+// One provider's section: where the server is, how to authenticate to it, and which of
+// its models to start with. Unknown keys are refused here too — a `modle` that silently
+// did nothing would bring the picker up on every start with no hint why.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderFile {
+    pub(crate) url: Option<String>,
+    pub(crate) token: Option<String>,
+    pub(crate) model: Option<String>,
+}
+
+impl FileConfig {
+    // The provider the file starts with: the one it remembers, else the first one listed.
+    pub(crate) fn active_provider(&self) -> Option<&str> {
+        self.provider.as_deref().or(self.providers.first().map(String::as_str))
+    }
+}
+
+// The newest layout this haico reads. See `FileConfig::version`.
+pub(crate) const CONFIG_VERSION: u32 = 1;
+
+// The top-level keys of the file itself, which a provider may not be named after: its
+// section would be taken for the setting, or the setting for its section.
+const RESERVED_KEYS: &[&str] = &[
+    "version", "providers", "provider", "url", "token", "model", "searxng", "system_prompt",
+    "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
+    "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "models",
+];
+
+// Parse the text of a config file. The error is the message to show, without the path,
+// which the caller knows and this does not.
+//
+// Two passes, because a version-1 file has sections named by the user, and those cannot
+// be fields of a struct that refuses unknown ones. The first reads only `version` and
+// `providers`; the second lifts each named section out of the parsed document and reads
+// what is left as a `FileConfig`, as strictly as ever. Both read from spans into the
+// original text, so a typo is still reported with its line, sections included.
+pub(crate) fn parse_file_config(raw: &str) -> Result<FileConfig, String> {
+    #[derive(Deserialize)]
+    struct Header {
+        version: Option<i64>,
+        #[serde(default)]
+        providers: Vec<String>,
+    }
+    let shown = |mut e: toml::de::Error| {
+        e.set_input(Some(raw));
+        e.to_string().trim_end().to_string()
+    };
+
+    let header: Header = toml::from_str(raw).map_err(|e| e.to_string().trim_end().to_string())?;
+    let version = header.version.unwrap_or(0);
+    if !(0..=CONFIG_VERSION as i64).contains(&version) {
+        return Err(format!(
+            "version = {version} is not a layout this haico knows; it reads 0 to {CONFIG_VERSION}"
+        ));
+    }
+
+    // Before the strict read, which would otherwise answer a version-0 file with its
+    // sections as unknown keys — true, and no help at all.
+    if version == 0 && !header.providers.is_empty() {
+        return Err("`providers` needs `version = 1` at the top of the file".to_string());
+    }
+
+    let mut root = toml::de::DeTable::parse(raw).map_err(shown)?;
+    let mut sections = Vec::new();
+    if version >= 1 {
+        for (at, name) in header.providers.iter().enumerate() {
+            if RESERVED_KEYS.contains(&name.as_str()) {
+                return Err(format!("a provider cannot be called '{name}': that is a setting of its own"));
+            }
+            if header.providers[..at].contains(name) {
+                return Err(format!("provider '{name}' is listed twice in `providers`"));
+            }
+            let key = root.get_ref().keys().find(|key| key.get_ref() == name).cloned();
+            let Some(value) = key.and_then(|key| root.get_mut().remove(&key)) else {
+                return Err(format!("provider '{name}' is listed in `providers` but has no [{name}] section"));
+            };
+            let section = ProviderFile::deserialize(toml::de::ValueDeserializer::from(value))
+                .map_err(shown)?;
+            if section.url.is_none() {
+                return Err(format!("[{name}] has no url"));
+            }
+            sections.push((name.clone(), section));
+        }
+    }
+
+    let mut file = FileConfig::deserialize(toml::de::Deserializer::from(root)).map_err(shown)?;
+    if file.version.unwrap_or(0) == 0 && file.provider.is_some() {
+        return Err("`provider` needs `version = 1` at the top of the file".to_string());
+    }
+    // Once there are providers, they are where the server is described; a url at the top
+    // level as well would leave the user guessing which of the two is in force. With none
+    // listed, a version-1 file is a version-0 file and the top level is all there is.
+    if !file.providers.is_empty() {
+        let stray: Vec<&str> = [
+            ("url", file.url.is_some()),
+            ("token", file.token.is_some()),
+            ("model", file.model.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect();
+        if !stray.is_empty() {
+            return Err(format!(
+                "with providers listed, {} belong in a provider's section, not at the top level",
+                stray.join(", ")
+            ));
+        }
+    }
+    if let Some(name) = &file.provider {
+        if !file.providers.contains(name) {
+            return Err(format!("provider = \"{name}\" is not one of `providers`"));
+        }
+    }
+    file.provider_sections = sections.into_iter().collect();
+    Ok(file)
+}
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
     crate::store::path("config.toml")
@@ -451,27 +621,30 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
 
 // The config written on first start.
 //
-// Every top-level key is commented out, so a fresh file changes nothing: `url` in particular
-// must stay unset, because a supplied URL is what turns on `web_fetch`'s summarizer, and a
+// Every top-level key but `version` is commented out, so a fresh file changes nothing: a url
+// in particular must stay unset, because a supplied URL is what turns on `web_fetch`'s summarizer, and a
 // starter that set it would switch that on for a server the user never named. The one live
 // section is a model's own, which only applies when that model is the one in use. What the
 // file is for is being read — a user who never opens it has no way to learn that `[models]`
 // exists, or which keys it takes, short of reading this source.
 //
-// Examples are written `# key = value`, one space after the hash, and prose never starts that
-// way: the test that uncomments every example and parses the result depends on it, and that
+// Examples are written `# key = value` (and a section `# [name]`), one space after the hash,
+// and prose never starts that way: the test that uncomments every example and parses the result depends on it, and that
 // test is what keeps a key renamed here from being handed to users as a typo that
 // `deny_unknown_fields` then refuses.
 pub(crate) const STARTER_CONFIG: &str = r#"# haico's config. Everything here is optional; the command line and the environment
 # outrank it, and a model's own [models."<name>"] section outranks the top level.
-# /model and /set context write their choices back into this file, leaving the rest alone.
+# /provider, /model and /set context write their choices back into this file, leaving
+# the rest alone.
 
-# The OpenAI-compatible server: Ollama (11434), LM Studio (1234), llama-server (8080).
-# url = "http://127.0.0.1:11434"
-# token = "..."
+# The layout of this file; leave it as it is.
+version = 1
 
-# The model to start with, skipping the picker.
-# model = "qwen2.5:14b"
+# The OpenAI-compatible servers to choose from with /provider, each described by a
+# section of its own at the end of the file. `provider` is the one to start with, which
+# /provider writes back; unset, it is the first listed. --provider picks one for a run.
+# providers = ["local"]
+# provider = "local"
 
 # Search through a SearxNG instance instead of DuckDuckGo.
 # searxng = "http://127.0.0.1:8888"
@@ -502,9 +675,18 @@ pub(crate) const STARTER_CONFIG: &str = r#"# haico's config. Everything here is 
 # reasoning_threshold = 800
 
 # Per-model settings, keyed by the name the server reports. Takes every setting above
-# except url, token, model, searxng, system_prompt, read_paths, tui and mouse, plus:
+# except providers, provider, searxng, system_prompt, read_paths, tui and mouse, plus:
 #   use_system_prompt = false     for a model trained with instructions of its own
 #   sub_agent_effort = "low"      reasoning_effort for research, review and summaries
+
+# One section per provider: the server — Ollama (11434), LM Studio (1234), llama-server
+# (8080) — its token if it wants one, and the model to start with there, skipping the
+# picker. /model writes its choice into the section of the provider in use.
+# [local]
+# url = "http://127.0.0.1:11434"
+# token = "..."
+# model = "qwen2.5:14b"
+
 [models."tiel-coder-35b-a3b-mtp"]
 context = 131072
 temperature = 0.3
@@ -564,8 +746,8 @@ pub(crate) fn read_file_config(path: Option<&std::path::Path>) -> Result<FileCon
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
         Err(e) => return Err(format!("could not read {}: {}", path.display(), e)),
     };
-    toml::from_str(&raw).map_err(|e| format!("could not parse {}:
-{}", path.display(), e.to_string().trim_end()))
+    parse_file_config(&raw).map_err(|why| format!("could not parse {}:
+{}", path.display(), why))
 }
 
 // The file's settings, or the defaults when it cannot be used: what the tests read a
@@ -620,6 +802,31 @@ pub(crate) fn save_default_model(path: &Path, model: &str) -> Result<()> {
     })
 }
 
+// Record the model to start with next time on this provider, in the provider's own
+// section: a model belongs to the server that serves it, and the next provider over may
+// not have one by that name at all.
+
+pub(crate) fn save_provider_model(path: &Path, provider: &str, model: &str) -> Result<()> {
+    edit_config_file(path, |doc| {
+        let section = doc
+            .get_mut(provider)
+            .and_then(Item::as_table_mut)
+            .with_context(|| format!("[{provider}] is missing or an inline table; edit it by hand"))?;
+        section["model"] = toml_edit::value(model);
+        Ok(())
+    })
+}
+
+// Record the provider to start with next time.
+
+pub(crate) fn save_active_provider(path: &Path, provider: &str) -> Result<()> {
+    edit_config_file(path, |doc| {
+        uncomment_example(doc, "provider");
+        doc["provider"] = toml_edit::value(provider);
+        Ok(())
+    })
+}
+
 // Turn a commented `# key = ...` example at the top of the file into the key itself, so a
 // value saved there lands under the comment describing it.
 //
@@ -627,10 +834,11 @@ pub(crate) fn save_default_model(path: &Path, model: &str) -> Result<()> {
 // top level holds only comments, which toml_edit keeps as the prefix of the first section's
 // header, and a new top-level key is rendered before all of it. Splitting that prefix at the
 // example gives the key everything above the example and the header everything below.
-// Only when the key is absent and the top level holds no keys at all — otherwise a new key
-// goes after the existing ones, which is already somewhere sensible.
+// Only when the key is absent. Live keys above the example are no obstacle: the example
+// sits below them in the header's prefix, so the key still lands after them — a version-1
+// file always has one, `version = 1` itself.
 fn uncomment_example(doc: &mut DocumentMut, key: &str) {
-    if doc.contains_key(key) || doc.iter().any(|(_, item)| !item.is_table()) {
+    if doc.contains_key(key) {
         return;
     }
     // The first header in the file, which holds the comments above it. An implicit
@@ -927,6 +1135,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [options]", program);
     print!("{}", opts.usage(&brief));
     println!("\nEnvironment variables:");
+    println!("  HAICO_PROVIDER Provider from the config file to use (overridden by --provider)");
     println!("  LLM_URL       LLM server URL (overridden by --url)");
     println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
     println!("  SEARXNG_URL   SearxNG instance for web_search (overridden by --searxng)");
@@ -934,9 +1143,18 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  HAICO_DEBUG   Set to 1 to append diagnostics to {}", crate::store::display("debug.log"));
     println!("\nConfig file: {} — supplies defaults for all of the above,", crate::store::display("config.toml"));
     println!("plus per-model sections. Command line and environment take precedence over it.");
-    println!("\n  url   = \"http://127.0.0.1:1234\"");
+    println!("\n  version   = 1");
+    println!("  providers = [\"lmstudio\", \"ollama\"]  # each one a section below; /provider switches");
+    println!("  provider  = \"lmstudio\"              # the one to start with (default: the first)");
+    println!("\n  [lmstudio]");
+    println!("  url   = \"http://127.0.0.1:1234\"");
     println!("  token = \"sk-lm-...\"");
-    println!("  model = \"qwen2.5:14b\"");
+    println!("  model = \"qwen2.5:14b\"                # the model to start with on this server");
+    println!("\n  [ollama]");
+    println!("  url   = \"http://127.0.0.1:11434\"");
+    println!("\nA file without `version` is read the old way, with url, token and model at the");
+    println!("top level; those are refused there once providers are listed. --url, --token and");
+    println!("--model still override the provider's own, one by one.");
     println!("\n  [models.\"qwen2.5:14b\"]");
     println!("  context        = 32768");
     println!("  temperature    = 0.2");
@@ -1030,6 +1248,7 @@ mod tests {
         crate::Config {
             llm_url: "http://127.0.0.1:1234".to_string(),
             token: None,
+            provider: None,
             system_prompt: None,
             model: None,
             server: false,
@@ -1410,8 +1629,10 @@ mod tests {
     // a supplied URL turns on web_fetch's summarizer.
     #[test]
     fn the_starter_config_sets_nothing_but_its_example_model() {
-        let parsed: FileConfig = toml::from_str(STARTER_CONFIG).expect("starter must parse");
+        let parsed = parse_file_config(STARTER_CONFIG).expect("starter must parse");
         assert!(parsed.url.is_none() && parsed.model.is_none() && parsed.token.is_none());
+        assert_eq!(parsed.version, Some(CONFIG_VERSION));
+        assert!(parsed.providers.is_empty() && parsed.provider_sections.is_empty());
         assert!(parsed.context.is_none() && parsed.temperature.is_none());
         assert!(parsed.read_paths.is_empty() && parsed.tui.is_none());
         assert_eq!(parsed.models.len(), 1);
@@ -1427,7 +1648,7 @@ mod tests {
     // `deny_unknown_fields` then refuses.
     #[test]
     fn every_example_in_the_starter_config_is_a_real_setting() {
-        let example = regex::Regex::new(r"^# ([a-z_]+ = .*)$").unwrap();
+        let example = regex::Regex::new(r"^# ([a-z_]+ = .*|\[[a-z_]+\])$").unwrap();
         let mut uncommented = 0;
         let text: String = STARTER_CONFIG
             .lines()
@@ -1441,9 +1662,12 @@ mod tests {
             .collect();
         assert!(uncommented >= 15, "the pattern stopped matching the examples: {uncommented}");
 
-        let parsed: FileConfig = toml::from_str(&text)
+        let parsed = parse_file_config(&text)
             .unwrap_or_else(|e| panic!("uncommented starter does not parse: {e}\n{text}"));
-        assert!(parsed.url.is_some() && parsed.reasoning_threshold.is_some());
+        assert!(parsed.reasoning_threshold.is_some());
+        let local = &parsed.provider_sections["local"];
+        assert!(local.url.is_some() && local.token.is_some() && local.model.is_some());
+        assert_eq!(parsed.active_provider(), Some("local"));
     }
 
     #[test]
@@ -1461,28 +1685,116 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // /model writes into the starter like into any other file: its comments stay, and the
-    // model lands at the top level rather than inside the example's section.
+    // /provider and /model write into the starter like into any other file: its comments
+    // stay, the provider lands in place of its own example, and the model in the
+    // provider's section. Set up the way a user would: `providers` and the example
+    // section uncommented, `provider` left as it came.
     #[test]
     fn saving_into_the_starter_config_keeps_its_comments() {
-        let path = scratch("starter-then-save.toml", STARTER_CONFIG);
+        let edited = STARTER_CONFIG
+            .replace("# providers = [\"local\"]", "providers = [\"local\"]")
+            .replace("# [local]\n# url = ", "[local]\nurl = ");
+        let path = scratch("starter-then-save.toml", &edited);
 
-        save_default_model(&path, "qwen2.5:14b").unwrap();
+        save_active_provider(&path, "local").unwrap();
+        save_provider_model(&path, "local", "qwen2.5:14b").unwrap();
         save_model_context(&path, "qwen2.5:14b", Some(32768)).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("# Per-model settings, keyed by"), "comment lost:\n{raw}");
-        // In place of its own example, under the comment describing it — not above the
-        // file's header, where toml_edit puts a new key when the top level has none.
+        // In place of its own example, under the comment describing it — not straight
+        // after `version`, where toml_edit puts a new key of its own accord.
         assert!(
-            raw.contains("# The model to start with, skipping the picker.\nmodel = \"qwen2.5:14b\"\n"),
-            "model landed elsewhere:\n{raw}"
+            raw.contains("providers = [\"local\"]\nprovider = \"local\"\n"),
+            "provider landed elsewhere:\n{raw}"
         );
-        assert!(!raw.contains("# model ="), "the example was left beside the value:\n{raw}");
-        let parsed = load_file_config(Some(&path));
-        assert_eq!(parsed.model.as_deref(), Some("qwen2.5:14b"));
+        assert!(!raw.contains("# provider ="), "the example was left beside the value:\n{raw}");
+        let parsed = parse_file_config(&raw).unwrap_or_else(|e| panic!("{e}\n{raw}"));
+        assert_eq!(parsed.provider.as_deref(), Some("local"));
+        assert_eq!(parsed.provider_sections["local"].model.as_deref(), Some("qwen2.5:14b"));
+        assert!(parsed.model.is_none(), "the model is the provider's, not the top level's");
         assert_eq!(parsed.models["qwen2.5:14b"].context, Some(32768));
         assert_eq!(parsed.models["tiel-coder-35b-a3b-mtp"].context, Some(131072));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    const TWO_PROVIDERS: &str = "version = 1\nproviders = [\"lm\", \"ollama\"]\ntemperature = 0.5\n\n\
+        [lm]\nurl = \"http://h:1234\"\ntoken = \"sk\"\nmodel = \"qwen\"\n\n\
+        [ollama]\nurl = \"http://h:11434\"\n\n\
+        [models.\"qwen\"]\ncontext = 8192\n";
+
+    // Each name in `providers` is a section of its own, read beside the usual settings
+    // rather than instead of them; the first listed is the one in force until one is named.
+    #[test]
+    fn a_version_1_file_reads_its_providers_from_their_sections() {
+        let parsed = parse_file_config(TWO_PROVIDERS).unwrap();
+        assert_eq!(parsed.providers, ["lm", "ollama"]);
+        assert_eq!(parsed.active_provider(), Some("lm"));
+        let lm = &parsed.provider_sections["lm"];
+        assert_eq!(lm.url.as_deref(), Some("http://h:1234"));
+        assert_eq!(lm.token.as_deref(), Some("sk"));
+        assert_eq!(lm.model.as_deref(), Some("qwen"));
+        assert_eq!(parsed.provider_sections["ollama"].model, None);
+        assert_eq!(parsed.temperature, Some(0.5));
+        assert_eq!(parsed.models["qwen"].context, Some(8192));
+
+        let chosen = TWO_PROVIDERS.replace("temperature", "provider = \"ollama\"\ntemperature");
+        assert_eq!(parse_file_config(&chosen).unwrap().active_provider(), Some("ollama"));
+
+        // A file with no version is the old layout, read as it always was.
+        let old = parse_file_config("url = \"http://h:1\"\nmodel = \"m\"\n").unwrap();
+        assert_eq!(old.url.as_deref(), Some("http://h:1"));
+        assert_eq!(old.active_provider(), None);
+        // And so is a version-1 file that lists no providers yet.
+        let empty = parse_file_config("version = 1\nurl = \"http://h:1\"\n").unwrap();
+        assert_eq!(empty.url.as_deref(), Some("http://h:1"));
+    }
+
+    // Every way of getting the layout wrong is said, not guessed around: a provider that
+    // silently fell back to another would send the requests to a server nobody picked.
+    #[test]
+    fn a_provider_layout_that_does_not_add_up_is_refused() {
+        let refused = |text: &str, says: &str| {
+            let why = parse_file_config(text).expect_err(text);
+            assert!(why.contains(says), "{text:?} was refused for {why:?}, not {says:?}");
+        };
+        refused("version = 1\nproviders = [\"lm\"]\n", "has no [lm] section");
+        refused("version = 1\nproviders = [\"lm\"]\n[lm]\nmodel = \"m\"\n", "[lm] has no url");
+        refused("version = 1\nproviders = [\"lm\"]\n[lm]\nurl = \"u\"\nmodle = \"m\"\n", "modle");
+        refused("version = 1\nproviders = [\"models\"]\n[models]\n", "cannot be called 'models'");
+        refused("version = 1\nproviders = [\"a\", \"a\"]\n[a]\nurl = \"u\"\n", "listed twice");
+        refused(
+            "version = 1\nurl = \"u\"\nproviders = [\"a\"]\n[a]\nurl = \"u\"\n",
+            "url belong in a provider's section",
+        );
+        refused("version = 1\nprovider = \"b\"\nproviders = [\"a\"]\n[a]\nurl = \"u\"\n", "not one of");
+        refused("providers = [\"a\"]\n[a]\nurl = \"u\"\n", "needs `version = 1`");
+        refused("provider = \"a\"\n", "needs `version = 1`");
+        refused("version = 2\n", "version = 2");
+        // A section nobody listed is an unknown key like any other.
+        refused("version = 1\n[stray]\nurl = \"u\"\n", "unknown field `stray`");
+
+        // A typo inside a section is still placed on its line.
+        let why = parse_file_config(
+            "version = 1\nproviders = [\"lm\"]\n\n[lm]\nurl = \"u\"\nmodle = \"m\"\n",
+        )
+        .unwrap_err();
+        assert!(why.contains("line 6"), "no line in {why:?}");
+    }
+
+    #[test]
+    fn the_model_is_saved_into_the_provider_s_own_section() {
+        let path = scratch("save-provider-model.toml", TWO_PROVIDERS);
+
+        save_provider_model(&path, "ollama", "llama3.1:8b").unwrap();
+        save_active_provider(&path, "ollama").unwrap();
+
+        let parsed = load_file_config(Some(&path));
+        assert_eq!(parsed.provider.as_deref(), Some("ollama"));
+        assert_eq!(parsed.provider_sections["ollama"].model.as_deref(), Some("llama3.1:8b"));
+        assert_eq!(parsed.provider_sections["lm"].model.as_deref(), Some("qwen"));
+        assert!(save_provider_model(&path, "absent", "m").is_err());
 
         let _ = std::fs::remove_file(&path);
     }

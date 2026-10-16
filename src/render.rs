@@ -1480,6 +1480,7 @@ mod log_tests {
 // renderers already have for something that belongs on the screen rather than in the
 // transcript — the permission prompt and the plan review are drawn the same way.
 fn picker_rows(
+    noun: &str,
     models: &[String],
     selected: usize,
     width: usize,
@@ -1501,7 +1502,7 @@ fn picker_rows(
     let end = (start + body).min(models.len());
 
     let mut rows = vec![crate::input::fit(
-        "Select a model — Up/Down to move, Enter to confirm, Esc to cancel",
+        &format!("Select a {noun} — Up/Down to move, Enter to confirm, Esc to cancel"),
         columns,
     )];
     for (offset, model) in models[start..end].iter().enumerate() {
@@ -1520,21 +1521,36 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
     if models.is_empty() {
         return Err(anyhow::anyhow!("No models available"));
     }
+    select_interactive(keys, "model", models, 0).await
+}
 
-    let mut selected_index = 0;
+// The same list for anything else picked by name — a provider, today. `noun` is what the
+// heading and the transcript call the choice; `selected_index` is where the caret starts,
+// which for a provider is the one in force, so Enter alone changes nothing.
+pub(crate) async fn select_interactive(
+    keys: &mut Keys,
+    noun: &str,
+    models: Vec<String>,
+    selected_index: usize,
+) -> Result<String> {
+    if models.is_empty() {
+        return Err(anyhow::anyhow!("Nothing to choose from"));
+    }
+    let mut selected_index = selected_index.min(models.len() - 1);
 
     loop {
         let (width, height) = crossterm::terminal::size()
             .map(|(columns, rows)| (columns as usize, rows as usize))
             .unwrap_or((80, 24));
         // Two rows left to the transcript, so the picker never becomes the whole screen.
-        let (rows, caret) = picker_rows(&models, selected_index, width.max(20), height.saturating_sub(2));
+        let (rows, caret) =
+            picker_rows(noun, &models, selected_index, width.max(20), height.saturating_sub(2));
         crate::out::set_region(rows, caret, 0);
 
         // Read key event
         let Some(event) = keys.next().await else {
             crate::out::clear_region();
-            return Err(anyhow::anyhow!("no interactive terminal to pick a model"));
+            return Err(anyhow::anyhow!("no interactive terminal to pick a {noun}"));
         };
         // Anything that is not a keystroke redraws the list at the top of the loop instead
         // of ending the picker: a window losing focus is not a choice of model.
@@ -1564,7 +1580,7 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
             }
             KeyCode::Esc => {
                 crate::out::clear_region();
-                return Err(anyhow::anyhow!("Model selection cancelled"));
+                return Err(anyhow::anyhow!("{} selection cancelled", capitalized(noun)));
             }
             _ => {
                 // Ignore other keys
@@ -1575,9 +1591,17 @@ pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String
     // The list comes off the screen; what was chosen goes into the transcript, which is
     // where the rest of the session will be looking for it.
     crate::out::clear_region();
-    outln!("Selected model: {}\n", models[selected_index]);
+    outln!("Selected {}: {}\n", noun, models[selected_index]);
 
     Ok(models[selected_index].clone())
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 // Configuration structure

@@ -438,6 +438,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
     crate::Config {
         llm_url: url.to_string(),
         token: None,
+        provider: None,
         system_prompt: None,
         model: None,
         server: false,
