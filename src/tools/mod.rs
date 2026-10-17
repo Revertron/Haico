@@ -86,6 +86,9 @@ pub(crate) struct MyMcpServer {
     // One client for crates.io and docs.rs, so their connections are pooled. Cloning the
     // server clones a handle to it, not the pool.
     pub(crate) crates_client: reqwest::Client,
+    // One client for the web tools, for the same reason; its cookies are kept for
+    // `web::COOKIE_LIFETIME`, not for the session.
+    pub(crate) web_client: reqwest::Client,
 }
 
 // A file's contents immediately before a tool changed it.
@@ -210,6 +213,7 @@ impl MyMcpServer {
             hang_count: Arc::new(Mutex::new(0)),
             timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
             crates_client: crate::tools::crates::rust_api_client(),
+            web_client: crate::tools::web::browser_client(),
         }
     }
 

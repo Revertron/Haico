@@ -52,15 +52,80 @@ pub(crate) struct WebSearchParams {
 // bot signal.
 pub(crate) const FIREFOX_VERSION: &str = "153";
 
-// Shared HTTP client for the web tools (web_search, web_get, web_fetch). Many sites
+// How long the web tools remember the cookies sites give them. The user's choice: long
+// enough that an anti-bot cookie earned on one fetch is still there for the next few, the
+// way a browser keeps it; short enough that a session does not carry one site's tracking
+// cookies around for hours.
+pub(crate) const COOKIE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+// The web client's cookie jar, emptied once its cookies are `COOKIE_LIFETIME` old.
+//
+// The client lives as long as the server, so connections are pooled across fetches — and so
+// would reqwest's own jar be, keeping every cookie for the whole session. reqwest's `Jar` has
+// no notion of age, so this wraps one and starts a fresh one when the oldest cookie in it
+// passes the lifetime. That is per jar, not per cookie: a cookie set late in a jar's life is
+// forgotten with the rest, sooner than ten minutes. Per-cookie ages would mean re-implementing
+// cookie domain and path matching here, which `Jar` already does correctly.
+pub(crate) struct ShortLivedJar {
+    // The jar, and when the first cookie went into it — None while it is empty, so a jar
+    // that has sat unused does not expire the first cookie the moment it arrives.
+    state: std::sync::Mutex<(reqwest::cookie::Jar, Option<std::time::Instant>)>,
+    lifetime: std::time::Duration,
+}
+
+impl ShortLivedJar {
+    pub(crate) fn new(lifetime: std::time::Duration) -> Self {
+        Self { state: std::sync::Mutex::new((reqwest::cookie::Jar::default(), None)), lifetime }
+    }
+
+    fn set_at(&self, headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>, url: &url::Url, now: std::time::Instant) {
+        let mut headers = headers.peekable();
+        if headers.peek().is_none() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.expire(&mut state, now);
+        state.1.get_or_insert(now);
+        reqwest::cookie::CookieStore::set_cookies(&state.0, &mut headers, url);
+    }
+
+    fn cookies_at(&self, url: &url::Url, now: std::time::Instant) -> Option<reqwest::header::HeaderValue> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.expire(&mut state, now);
+        reqwest::cookie::CookieStore::cookies(&state.0, url)
+    }
+
+    fn expire(&self, state: &mut (reqwest::cookie::Jar, Option<std::time::Instant>), now: std::time::Instant) {
+        if state.1.is_some_and(|first| now.duration_since(first) >= self.lifetime) {
+            *state = (reqwest::cookie::Jar::default(), None);
+        }
+    }
+}
+
+impl reqwest::cookie::CookieStore for ShortLivedJar {
+    fn set_cookies(&self, headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>, url: &url::Url) {
+        self.set_at(headers, url, std::time::Instant::now());
+    }
+
+    fn cookies(&self, url: &url::Url) -> Option<reqwest::header::HeaderValue> {
+        self.cookies_at(url, std::time::Instant::now())
+    }
+}
+
+// The HTTP client for the web tools (web_search, web_get, web_fetch). Many sites
 // challenge or reject requests whose headers look like a bare HTTP library, so we send
 // the same header set a desktop Firefox sends for a top-level page load.
 //
 // This only disguises the headers. The TLS ClientHello and HTTP/2 settings are still
 // reqwest's, so services that fingerprint at that level (Cloudflare, DataDome) can
 // still tell us apart from a real browser.
+//
+// Built once per server (`MyMcpServer::web_client`) rather than per call, so fetches reuse
+// connections and a cookie earned on one is still there for the next (see `ShortLivedJar`).
+// Per server and not in a static, because a client keeps its pooled connections on the
+// runtime that opened them, and each test runs its own.
 
-pub(crate) fn browser_client() -> Result<reqwest::Client, McpError> {
+pub(crate) fn browser_client() -> reqwest::Client {
     use reqwest::header::{
         HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
         UPGRADE_INSECURE_REQUESTS,
@@ -98,10 +163,11 @@ pub(crate) fn browser_client() -> Result<reqwest::Client, McpError> {
         ))
         .default_headers(headers)
         // Anti-bot flows commonly set a cookie and redirect; without a jar we drop it.
-        .cookie_store(true)
+        .cookie_provider(std::sync::Arc::new(ShortLivedJar::new(COOKIE_LIFETIME)))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
+        // Fails only where `Client::new` itself would panic (no TLS backend); see llm.rs.
+        .expect("HTTP client")
 }
 
 // Why a fetched page's status is read before its body.
@@ -244,11 +310,11 @@ pub(crate) struct SearxngResult {
 // passed deliberately, so a broken instance is reported rather than worked around.
 
 pub(crate) async fn searxng_search(
+    client: &reqwest::Client,
     base_url: &str,
     query: &str,
     max_results: usize,
 ) -> Result<CallToolResult, McpError> {
-    let client = browser_client()?;
     let search_url = format!("{}/search?q={}", base_url, urlencoding::encode(query));
 
     let response = client
@@ -414,7 +480,7 @@ impl MyMcpServer {
         }
 
         // Fetch the content
-        let client = browser_client()?;
+        let client = &self.web_client;
 
         let response = client
             .get(&url_string)
@@ -540,7 +606,7 @@ impl MyMcpServer {
 
         // A configured SearxNG instance replaces DuckDuckGo entirely.
         if let Some(base_url) = &self.searxng {
-            return searxng_search(base_url, &query, max_results).await;
+            return searxng_search(&self.web_client, base_url, &query, max_results).await;
         }
 
         // URL encode the query
@@ -550,7 +616,7 @@ impl MyMcpServer {
         // Fetch search results. browser_client() already carries the Firefox header set;
         // this request additionally looks like the search form on duckduckgo.com was
         // submitted, so the Referer and Sec-Fetch-Site have to agree with each other.
-        let client = browser_client()?;
+        let client = &self.web_client;
 
         let response = client
             .get(&search_url)
@@ -656,6 +722,36 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[test]
+    fn web_cookies_are_forgotten_once_the_jar_is_ten_minutes_old() {
+        use super::ShortLivedJar;
+        use reqwest::header::HeaderValue;
+        use std::time::{Duration, Instant};
+
+        let jar = ShortLivedJar::new(Duration::from_secs(600));
+        let url: url::Url = "https://example.com/".parse().unwrap();
+        let start = Instant::now();
+
+        // Nothing stored yet, and an empty Set-Cookie list starts no clock.
+        assert!(jar.cookies_at(&url, start).is_none());
+        jar.set_at(&mut std::iter::empty(), &url, start);
+
+        let challenge = HeaderValue::from_static("challenge=passed; Path=/");
+        jar.set_at(&mut std::iter::once(&challenge), &url, start);
+        // Sent back on the next fetch, as a browser would…
+        assert_eq!(jar.cookies_at(&url, start + Duration::from_secs(599)).unwrap(), "challenge=passed");
+        // …and to that site only.
+        let other: url::Url = "https://other.example/".parse().unwrap();
+        assert!(jar.cookies_at(&other, start + Duration::from_secs(1)).is_none());
+
+        // Ten minutes after the first cookie went in, the jar is emptied…
+        assert!(jar.cookies_at(&url, start + Duration::from_secs(600)).is_none());
+        // …and a cookie arriving afterwards starts a fresh ten minutes of its own.
+        let later = start + Duration::from_secs(900);
+        jar.set_at(&mut std::iter::once(&challenge), &url, later);
+        assert!(jar.cookies_at(&url, later + Duration::from_secs(599)).is_some());
+    }
 
     #[test]
     fn decodes_duckduckgo_redirect() {
