@@ -175,9 +175,17 @@ async fn drive(agent: &mut Agent, input: &str) -> TurnEnd {
             tokio::select! {
                 end = &mut turn => break end,
                 Some(event) = events.recv() => show(&mut presenter, event),
+                // The first Ctrl+C asks the turn to stop where it chooses, with its
+                // history balanced; the second stops waiting for it. That used to be
+                // `process::exit`, which skipped everything on the way out — background
+                // jobs were left running holding their ports, and the trace never got
+                // its `end` line. Dropping the turn instead lets `run` stop the jobs and
+                // `main` end the trace, which is still immediate: nothing is awaited but
+                // the kills. The history dropped mid-round is never saved, since the
+                // save is the turn's own last step.
                 _ = tokio::signal::ctrl_c() => {
                     if cancelled {
-                        std::process::exit(EXIT_INTERRUPTED);
+                        break TurnEnd::Interrupted;
                     }
                     cancelled = true;
                     link.cancel();
