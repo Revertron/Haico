@@ -2736,6 +2736,63 @@ mod turn_tests {
         assert_eq!(roles.last(), Some(&"user"));
         assert!(tool_replies(&agent.messages).is_empty());
     }
+
+    /// Esc during the first of two calls in one reply. The turn used to stop at the
+    /// call it interrupted and leave the second id unanswered, and the next request
+    /// was rejected for it.
+    #[tokio::test]
+    async fn an_interrupt_mid_round_still_answers_every_call_of_the_reply() {
+        let _capture = out::capture_guard();
+        let sleeper = if cfg!(windows) { "ping -n 30 127.0.0.1 > NUL" } else { "sleep 30" };
+        let reply = Box::leak(
+            serde_json::json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "slow", "type": "function", "function": {
+                        "name": "run_command",
+                        "arguments": serde_json::json!({"command": sleeper}).to_string()}},
+                    {"id": "never", "type": "function", "function": {
+                        "name": "get_date", "arguments": "{}"}}
+                ]
+            }}]})
+            .to_string()
+            .into_boxed_str(),
+        );
+        let bodies: &'static [&'static str] = Box::leak(Box::new([&*reply]));
+
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        // The frontend: approve the command, and press Esc once it is running.
+        let frontend = async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Ask(Ask::Permission { reply, .. }) => {
+                        let _ = reply.send(PermissionResponse::Allow);
+                    }
+                    AgentEvent::ToolStarted { name, .. } if name == "run_command" => link.cancel(),
+                    _ => {}
+                }
+            }
+        };
+        let turn = async {
+            let end = run_turn(&mut agent, "go", false, &tx, &link).await;
+            drop(tx);
+            end
+        };
+        let (end, ()) = tokio::join!(turn, frontend);
+
+        assert_eq!(end, TurnEnd::Interrupted);
+        assert_eq!(*served.lock().unwrap(), 1);
+        let replies = tool_replies(&agent.messages);
+        let ids: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["slow", "never"], "every call of the reply needs its reply");
+        assert!(replies[1].1.contains("Not run"), "got: {}", replies[1].1);
+    }
 }
 
 /// The window frontend, when this binary was built with it.

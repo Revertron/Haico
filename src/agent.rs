@@ -1050,6 +1050,113 @@ pub(crate) async fn authorize(
 // One turn
 // ---------------------------------------------------------------------------
 
+// Get LLM response and handle tool call chains. The cap stops a model that keeps calling
+// tools forever from spinning until the user kills the process. It does not apply in auto
+// mode: a fixed number of rounds is a poor stand-in for "this is going nowhere", and a long
+// job that hits it unattended has nobody to say "continue". Repetition is the better
+// signal, and it is what guards auto mode.
+const MAX_TOOL_ROUNDS: usize = 50;
+
+// Replies in a row that were cut off for repeating themselves (see `repetition`). In a row,
+// not per turn: an auto-mode turn lives for hours, and a model that fell into a loop once,
+// was told, and went on to do an hour of real work has earned the same second chance the
+// next time. Two in a row means the nudge is not landing, and a third try would most likely
+// be the same loop at the same cost.
+pub(crate) const MAX_REPEATING_REPLIES: usize = 2;
+
+/// The identical-call guard: the (tool, arguments) pair called last, and how long the
+/// unbroken run of it is.
+///
+/// Consecutive rather than counted across the turn: a model working through a list of
+/// compiler errors legitimately runs the same build command a dozen times in one turn, and
+/// every one of those is progress because there were edits in between. A loop is the same
+/// call with nothing else happening between the tries. Any different call resets the run,
+/// `nudged_at` with it, so a later loop still gets its warning.
+#[derive(Default)]
+pub(crate) struct LoopGuard {
+    last: Option<(String, String)>,
+    run: usize,
+    nudged_at: usize,
+}
+
+/// What the guard has to say once a round's calls have all been answered.
+pub(crate) enum LoopVerdict {
+    Fine,
+    /// The same call `count` times in a row: say so in the conversation, once per count.
+    Nudge { tool: String, count: usize },
+    /// …and this is where the loop gives up on it.
+    Break { tool: String, count: usize },
+}
+
+impl LoopGuard {
+    /// Count one call.
+    ///
+    /// Before anything else looks at it, so a call that is refused, denied *or malformed*
+    /// counts too — retrying a call the workspace or the user has already turned down,
+    /// unchanged and immediately, is a loop like any other. What it returned is
+    /// deliberately not part of the key: a build that fails three times in a row with
+    /// nothing done between the tries is stuck whatever the errors say.
+    ///
+    /// The malformed case has to be counted *before* the parse is acted on, not after, and
+    /// that is not tidiness. Counting only calls that parsed meant a model repeating a call
+    /// whose arguments are not JSON never advanced the run at all. In normal mode the round
+    /// cap still stopped it; in auto mode, which skips that cap on purpose because there is
+    /// nobody there to type "continue", nothing stopped it and the turn span forever
+    /// unattended. Keyed on the canonical form when it parses (serde_json sorts object
+    /// keys, so the same call always renders to the same string) and on the raw argument
+    /// text when it does not, which is the only form a malformed call has.
+    pub(crate) fn observe(&mut self, tool: &str, function: &Value, parsed: &std::result::Result<Value, String>) {
+        let key = match parsed {
+            Ok(arguments) => arguments.to_string(),
+            Err(_) => function.get("arguments").map(|a| a.to_string()).unwrap_or_default(),
+        };
+        let call = (tool.to_string(), key);
+        if self.last.as_ref() == Some(&call) {
+            self.run += 1;
+        } else {
+            self.last = Some(call);
+            self.run = 1;
+            self.nudged_at = 0;
+        }
+    }
+
+    /// Asked after every call of a round has its reply, which is the one point a nudge
+    /// can join the conversation.
+    pub(crate) fn verdict(&mut self) -> LoopVerdict {
+        let tool = self.last.as_ref().map(|(tool, _)| tool.clone()).unwrap_or_default();
+        if self.run >= LOOP_BREAK {
+            return LoopVerdict::Break { tool, count: self.run };
+        }
+        if self.run >= LOOP_NUDGE && self.run > self.nudged_at {
+            self.nudged_at = self.run;
+            return LoopVerdict::Nudge { tool, count: self.run };
+        }
+        LoopVerdict::Fine
+    }
+}
+
+// What the rounds of one turn carry from one to the next.
+struct TurnState {
+    round: usize,
+    guard: LoopGuard,
+    // Cleared when compacting fails to get the history back under the line, which means
+    // the window is too small to hold even a summary of it. Trying again the next round
+    // would summarize the summary and throw the round away with it, so the turn runs on
+    // instead and lets the server error be the honest end of it.
+    autocompact: bool,
+    // Set by an auto-compaction and cleared by the next reply that calls a tool. While it
+    // is set, a reply that calls nothing does not end the turn: the task was mid-flight
+    // when the history was replaced, and the loop has just said so. On a p2p_auth run the
+    // first reply after a compaction was one sentence of intent ("Let me check the current
+    // state of the codebase") with no tool call, the turn ended on it, and the unattended
+    // run exited as finished with 19 compile errors in its tests.
+    just_compacted: bool,
+    // Set once the image recovery has run, so a failure that has nothing to do with images
+    // cannot make the turn retry forever.
+    stripped_images: bool,
+    repeating_replies: usize,
+}
+
 /// One turn: the user's message in, and everything that follows from it — rounds
 /// of tool calls, the prompts they need answering, the reply as it streams.
 ///
@@ -1065,933 +1172,839 @@ pub(crate) async fn run_turn(
     tx: &EventSink,
     link: &TurnLink,
 ) -> TurnEnd {
-        // Wall clock, started here rather than at the first request: what the summary at
-        // the end of the turn reports is how long the user waited, which includes the tool
-        // runs, the permission prompts they answered and every round of the loop below —
-        // not just the time the model spent generating.
-        let turn_started = std::time::Instant::now();
+    // Wall clock, started here rather than at the first request: what the summary at the
+    // end of the turn reports is how long the user waited, which includes the tool runs,
+    // the permission prompts they answered and every round of the loop below — not just
+    // the time the model spent generating.
+    let turn_started = std::time::Instant::now();
 
-        // Add user message, with any `@path` in it already read into it.
-        let content = attach_mentions(agent, input, tx).await;
-        agent.messages.push(json!({
-            "role": "user",
-            "content": content
-        }));
+    // Add user message, with any `@path` in it already read into it.
+    let content = attach_mentions(agent, input, tx).await;
+    agent.messages.push(json!({
+        "role": "user",
+        "content": content
+    }));
 
-        // Get LLM response and handle tool call chains. The cap stops a model that keeps
-        // calling tools forever from spinning until the user kills the process. It does
-        // not apply in auto mode: a fixed number of rounds is a poor stand-in for "this is
-        // going nowhere", and a long job that hits it unattended has nobody to say
-        // "continue". Repetition is the better signal, and it is what guards auto mode.
-        const MAX_TOOL_ROUNDS: usize = 50;
-        let mut round = 0usize;
+    let mut state = TurnState {
+        round: 0,
+        guard: LoopGuard::default(),
+        autocompact: true,
+        just_compacted: false,
+        stripped_images: false,
+        repeating_replies: 0,
+    };
 
-        // The (tool, arguments) pair called last, and how long the unbroken run of it is.
-        // Consecutive rather than counted across the turn: a model working through a list
-        // of compiler errors legitimately runs the same build command a dozen times in one
-        // turn, and every one of those is progress because there were edits in between. A
-        // loop is the same call with nothing else happening between the tries. Any
-        // different call resets the run, `nudged_at` with it, so a later loop still gets
-        // its warning.
-        let mut last_call: Option<(String, String)> = None;
-        let mut run = (0usize, String::new());
-        let mut nudged_at = 0usize;
+    let end = loop {
+        state.round += 1;
+        // Once a round, because that is when the history has changed and the status bar is
+        // what reports it. The numbers, not the line: how wide the bar is and what goes
+        // where is the frontend's business.
+        let _ = tx.send(AgentEvent::Status {
+            provider: agent.provider().map(str::to_string),
+            model: agent.client.model.clone(),
+            used_tokens: agent.context_used(),
+            context_tokens: agent.context_tokens,
+            effort: agent.reasoning_effort().map(str::to_string),
+        });
+        // Re-read every round rather than captured once: approving a plan can switch into
+        // auto mode mid-turn, and the cap should stop applying from that point.
+        if link.mode() != Mode::Auto && state.round > MAX_TOOL_ROUNDS {
+            let _ = tx.send(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
+            break TurnEnd::Failed;
+        }
 
-        // Cleared when compacting fails to get the history back under the line, which
-        // means the window is too small to hold even a summary of it. Trying again the
-        // next round would summarize the summary and throw the round away with it, so
-        // the turn runs on instead and lets the server error be the honest end of it.
-        let mut autocompact = true;
+        if let Some(end) = autocompact_if_due(agent, tx, link, &mut state).await {
+            break end;
+        }
 
-        // Set by an auto-compaction and cleared by the next reply that calls a tool. While it
-        // is set, a reply that calls nothing does not end the turn: the task was mid-flight
-        // when the history was replaced, and the loop has just said so. On a p2p_auth run the
-        // first reply after a compaction was one sentence of intent ("Let me check the current
-        // state of the codebase") with no tool call, the turn ended on it, and the unattended
-        // run exited as finished with 19 compile errors in its tests.
-        let mut just_compacted = false;
+        // Whether anything has reached the screen for this reply, and the half-rendered
+        // markdown line, both belong to the presenter — see `Presenter::start_reply`. Per
+        // round, not per turn: a turn is many rounds and each one streams its own reply.
+        let _ = tx.send(AgentEvent::ReplyStart);
+        // The count of characters streamed so far, which the activity bar shows so a model
+        // that reasons for minutes before its first content token is distinguishable from
+        // one that has hung, is now the pump's: it sees every chunk go past and can count
+        // them itself.
+        //
+        // Rebuilt every round rather than once per turn: approving a plan switches the mode
+        // mid-turn, and the very next request has to carry the full tool list.
+        let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
+        let request_tools = tools_for_mode(link.mode(), &agent.tools);
+        // Of the history as it stands, not of `request_messages`: the mode note is not
+        // kept, and `context_used` compares against the history it will be looking at.
+        let estimate_sent = estimate_tokens(&agent.messages);
 
-        // Set once the recovery below has run, so a failure that has nothing to do with
-        // images cannot make the turn retry forever.
-        let mut stripped_images = false;
-
-        // Replies in a row that were cut off for repeating themselves (see `repetition`).
-        // In a row, not per turn: an auto-mode turn lives for hours, and a model that fell
-        // into a loop once, was told, and went on to do an hour of real work has earned the
-        // same second chance the next time. Two in a row means the nudge is not landing, and
-        // a third try would most likely be the same loop at the same cost.
-        const MAX_REPEATING_REPLIES: usize = 2;
-        let mut repeating_replies = 0usize;
-
-        let end = loop {
-            round += 1;
-            // Once a round, because that is when the history has changed and the
-            // status bar is what reports it. The numbers, not the line: how wide
-            // the bar is and what goes where is the frontend's business.
-            let _ = tx.send(AgentEvent::Status {
-                provider: agent.provider().map(str::to_string),
-                model: agent.client.model.clone(),
-                used_tokens: agent.context_used(),
-                context_tokens: agent.context_tokens,
-                effort: agent.reasoning_effort().map(str::to_string),
-            });
-            // Re-read every round rather than captured once: approving a plan can switch
-            // into auto mode mid-turn, and the cap should stop applying from that point.
-            if link.mode() != Mode::Auto && round > MAX_TOOL_ROUNDS {
-                let _ = tx.send(Notice::RoundCapReached(MAX_TOOL_ROUNDS).into());
-                break TurnEnd::Failed;
-            }
-
-            // Auto mode is meant to run unattended, so the one thing it must not do at the
-            // edge of the window is stop and ask for /compact: there is nobody there to
-            // type it, and a job left running overnight would be found dead at the prompt.
-            // Checked here rather than at the end of a turn, where the old hint printed,
-            // because a long job lives inside this loop for hours and may never reach the
-            // end of a turn at all. The history is balanced at this point — every tool call
-            // from the round before already has its reply — so replacing it wholesale
-            // cannot orphan a tool_call_id, which is not true further down.
-            if link.mode() == Mode::Auto
-                && autocompact
-                && agent.context_used() > autocompact_threshold(agent.context_tokens)
-            {
-                let (context_tokens, before) = (agent.context_tokens, agent.context_used());
-                let compacted = interruptible(
-                    tx,
-                    link,
-                    Waiting::Compacting,
-                    compact_history(&agent.client, &mut agent.messages, context_tokens, before),
-                )
-                .await;
-
-                match compacted {
-                    Some(Ok(report)) => {
-                        // The same reclaim /compact does, for the same reason: the cache is
-                        // keyed to a history that no longer exists.
-                        agent.review_cache.clear();
-                        agent.refresh_memory();
-                        let _ = tx.send(Notice::Compacted(report).into());
-                        // The compacted history ends on the assistant agreeing that it has
-                        // the notes, and asking for a reply straight after that is asking
-                        // the model to talk past itself. This says the one thing the notes
-                        // cannot: the task was mid-flight when the summarizer ran, and it
-                        // is the same task that continues.
-                        just_compacted = true;
-                        agent.messages.push(json!({
-                            "role": "user",
-                            "content": "Your context was compacted mid-task. Continue the \
-                                        work described in the notes above from where it left \
-                                        off; do not start over."
-                        }));
-
-                        if agent.context_used() > autocompact_threshold(agent.context_tokens) {
-                            autocompact = false;
-                            let _ = tx.send(
-                                Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize)
-                                    .into(),
-                            );
+        // Esc abandons the turn instead of killing the process. It arrives at the pump as a
+        // keystroke rather than as a signal, because raw mode is on for the whole session —
+        // which is also what lets the next message be typed while this one is still
+        // running — and reaches here as the link's cancellation.
+        let result = interruptible(
+            tx,
+            link,
+            Waiting::Model,
+            agent.client.chat_completion_measured(
+                Caller::Main,
+                request_messages,
+                request_tools,
+                // Both kinds of text are handed on the moment they arrive, so nothing
+                // below re-prints anything from the finished message. What either one
+                // *looks* like — dim, italic, folded, markdown-wrapped — is the
+                // presenter's, and this no longer knows. The third carries no text at
+                // all, only how much of a tool call has landed: the call is shown whole
+                // when it is about to run, and once is enough.
+                |chunk| {
+                    let _ = tx.send(match chunk {
+                        Chunk::Reasoning(text) => AgentEvent::ReasoningChunk(text),
+                        Chunk::Content(text) => AgentEvent::ReplyChunk(text),
+                        Chunk::ToolFragment(characters) => AgentEvent::ToolCallChunk(characters),
+                        // The failed attempt's reply is closed as one that ended, and the
+                        // next attempt opens a reply of its own, so what it streams is
+                        // never shown as the rest of the text the failure cut off. Nothing
+                        // of it reaches the history: only the reply that comes back whole
+                        // is returned.
+                        Chunk::Retrying { error, retry, of, delay } => {
+                            let _ = tx.send(AgentEvent::ReplyEnd);
+                            let _ = tx.send(Notice::Retrying { error, retry, of, delay }.into());
+                            AgentEvent::ReplyStart
                         }
-                    }
-                    // Not fatal by itself: the request below may still fit, and if it does
-                    // not, the server's own error ends the turn — exactly what would have
-                    // happened with none of this here.
-                    Some(Err(e)) => {
-                        let _ = tx.send(Notice::CompactionFailed(format!("{:#}", e)).into());
-                    }
-                    // Esc during the summarization is Esc during the turn, as everywhere
-                    // else in this loop.
-                    None => {
-                        let _ = tx.send(Notice::Interrupted.into());
-                        break TurnEnd::Interrupted;
-                    }
-                }
-            }
+                    });
+                },
+            ),
+        )
+        .await;
 
-
-            // Whether anything has reached the screen for this reply, and the
-            // half-rendered markdown line, both belong to the presenter — see
-            // `Presenter::start_reply`. Per round, not per turn: a turn is many
-            // rounds and each one streams its own reply.
-            let _ = tx.send(AgentEvent::ReplyStart);
-            // The count of characters streamed so far, which the activity bar
-            // shows so a model that reasons for minutes before its first content
-            // token is distinguishable from one that has hung, is now the pump's:
-            // it sees every chunk go past and can count them itself.
-            //
-            // Rebuilt every round rather than once per turn: approving a plan switches the
-            // mode mid-turn, and the very next request has to carry the full tool list.
-            let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
-            let request_tools = tools_for_mode(link.mode(), &agent.tools);
-            // Of the history as it stands, not of `request_messages`: the mode note is not
-            // kept, and `context_used` compares against the history it will be looking at.
-            let estimate_sent = estimate_tokens(&agent.messages);
-
-            // Esc abandons the turn instead of killing the process. It arrives at
-            // the pump as a keystroke rather than as a signal, because raw mode is
-            // on for the whole session — which is also what lets the next message
-            // be typed while this one is still running — and reaches here as the
-            // link's cancellation.
-            let result = interruptible(
-                tx,
-                link,
-                Waiting::Model,
-                agent.client.chat_completion_measured(
-                    Caller::Main,
-                    request_messages,
-                    request_tools,
-                    // Both kinds of text are handed on the moment they arrive, so
-                    // none of the branches below re-print anything from the
-                    // finished message. What either one *looks* like — dim,
-                    // italic, folded, markdown-wrapped — is the presenter's, and
-                    // this no longer knows. The third carries no text at all,
-                    // only how much of a tool call has landed: the call is shown
-                    // whole when it is about to run, and once is enough.
-                    |chunk| {
-                        let _ = tx.send(match chunk {
-                            Chunk::Reasoning(text) => AgentEvent::ReasoningChunk(text),
-                            Chunk::Content(text) => AgentEvent::ReplyChunk(text),
-                            Chunk::ToolFragment(characters) => {
-                                AgentEvent::ToolCallChunk(characters)
-                            }
-                            // The failed attempt's reply is closed as one that ended, and
-                            // the next attempt opens a reply of its own, so what it streams
-                            // is never shown as the rest of the text the failure cut off.
-                            // Nothing of it reaches the history: only the reply that comes
-                            // back whole is returned.
-                            Chunk::Retrying { error, retry, of, delay } => {
-                                let _ = tx.send(AgentEvent::ReplyEnd);
-                                let _ = tx.send(Notice::Retrying { error, retry, of, delay }.into());
-                                AgentEvent::ReplyStart
-                            }
-                        });
-                    },
-                ),
-            )
-            .await;
-
-            let Some(result) = result else {
-                // The partial reply is dropped rather than stored: half a tool call in the
-                // history is worse than no reply at all. Everything before this turn stays
-                // consistent, so the conversation is still usable.
-                let _ = tx.send(AgentEvent::ReplyEnd);
-                let _ = tx.send(Notice::Interrupted.into());
-                break TurnEnd::Interrupted;
-            };
-
-            let mut message = match result {
-                Ok((message, ending)) => {
-                    repeating_replies = 0;
-                    if let Some(prompt_tokens) = ending.usage.as_ref().and_then(|u| u["prompt_tokens"].as_u64()) {
-                        agent.measured = Some(Measured { prompt_tokens: prompt_tokens as usize, estimate: estimate_sent });
-                    }
-                    message
-                }
-                Err(e) => {
-                    let _ = tx.send(AgentEvent::ReplyEnd);
-
-                    // The stream was cut off because the reply had gone into a loop. The
-                    // partial reply is dropped, exactly as an interrupt drops one — it is
-                    // the loop, and half a tool call in the history is worse than none. The
-                    // history is as consistent as it was before the request, so asking again
-                    // is safe; asking again *unchanged* would mostly get the same loop back,
-                    // which is why the model is shown what it was repeating first.
-                    if let Some(repeating) = e.downcast_ref::<Repeating>() {
-                        repeating_replies += 1;
-                        let retrying = repeating_replies < MAX_REPEATING_REPLIES;
-                        let _ = tx.send(
-                            Notice::Repeating { passage: repeating.passage.clone(), retrying }.into(),
-                        );
-                        if !retrying {
-                            break TurnEnd::Failed;
-                        }
-                        push_user_note(
-                            &mut agent.messages,
-                            &format!(
-                                "Your previous reply was cut off and discarded because it had \
-                                 started repeating the same passage over and over:\n\n> {}\n\n\
-                                 Do not go back over that reasoning again. Decide on one \
-                                 concrete next step and take it now — call a tool, try a \
-                                 different approach, or say plainly what you are stuck on.",
-                                repeating.passage
-                            ),
-                        );
-                        continue;
-                    }
-
-                    // An image in the history is the one failure this can back
-                    // out of, and the only one worth trying to: a model without
-                    // a vision head rejects the request that carries a picture
-                    // and every request after it, so the conversation is dead
-                    // until the picture leaves. That is a real risk here and not
-                    // a theoretical one, because `read` lets the *model* choose
-                    // the file — it can point itself at a screenshot with no
-                    // way to know whether it can see one.
-                    //
-                    // Once per turn, so an unrelated failure that keeps failing
-                    // still ends at the prompt instead of looping. The images
-                    // are gone from the history for good, which is the point:
-                    // retrying with them in would fail the same way.
-                    if !stripped_images && strip_images(&mut agent.messages) > 0 {
-                        stripped_images = true;
-                        let _ = tx.send(Notice::ImagesStripped(format!("{:#}", e)).into());
-                        continue;
-                    }
-
-                    // A dropped connection, a server-side error, or an unparseable body
-                    // must not end the session. Every tool call made so far already has its
-                    // reply, so the history is consistent: drop back to the prompt.
-                    let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
-                    break TurnEnd::Failed;
-                }
-            };
-
-            // Both kinds of text were handed on as they arrived — including the case of a
-            // model whose entire reply is chain of thought with no content at all, which
-            // is why nothing is re-emitted from `message` here. All that is left is to say
-            // the reply is over, and let the presenter close whatever it has open.
+        let Some(result) = result else {
+            // The partial reply is dropped rather than stored: half a tool call in the
+            // history is worse than no reply at all. Everything before this turn stays
+            // consistent, so the conversation is still usable.
             let _ = tx.send(AgentEvent::ReplyEnd);
+            let _ = tx.send(Notice::Interrupted.into());
+            break TurnEnd::Interrupted;
+        };
 
-            // The one place the reasoning policy is applied, deliberately ahead of every
-            // `agent.messages.push(message.clone())` below rather than at each of them: all three
-            // push this same value, and a policy enforced at two of the three sites would
-            // leave whole traces in the history depending on how the turn happened to end.
-            //
-            // Only the compression of a long enough trace costs a request, and only that
-            // goes through `work_with_input` — several seconds with a frozen input box
-            // every turn would be worse than the tokens are worth. Esc during it means
-            // `None`, which lands in the same place a failure does: the original chain of
-            // thought is kept and the turn carries on. Dropping a field, and declining a
-            // trace under the threshold, are both over before a frame could be painted, so
-            // they are awaited directly rather than announced as work in progress.
-            if agent.reasoning != Reasoning::Keep {
-                let note = if reasoning_needs_a_request(&message, agent.reasoning, agent.reasoning_threshold) {
-                    interruptible(
-                        tx,
-                        link,
-                        Waiting::CompressingReasoning,
-                        apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold),
-                    )
-                    .await
-                    .flatten()
-                } else {
-                    apply_reasoning(&agent.client, &mut message, agent.reasoning, agent.reasoning_threshold).await
-                };
-
-                match note {
-                    // Shown rather than folded, and wearing the chrome's light blue: the
-                    // whole point of compressing is to find out whether it is paying for
-                    // itself, which cannot be judged from a line that is hidden by
-                    // default. Tinted, not painted — the bars are the only thing on
-                    // screen that gets a background, and that is what makes them read as
-                    // furniture rather than as output.
-                    Some(ReasoningOutcome::Compressed { before, after }) => {
-                        agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
-                        // Read back out of the message rather than handed over with the
-                        // figures: `apply_reasoning` has just written the summary into the
-                        // reasoning field, and that field is the version the history now
-                        // carries — reporting anything else would be reporting a text the
-                        // conversation does not actually contain.
-                        let summary = reasoning_text(&message).unwrap_or_default().to_string();
-                        let _ = tx.send(Notice::ReasoningCompressed { before, after, summary }.into());
-                    }
-                    // Dropping says nothing the policy did not already say: it removes
-                    // every trace, every turn, so a line per reply would be a line per
-                    // reply saying the same thing.
-                    Some(ReasoningOutcome::Dropped { tokens }) => {
-                        let _ = tx.send(Notice::ReasoningDropped { tokens }.into());
-                    }
-                    None => {}
+        let mut message = match result {
+            Ok((message, ending)) => {
+                state.repeating_replies = 0;
+                if let Some(prompt_tokens) = ending.usage.as_ref().and_then(|u| u["prompt_tokens"].as_u64()) {
+                    agent.measured = Some(Measured { prompt_tokens: prompt_tokens as usize, estimate: estimate_sent });
                 }
+                message
             }
-
-            // Check if model wants to call a tool
-            if let Some(tool_calls) = message.get("tool_calls").filter(|c| !c.is_null()) {
-                let tool_calls_array = match tool_calls.as_array() {
-                    Some(arr) => arr,
-                    None => {
-                        let _ = tx.send(Notice::ToolCallsMalformed(format!("{:?}", tool_calls)).into());
-                        break TurnEnd::Failed;
-                    }
-                };
-
-                // Check if array is empty
-                if tool_calls_array.is_empty() {
-                    // No actual tool calls, this is the final response — already streamed.
-                    agent.messages.push(message.clone());
-                    if std::mem::take(&mut just_compacted) {
-                        push_user_note(&mut agent.messages, AFTER_COMPACTION);
-                        continue;
-                    }
-                    break TurnEnd::Answered;
+            Err(e) => {
+                let _ = tx.send(AgentEvent::ReplyEnd);
+                match recover_from_failed_request(agent, tx, &mut state, e) {
+                    Some(end) => break end,
+                    None => continue,
                 }
-                just_compacted = false;
-
-                // Add assistant message with tool call first
-                agent.messages.push(message.clone());
-
-                // Set when Ctrl+C lands during a tool call, so the turn ends rather than
-                // only the tool loop.
-                let mut interrupted = false;
-
-                // Pictures the round's tools returned, waiting for the one place
-                // an image is allowed to go. See where they are pushed below.
-                let mut seen_images: Vec<Value> = Vec::new();
-
-                for tool_call in tool_calls_array {
-
-                    // Captured up front: every path out of this iteration owes the model a
-                    // `role:"tool"` message under this id. Leaving one unanswered makes the
-                    // next request fail server-side, which is far harder to recover from
-                    // than telling the model its call was malformed.
-                    let tool_call_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
-                    let function = &tool_call["function"];
-
-                    let tool_name = match function["name"].as_str() {
-                        Some(name) => name,
-                        None => {
-                            let detail = format!(
-                                "Malformed tool call: no function name in {}",
-                                truncate_at_boundary(&function.to_string(), 500)
-                            );
-                            let _ = tx.send(Notice::ToolCallUnnamed(detail.clone()).into());
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": detail
-                            }));
-                            continue;
-                        }
-                    };
-
-                    let parsed = parse_tool_arguments(function);
-
-                    // Counted here, before any of the branches below, so a call that is
-                    // refused, denied *or malformed* counts too — retrying a call the
-                    // workspace or the user has already turned down, unchanged and
-                    // immediately, is a loop like any other. What it returned is
-                    // deliberately not part of the key: a build that fails three times in a
-                    // row with nothing done between the tries is stuck whatever the errors
-                    // say.
-                    //
-                    // The malformed case has to be counted *before* the parse, not after,
-                    // and that is not tidiness. The error arm below `continue`s, so
-                    // counting after it meant a model repeating a call whose arguments are
-                    // not JSON never advanced the run at all. In normal mode the round cap
-                    // still stopped it; in auto mode, which skips that cap on purpose
-                    // because there is nobody there to type "continue", nothing stopped it
-                    // and the turn span forever unattended. Keyed on the canonical form
-                    // when it parses (serde_json sorts object keys, so the same call always
-                    // renders to the same string) and on the raw argument text when it does
-                    // not, which is the only form a malformed call has.
-                    let args_key = match &parsed {
-                        Ok(arguments) => arguments.to_string(),
-                        Err(_) => function.get("arguments").map(|a| a.to_string()).unwrap_or_default(),
-                    };
-                    let call = (tool_name.to_string(), args_key);
-                    if last_call.as_ref() == Some(&call) {
-                        run.0 += 1;
-                    } else {
-                        last_call = Some(call);
-                        run = (1, tool_name.to_string());
-                        nudged_at = 0;
-                    }
-
-                    let mut arguments = match parsed {
-                        Ok(arguments) => arguments,
-                        Err(detail) => {
-                            let _ = tx.send(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": format!(
-                                    "Could not run '{}': {}. Call it again with valid JSON arguments.",
-                                    tool_name, detail
-                                )
-                            }));
-                            continue;
-                        }
-                    };
-
-                    // Before anything looks at the arguments, so the gate, the diff preview
-                    // and the tool all see what the model meant rather than what it typed
-                    // (see `repair_leaked_arguments`). Said in the tool's reply: a model
-                    // that is never told keeps making the same slip, and this one made it
-                    // in half the edits of a run.
-                    let repaired = repair_leaked_arguments(&mut arguments);
-
-                    // The model can put itself into plan mode, for when the user asked for
-                    // a plan rather than for the work. Nothing to approve: this only ever
-                    // takes capability away, and present_plan is where consent is needed.
-                    if tool_name == START_PLAN {
-                        let content = if link.mode() == Mode::Plan {
-                            "Already in plan mode. Investigate with the reading tools, then \
-                             call present_plan."
-                        } else {
-                            link.set_mode(Mode::Plan);
-                            let _ = tx.send(Notice::PlanModeEntered.into());
-                            "Plan mode is active. The tools that change this machine are no \
-                             longer available to you. Investigate the real code with read, \
-                             grep, ls and glob_search, then call present_plan with what you \
-                             propose. Do not start work until the user approves it."
-                        };
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // A finished plan is not a tool call so much as the end of plan mode,
-                    // and the mode it ends lives out here rather than inside the tool.
-                    if tool_name == PRESENT_PLAN {
-                        let plan = arguments["plan"].as_str().unwrap_or("").trim().to_string();
-                        if plan.is_empty() {
-                            agent.messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": "The plan was empty. Put the plan itself in the \
-                                            'plan' field and call present_plan again."
-                            }));
-                            continue;
-                        }
-
-                        // A terminal that cannot be read from must not be taken as
-                        // approval — the same rule the permission prompt follows.
-                        let decision =
-                            ask_frontend(tx, |reply| Ask::Plan { plan: plan.clone(), reply }).await;
-                        let content = match decision {
-                            Some(PlanDecision::Approve) => {
-                                link.set_mode(Mode::Normal);
-                                let _ = tx.send(Notice::PlanApproved { auto: false }.into());
-                                "The user approved the plan. Plan mode is over and the full \
-                                 tool set is available again. Begin work now, following the \
-                                 plan you just had approved."
-                                    .to_string()
-                            }
-                            Some(PlanDecision::ApproveWithAuto) => {
-                                link.set_mode(Mode::Auto);
-                                let _ = tx.send(Notice::PlanApproved { auto: true }.into());
-                                // The model is told nothing about the review. It should
-                                // propose the same call either way, and knowing it is being
-                                // checked is an invitation to write for the checker.
-                                "The user approved the plan. Plan mode is over and the full \
-                                 tool set is available again. Begin work now, following the \
-                                 plan you just had approved."
-                                    .to_string()
-                            }
-                            Some(PlanDecision::Revise(feedback)) => {
-                                let _ = tx.send(Notice::PlanRejected.into());
-                                format!(
-                                    "The user did not approve the plan. Their corrections: {}\n\n\
-                                     You are still in plan mode and must not change anything. \
-                                     Fold this in — investigating further if you need to — and \
-                                     call present_plan again.",
-                                    feedback
-                                )
-                            }
-                            None => {
-                                let _ = tx.send(
-                                    Notice::AskFailed {
-                                        what: "about the plan",
-                                        detail: "no interactive terminal".to_string(),
-                                    }
-                                    .into(),
-                                );
-                                "The plan could not be shown for approval (no interactive \
-                                 terminal), so it is not approved. Do not start work."
-                                    .to_string()
-                            }
-                        };
-
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // A question for the user is answered out here for the same reason a
-                    // plan is: the keyboard belongs to the REPL, and the tool body runs in
-                    // the MCP server too, where there is nobody to ask.
-                    if tool_name == ASK_USER {
-                        let question = arguments["question"].as_str().unwrap_or_default();
-                        // Anything that is not a string is dropped rather than rendered as
-                        // JSON: a model that sent objects here is better told the list was
-                        // too short than shown its own braces back on screen.
-                        let options: Vec<String> = arguments["options"]
-                            .as_array()
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(|item| item.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        let content = match ask::normalize(question, &options) {
-                            Err(reason) => reason,
-                            Ok((question, options)) => {
-                                let answered = ask_frontend(tx, |reply| Ask::User {
-                                    question: question.clone(),
-                                    options: options.clone(),
-                                    reply,
-                                })
-                                .await;
-                                match answered {
-                                    Some(answer) => ask::reply_for(&answer, &options),
-                                    // Nobody to ask is not the same as an answer, and it
-                                    // must not stall the turn either: the model is told to
-                                    // carry the decision itself.
-                                    None => {
-                                        let _ = tx.send(
-                                            Notice::AskFailed {
-                                                what: "the user",
-                                                detail: "no interactive terminal".to_string(),
-                                            }
-                                            .into(),
-                                        );
-                                        "The question could not be put to the user (no \
-                                         interactive terminal). Decide it yourself, say in \
-                                         one line which way you went and why, and carry on."
-                                            .to_string()
-                                    }
-                                }
-                            }
-                        };
-
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    // Run out here rather than in the tool, because every call the helper
-                    // makes is cleared through `authorize` — and that needs the agent.
-                    // The call itself needs no clearing: it does nothing that its own
-                    // calls do not each answer for.
-                    if tool_name == SUB_AGENT {
-                        let task = arguments["task"].as_str().unwrap_or_default().trim().to_string();
-                        let content = if task.is_empty() {
-                            "The task was empty. Put the whole task in the 'task' field and \
-                             call sub_agent again."
-                                .to_string()
-                        } else {
-                            let _ = tx.send(AgentEvent::ToolStarted {
-                                name: tool_name.to_string(),
-                                arguments: arguments.clone(),
-                                auto_note: None,
-                            });
-                            let Some(report) = run_sub_agent(agent, &task, tx, link).await else {
-                                let _ = tx.send(Notice::Interrupted.into());
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": "Interrupted by the user before the sub-agent finished."
-                                }));
-                                interrupted = true;
-                                break;
-                            };
-                            let _ = tx.send(AgentEvent::DidTool {
-                                name: tool_name.to_string(),
-                                arguments: arguments.clone(),
-                            });
-                            let _ = tx.send(AgentEvent::ToolResult(report.clone()));
-                            report
-                        };
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": content
-                        }));
-                        continue;
-                    }
-
-                    let Cleared { auto_note, prompted } =
-                        match authorize(agent, tx, link, tool_name, &arguments).await {
-                            Ok(cleared) => cleared,
-                            Err(content) => {
-                                agent.messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": content
-                                }));
-                                continue;
-                            }
-                        };
-                    // Execute the tool
-                    // A slow tool (a big fetch, a long build) is interruptible too. The
-                    // tool_call_id is still answered before breaking out — an unanswered one
-                    // is what the next request gets rejected for.
-                    let _ = tx.send(AgentEvent::ToolStarted { name: tool_name.to_string(), arguments: arguments.clone(), auto_note: auto_note.clone() });
-
-                    // The diff belongs under the call line, not before it, and it has to
-                    // appear on every path that skipped the prompt — a pre-approved write
-                    // and now an auto-approved one both used to arrive as a path and a byte
-                    // count, with no way to see what went into the file. Convenience should
-                    // cost the prompt, not the oversight. Suppressed only when the prompt
-                    // itself already showed the same diff a moment ago.
-                    if !prompted {
-                        if let Some(diff) = file_change_diff(tool_name, &arguments) {
-                            let _ = tx.send(AgentEvent::ToolDiff(diff));
-                        }
-                    }
-
-
-                    // Captured before the arguments move into the call. For a shell tool
-                    // the command is the thing that ran, so naming the tool as well would
-                    // only say "run_command" twice.
-                    // Cloned before the arguments move into the call, because what
-                    // ran has to be nameable after it has run. Cheap next to the
-                    // call itself, and the alternative is the frontend inventing
-                    // a description from the tool name alone.
-                    let activity_arguments = arguments.clone();
-                    // What a picture coming back from this call is called, asked
-                    // while the arguments are still here to ask. `read` is the
-                    // only tool that returns one, so its path is the only name
-                    // worth looking for.
-                    let image_label = arguments["file_path"]
-                        .as_str()
-                        .map(|path| display_path(std::path::Path::new(path)))
-                        .unwrap_or_else(|| tool_name.to_string());
-                    let executed = interruptible(
-                        tx,
-                        link,
-                        Waiting::Tool(tool_name.to_string()),
-                        agent.server.execute_tool(tool_name, arguments),
-                    )
-                    .await;
-
-                    let Some(result) = executed else {
-                        let _ = tx.send(Notice::Interrupted.into());
-                        agent.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": "Interrupted by the user before this tool finished."
-                        }));
-                        interrupted = true;
-                        break;
-                    };
-
-                    // It ran, whatever it returned: a failed build is still the last
-                    // thing that happened, and the bar saying so is the point.
-                    let _ = tx.send(AgentEvent::DidTool {
-                        name: tool_name.to_string(),
-                        arguments: activity_arguments,
-                    });
-
-                    let tool_result = result.unwrap_or_else(|e| {
-                        let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
-                        crate::tools::ToolOutput {
-                            text: format!("Error: {}", e),
-                            images: Vec::new(),
-                        }
-                    });
-
-                    // Held for after the loop rather than pushed here. A picture
-                    // cannot go in the `role: "tool"` reply — that message may
-                    // carry text and nothing else, and a server rejects an image
-                    // part in one outright — so it has to arrive as a user
-                    // message, and a user message may not sit between an
-                    // assistant turn and the tool results it is waiting for.
-                    for (mime, data) in tool_result.images {
-                        let _ = tx.send(
-                            Notice::ImageAttached {
-                                path: image_label.clone(),
-                                // Back from base64 to the size of the thing it
-                                // encodes, which is the figure that means
-                                // something to whoever reads the line.
-                                bytes: data.len() / 4 * 3,
-                                outside: false,
-                            }
-                            .into(),
-                        );
-                        seen_images.push(json!({
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{};base64,{}", mime, data) }
-                        }));
-                    }
-                    let tool_result = tool_result.text;
-
-                    // The summary is the row that used to be all there was: the first
-                    // line of the result, cut to fit. The result itself is kept behind it
-                    // now rather than thrown away, and Ctrl+O opens it.
-                    //
-                    // research and library are the exception: each has already printed its
-                    // progress and its whole answer while it ran, so a summary here would
-                    // repeat the answer's first line immediately underneath the answer.
-                    if tool_name != "research" && tool_name != "library" {
-                        let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
-                    }
-
-                    let tool_result = if repaired.is_empty() {
-                        tool_result
-                    } else {
-                        format!(
-                            "{tool_result}\n\n[haico] Your `{names}` argument ended with a second copy of \
-                             this call's other arguments written inside its text (`\", \"old_string\": \"...`). \
-                             That copy was cut off before the tool ran, so only the text before it \
-                             was used. End each string argument where its own text ends.",
-                            names = repaired.join("`, `"),
-                        )
-                    };
-
-                    // Add tool result
-                    agent.messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": tool_result
-                    }));
-                }
-
-                // The break above only leaves the tool loop; this leaves the turn.
-                if interrupted {
-                    break TurnEnd::Interrupted;
-                }
-
-                // The pictures the round's tools produced, in the one position
-                // they are legal: after every tool call in the round has its
-                // reply, as a user message. The wire format allows no image in a
-                // `role: "tool"` message, and no user message before those
-                // replies are complete — between them that leaves exactly here.
-                //
-                // A line of text goes with them because the images arrive with
-                // no `tool_call_id` and nothing else ties them to the call that
-                // fetched them. The tool's own reply named the file; this says
-                // which message the picture is in.
-                if !seen_images.is_empty() {
-                    let count = seen_images.len();
-                    let mut parts = seen_images;
-                    parts.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "{} named in the tool result{} above, attached here because an \
-                             image cannot be sent inside a tool result.",
-                            if count == 1 { "The image" } else { "The images" },
-                            if count == 1 { "" } else { "s" }
-                        )
-                    }));
-                    agent.messages.push(json!({"role": "user", "content": parts}));
-                }
-
-                // The tool log makes a loop obvious to whoever is watching it scroll past,
-                // but the model reads none of that — every round looks to it like a fresh
-                // decision, which is why it can repeat one call fifty times. Saying the
-                // repetition out loud in the conversation is what breaks it, and it breaks
-                // it far earlier than the round cap. That matters most in auto mode, where
-                // the cap is the only backstop and nobody is watching it climb.
-                if run.0 >= LOOP_BREAK {
-                    let _ =
-                        tx.send(Notice::LoopBroken { tool: run.1.clone(), count: run.0 }.into());
-                    // Whatever was typed while this ran is deliberately left queued: it
-                    // becomes the next prompt, which is where the user takes over.
-                    break TurnEnd::Failed;
-                }
-                if run.0 >= LOOP_NUDGE && run.0 > nudged_at {
-                    nudged_at = run.0;
-                    let _ = tx.send(Notice::LoopNudge { tool: run.1.clone(), count: run.0 }.into());
-                    // A user message rather than a system one: mid-conversation system
-                    // messages are ignored by some local models and rejected outright by
-                    // some servers, and this one has to land. The order is legal here for
-                    // the same reason the queued text below is — every tool call in this
-                    // round already has its result.
-                    agent.messages.push(json!({
-                        "role": "user",
-                        "content": format!(
-                            "You have called '{}' with the same arguments {} times in a \
-                             row. Get out of the loop — calling it again will not tell you \
-                             anything you have not already been told. Take a different \
-                             approach, or stop and say what you are stuck on.",
-                            run.1, run.0
-                        )
-                    }));
-                }
-
-                // Anything typed while this round ran joins the conversation here, where
-                // every tool call already has its result. Any sooner would put a user
-                // message between an assistant turn and the tool results it is waiting
-                // for, which is a message order servers reject outright.
-                // The echo carries what was typed; the message carries the same
-                // text with its mentions read into it. Typing `@path` while the
-                // model works is as ordinary as typing it at the prompt, and a
-                // mention that expanded in one place and not the other would be
-                // the harder thing to explain.
-                for text in link.take_queued() {
-                    let _ = tx.send(Notice::QueuedSent(text.clone()).into());
-                    let content = attach_mentions(agent, &text, tx).await;
-                    agent.messages.push(json!({"role": "user", "content": content}));
-                }
-                // Timers that came due while this round ran join at the same boundary and
-                // for the same reason. Not sooner — and not by interrupting the round
-                // either: a timer is a reminder, and the work in progress may well be the
-                // thing it was set to check on.
-                let fired = agent.server.take_due_timers();
-                if !fired.is_empty() {
-                    let _ = tx.send(Notice::TimersFired(fired.clone()).into());
-                    agent.messages.push(json!({
-                        "role": "user",
-                        "content": crate::timers::message_for(&fired)
-                    }));
-                }
-
-                // Continue the loop to get next response (might be more tool calls or final answer)
-                continue;
-            } else {
-                // No tool call, this is the final response — already streamed above.
-                agent.messages.push(message.clone());
-                if std::mem::take(&mut just_compacted) {
-                    push_user_note(&mut agent.messages, AFTER_COMPACTION);
-                    continue;
-                }
-                break TurnEnd::Answered;
             }
         };
 
-        // Every way out of the loop above lands here, an interrupt and a server error
-        // included: the line says how long the turn ran for, not whether it got anywhere,
-        // and a turn that ended badly after four minutes is exactly the one worth timing.
-        // Dimmed for the same reason the chain of thought is — it is not the answer.
-        let _ = tx.send(AgentEvent::Finished { elapsed: turn_started.elapsed() });
+        // Both kinds of text were handed on as they arrived — including the case of a model
+        // whose entire reply is chain of thought with no content at all, which is why
+        // nothing is re-emitted from `message` here. All that is left is to say the reply
+        // is over, and let the presenter close whatever it has open.
+        let _ = tx.send(AgentEvent::ReplyEnd);
 
-        // The file /init just wrote is the one that belongs in the system message, and what
-        // was loaded at startup — usually nothing, since /init is what you run when the
-        // project has no instructions yet — is now out of date. Re-read it here rather than
-        // leaving it to the next startup, so the new rules are in force for the rest of this
-        // session and survive /clear, which re-pushes this same content.
-        if initializing {
-            let reloaded = load_project_context();
-            if reloaded != agent.project_context {
-                agent.project_context = reloaded;
-                if let Some((name, _)) = &agent.project_context {
-                    let _ = tx.send(Notice::ProjectContextReloaded(name.clone()).into());
+        apply_reasoning_policy(agent, tx, link, &mut message).await;
+
+        // A reply with no `tool_calls`, a null one and an empty array are the same answer,
+        // and they end the turn in the one place below.
+        let calls = match message.get("tool_calls").filter(|c| !c.is_null()) {
+            None => Vec::new(),
+            Some(calls) => match calls.as_array() {
+                Some(calls) => calls.clone(),
+                None => {
+                    let _ = tx.send(Notice::ToolCallsMalformed(format!("{:?}", calls)).into());
+                    break TurnEnd::Failed;
                 }
-                agent.system_prompt = compose_system_prompt(
-                    agent.config.system_prompt.as_deref(),
-                    &agent.client.model,
-                    agent.settings.use_system_prompt,
-                    agent.user_context.as_deref(),
-                    agent.project_context.as_ref(),
-                    agent.skill_index.as_deref(),
-                    agent.library_index.as_deref(),
-                    agent.memory_index.as_deref(),
-                    &agent.workspace,
-                );
-                set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
+            },
+        };
+
+        // The reply goes into the history before any of its calls is answered: the tool
+        // replies refer to it by id.
+        agent.messages.push(message);
+
+        if calls.is_empty() {
+            // The final response, already streamed.
+            if std::mem::take(&mut state.just_compacted) {
+                push_user_note(&mut agent.messages, AFTER_COMPACTION);
+                continue;
             }
+            break TurnEnd::Answered;
+        }
+        state.just_compacted = false;
+
+        if run_tool_calls(agent, tx, link, &calls, &mut state.guard).await == Round::Interrupted {
+            break TurnEnd::Interrupted;
         }
 
-        // Persisted every turn, so a crash does not cost the session's history.
-        // The input history is the frontend's and is saved by the pump.
-        if let Some(path) = &agent.session_path {
-            let todos = agent.plan();
-            if let Err(e) = save_session(path, &agent.messages, &agent.client.model, &todos) {
-                let _ = tx.send(Notice::SessionNotSaved(format!("{:#}", e)).into());
-            }
+        if let Some(end) = after_round(agent, tx, link, &mut state.guard).await {
+            break end;
         }
+        // On to the next response, which might be more tool calls or the final answer.
+    };
 
-        end
+    // Every way out of the loop above lands here, an interrupt and a server error included:
+    // the line says how long the turn ran for, not whether it got anywhere, and a turn that
+    // ended badly after four minutes is exactly the one worth timing. Dimmed for the same
+    // reason the chain of thought is — it is not the answer.
+    let _ = tx.send(AgentEvent::Finished { elapsed: turn_started.elapsed() });
+
+    // The file /init just wrote is the one that belongs in the system message, and what was
+    // loaded at startup — usually nothing, since /init is what you run when the project has
+    // no instructions yet — is now out of date. Re-read it here rather than leaving it to
+    // the next startup, so the new rules are in force for the rest of this session and
+    // survive /clear, which re-pushes this same content.
+    if initializing {
+        let reloaded = load_project_context();
+        if reloaded != agent.project_context {
+            agent.project_context = reloaded;
+            if let Some((name, _)) = &agent.project_context {
+                let _ = tx.send(Notice::ProjectContextReloaded(name.clone()).into());
+            }
+            agent.recompose_system_prompt();
+            set_system_message(&mut agent.messages, agent.system_prompt.as_deref());
+        }
+    }
+
+    // Persisted every turn, so a crash does not cost the session's history. The input
+    // history is the frontend's and is saved by the pump.
+    if let Some(path) = &agent.session_path {
+        let todos = agent.plan();
+        if let Err(e) = save_session(path, &agent.messages, &agent.client.model, &todos) {
+            let _ = tx.send(Notice::SessionNotSaved(format!("{:#}", e)).into());
+        }
+    }
+
+    end
+}
+
+/// Compact the history before the round's request when auto mode has filled the window.
+/// `Some` ends the turn.
+///
+/// Auto mode is meant to run unattended, so the one thing it must not do at the edge of the
+/// window is stop and ask for /compact: there is nobody there to type it, and a job left
+/// running overnight would be found dead at the prompt. Checked at the top of a round rather
+/// than at the end of a turn, where the old hint printed, because a long job lives inside
+/// the loop for hours and may never reach the end of a turn at all. The history is balanced
+/// at this point — every tool call from the round before already has its reply — so
+/// replacing it wholesale cannot orphan a tool_call_id, which is not true anywhere later in
+/// the round.
+async fn autocompact_if_due(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    state: &mut TurnState,
+) -> Option<TurnEnd> {
+    if link.mode() != Mode::Auto
+        || !state.autocompact
+        || agent.context_used() <= autocompact_threshold(agent.context_tokens)
+    {
+        return None;
+    }
+
+    let (context_tokens, before) = (agent.context_tokens, agent.context_used());
+    let compacted = interruptible(
+        tx,
+        link,
+        Waiting::Compacting,
+        compact_history(&agent.client, &mut agent.messages, context_tokens, before),
+    )
+    .await;
+
+    match compacted {
+        Some(Ok(report)) => {
+            // The same reclaim /compact does, for the same reason: the cache is keyed to a
+            // history that no longer exists.
+            agent.review_cache.clear();
+            agent.refresh_memory();
+            let _ = tx.send(Notice::Compacted(report).into());
+            // The compacted history ends on the assistant agreeing that it has the notes,
+            // and asking for a reply straight after that is asking the model to talk past
+            // itself. This says the one thing the notes cannot: the task was mid-flight
+            // when the summarizer ran, and it is the same task that continues.
+            state.just_compacted = true;
+            agent.messages.push(json!({
+                "role": "user",
+                "content": "Your context was compacted mid-task. Continue the \
+                            work described in the notes above from where it left \
+                            off; do not start over."
+            }));
+
+            if agent.context_used() > autocompact_threshold(agent.context_tokens) {
+                state.autocompact = false;
+                let _ = tx.send(Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize).into());
+            }
+            None
+        }
+        // Not fatal by itself: the request may still fit, and if it does not, the server's
+        // own error ends the turn — exactly what would have happened with none of this here.
+        Some(Err(e)) => {
+            let _ = tx.send(Notice::CompactionFailed(format!("{:#}", e)).into());
+            None
+        }
+        // Esc during the summarization is Esc during the turn, as everywhere else in it.
+        None => {
+            let _ = tx.send(Notice::Interrupted.into());
+            Some(TurnEnd::Interrupted)
+        }
+    }
+}
+
+/// What to do about a request that failed: `None` asks again, `Some` ends the turn.
+fn recover_from_failed_request(
+    agent: &mut Agent,
+    tx: &EventSink,
+    state: &mut TurnState,
+    e: anyhow::Error,
+) -> Option<TurnEnd> {
+    // The stream was cut off because the reply had gone into a loop. The partial reply is
+    // dropped, exactly as an interrupt drops one — it is the loop, and half a tool call in
+    // the history is worse than none. The history is as consistent as it was before the
+    // request, so asking again is safe; asking again *unchanged* would mostly get the same
+    // loop back, which is why the model is shown what it was repeating first.
+    if let Some(repeating) = e.downcast_ref::<Repeating>() {
+        state.repeating_replies += 1;
+        let retrying = state.repeating_replies < MAX_REPEATING_REPLIES;
+        let _ = tx.send(Notice::Repeating { passage: repeating.passage.clone(), retrying }.into());
+        if !retrying {
+            return Some(TurnEnd::Failed);
+        }
+        push_user_note(
+            &mut agent.messages,
+            &format!(
+                "Your previous reply was cut off and discarded because it had \
+                 started repeating the same passage over and over:\n\n> {}\n\n\
+                 Do not go back over that reasoning again. Decide on one \
+                 concrete next step and take it now — call a tool, try a \
+                 different approach, or say plainly what you are stuck on.",
+                repeating.passage
+            ),
+        );
+        return None;
+    }
+
+    // An image in the history is the one failure this can back out of, and the only one
+    // worth trying to: a model without a vision head rejects the request that carries a
+    // picture and every request after it, so the conversation is dead until the picture
+    // leaves. That is a real risk here and not a theoretical one, because `read` lets the
+    // *model* choose the file — it can point itself at a screenshot with no way to know
+    // whether it can see one.
+    //
+    // Once per turn, so an unrelated failure that keeps failing still ends at the prompt
+    // instead of looping. The images are gone from the history for good, which is the
+    // point: retrying with them in would fail the same way.
+    if !state.stripped_images && strip_images(&mut agent.messages) > 0 {
+        state.stripped_images = true;
+        let _ = tx.send(Notice::ImagesStripped(format!("{:#}", e)).into());
+        return None;
+    }
+
+    // A dropped connection, a server-side error, or an unparseable body must not end the
+    // session. Every tool call made so far already has its reply, so the history is
+    // consistent: drop back to the prompt.
+    let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
+    Some(TurnEnd::Failed)
+}
+
+/// The one place the reasoning policy is applied, on the reply just finished and before it
+/// is pushed — so the history only ever holds the post-policy version, however the round
+/// goes on to end.
+///
+/// Only the compression of a long enough trace costs a request, and only that goes through
+/// `interruptible` — several seconds with a frozen input box every turn would be worse than
+/// the tokens are worth. Esc during it means `None`, which lands in the same place a failure
+/// does: the original chain of thought is kept and the turn carries on. Dropping a field,
+/// and declining a trace under the threshold, are both over before a frame could be
+/// painted, so they are awaited directly rather than announced as work in progress.
+async fn apply_reasoning_policy(agent: &mut Agent, tx: &EventSink, link: &TurnLink, message: &mut Value) {
+    if agent.reasoning == Reasoning::Keep {
+        return;
+    }
+    let note = if reasoning_needs_a_request(message, agent.reasoning, agent.reasoning_threshold) {
+        interruptible(
+            tx,
+            link,
+            Waiting::CompressingReasoning,
+            apply_reasoning(&agent.client, message, agent.reasoning, agent.reasoning_threshold),
+        )
+        .await
+        .flatten()
+    } else {
+        apply_reasoning(&agent.client, message, agent.reasoning, agent.reasoning_threshold).await
+    };
+
+    match note {
+        // Shown rather than folded, and wearing the chrome's light blue: the whole point of
+        // compressing is to find out whether it is paying for itself, which cannot be
+        // judged from a line that is hidden by default. Tinted, not painted — the bars are
+        // the only thing on screen that gets a background, and that is what makes them
+        // read as furniture rather than as output.
+        Some(ReasoningOutcome::Compressed { before, after }) => {
+            agent.reasoning_stats.record(ReasoningOutcome::Compressed { before, after });
+            // Read back out of the message rather than handed over with the figures:
+            // `apply_reasoning` has just written the summary into the reasoning field, and
+            // that field is the version the history now carries — reporting anything else
+            // would be reporting a text the conversation does not actually contain.
+            let summary = reasoning_text(message).unwrap_or_default().to_string();
+            let _ = tx.send(Notice::ReasoningCompressed { before, after, summary }.into());
+        }
+        // Dropping says nothing the policy did not already say: it removes every trace,
+        // every turn, so a line per reply would be a line per reply saying the same thing.
+        Some(ReasoningOutcome::Dropped { tokens }) => {
+            let _ = tx.send(Notice::ReasoningDropped { tokens }.into());
+        }
+        None => {}
+    }
+}
+
+#[derive(PartialEq)]
+enum Round {
+    Done,
+    Interrupted,
+}
+
+/// What one call is answered with, and whether the user stopped it.
+struct CallReply {
+    content: String,
+    interrupted: bool,
+}
+
+impl From<String> for CallReply {
+    fn from(content: String) -> Self {
+        CallReply { content, interrupted: false }
+    }
+}
+
+impl From<&str> for CallReply {
+    fn from(content: &str) -> Self {
+        content.to_string().into()
+    }
+}
+
+/// Answer every call of one reply, in order.
+///
+/// **Every `tool_call_id` gets its `role:"tool"` reply here and nowhere else.** An
+/// unanswered id makes the *next* request fail server-side, which is far harder to recover
+/// from than telling the model its call was malformed. Each kind of call used to push its
+/// own reply, eight sites that each had to remember; now a call only says what its reply
+/// is, and this pushes it.
+///
+/// That includes the calls an interrupt never reached. Stopping at the first one left the
+/// rest of the reply's ids unanswered, and the conversation then failed on its next
+/// request.
+async fn run_tool_calls(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    calls: &[Value],
+    guard: &mut LoopGuard,
+) -> Round {
+    // Pictures the round's tools returned, waiting for the one place an image is allowed
+    // to go. See where they are pushed below.
+    let mut seen_images: Vec<Value> = Vec::new();
+    let mut round = Round::Done;
+
+    for tool_call in calls {
+        let tool_call_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
+        let reply = if round == Round::Interrupted {
+            CallReply::from("Not run: the user interrupted the turn before this call was reached.")
+        } else {
+            run_one_call(agent, tx, link, tool_call, guard, &mut seen_images).await
+        };
+        if reply.interrupted {
+            round = Round::Interrupted;
+        }
+        agent.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": reply.content
+        }));
+    }
+
+    // An interrupted round ends the turn; whatever the user does next starts from the
+    // replies alone.
+    if round == Round::Interrupted {
+        return round;
+    }
+
+    // The pictures the round's tools produced, in the one position they are legal: after
+    // every tool call in the round has its reply, as a user message. The wire format allows
+    // no image in a `role: "tool"` message, and no user message before those replies are
+    // complete — between them that leaves exactly here.
+    //
+    // A line of text goes with them because the images arrive with no `tool_call_id` and
+    // nothing else ties them to the call that fetched them. The tool's own reply named the
+    // file; this says which message the picture is in.
+    if !seen_images.is_empty() {
+        let count = seen_images.len();
+        let mut parts = seen_images;
+        parts.push(json!({
+            "type": "text",
+            "text": format!(
+                "{} named in the tool result{} above, attached here because an \
+                 image cannot be sent inside a tool result.",
+                if count == 1 { "The image" } else { "The images" },
+                if count == 1 { "" } else { "s" }
+            )
+        }));
+        agent.messages.push(json!({"role": "user", "content": parts}));
+    }
+    round
+}
+
+/// One call, from its raw form in the reply to the text its id is answered with.
+async fn run_one_call(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    tool_call: &Value,
+    guard: &mut LoopGuard,
+    seen_images: &mut Vec<Value>,
+) -> CallReply {
+    let function = &tool_call["function"];
+
+    let Some(tool_name) = function["name"].as_str() else {
+        let detail = format!(
+            "Malformed tool call: no function name in {}",
+            truncate_at_boundary(&function.to_string(), 500)
+        );
+        let _ = tx.send(Notice::ToolCallUnnamed(detail.clone()).into());
+        return detail.into();
+    };
+
+    let parsed = parse_tool_arguments(function);
+    guard.observe(tool_name, function, &parsed);
+
+    let mut arguments = match parsed {
+        Ok(arguments) => arguments,
+        Err(detail) => {
+            let _ = tx.send(Notice::ToolArgumentsInvalid { tool: tool_name.to_string(), detail: detail.clone() }.into());
+            return format!("Could not run '{}': {}. Call it again with valid JSON arguments.", tool_name, detail).into();
+        }
+    };
+
+    // Before anything looks at the arguments, so the gate, the diff preview and the tool
+    // all see what the model meant rather than what it typed (see
+    // `repair_leaked_arguments`). Said in the tool's reply: a model that is never told
+    // keeps making the same slip, and this one made it in half the edits of a run.
+    let repaired = repair_leaked_arguments(&mut arguments);
+
+    // The calls answered out here rather than by a tool body, each because what it needs
+    // is the agent's or the frontend's, not the tool server's.
+    match tool_name {
+        START_PLAN => start_plan_reply(tx, link).into(),
+        PRESENT_PLAN => present_plan_reply(tx, link, &arguments).await.into(),
+        ASK_USER => ask_user_reply(tx, &arguments).await.into(),
+        SUB_AGENT => sub_agent_reply(agent, tx, link, &arguments).await,
+        _ => gated_call(agent, tx, link, tool_name, arguments, &repaired, seen_images).await,
+    }
+}
+
+// The model can put itself into plan mode, for when the user asked for a plan rather than
+// for the work. Nothing to approve: this only ever takes capability away, and present_plan
+// is where consent is needed.
+fn start_plan_reply(tx: &EventSink, link: &TurnLink) -> &'static str {
+    if link.mode() == Mode::Plan {
+        return "Already in plan mode. Investigate with the reading tools, then call present_plan.";
+    }
+    link.set_mode(Mode::Plan);
+    let _ = tx.send(Notice::PlanModeEntered.into());
+    "Plan mode is active. The tools that change this machine are no \
+     longer available to you. Investigate the real code with read, \
+     grep, ls and glob_search, then call present_plan with what you \
+     propose. Do not start work until the user approves it."
+}
+
+// A finished plan is not a tool call so much as the end of plan mode, and the mode it ends
+// lives out here rather than inside the tool.
+async fn present_plan_reply(tx: &EventSink, link: &TurnLink, arguments: &Value) -> String {
+    let plan = arguments["plan"].as_str().unwrap_or("").trim().to_string();
+    if plan.is_empty() {
+        return "The plan was empty. Put the plan itself in the 'plan' field and call present_plan again."
+            .to_string();
+    }
+
+    // A terminal that cannot be read from must not be taken as approval — the same rule
+    // the permission prompt follows.
+    let decision = ask_frontend(tx, |reply| Ask::Plan { plan: plan.clone(), reply }).await;
+    match decision {
+        Some(PlanDecision::Approve) => {
+            link.set_mode(Mode::Normal);
+            let _ = tx.send(Notice::PlanApproved { auto: false }.into());
+            "The user approved the plan. Plan mode is over and the full \
+             tool set is available again. Begin work now, following the \
+             plan you just had approved."
+                .to_string()
+        }
+        Some(PlanDecision::ApproveWithAuto) => {
+            link.set_mode(Mode::Auto);
+            let _ = tx.send(Notice::PlanApproved { auto: true }.into());
+            // The model is told nothing about the review. It should propose the same call
+            // either way, and knowing it is being checked is an invitation to write for the
+            // checker.
+            "The user approved the plan. Plan mode is over and the full \
+             tool set is available again. Begin work now, following the \
+             plan you just had approved."
+                .to_string()
+        }
+        Some(PlanDecision::Revise(feedback)) => {
+            let _ = tx.send(Notice::PlanRejected.into());
+            format!(
+                "The user did not approve the plan. Their corrections: {}\n\n\
+                 You are still in plan mode and must not change anything. \
+                 Fold this in — investigating further if you need to — and \
+                 call present_plan again.",
+                feedback
+            )
+        }
+        None => {
+            let _ = tx.send(
+                Notice::AskFailed { what: "about the plan", detail: "no interactive terminal".to_string() }.into(),
+            );
+            "The plan could not be shown for approval (no interactive \
+             terminal), so it is not approved. Do not start work."
+                .to_string()
+        }
+    }
+}
+
+// A question for the user is answered out here for the same reason a plan is: the keyboard
+// belongs to the frontend, and the tool body runs in the MCP server too, where there is
+// nobody to ask.
+async fn ask_user_reply(tx: &EventSink, arguments: &Value) -> String {
+    let question = arguments["question"].as_str().unwrap_or_default();
+    // Anything that is not a string is dropped rather than rendered as JSON: a model that
+    // sent objects here is better told the list was too short than shown its own braces
+    // back on screen.
+    let options: Vec<String> = arguments["options"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    let (question, options) = match ask::normalize(question, &options) {
+        Err(reason) => return reason,
+        Ok(normalized) => normalized,
+    };
+    let answered =
+        ask_frontend(tx, |reply| Ask::User { question: question.clone(), options: options.clone(), reply }).await;
+    match answered {
+        Some(answer) => ask::reply_for(&answer, &options),
+        // Nobody to ask is not the same as an answer, and it must not stall the turn
+        // either: the model is told to carry the decision itself.
+        None => {
+            let _ = tx.send(Notice::AskFailed { what: "the user", detail: "no interactive terminal".to_string() }.into());
+            "The question could not be put to the user (no \
+             interactive terminal). Decide it yourself, say in \
+             one line which way you went and why, and carry on."
+                .to_string()
+        }
+    }
+}
+
+// Run out here rather than in the tool, because every call the helper makes is cleared
+// through `authorize` — and that needs the agent. The call itself needs no clearing: it
+// does nothing that its own calls do not each answer for.
+async fn sub_agent_reply(agent: &mut Agent, tx: &EventSink, link: &TurnLink, arguments: &Value) -> CallReply {
+    let task = arguments["task"].as_str().unwrap_or_default().trim().to_string();
+    if task.is_empty() {
+        return "The task was empty. Put the whole task in the 'task' field and call sub_agent again.".into();
+    }
+    let _ = tx.send(AgentEvent::ToolStarted {
+        name: SUB_AGENT.to_string(),
+        arguments: arguments.clone(),
+        auto_note: None,
+    });
+    let Some(report) = run_sub_agent(agent, &task, tx, link).await else {
+        let _ = tx.send(Notice::Interrupted.into());
+        return CallReply {
+            content: "Interrupted by the user before the sub-agent finished.".to_string(),
+            interrupted: true,
+        };
+    };
+    let _ = tx.send(AgentEvent::DidTool { name: SUB_AGENT.to_string(), arguments: arguments.clone() });
+    let _ = tx.send(AgentEvent::ToolResult(report.clone()));
+    report.into()
+}
+
+// Every other call: through the gates, then to the tool server.
+async fn gated_call(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    tool_name: &str,
+    arguments: Value,
+    repaired: &[String],
+    seen_images: &mut Vec<Value>,
+) -> CallReply {
+    let Cleared { auto_note, prompted } = match authorize(agent, tx, link, tool_name, &arguments).await {
+        Ok(cleared) => cleared,
+        Err(refusal) => return refusal.into(),
+    };
+
+    // A slow tool (a big fetch, a long build) is interruptible too. The tool_call_id is
+    // still answered before the turn ends — an unanswered one is what the next request
+    // gets rejected for.
+    let _ = tx.send(AgentEvent::ToolStarted {
+        name: tool_name.to_string(),
+        arguments: arguments.clone(),
+        auto_note: auto_note.clone(),
+    });
+
+    // The diff belongs under the call line, not before it, and it has to appear on every
+    // path that skipped the prompt — a pre-approved write and now an auto-approved one both
+    // used to arrive as a path and a byte count, with no way to see what went into the
+    // file. Convenience should cost the prompt, not the oversight. Suppressed only when the
+    // prompt itself already showed the same diff a moment ago.
+    if !prompted {
+        if let Some(diff) = file_change_diff(tool_name, &arguments) {
+            let _ = tx.send(AgentEvent::ToolDiff(diff));
+        }
+    }
+
+    // Cloned before the arguments move into the call, because what ran has to be nameable
+    // after it has run. Cheap next to the call itself, and the alternative is the frontend
+    // inventing a description from the tool name alone.
+    let activity_arguments = arguments.clone();
+    // What a picture coming back from this call is called, asked while the arguments are
+    // still here to ask. `read` is the only tool that returns one, so its path is the only
+    // name worth looking for.
+    let image_label = arguments["file_path"]
+        .as_str()
+        .map(|path| display_path(std::path::Path::new(path)))
+        .unwrap_or_else(|| tool_name.to_string());
+    let executed = interruptible(
+        tx,
+        link,
+        Waiting::Tool(tool_name.to_string()),
+        agent.server.execute_tool(tool_name, arguments),
+    )
+    .await;
+
+    let Some(result) = executed else {
+        let _ = tx.send(Notice::Interrupted.into());
+        return CallReply {
+            content: "Interrupted by the user before this tool finished.".to_string(),
+            interrupted: true,
+        };
+    };
+
+    // It ran, whatever it returned: a failed build is still the last thing that happened,
+    // and the bar saying so is the point.
+    let _ = tx.send(AgentEvent::DidTool { name: tool_name.to_string(), arguments: activity_arguments });
+
+    let tool_result = result.unwrap_or_else(|e| {
+        let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
+        crate::tools::ToolOutput { text: format!("Error: {}", e), images: Vec::new() }
+    });
+
+    // Held for after the round rather than answered here. A picture cannot go in the
+    // `role: "tool"` reply — that message may carry text and nothing else, and a server
+    // rejects an image part in one outright — so it has to arrive as a user message, and a
+    // user message may not sit between an assistant turn and the tool results it is
+    // waiting for.
+    for (mime, data) in tool_result.images {
+        let _ = tx.send(
+            Notice::ImageAttached {
+                path: image_label.clone(),
+                // Back from base64 to the size of the thing it encodes, which is the figure
+                // that means something to whoever reads the line.
+                bytes: data.len() / 4 * 3,
+                outside: false,
+            }
+            .into(),
+        );
+        seen_images.push(json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+        }));
+    }
+    let tool_result = tool_result.text;
+
+    // The summary is the row that used to be all there was: the first line of the result,
+    // cut to fit. The result itself is kept behind it now rather than thrown away, and
+    // Ctrl+O opens it.
+    //
+    // research and library are the exception: each has already printed its progress and
+    // its whole answer while it ran, so a summary here would repeat the answer's first line
+    // immediately underneath the answer.
+    if tool_name != "research" && tool_name != "library" {
+        let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
+    }
+
+    if repaired.is_empty() {
+        return tool_result.into();
+    }
+    format!(
+        "{tool_result}\n\n[haico] Your `{names}` argument ended with a second copy of \
+         this call's other arguments written inside its text (`\", \"old_string\": \"...`). \
+         That copy was cut off before the tool ran, so only the text before it \
+         was used. End each string argument where its own text ends.",
+        names = repaired.join("`, `"),
+    )
+    .into()
+}
+
+/// What happens once every call of a round has its reply: the loop guard, then whatever
+/// joined the conversation while the round ran. `Some` ends the turn.
+async fn after_round(agent: &mut Agent, tx: &EventSink, link: &TurnLink, guard: &mut LoopGuard) -> Option<TurnEnd> {
+    // The tool log makes a loop obvious to whoever is watching it scroll past, but the
+    // model reads none of that — every round looks to it like a fresh decision, which is
+    // why it can repeat one call fifty times. Saying the repetition out loud in the
+    // conversation is what breaks it, and it breaks it far earlier than the round cap. That
+    // matters most in auto mode, where the cap is the only backstop and nobody is watching
+    // it climb.
+    match guard.verdict() {
+        LoopVerdict::Break { tool, count } => {
+            let _ = tx.send(Notice::LoopBroken { tool, count }.into());
+            // Whatever was typed while this ran is deliberately left queued: it becomes the
+            // next prompt, which is where the user takes over.
+            return Some(TurnEnd::Failed);
+        }
+        LoopVerdict::Nudge { tool, count } => {
+            let _ = tx.send(Notice::LoopNudge { tool: tool.clone(), count }.into());
+            // A user message rather than a system one: mid-conversation system messages are
+            // ignored by some local models and rejected outright by some servers, and this
+            // one has to land. The order is legal here for the same reason the queued text
+            // below is — every tool call in this round already has its result.
+            agent.messages.push(json!({
+                "role": "user",
+                "content": format!(
+                    "You have called '{}' with the same arguments {} times in a \
+                     row. Get out of the loop — calling it again will not tell you \
+                     anything you have not already been told. Take a different \
+                     approach, or stop and say what you are stuck on.",
+                    tool, count
+                )
+            }));
+        }
+        LoopVerdict::Fine => {}
+    }
+
+    // Anything typed while this round ran joins the conversation here, where every tool
+    // call already has its result. Any sooner would put a user message between an
+    // assistant turn and the tool results it is waiting for, which is a message order
+    // servers reject outright. The echo carries what was typed; the message carries the
+    // same text with its mentions read into it. Typing `@path` while the model works is as
+    // ordinary as typing it at the prompt, and a mention that expanded in one place and not
+    // the other would be the harder thing to explain.
+    for text in link.take_queued() {
+        let _ = tx.send(Notice::QueuedSent(text.clone()).into());
+        let content = attach_mentions(agent, &text, tx).await;
+        agent.messages.push(json!({"role": "user", "content": content}));
+    }
+    // Timers that came due while this round ran join at the same boundary and for the same
+    // reason. Not sooner — and not by interrupting the round either: a timer is a reminder,
+    // and the work in progress may well be the thing it was set to check on.
+    let fired = agent.server.take_due_timers();
+    if !fired.is_empty() {
+        let _ = tx.send(Notice::TimersFired(fired.clone()).into());
+        agent.messages.push(json!({
+            "role": "user",
+            "content": crate::timers::message_for(&fired)
+        }));
+    }
+    None
 }
 
 #[cfg(test)]
