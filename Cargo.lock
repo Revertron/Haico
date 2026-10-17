@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "haico"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2707,6 +2707,8 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lumio-gui"
 version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9f7c2040c02dc14219c434042504be9a3c9689a4501d77ff4ab449101e41daf"
 dependencies = [
  "accesskit",
  "accesskit_winit",

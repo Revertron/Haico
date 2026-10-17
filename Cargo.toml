@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.26"
+version = "0.2.27"
 edition = "2021"
 description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
@@ -17,8 +17,8 @@ gui = ["dep:lumio-gui", "dep:pulldown-cmark"]
 # run in VMs and over forwarded displays, and the cost of the second backend is
 # tree size rather than runtime. The software one is also what makes the GUI
 # testable — it renders to a pixmap with no window at all.
-lumio-gui = { path = "../Lumio", optional = true, features = ["backend-software"] }
-# Only the GUI parses markdown into a view tree. The terminal has its own
+lumio-gui = { version = "0.7", optional = true, features = ["backend-software"] }
+# Only the GUI parses Markdown into a view tree. The terminal has its own
 # streaming renderer in render.rs, which emits escapes rather than structure and
 # is not reusable here — see plan.md 11.4.
 pulldown-cmark = { version = "0.13", optional = true, default-features = false }
