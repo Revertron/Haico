@@ -213,11 +213,13 @@ pub(crate) async fn run_sub_agent(
                                         .into(),
                                 );
                                 calls_made += 1;
-                                let executed = interruptible(
+                                // In a progress scope like the main loop's calls, so a
+                                // build run down here still shows its output as it goes.
+                                let (executed, _) = interruptible(
                                     tx,
                                     link,
                                     Waiting::Tool(name.clone()),
-                                    agent.server.execute_tool(&name, arguments),
+                                    crate::progress::reporting(tx, agent.server.execute_tool(&name, arguments)),
                                 )
                                 .await?;
                                 match executed {

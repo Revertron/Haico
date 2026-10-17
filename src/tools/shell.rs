@@ -71,7 +71,9 @@ impl OutputBuffer {
     }
 }
 
-pub(crate) async fn pump_output<R>(mut reader: R, echo: bool, sink: Arc<Mutex<OutputBuffer>>)
+// `echo` is where to show each line as it arrives: the scope of the turn that ran the command
+// (`crate::progress`), or nowhere — a background job, an MCP host.
+pub(crate) async fn pump_output<R>(mut reader: R, echo: Option<crate::progress::Reporter>, sink: Arc<Mutex<OutputBuffer>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -89,24 +91,22 @@ where
         let mut collected = sink.lock().unwrap();
         collected.push(&chunk[..read]);
 
-        if echo {
+        if let Some(echo) = &echo {
             let data = collected.bytes();
             while let Some(offset) = data[echoed_to..].iter().position(|&b| b == b'\n') {
                 let end = echoed_to + offset;
-                let line = String::from_utf8_lossy(&data[echoed_to..end]);
-                outln!("  │ {}", line.trim_end_matches('\r'));
+                echo.output(&String::from_utf8_lossy(&data[echoed_to..end]));
                 echoed_to = end + 1;
             }
         }
     }
 
     // A final line with no trailing newline (a progress bar, a prompt) still deserves showing.
-    if echo {
+    if let Some(echo) = &echo {
         let collected = sink.lock().unwrap();
         let data = collected.bytes();
         if echoed_to < data.len() {
-            let line = String::from_utf8_lossy(&data[echoed_to..]);
-            outln!("  │ {}", line.trim_end_matches('\r'));
+            echo.output(&String::from_utf8_lossy(&data[echoed_to..]));
         }
     }
 }
@@ -464,13 +464,13 @@ impl MyMcpServer {
         // Both pipes are drained concurrently with the wait. Reading them only after the
         // process exits can deadlock: a command that fills the pipe buffer blocks forever
         // waiting for someone to read it.
-        let echo = self.interactive;
+        let echo = crate::progress::current();
         let stdout_buf = Arc::new(Mutex::new(OutputBuffer::new(usize::MAX)));
         let stderr_buf = Arc::new(Mutex::new(OutputBuffer::new(usize::MAX)));
         let stdout_task = child
             .stdout
             .take()
-            .map(|pipe| tokio::spawn(pump_output(pipe, echo, stdout_buf.clone())));
+            .map(|pipe| tokio::spawn(pump_output(pipe, echo.clone(), stdout_buf.clone())));
         let stderr_task = child
             .stderr
             .take()
@@ -721,10 +721,10 @@ impl MyMcpServer {
         // assistant's streaming reply is unreadable.
         let output = Arc::new(Mutex::new(OutputBuffer::new(BACKGROUND_OUTPUT_CAP)));
         if let Some(pipe) = child.stdout.take() {
-            tokio::spawn(pump_output(pipe, false, output.clone()));
+            tokio::spawn(pump_output(pipe, None, output.clone()));
         }
         if let Some(pipe) = child.stderr.take() {
-            tokio::spawn(pump_output(pipe, false, output.clone()));
+            tokio::spawn(pump_output(pipe, None, output.clone()));
         }
 
         // A waiter owns the Child so the exit status is recorded the moment it happens.
@@ -1401,6 +1401,26 @@ serde = \"1\"
         );
     }
 
+
+    #[tokio::test]
+    async fn a_command_run_by_a_turn_reports_its_lines_as_they_arrive() {
+        let server = test_server();
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let ((ok, _), _) = crate::progress::reporting(&tx, run(&server, "echo hello", Some(10), None)).await;
+        assert!(ok);
+        let lines: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::turn::AgentEvent::Notice(crate::turn::Notice::CommandOutput(line)) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.iter().map(|l| l.trim()).collect::<Vec<_>>(), ["hello"]);
+
+        // Outside a turn — an MCP host, a test calling the tool — there is nobody to tell.
+        let (ok, _) = run(&server, "echo quiet", Some(10), None).await;
+        assert!(ok);
+        assert!(events.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn an_interrupted_run_command_takes_its_command_with_it() {

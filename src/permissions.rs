@@ -1,10 +1,7 @@
 //! What a tool call needs before it runs, and how the user is asked.
 
-use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::util::truncate_at_boundary;
 use crate::workspace::Workspace;
-use anyhow::{anyhow, Result};
-use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -376,87 +373,6 @@ pub(crate) fn gate_for(workspace: &Workspace, tool_name: &str, arguments: &Value
         },
     }
 }
-
-// Generate a colored diff with line numbers, showing only context around changes
-
-pub(crate) async fn ask_permission(
-    keys: &mut Keys,
-    allow_all_label: &str,
-    description: &str,
-    diff: Option<&str>,
-) -> Result<PermissionResponse> {
-    outln!("🔒 Allow this tool usage?");
-    outln!("{}\n", description);
-
-    if let Some(diff_content) = diff {
-        outln!("{}", diff_content);
-    }
-
-    outln!("1. Allow once");
-    outln!("2. {}", allow_all_label);
-    outln!("3. Reject and provide alternative");
-    crate::out::flush();
-
-    let response = loop {
-        let Some(event) = keys.next().await else {
-            // The keyboard reader is gone, which is not consent.
-            return Err(anyhow!("no interactive terminal to ask for permission"));
-        };
-
-        // Only a closed channel means nobody is there to answer. Everything else that can
-        // arrive here is not an answer but is not an absent user either, and matching the
-        // key event directly above used to lump the two together: on Windows the console
-        // emits a focus event whenever the window is clicked away from or minimized, so
-        // stepping away from the keyboard refused the pending call - and every call after
-        // it - as if the terminal had gone.
-        let Event::Key(key_event) = event else {
-            continue;
-        };
-
-        // Only process key press events, ignore key release
-        if key_event.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key_event.code {
-            KeyCode::Char('1') => {
-                break PermissionResponse::Allow;
-            }
-            KeyCode::Char('2') => {
-                break PermissionResponse::AllowAll;
-            }
-            KeyCode::Char('3') => {
-                outln!("3\n");
-
-                let mut editor = Editor::new(Vec::new());
-                let alternative = match read_text(keys, &mut editor, "> ").await {
-                    Input::Text(text) => text,
-                    // Backing out of the question is not an answer to it, so it is the
-                    // same as rejecting with nothing to say.
-                    _ => String::new(),
-                };
-                outln!("{}", echo("> ", &alternative));
-
-                break PermissionResponse::Reject(alternative.trim().to_string());
-            }
-            _ => {
-                // Invalid key, continue waiting
-                continue;
-            }
-        }
-    };
-
-    // Anything typed while the question was on screen was not meant for whatever comes
-    // after it.
-    keys.drain();
-
-    Ok(response)
-}
-
-// Normalize an LLM server URL down to a bare origin, so the "/v1/..." paths below always
-// concatenate cleanly. LM Studio's UI hands out its base URL with "/v1" already appended
-// (and OpenAI SDKs expect it that way), which would otherwise build
-// "/v1/v1/chat/completions" — a path LM Studio rejects while still answering HTTP 200.
 
 #[cfg(test)]
 mod tests {

@@ -10,6 +10,8 @@
 //! nobody on the other end at all.
 
 use crate::input::{echo, read_text, Editor, Input, Keys};
+use crate::modes::PlanDecision;
+use crate::permissions::PermissionResponse;
 use anyhow::{anyhow, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
@@ -316,6 +318,136 @@ pub(crate) async fn ask_question(
 
     outln!("{}\n", echo(PROMPT, &typed));
     Ok(Answer::Typed(typed))
+}
+
+// The permission prompt: the call described, its diff when it writes a file, and three
+// answers. Here beside the question dialog for the question dialog's reason — it reads the
+// keyboard, which the gate in `permissions.rs` must not.
+pub(crate) async fn ask_permission(
+    keys: &mut Keys,
+    allow_all_label: &str,
+    description: &str,
+    diff: Option<&str>,
+) -> Result<PermissionResponse> {
+    outln!("🔒 Allow this tool usage?");
+    outln!("{}\n", description);
+
+    if let Some(diff_content) = diff {
+        outln!("{}", diff_content);
+    }
+
+    outln!("1. Allow once");
+    outln!("2. {}", allow_all_label);
+    outln!("3. Reject and provide alternative");
+    crate::out::flush();
+
+    let response = loop {
+        let Some(event) = keys.next().await else {
+            // The keyboard reader is gone, which is not consent.
+            return Err(anyhow!("no interactive terminal to ask for permission"));
+        };
+
+        // Only a closed channel means nobody is there to answer. Everything else that can
+        // arrive here is not an answer but is not an absent user either, and matching the
+        // key event directly above used to lump the two together: on Windows the console
+        // emits a focus event whenever the window is clicked away from or minimized, so
+        // stepping away from the keyboard refused the pending call - and every call after
+        // it - as if the terminal had gone.
+        let Event::Key(key_event) = event else {
+            continue;
+        };
+
+        // Only process key press events, ignore key release
+        if key_event.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key_event.code {
+            KeyCode::Char('1') => {
+                break PermissionResponse::Allow;
+            }
+            KeyCode::Char('2') => {
+                break PermissionResponse::AllowAll;
+            }
+            KeyCode::Char('3') => {
+                outln!("3\n");
+
+                let mut editor = Editor::new(Vec::new());
+                let alternative = match read_text(keys, &mut editor, "> ").await {
+                    Input::Text(text) => text,
+                    // Backing out of the question is not an answer to it, so it is the
+                    // same as rejecting with nothing to say.
+                    _ => String::new(),
+                };
+                outln!("{}", echo("> ", &alternative));
+
+                break PermissionResponse::Reject(alternative.trim().to_string());
+            }
+            _ => {
+                // Invalid key, continue waiting
+                continue;
+            }
+        }
+    };
+
+    // Anything typed while the question was on screen was not meant for whatever comes
+    // after it.
+    keys.drain();
+
+    Ok(response)
+}
+
+// Show a plan and ask what to do with it. Here for the permission prompt's reason, and laid out
+// like it.
+
+pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecision> {
+    outln!("\n📋 Proposed plan\n");
+    // Rendered rather than printed raw: plans come back as markdown, and an unrendered
+    // one is a wall of asterisks exactly when it most needs reading.
+    out!("{}", crate::render::render_markdown(plan));
+    outln!();
+    // Same shape as the permission prompt: the approvals first, the refusal last, so the
+    // key that means "no" is in the same place in both.
+    outln!("1. Approve and start work");
+    outln!("2. Approve and enable auto mode (routine calls run without asking)");
+    outln!("3. Send back corrections");
+    crate::out::flush();
+
+    let decision = loop {
+        let Some(event) = keys.next().await else {
+            return Err(anyhow!("no interactive terminal to review the plan"));
+        };
+        // A focus change or a resize is not a decision, but it is not a missing terminal
+        // either; see the permission prompt for the failure that motivated the split.
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('1') => break PlanDecision::Approve,
+            KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
+            KeyCode::Char('3') => {
+                outln!("3\n");
+                const PROMPT: &str = "What should change? > ";
+                let mut editor = Editor::new(Vec::new());
+                let feedback = match read_text(keys, &mut editor, PROMPT).await {
+                    Input::Text(text) => text,
+                    // Backing out is not corrections; the plan stands unapproved and the
+                    // model is told only that.
+                    _ => String::new(),
+                };
+                outln!("{}", echo(PROMPT, &feedback));
+                break PlanDecision::Revise(feedback.trim().to_string());
+            }
+            _ => continue,
+        }
+    };
+
+    keys.drain();
+
+    Ok(decision)
 }
 
 #[cfg(test)]

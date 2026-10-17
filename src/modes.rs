@@ -7,13 +7,11 @@
 //! produced no verdict (failed, or interrupted) falls through to the user.
 
 use crate::trace::Caller;
-use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::llm::LMStudioClient;
 use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
 use crate::diff::file_change_diff;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, Result};
-use crossterm::event::{Event, KeyCode, KeyEventKind};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -199,58 +197,6 @@ pub(crate) enum PlanDecision {
     // can reasonably decide to loosen their grip on the individual steps.
     ApproveWithAuto,
     Revise(String),
-}
-
-// Show a plan and ask what to do with it.
-
-pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecision> {
-    outln!("\n📋 Proposed plan\n");
-    // Rendered rather than printed raw: plans come back as markdown, and an unrendered
-    // one is a wall of asterisks exactly when it most needs reading.
-    out!("{}", crate::render::render_markdown(plan));
-    outln!();
-    // Same shape as the permission prompt: the approvals first, the refusal last, so the
-    // key that means "no" is in the same place in both.
-    outln!("1. Approve and start work");
-    outln!("2. Approve and enable auto mode (routine calls run without asking)");
-    outln!("3. Send back corrections");
-    crate::out::flush();
-
-    let decision = loop {
-        let Some(event) = keys.next().await else {
-            return Err(anyhow!("no interactive terminal to review the plan"));
-        };
-        // A focus change or a resize is not a decision, but it is not a missing terminal
-        // either; see the permission prompt for the failure that motivated the split.
-        let Event::Key(key) = event else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('1') => break PlanDecision::Approve,
-            KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
-            KeyCode::Char('3') => {
-                outln!("3\n");
-                const PROMPT: &str = "What should change? > ";
-                let mut editor = Editor::new(Vec::new());
-                let feedback = match read_text(keys, &mut editor, PROMPT).await {
-                    Input::Text(text) => text,
-                    // Backing out is not corrections; the plan stands unapproved and the
-                    // model is told only that.
-                    _ => String::new(),
-                };
-                outln!("{}", echo(PROMPT, &feedback));
-                break PlanDecision::Revise(feedback.trim().to_string());
-            }
-            _ => continue,
-        }
-    };
-
-    keys.drain();
-
-    Ok(decision)
 }
 
 // The safety reviewer's verdict on one call.

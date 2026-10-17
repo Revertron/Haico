@@ -1,7 +1,7 @@
 //! Saving, resuming and compacting a conversation.
 
 use crate::trace::Caller;
-use crate::config::{compact_hint_threshold, Reasoning};
+use crate::config::Reasoning;
 use crate::llm::LMStudioClient;
 use crate::tools::TodoItem;
 use crate::util::truncate_at_boundary;
@@ -222,51 +222,6 @@ fn estimate_message(message: &Value) -> usize {
             })
             .sum(),
     }
-}
-
-// Assumed context window when none is configured. Override with --context / HAICO_CONTEXT;
-// a hard-coded guess would either nag constantly on a large window or warn too late on a
-// small one.
-
-/// `used` is `Agent::context_used`, and `measured` whether that rests on the server's own
-/// count of the last request rather than on the estimate alone.
-pub(crate) fn report_context(
-    messages: &[Value],
-    used: usize,
-    measured: bool,
-    context_tokens: usize,
-    reasoning: &ReasoningStats,
-) {
-    let turns = messages.iter().filter(|m| m["role"] == "user").count();
-    let percent = (used as f64 / context_tokens as f64) * 100.0;
-
-    outln!(
-        "{} messages, {} user turn(s), ~{} of {} tokens ({:.1}%, {}).",
-        messages.len(),
-        turns,
-        used,
-        context_tokens,
-        percent,
-        if measured { "from the server's count of the last request" } else { "estimated" }
-    );
-
-    // Only once there is something to report. A line of zeroes under every /context would
-    // be noise for the default policy, which never compresses anything.
-    if reasoning.turns > 0 {
-        outln!(
-            "Reasoning compressed on {} repl{}: ~{} -> ~{} tokens, saving ~{}.",
-            reasoning.turns,
-            if reasoning.turns == 1 { "y" } else { "ies" },
-            reasoning.before,
-            reasoning.after,
-            reasoning.saved()
-        );
-    }
-
-    if used > compact_hint_threshold(context_tokens) {
-        outln!("Run /compact to replace the history with a summary.");
-    }
-    outln!();
 }
 
 // Flatten the conversation for a summarizer, dropping the system prompt (it is re-attached

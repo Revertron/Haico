@@ -307,6 +307,11 @@ pub(crate) enum Notice {
     /// …and the answer that loop arrived at, whole. The call's result summary is not
     /// shown after it, since it would repeat the answer's first line.
     LookupAnswer { label: &'static str, answer: String },
+    /// One line of a running command's output, as it arrives — a long build's progress
+    /// is the only sign it is going anywhere.
+    CommandOutput(String),
+    /// `todo_write` set the task list.
+    PlanUpdated(Vec<crate::tools::TodoItem>),
     /// A reply was cut off mid-stream for going round in a loop, and dropped.
     /// `retrying` says whether the model has been told and asked again, or the
     /// turn has given up; `passage` is a line of what kept coming back.

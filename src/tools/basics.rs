@@ -17,7 +17,7 @@ pub(crate) struct CalculatorParams {
 }
 
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Debug)]
 pub(crate) struct TodoItem {
     #[schemars(description = "What needs doing, phrased as an action (e.g. 'Add the --context flag')")]
     pub(crate) task: String,
@@ -174,22 +174,9 @@ impl MyMcpServer {
 
         *self.todos.lock().unwrap() = todos.clone();
 
-        // Nothing to print in the REPL: the list is pinned above the input box, and the
-        // next draw picks the new one up from here. A piped session has no bottom region
-        // to pin anything to, so there it still goes into the transcript — buried under
-        // the next few tool calls, but shown, which beats not shown at all.
-        if self.interactive && !crate::out::has_region() {
-            outln!("\n  Plan:");
-            for item in &todos {
-                let mark = match item.status.as_str() {
-                    "completed" => "x",
-                    "in_progress" => "»",
-                    _ => " ",
-                };
-                outln!("   [{}] {}", mark, item.task);
-            }
-            outln!();
-        }
+        // Whether and where the list is shown is the frontend's: the REPL pins it above the
+        // input box, a piped session prints it.
+        crate::progress::plan(&todos);
 
         let done = todos
             .iter()

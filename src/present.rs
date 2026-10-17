@@ -355,6 +355,25 @@ impl Presenter {
             Notice::LookupAnswer { label, answer } => {
                 outln!("{}{}:{} {}", SetForegroundColor(crate::out::DIM), label, ResetColor, answer)
             }
+            Notice::CommandOutput(line) => outln!("  │ {}", line.trim_end_matches('\r')),
+            // Nothing to print in the REPL: the list is pinned above the input box, and the
+            // next draw picks the new one up from the agent. A piped session has no bottom
+            // region to pin anything to, so there it still goes into the transcript —
+            // buried under the next few tool calls, but shown, which beats not shown at all.
+            Notice::PlanUpdated(todos) => {
+                if !crate::out::has_region() {
+                    outln!("\n  Plan:");
+                    for item in &todos {
+                        let mark = match item.status.as_str() {
+                            "completed" => "x",
+                            "in_progress" => "»",
+                            _ => " ",
+                        };
+                        outln!("   [{}] {}", mark, item.task);
+                    }
+                    outln!();
+                }
+            }
             Notice::LoopNudge { tool, count } => outln!(
                 "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
                 tool, count
@@ -482,4 +501,47 @@ pub(crate) fn timers_fired(fired: &[crate::timers::Fired]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What /context says: how full the window is, and whether reasoning compression is paying.
+///
+/// `used` is `Agent::context_used`, and `measured` whether that rests on the server's own
+/// count of the last request rather than on the estimate alone.
+pub(crate) fn report_context(
+    messages: &[Value],
+    used: usize,
+    measured: bool,
+    context_tokens: usize,
+    reasoning: &crate::session::ReasoningStats,
+) {
+    let turns = messages.iter().filter(|m| m["role"] == "user").count();
+    let percent = (used as f64 / context_tokens as f64) * 100.0;
+
+    outln!(
+        "{} messages, {} user turn(s), ~{} of {} tokens ({:.1}%, {}).",
+        messages.len(),
+        turns,
+        used,
+        context_tokens,
+        percent,
+        if measured { "from the server's count of the last request" } else { "estimated" }
+    );
+
+    // Only once there is something to report. A line of zeroes under every /context would
+    // be noise for the default policy, which never compresses anything.
+    if reasoning.turns > 0 {
+        outln!(
+            "Reasoning compressed on {} repl{}: ~{} -> ~{} tokens, saving ~{}.",
+            reasoning.turns,
+            if reasoning.turns == 1 { "y" } else { "ies" },
+            reasoning.before,
+            reasoning.after,
+            reasoning.saved()
+        );
+    }
+
+    if used > crate::config::compact_hint_threshold(context_tokens) {
+        outln!("Run /compact to replace the history with a summary.");
+    }
+    outln!();
 }

@@ -63,9 +63,6 @@ pub(crate) struct MyMcpServer {
     pub(crate) checkpoints: Arc<Mutex<Vec<FileCheckpoint>>>,
     // Long-running commands started with run_background, killed when the session ends.
     pub(crate) background: Arc<Mutex<BackgroundJobs>>,
-    // True in the REPL, false in MCP server mode. Gates progress output: run_command echoes
-    // a long command's output as it arrives, which is noise for an MCP host.
-    pub(crate) interactive: bool,
     // The library the `library` tool reads, or None when that tool is off — no LLM to run
     // its librarian, or no articles to read. `run_command` checks it too: a failed build is
     // only pointed at the library when there is one to point at.
@@ -214,7 +211,6 @@ impl MyMcpServer {
             todos: Arc::new(Mutex::new(Vec::new())),
             checkpoints: Arc::new(Mutex::new(Vec::new())),
             background: Arc::new(Mutex::new(BackgroundJobs::default())),
-            interactive,
             library_root,
             library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
             hang_count: Arc::new(Mutex::new(0)),

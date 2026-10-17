@@ -53,6 +53,28 @@ pub(crate) fn answer(label: &'static str, answer: &str) {
     });
 }
 
+/// The task list as `todo_write` just set it. Whether to show it — the REPL pins it
+/// above the input box already — is the frontend's call.
+pub(crate) fn plan(todos: &[crate::tools::TodoItem]) {
+    let _ = SINK.try_with(|sink| sink.tx.send(Notice::PlanUpdated(todos.to_vec()).into()));
+}
+
+/// The scope's channel, for work the call hands to a task of its own — `run_command`'s
+/// output pumps — which the task-local does not follow into.
+pub(crate) fn current() -> Option<Reporter> {
+    SINK.try_with(|sink| Reporter(sink.tx.clone())).ok()
+}
+
+#[derive(Clone)]
+pub(crate) struct Reporter(EventSink);
+
+impl Reporter {
+    /// One line of a running command's output, as it arrives.
+    pub(crate) fn output(&self, line: &str) {
+        let _ = self.0.send(Notice::CommandOutput(line.to_string()).into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

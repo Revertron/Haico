@@ -877,6 +877,13 @@ fn describe(notice: Notice) -> (String, Tone) {
         }
         Notice::LookupStep(step) => (format!("  {step}"), Tone::Muted),
         Notice::LookupAnswer { label, answer } => (format!("{label}: {answer}"), Tone::Normal),
+        Notice::CommandOutput(line) => (format!("  │ {}", line.trim_end_matches('\r')), Tone::Muted),
+        // The window has no pinned list, so the change is said in a line: how far along
+        // the plan is, which is what a glance at it is for.
+        Notice::PlanUpdated(todos) => {
+            let done = todos.iter().filter(|item| item.status == "completed").count();
+            (format!("plan: {done}/{} done", todos.len()), Tone::Muted)
+        }
         Notice::LoopNudge { tool, count } => {
             (format!("'{tool}' called {count} times in a row — telling the model"), Tone::Warning)
         }
@@ -2371,6 +2378,8 @@ mod tests {
             Notice::PermissionDenied { alternative: "a".into() },
             Notice::LookupStep("Searching: s".into()),
             Notice::LookupAnswer { label: "Library answer", answer: "a".into() },
+            Notice::CommandOutput("Compiling haico".into()),
+            Notice::PlanUpdated(Vec::new()),
             Notice::LoopNudge { tool: "t".into(), count: 3 },
             Notice::LoopBroken { tool: "t".into(), count: 5 },
             Notice::Repeating { passage: "p".into(), retrying: true },
