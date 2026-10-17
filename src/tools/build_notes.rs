@@ -10,7 +10,8 @@
 //! search, the state that makes it once-only as two loose mutexes on the tool server, and
 //! the decision in `shell.rs`. The store is `library.rs`'s; reading a build is this file's.
 
-use crate::library::{one_line, Library};
+use crate::library::Library;
+use crate::util::one_line;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ pub(crate) fn is_cargo_program(word: &str) -> bool {
     program == "cargo" || program == "cargo.exe"
 }
 
+/// Crate names as they appear in Rust code: `actix-web` is written `actix_web`.
 fn code_name(crate_name: &str) -> String {
     crate_name.replace('-', "_").to_lowercase()
 }

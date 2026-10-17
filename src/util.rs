@@ -212,6 +212,23 @@ pub(crate) fn file_key(path: &std::path::Path) -> PathBuf {
     absolute_path(path)
 }
 
+// Text collapsed onto one line of at most `max` characters, the ellipsis included, for an
+// index entry, a summary or a quoted error. It ends on a whole word when one is close
+// enough, since what is cut here is read back by a model, and half a word is a word it
+// has to guess at. Memory, skills and the library each had their own copy, two of which
+// cut mid-word.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= max {
+        return flattened;
+    }
+    let cut: String = flattened.chars().take(max.saturating_sub(1)).collect();
+    match cut.rfind(' ') {
+        Some(space) if space > cut.len() / 2 => format!("{}…", &cut[..space]),
+        _ => format!("{}…", cut.trim_end()),
+    }
+}
+
 pub(crate) fn modified_time(path: &std::path::Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }

@@ -95,17 +95,7 @@ pub(crate) fn slug(raw: &str) -> Option<String> {
 
 /// Flatten to something that can be one line of an index.
 pub(crate) fn one_line(text: &str) -> String {
-    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flattened.chars().count() <= MAX_DESCRIPTION_CHARS {
-        return flattened;
-    }
-    let cut: String = flattened.chars().take(MAX_DESCRIPTION_CHARS - 1).collect();
-    // Back off to the last space so the line ends on a word rather than part way
-    // through one, which is what the model reads back to itself next session.
-    match cut.rfind(' ') {
-        Some(space) if space > cut.len() / 2 => format!("{}…", &cut[..space]),
-        _ => format!("{}…", cut),
-    }
+    crate::util::one_line(text, MAX_DESCRIPTION_CHARS)
 }
 
 /// Read one file into a `Memory`.
@@ -119,23 +109,17 @@ pub(crate) fn one_line(text: &str) -> String {
 /// fact worth keeping; its first non-empty line becomes the description, which is what
 /// a person writing one would have meant anyway.
 fn parse(stem: &str, text: &str) -> Memory {
-    let text = text.trim_start_matches('\u{feff}');
-    let mut description = String::new();
-    let mut body = text;
-
-    if let Some(rest) = text.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            let (front, after) = rest.split_at(end);
-            for line in front.lines() {
-                if let Some((key, value)) = line.split_once(':') {
-                    if key.trim() == "description" {
-                        description = one_line(value);
-                    }
-                }
-            }
-            body = after.trim_start_matches('\n').trim_start_matches("---");
-        }
-    }
+    let (front, body) = crate::skills::split_frontmatter(text);
+    // Read as written, not through `skills::front_value`: `write` puts the description
+    // down unquoted, so a fact described as "> 10 tests fail" or in quotes has to come
+    // back as it went in rather than as a YAML block or with its quotes stripped.
+    let mut description = front
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.trim() == "description")
+        .last()
+        .map(|(_, value)| one_line(value))
+        .unwrap_or_default();
 
     let body = body.trim().to_string();
     if description.is_empty() {
@@ -306,6 +290,17 @@ pub(crate) fn index_for_cwd() -> Option<String> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    #[test]
+    fn a_description_comes_back_exactly_as_it_was_written() {
+        // Written unquoted, so read that way: these are what a YAML reader would mangle.
+        for description in ["> 10 tests fail without --test-threads=1", "\"quoted\" in the code"] {
+            let text = format!("---\nname: n\ndescription: {}\n---\n\nbody\n", description);
+            let parsed = parse("n", &text);
+            assert_eq!(parsed.description, description);
+            assert_eq!(parsed.body, "body");
+        }
+    }
 
     fn memory(name: &str, description: &str, body: &str) -> Memory {
         Memory {

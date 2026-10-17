@@ -488,6 +488,23 @@ dispatch_tools! {
     sub_agent(SubAgentParams),
 }
 
+// A tool's reply as text, refused or answered. `memory` and `timers` each had a copy.
+pub(super) fn error(text: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+pub(super) fn success(text: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::success(vec![ContentBlock::text(text)])
+}
+
+// An action word as the synonym tables match it: lowercase, with the dashes, underscores
+// and spaces a model puts between words left out, so `set-timeout`, `set_timeout` and
+// `setTimeout` are one word. The tables themselves stay with their tools, since what
+// "clear" means depends on whose action it is.
+pub(super) fn action_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().chars().filter(|c| !matches!(c, '-' | '_' | ' ')).collect()
+}
+
 // A tool's `Err`, in the words the model will read.
 //
 // Formatted with `{:?}` it reached the model as `ErrorData { code: ErrorCode(-32603),

@@ -258,12 +258,7 @@ pub(crate) fn front_value(front: &str, key: &str) -> Option<String> {
 }
 
 fn one_line(text: &str) -> String {
-    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flattened.chars().count() <= MAX_DESCRIPTION_CHARS {
-        return flattened;
-    }
-    let cut: String = flattened.chars().take(MAX_DESCRIPTION_CHARS - 1).collect();
-    format!("{}…", cut.trim_end())
+    crate::util::one_line(text, MAX_DESCRIPTION_CHARS)
 }
 
 #[cfg(test)]

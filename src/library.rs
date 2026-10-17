@@ -24,6 +24,7 @@
 //! is a millisecond, and a cache would be one more thing that can disagree with the
 //! directory — the lesson memory's index already taught.
 
+use crate::util::one_line;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -670,16 +671,7 @@ fn snippet(text: &str, terms: &[String]) -> String {
     one_line(line, 160)
 }
 
-pub(crate) fn one_line(text: &str, max: usize) -> String {
-    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flattened.chars().count() <= max {
-        return flattened;
-    }
-    let cut: String = flattened.chars().take(max - 1).collect();
-    format!("{}…", cut.trim_end())
-}
 
-/// Crate names as they appear in Rust code: `actix-web` is written `actix_web`.
 /// The distinct error codes (`E0502`) in some text, in order of appearance, uppercased.
 pub(crate) fn error_codes(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();

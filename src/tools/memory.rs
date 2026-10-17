@@ -7,7 +7,7 @@
 use super::MyMcpServer;
 use crate::memory::{self, Memory};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,13 +54,7 @@ pub(crate) struct RecallParams {
 /// rather than guessed at — guessing between "add" and "delete" is not a mistake worth
 /// making on the user's behalf.
 fn normalize_action(raw: &str) -> Option<&'static str> {
-    let key: String = raw
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c == '-' || c == ' ' { '_' } else { c })
-        .collect();
-    match key.as_str() {
+    match super::action_key(raw).as_str() {
         "add" | "create" | "new" | "write" | "save" | "store" | "remember" | "record"
         | "insert" => Some("add"),
         "update" | "edit" | "change" | "modify" | "replace" | "revise" | "correct" | "fix" => {
@@ -71,13 +65,7 @@ fn normalize_action(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn error(text: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(text)])
-}
-
-fn success(text: String) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
+use super::{error, success};
 
 /// What is on file, for a message that has to tell the model where it went wrong.
 ///

@@ -8,7 +8,7 @@
 use super::MyMcpServer;
 use crate::timers::{Cron, Fired, Schedule};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,13 +42,7 @@ pub(crate) struct TimerParams {
 /// JavaScript names are on the list because they are the names the model was just
 /// told these work like.
 fn normalize_action(raw: &str) -> Option<&'static str> {
-    let key: String = raw
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| *c != '-' && *c != '_' && *c != ' ')
-        .collect();
-    match key.as_str() {
+    match super::action_key(raw).as_str() {
         "once" | "timeout" | "settimeout" | "after" | "delay" | "oneshot" | "later" | "in" => Some("once"),
         "every" | "interval" | "setinterval" | "repeat" | "recurring" | "periodic" => Some("every"),
         "cron" | "schedule" | "crontab" | "at" => Some("cron"),
@@ -59,13 +53,7 @@ fn normalize_action(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn error(text: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(text)])
-}
-
-fn success(text: String) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
+use super::{error, success};
 
 impl MyMcpServer {
     /// When the frontend should next look at the timers, or `None` with none armed.
