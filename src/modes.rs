@@ -73,12 +73,17 @@ const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch", "resear
 pub(crate) const START_PLAN: &str = "start_plan";
 pub(crate) const PRESENT_PLAN: &str = "present_plan";
 
-// The one tool on the auto-allow list that plan mode has to take back. `remember` is
+// The tools on the auto-allow list that plan mode has to take back. `remember` is
 // auto-allowed because the user asked for it in so many words, but it writes a file, and
 // plan mode has just promised the user that nothing will be written until they approve.
 // A promise with an exception in it is not one — and the fact is not lost either way,
 // because the conversation that produced it is still there to record it afterwards.
-const PLAN_MODE_DENIES: &[&str] = &["remember"];
+//
+// `background_stop` is auto-allowed because stopping what the model itself started is
+// cleanup, but it kills a process — a dev server started before planning began is still
+// running, and plan mode has promised that nothing on this machine changes. It rode in on
+// the auto-allow list unnoticed, which is the hazard of a plan mode that reads that list.
+const PLAN_MODE_DENIES: &[&str] = &["remember", "background_stop"];
 
 pub(crate) fn plan_mode_allows(tool_name: &str) -> bool {
     if PLAN_MODE_DENIES.contains(&tool_name) {
@@ -689,6 +694,24 @@ mod tests {
         let tools = vec![json!({"function": {"name": ASK_USER}})];
         assert_eq!(tools_for_mode(Mode::Plan, &tools).len(), 1);
         assert_eq!(tools_for_mode(Mode::Normal, &tools).len(), 1);
+    }
+
+    #[test]
+    fn plan_mode_takes_back_the_auto_allowed_tools_that_change_something() {
+        // Both run unprompted in normal mode, and neither may run while planning: one
+        // writes a file, the other kills a process.
+        for tool in ["remember", "background_stop"] {
+            assert!(AUTO_ALLOWED_TOOLS.contains(&tool), "{tool} is no longer auto-allowed");
+            assert!(!plan_mode_allows(tool), "{tool} is offered in plan mode");
+            assert!(
+                matches!(gate_for_mode(Mode::Plan, &ws(), tool, &json!({})), Gate::Deny(_)),
+                "{tool} is not refused in plan mode"
+            );
+            let tools = vec![json!({"function": {"name": tool}})];
+            assert!(tools_for_mode(Mode::Plan, &tools).is_empty());
+        }
+        // Reading what a background job printed changes nothing, so it stays.
+        assert!(plan_mode_allows("background_output"));
     }
 
     #[test]
