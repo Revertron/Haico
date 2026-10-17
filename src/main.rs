@@ -12,6 +12,7 @@ mod out;
 
 mod agent;
 mod ask;
+mod commands;
 mod config;
 mod debug;
 #[cfg(feature = "gui")]
@@ -770,6 +771,7 @@ async fn main() -> Result<()> {
         last_activity: None,
         history_path,
     };
+    io.editor.set_commands(commands::for_cwd());
 
     outln!("Type /help for commands.\n");
 
@@ -916,6 +918,7 @@ async fn main() -> Result<()> {
                     // and that is the whole of the reminder: the model is still carrying
                     // a history about somewhere else.
                     cwd = moved;
+                    io.editor.set_commands(commands::for_cwd());
                     outln!("Working directory: {}", display_path(&cwd));
                     if let Some((name, _)) = &agent.project_context {
                         outln!("Loaded project context from {}", name);
@@ -1034,6 +1037,7 @@ async fn main() -> Result<()> {
 
         if input == "/update-skills" {
             let changed = agent.reload_skills();
+            io.editor.set_commands(commands::for_cwd());
             let count = skills::discover(&skills::roots_for_cwd()).len();
             if changed {
                 outln!("Skills reloaded: {} available. The system prompt was updated.

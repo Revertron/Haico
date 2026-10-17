@@ -10,7 +10,8 @@ use crate::modes::Mode;
 use crate::out;
 use crate::tools::TodoItem;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
-use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crate::commands::{self, Args, Command, Suggestion};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::tty::IsTty;
 use std::fs;
 use std::io;
@@ -149,7 +150,29 @@ pub(crate) struct Editor {
     // browsing started, so walking back down returns it rather than losing it.
     browsing: Option<usize>,
     stash: Vec<String>,
+    // What a `/` at the start of the box offers. Empty for the editors the dialogs make,
+    // which is what keeps the list out of them: a reply to a permission prompt that starts
+    // with a slash is a path, not a command.
+    commands: Vec<Command>,
+    // Which row of the list is picked. Back to the top whenever the query changes, since
+    // the row it pointed at is then a different command or gone.
+    picked: usize,
+    // The entry as it stood when Esc closed the list. It stays closed until the entry
+    // changes, rather than reopening on the very next redraw.
+    dismissed: Option<String>,
 }
+
+// How many suggestions show at once. The list scrolls to keep the picked one in view.
+const SUGGESTION_ROWS: usize = 5;
+
+// The widest a name column gets; a longer skill name is cut rather than pushing every
+// description over.
+const SUGGESTION_NAME_COLUMNS: usize = 24;
+
+// The picked row's color, and the marker beside it — the marker being what still shows
+// which row it is under NO_COLOR.
+const SUGGESTION_PICKED: Color = Color::AnsiValue(68);
+const SUGGESTION_MARKER: &str = "› ";
 
 impl Editor {
     pub(crate) fn new(history: Vec<String>) -> Self {
@@ -160,7 +183,147 @@ impl Editor {
             history,
             browsing: None,
             stash: Vec::new(),
+            commands: Vec::new(),
+            picked: 0,
+            dismissed: None,
         }
+    }
+
+    // Re-read where the skills could have changed: at startup, after /update-skills, and
+    // after /cd, since the project's own skills moved with it.
+    pub(crate) fn set_commands(&mut self, commands: Vec<Command>) {
+        self.commands = commands;
+        self.picked = 0;
+    }
+
+    // What follows the `/`, while the entry is still nothing but the start of a command.
+    // Not while walking the history: there Up and Down belong to the history, and an old
+    // `/compact` coming round must not trap them in a list.
+    fn query(&self) -> Option<&str> {
+        if self.commands.is_empty() || self.lines.len() != 1 || self.browsing.is_some() {
+            return None;
+        }
+        let rest = self.lines[0].strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        if self.dismissed.as_deref() == Some(self.lines[0].as_str()) {
+            return None;
+        }
+        Some(rest)
+    }
+
+    fn suggestions(&self) -> Vec<Suggestion> {
+        match self.query() {
+            Some(query) => commands::suggest(&self.commands, query),
+            None => Vec::new(),
+        }
+    }
+
+    // Put a picked command in the box, with a space after it when it takes arguments, so
+    // the next thing typed is the argument.
+    fn fill(&mut self, command: &Command) {
+        let space = if command.args == Args::None { "" } else { " " };
+        self.lines = vec![format!("/{}{}", command.name, space)];
+        self.row = 0;
+        self.column = self.line_length();
+    }
+
+    // The keys the list takes while it is open. `None` lets the key through to the editor.
+    fn suggestion_key(&mut self, key: &KeyEvent) -> Option<Option<Input>> {
+        let suggestions = self.suggestions();
+        if suggestions.is_empty() {
+            return None;
+        }
+        let count = suggestions.len();
+        let picked = self.picked.min(count - 1);
+        let command = self.commands[suggestions[picked].index].clone();
+        let modified = key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => self.picked = (picked + count - 1) % count,
+            KeyCode::Down => self.picked = (picked + 1) % count,
+            KeyCode::Tab => self.fill(&command),
+            KeyCode::Esc => self.dismissed = Some(self.lines[0].clone()),
+            // A command that cannot run bare goes into the box to be finished; any other
+            // runs, as though its whole name had been typed.
+            KeyCode::Enter if !modified => {
+                if command.args == Args::Required {
+                    self.fill(&command);
+                } else {
+                    let text = format!("/{}", command.name);
+                    self.remember(&text);
+                    self.reset();
+                    return Some(Some(Input::Text(text)));
+                }
+            }
+            _ => return None,
+        }
+        Some(None)
+    }
+
+    // The list, one row per suggestion, topmost first. Empty while it is closed.
+    pub(crate) fn suggestion_rows(&self, width: usize) -> Vec<String> {
+        let suggestions = self.suggestions();
+        let room = width.saturating_sub(1);
+        if suggestions.is_empty() || room == 0 {
+            return Vec::new();
+        }
+        let picked = self.picked.min(suggestions.len() - 1);
+        let first = (picked + 1).saturating_sub(SUGGESTION_ROWS);
+
+        // Wide enough for every name in the list, not only the ones in view, so the
+        // descriptions do not shift sideways as it scrolls.
+        let column = suggestions
+            .iter()
+            .map(|suggestion| self.commands[suggestion.index].name.chars().count() + 1)
+            .max()
+            .unwrap_or(0)
+            .min(SUGGESTION_NAME_COLUMNS);
+
+        suggestions
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(SUGGESTION_ROWS)
+            .map(|(position, suggestion)| {
+                let command = &self.commands[suggestion.index];
+                let is_picked = position == picked;
+                let marker = if is_picked { SUGGESTION_MARKER } else { "  " };
+                let name = fit(&format!("/{}", command.name), column);
+                let pad = column.saturating_sub(name.chars().count());
+                let about_room = room.saturating_sub(marker.chars().count() + column + 2);
+                let about = fit(&command.about, about_room);
+
+                // The hit is counted in the name without its slash.
+                let hit = suggestion.hit.map(|(start, end)| (start + 1, end + 1));
+                let mut painted = String::new();
+                for (at, ch) in name.chars().enumerate() {
+                    if hit.map(|(start, _)| start == at).unwrap_or(false) {
+                        painted.push_str(&SetAttribute(Attribute::Bold).to_string());
+                    }
+                    if hit.map(|(_, end)| end == at).unwrap_or(false) {
+                        painted.push_str(&SetAttribute(Attribute::NormalIntensity).to_string());
+                    }
+                    painted.push(ch);
+                }
+                painted.push_str(&SetAttribute(Attribute::NormalIntensity).to_string());
+
+                let gap = " ".repeat(pad + 2);
+                if is_picked {
+                    format!(
+                        "{}{}{}{}{}{}",
+                        SetForegroundColor(SUGGESTION_PICKED),
+                        marker,
+                        painted,
+                        gap,
+                        about,
+                        ResetColor
+                    )
+                } else {
+                    format!("{}{}{}{}", marker, painted, gap, dim(about))
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn history(&self) -> &[String] {
@@ -431,6 +594,18 @@ impl Editor {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if let Some(taken) = self.suggestion_key(&key) {
+            return taken;
+        }
+        let before = self.lines.clone();
+        let input = self.edit(key);
+        if self.lines != before {
+            self.picked = 0;
+        }
+        input
+    }
+
+    fn edit(&mut self, key: KeyEvent) -> Option<Input> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -942,6 +1117,12 @@ pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     let width = terminal_width();
     let (mut rows, caret_row, caret_column) = editor.rows(PROMPT, width);
 
+    // The command list opens upward, between the activity bar and the box, so the box and
+    // everything under it stay where they were while it comes and goes.
+    let suggestions = editor.suggestion_rows(width);
+    let suggestion_count = suggestions.len();
+    rows.splice(0..0, suggestions);
+
     rows.insert(0, activity_bar(chrome, width));
     rows.push(status_bar(chrome.mode, chrome.status, width));
 
@@ -962,7 +1143,7 @@ pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {
     // it the pinned block butts straight up against the transcript and the last line of
     // output reads as another row of chrome. Everything below them — the box included —
     // is that many rows further down than it used to be.
-    let above = plan.len() + waiting_rows + 2;
+    let above = plan.len() + waiting_rows + suggestion_count + 2;
     rows.splice(0..0, plan);
     rows.insert(0, String::new());
 
@@ -2017,5 +2198,172 @@ mod tests {
         assert_eq!(load_history(&path), entries);
 
         let _ = fs::remove_file(&path);
+    }
+
+    fn with_commands(history: Vec<String>) -> Editor {
+        let mut editor = Editor::new(history);
+        editor.set_commands(commands::available(&[]));
+        editor
+    }
+
+    fn listed(editor: &Editor) -> Vec<String> {
+        editor
+            .suggestion_rows(120)
+            .iter()
+            .map(|row| crate::util::strip_ansi(row))
+            .collect()
+    }
+
+    fn submitted(input: Option<Input>) -> Option<String> {
+        match input {
+            Some(Input::Text(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_slash_opens_the_list_and_enter_runs_the_picked_command() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/com");
+        let rows = listed(&editor);
+        assert!(rows[0].starts_with("› /compact"), "{:?}", rows);
+        assert!(rows[0].contains("Replace the history"), "{:?}", rows);
+
+        let sent = submitted(editor.key(press(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(sent.as_deref(), Some("/compact"));
+        assert!(listed(&editor).is_empty(), "the list outlived the entry");
+        assert_eq!(editor.history(), ["/compact".to_string()]);
+    }
+
+    #[test]
+    fn a_command_that_needs_an_argument_is_put_in_the_box_instead() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/ad");
+        assert!(submitted(editor.key(press(KeyCode::Enter, KeyModifiers::NONE))).is_none());
+        assert_eq!(editor.lines, ["/add ".to_string()]);
+        assert!(listed(&editor).is_empty(), "a space ends the command, and the list with it");
+
+        type_text(&mut editor, "src");
+        let sent = submitted(editor.key(press(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(sent.as_deref(), Some("/add src"));
+    }
+
+    #[test]
+    fn the_arrows_move_the_pick_and_tab_fills_it_in() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/re");
+        let rows = listed(&editor);
+        assert!(rows[0].starts_with("› /reasoning") && rows[1].starts_with("  /resume"), "{:?}", rows);
+
+        editor.key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert!(listed(&editor)[1].starts_with("› /resume"));
+        // Up from the top wraps round to the bottom, and back.
+        editor.key(press(KeyCode::Up, KeyModifiers::NONE));
+        editor.key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert!(listed(&editor).last().unwrap().starts_with("› "));
+        editor.key(press(KeyCode::Down, KeyModifiers::NONE));
+        editor.key(press(KeyCode::Down, KeyModifiers::NONE));
+
+        // /resume takes nothing after it, so it goes in without a space.
+        editor.key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(editor.lines, ["/resume".to_string()]);
+    }
+
+    #[test]
+    fn typing_more_starts_the_pick_from_the_top_again() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/c");
+        editor.key(press(KeyCode::Down, KeyModifiers::NONE));
+        type_text(&mut editor, "o");
+        assert!(listed(&editor)[0].starts_with("› "));
+    }
+
+    #[test]
+    fn the_list_shows_five_rows_and_scrolls_to_keep_the_pick_in_view() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/");
+        assert_eq!(listed(&editor).len(), SUGGESTION_ROWS);
+        for _ in 0..7 {
+            editor.key(press(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let rows = listed(&editor);
+        assert_eq!(rows.len(), SUGGESTION_ROWS);
+        assert!(rows.last().unwrap().starts_with("› "), "{:?}", rows);
+    }
+
+    #[test]
+    fn esc_closes_the_list_until_the_entry_changes() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/com");
+        editor.key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(listed(&editor).is_empty());
+        // Closed, Enter sends what was typed rather than what was picked.
+        let mut closed = with_commands(Vec::new());
+        type_text(&mut closed, "/com");
+        closed.key(press(KeyCode::Esc, KeyModifiers::NONE));
+        let sent = submitted(closed.key(press(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(sent.as_deref(), Some("/com"));
+
+        type_text(&mut editor, "p");
+        assert!(!listed(&editor).is_empty());
+    }
+
+    #[test]
+    fn history_is_walked_past_a_command_without_the_list_taking_the_arrows() {
+        let mut editor = with_commands(vec!["first".to_string(), "/compact".to_string()]);
+        editor.key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor.lines, ["/compact".to_string()]);
+        assert!(listed(&editor).is_empty());
+        editor.key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor.lines, ["first".to_string()]);
+    }
+
+    #[test]
+    fn a_path_or_a_dialog_reply_is_not_taken_for_a_command() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/etc/hosts");
+        assert!(listed(&editor).is_empty());
+        let sent = submitted(editor.key(press(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(sent.as_deref(), Some("/etc/hosts"));
+
+        // The dialogs build their editors without a command list.
+        let mut dialog = Editor::new(Vec::new());
+        type_text(&mut dialog, "/com");
+        assert!(listed(&dialog).is_empty());
+        let sent = submitted(dialog.key(press(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(sent.as_deref(), Some("/com"));
+    }
+
+    #[test]
+    fn the_list_sits_between_the_activity_bar_and_the_box() {
+        let mut editor = with_commands(Vec::new());
+        type_text(&mut editor, "/com");
+
+        let _guard = crate::out::capture_guard();
+        crate::out::start_capture();
+        draw(
+            &editor,
+            &Chrome {
+                mode: Mode::Normal,
+                busy: None,
+                last: None,
+                status: "a-model  ctx 3%",
+                todos: &[],
+                queued: &[],
+                plan: PlanView::Windowed,
+            },
+        );
+        let written = crate::out::take_capture();
+
+        let bar = written.find("○ ready").expect("the activity bar");
+        let list = written.find("Replace the history").expect("the list");
+        let box_row = written.find("> /com").expect("the input box");
+        assert!(bar < list && list < box_row, "wrong order in {:?}", written);
+
+        // The caret still lands in the box, one row up from the status bar: an offset that
+        // forgot the list would put it in the list instead.
+        use crossterm::cursor::{MoveRight, MoveToColumn, MoveUp};
+        let landing = format!("{}{}{}", MoveUp(1), MoveToColumn(0), MoveRight(6));
+        assert!(written.contains(&landing), "the caret lands in the wrong place: {:?}", written);
     }
 }
