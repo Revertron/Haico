@@ -46,20 +46,23 @@ pub(crate) struct CrateApiParams {
 pub(crate) const CRATES_IO_API: &str = "https://crates.io/api/v1";
 pub(crate) const DOCS_RS: &str = "https://docs.rs";
 
-// Shared HTTP client for the Rust API tools (crates.io / docs.rs). crates.io's crawler
-// policy requires a descriptive, identifying User-Agent, so we always set one.
+// The HTTP client for the Rust API tools (crates.io / docs.rs). crates.io's crawler
+// policy requires a descriptive, identifying User-Agent, so we always set one — with the
+// real version, which a hand-written "0.1.0" had stopped being long ago.
+//
+// Built once per server (`MyMcpServer::crates_client`) rather than per call, so a
+// `crate_api` that reads a dozen docs.rs pages reuses one connection instead of opening a
+// dozen. Per server and not in a static, because a client keeps its pooled connections on
+// the runtime that opened them, and each test runs its own.
 
-pub(crate) fn rust_api_client() -> Result<reqwest::Client, McpError> {
+pub(crate) fn rust_api_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("haico/0.1.0 (Rust crate API lookup tool)")
+        .user_agent(concat!("haico/", env!("CARGO_PKG_VERSION"), " (Rust crate API lookup tool)"))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| McpError::internal_error(format!("Failed to build HTTP client: {}", e), None))
+        // Fails only where `Client::new` itself would panic (no TLS backend); see llm.rs.
+        .expect("HTTP client")
 }
-
-// The Firefox release we impersonate in the web tools. Bump this occasionally: a
-// user-agent that trails the real release train by too many versions is itself a
-// bot signal.
 
 #[tool_router(router = crates_router, vis = "pub(crate)")]
 impl MyMcpServer {
@@ -71,7 +74,7 @@ impl MyMcpServer {
         }
         let requested_version = params.0.version.clone();
 
-        let client = rust_api_client()?;
+        let client = &self.crates_client;
         let url = format!("{}/crates/{}", CRATES_IO_API, name);
         let resp = client.get(&url).send().await.map_err(|e| {
             McpError::internal_error(format!("Failed to query crates.io: {}", e), None)
@@ -190,7 +193,7 @@ impl MyMcpServer {
         }
         let limit = params.0.limit.unwrap_or(15).clamp(1, 50);
 
-        let client = rust_api_client()?;
+        let client = &self.crates_client;
         let url = format!(
             "{}/crates?q={}&per_page={}&sort=relevance",
             CRATES_IO_API,
@@ -257,7 +260,7 @@ impl MyMcpServer {
         let version = params.0.version.clone().unwrap_or_else(|| "latest".to_string());
         let item_filter = params.0.item.clone();
 
-        let client = rust_api_client()?;
+        let client = &self.crates_client;
         let url = format!("{}/crate/{}/{}/json.gz", DOCS_RS, name, version);
         let resp = client.get(&url).send().await.map_err(|e| {
             McpError::internal_error(format!("Failed to download rustdoc JSON: {}", e), None)

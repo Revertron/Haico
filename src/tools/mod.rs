@@ -83,6 +83,9 @@ pub(crate) struct MyMcpServer {
     // because the tool that arms them runs on this struct; the agent and the frontends
     // reach them through `take_due_timers` and `next_timer_wake`.
     pub(crate) timers: Arc<Mutex<crate::timers::Timers>>,
+    // One client for crates.io and docs.rs, so their connections are pooled. Cloning the
+    // server clones a handle to it, not the pool.
+    pub(crate) crates_client: reqwest::Client,
 }
 
 // A file's contents immediately before a tool changed it.
@@ -206,6 +209,7 @@ impl MyMcpServer {
             library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
             hang_count: Arc::new(Mutex::new(0)),
             timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
+            crates_client: crate::tools::crates::rust_api_client(),
         }
     }
 

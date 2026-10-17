@@ -47,6 +47,9 @@ pub(crate) struct WebSearchParams {
 }
 
 
+// The Firefox release we impersonate in the web tools. Bump this occasionally: a
+// user-agent that trails the real release train by too many versions is itself a
+// bot signal.
 pub(crate) const FIREFOX_VERSION: &str = "153";
 
 // Shared HTTP client for the web tools (web_search, web_get, web_fetch). Many sites
