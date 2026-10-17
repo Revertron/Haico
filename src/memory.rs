@@ -39,10 +39,11 @@ pub(crate) const MEMORY_DIR: &str = ".haico/memory";
 const INDEX_FILE: &str = "MEMORY.md";
 
 /// Caps. A memory is a fact, not a document, and the index is a prompt section that is
-/// sent on every single request — both of these are small on purpose.
+/// sent on every single request — both of these are small on purpose. The description has
+/// none: it is what the index says about the fact, and one cut short says less than the
+/// model needs to know whether to `recall` it — the whole reason the index exists.
 pub(crate) const MAX_MEMORIES: usize = 100;
 pub(crate) const MAX_FACT_CHARS: usize = 4000;
-pub(crate) const MAX_DESCRIPTION_CHARS: usize = 200;
 const MAX_NAME_CHARS: usize = 64;
 
 pub(crate) struct Memory {
@@ -93,9 +94,9 @@ pub(crate) fn slug(raw: &str) -> Option<String> {
     }
 }
 
-/// Flatten to something that can be one line of an index.
+/// Flatten to something that can be one line of an index, whole.
 pub(crate) fn one_line(text: &str) -> String {
-    crate::util::one_line(text, MAX_DESCRIPTION_CHARS)
+    crate::util::flatten(text)
 }
 
 /// Read one file into a `Memory`.
@@ -416,12 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn a_description_is_flattened_and_capped() {
+    fn a_description_is_flattened_and_kept_whole() {
         let long = "word ".repeat(100);
-        let line = one_line(&format!("first\nsecond\t{}", long));
+        let line = one_line(&format!("first\nsecond\t{}end", long));
         assert!(!line.contains('\n'));
-        assert!(line.chars().count() <= MAX_DESCRIPTION_CHARS);
-        assert!(line.ends_with('…'));
+        assert_eq!(line, format!("first second {}end", long));
     }
 
     #[test]

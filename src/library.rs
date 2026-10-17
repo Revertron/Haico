@@ -24,7 +24,7 @@
 //! is a millisecond, and a cache would be one more thing that can disagree with the
 //! directory — the lesson memory's index already taught.
 
-use crate::util::one_line;
+use crate::util::flatten;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -476,7 +476,7 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
                 .to_string()
         });
     // Whole: a summary cut short is one the librarian cannot judge the article by.
-    let summary = crate::util::flatten(&summary);
+    let summary = flatten(&summary);
 
     Article {
         id,
@@ -651,7 +651,8 @@ const STOPWORDS: &[&str] = &[
 ];
 
 // The line of a section that best shows why it matched: the one holding the most distinct
-// query words, cut short. Falls back to the section's first line.
+// query words, whole — a line cut at 160 characters, as it was, could stop before the words
+// that made it the match. Falls back to the section's first line.
 fn snippet(text: &str, terms: &[String]) -> String {
     let best = text
         .lines()
@@ -667,7 +668,7 @@ fn snippet(text: &str, terms: &[String]) -> String {
     } else {
         text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
     };
-    one_line(line, 160)
+    flatten(line)
 }
 
 
