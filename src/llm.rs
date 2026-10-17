@@ -765,6 +765,14 @@ impl LMStudioClient {
 
         let result = self.post_chat_traced(caller, &body).await?;
 
+        // `post_chat` hands back a non-transient error status with its body, so a context
+        // overflow arrives here as an error object, not as an `Err`. Read as a reply it was
+        // `Ok("")`: web_fetch then reported an extraction with nothing under it, and
+        // compaction an "empty summary", neither saying what the server had said.
+        if let Some(error) = result["error"]["message"].as_str() {
+            bail!("{}", truncate_at_boundary(error, 500));
+        }
+
         let content = result["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -1690,6 +1698,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no such model"));
+        assert_eq!(*served.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_simple_completion_reports_the_servers_error_rather_than_an_empty_reply() {
+        let (url, served) = crate::testutil::serve_sequence(&[
+            "{\"error\":{\"code\":400,\"message\":\"the request exceeds the available context size\"}}",
+        ])
+        .await;
+        let error = retrying_client(url, 3)
+            .simple_completion(Caller::Summarizer, "system", "user")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds the available context size"), "got: {error}");
         assert_eq!(*served.lock().unwrap(), 1);
     }
 
