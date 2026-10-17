@@ -300,6 +300,13 @@ pub(crate) enum Notice {
     /// gate. Its own kind rather than `ToolStarted`, because it is one step inside
     /// a call that is already on screen, not a call of the conversation's.
     SubAgentStep { tool: String, arguments: Value },
+    /// One lookup inside a tool that runs a loop of its own — research's searches and
+    /// pages, the librarian's sections (see `crate::progress`). Worded by the tool,
+    /// because what a step was is the tool's to say.
+    LookupStep(String),
+    /// …and the answer that loop arrived at, whole. The call's result summary is not
+    /// shown after it, since it would repeat the answer's first line.
+    LookupAnswer { label: &'static str, answer: String },
     /// A reply was cut off mid-stream for going round in a loop, and dropped.
     /// `retrying` says whether the model has been told and asked again, or the
     /// turn has given up; `passage` is a line of what kept coming back.

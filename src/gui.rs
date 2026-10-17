@@ -875,6 +875,8 @@ fn describe(notice: Notice) -> (String, Tone) {
             let summary = crate::render::tool_call_summary(&tool, &arguments);
             (format!("↳ {tool} {summary}"), Tone::Muted)
         }
+        Notice::LookupStep(step) => (format!("  {step}"), Tone::Muted),
+        Notice::LookupAnswer { label, answer } => (format!("{label}: {answer}"), Tone::Normal),
         Notice::LoopNudge { tool, count } => {
             (format!("'{tool}' called {count} times in a row — telling the model"), Tone::Warning)
         }
@@ -2367,6 +2369,8 @@ mod tests {
             Notice::PermissionAllowed,
             Notice::PermissionAllowedAll("l".into()),
             Notice::PermissionDenied { alternative: "a".into() },
+            Notice::LookupStep("Searching: s".into()),
+            Notice::LookupAnswer { label: "Library answer", answer: "a".into() },
             Notice::LoopNudge { tool: "t".into(), count: 3 },
             Notice::LoopBroken { tool: "t".into(), count: 5 },
             Notice::Repeating { passage: "p".into(), retrying: true },

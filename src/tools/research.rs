@@ -25,7 +25,6 @@ use crate::trace::Caller;
 use super::MyMcpServer;
 use crate::session::without_think_block;
 use crate::util::truncate_at_boundary;
-use crossterm::style::{ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -139,12 +138,6 @@ impl MyMcpServer {
     //
     // Only in the REPL: in MCP server mode stdout carries the protocol, and a stray line on
     // it is a parse error at the host rather than a cosmetic problem.
-    fn research_note(&self, line: &str) {
-        if self.interactive {
-            outln!("{}{}{}", SetForegroundColor(crate::out::DIM), line, ResetColor);
-        }
-    }
-
     // The loop itself.
     //
     // Never returns an error: a research call that failed is still something to tell the
@@ -323,15 +316,12 @@ impl MyMcpServer {
 
         if is_page {
             let url = arguments["url"].as_str().unwrap_or_default().to_string();
-            self.research_note(&format!("  Checking {}", url));
+            crate::progress::step(format!("Checking {}", url));
             if !url.is_empty() && !sources.contains(&url) {
                 sources.push(url);
             }
         } else {
-            self.research_note(&format!(
-                "  Searching: {}",
-                arguments["query"].as_str().unwrap_or_default()
-            ));
+            crate::progress::step(format!("Searching: {}", arguments["query"].as_str().unwrap_or_default()));
         }
 
         // `.text` and not the whole output: the two tools reachable from here
@@ -360,14 +350,7 @@ impl MyMcpServer {
         let answer = truncate_at_boundary(answer.trim(), MAX_ANSWER_CHARS);
         crate::debug::log("research answer", answer);
 
-        if self.interactive {
-            outln!(
-                "{}Got answer:{} {}",
-                SetForegroundColor(crate::out::DIM),
-                ResetColor,
-                answer
-            );
-        }
+        crate::progress::answer("Got answer", answer);
 
         let mut result = format!("Research answer for: {}\n\n{}", question, answer);
         if !sources.is_empty() {
@@ -459,8 +442,8 @@ mod tests {
             crate::LMStudioClient::new(url, String::new(), None),
             true,
             None,
-            // Not interactive: the progress lines go to a global writer, and a test that
-            // printed to it would have to take the capture lock to stay honest.
+            // Not interactive, as an MCP server is: research's own two tools are the same
+            // either way, and its progress goes nowhere outside a turn's scope.
             false,
         )
     }

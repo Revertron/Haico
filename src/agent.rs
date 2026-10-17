@@ -1873,15 +1873,17 @@ async fn gated_call(
         .as_str()
         .map(|path| display_path(std::path::Path::new(path)))
         .unwrap_or_else(|| tool_name.to_string());
+    // Inside a progress scope, so a tool that runs a loop of its own can say what it is
+    // doing as it goes (see `crate::progress`).
     let executed = interruptible(
         tx,
         link,
         Waiting::Tool(tool_name.to_string()),
-        agent.server.execute_tool(tool_name, arguments),
+        crate::progress::reporting(tx, agent.server.execute_tool(tool_name, arguments)),
     )
     .await;
 
-    let Some(result) = executed else {
+    let Some((result, answer_shown)) = executed else {
         let _ = tx.send(Notice::Interrupted.into());
         return CallReply {
             content: "Interrupted by the user before this tool finished.".to_string(),
@@ -1925,10 +1927,10 @@ async fn gated_call(
     // cut to fit. The result itself is kept behind it now rather than thrown away, and
     // Ctrl+O opens it.
     //
-    // research and library are the exception: each has already printed its progress and
-    // its whole answer while it ran, so a summary here would repeat the answer's first line
-    // immediately underneath the answer.
-    if tool_name != "research" && tool_name != "library" {
+    // A call that showed its own answer while it ran (research, library) is the
+    // exception: a summary here would repeat the answer's first line immediately
+    // underneath the answer.
+    if !answer_shown {
         let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
     }
 

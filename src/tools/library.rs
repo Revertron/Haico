@@ -25,7 +25,6 @@ use super::MyMcpServer;
 use crate::library::Library;
 use crate::session::without_think_block;
 use crate::trace::Caller;
-use crossterm::style::{ResetColor, SetForegroundColor};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
@@ -183,12 +182,6 @@ impl MyMcpServer {
 }
 
 impl MyMcpServer {
-    fn library_note(&self, line: &str) {
-        if self.interactive {
-            outln!("{}{}{}", SetForegroundColor(crate::out::DIM), line, ResetColor);
-        }
-    }
-
     // The loop. Never returns an error, for research's reason: what went wrong is still
     // something to tell the model in words it can act on.
     pub(crate) async fn run_library(&self, root: &Path, question: &str) -> String {
@@ -243,7 +236,7 @@ impl MyMcpServer {
                 // Out of time mid-round: the half-generated reply is dropped, and with it the
                 // stream, which is what stops the server spending more on it.
                 Err(_) => {
-                    self.library_note("  Out of time for lookups");
+                    crate::progress::step("Out of time for lookups");
                     break;
                 }
                 Ok(Ok(message)) => message,
@@ -342,7 +335,7 @@ impl MyMcpServer {
     ) -> String {
         if name == SEARCH {
             let query = arguments["query"].as_str().unwrap_or_default();
-            self.library_note(&format!("  Searching: {}", query));
+            crate::progress::step(format!("Searching: {}", query));
             let hits = library.search(query);
             if hits.is_empty() {
                 return format!(
@@ -361,7 +354,7 @@ impl MyMcpServer {
         }
 
         let id = arguments["id"].as_str().unwrap_or_default();
-        self.library_note(&format!("  Reading {}", id));
+        crate::progress::step(format!("Reading {}", id));
         match library.read(id) {
             Ok(text) => {
                 if id.contains('#') && !sources.iter().any(|s| s == id) {
@@ -383,14 +376,7 @@ impl MyMcpServer {
         crate::trace::library_answer(question, answer);
         crate::debug::log("library answer", answer);
 
-        if self.interactive {
-            outln!(
-                "{}Library answer:{} {}",
-                SetForegroundColor(crate::out::DIM),
-                ResetColor,
-                answer
-            );
-        }
+        crate::progress::answer("Library answer", answer);
 
         let mut result = format!("Library answer for: {}\n\n{}", question, answer);
         if !sources.is_empty() {

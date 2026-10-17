@@ -29,6 +29,7 @@ mod mention;
 mod modes;
 mod permissions;
 mod present;
+mod progress;
 mod prompt;
 mod readable;
 mod render;

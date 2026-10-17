@@ -349,6 +349,12 @@ impl Presenter {
                 crate::render::tool_call_summary(&tool, &arguments),
                 ResetColor
             ),
+            Notice::LookupStep(step) => {
+                outln!("{}  {}{}", SetForegroundColor(crate::out::DIM), step, ResetColor)
+            }
+            Notice::LookupAnswer { label, answer } => {
+                outln!("{}{}:{} {}", SetForegroundColor(crate::out::DIM), label, ResetColor, answer)
+            }
             Notice::LoopNudge { tool, count } => outln!(
                 "\n[looping: '{}' called {} times in a row — telling the model to stop]\n",
                 tool, count
