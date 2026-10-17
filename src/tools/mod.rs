@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod basics;
+pub(crate) mod build_notes;
 mod cargo_output;
 mod crates;
 mod files;
@@ -67,15 +68,9 @@ pub(crate) struct MyMcpServer {
     // its librarian, or no articles to read. `run_command` checks it too: a failed build is
     // only pointed at the library when there is one to point at.
     pub(crate) library_root: Option<PathBuf>,
-    // Fingerprints of the error sets a failed build has already been told to look up.
-    // Once per distinct set of errors: a model rebuilding against the same errors has
-    // either asked already or decided not to, and the same note under every rebuild is how
-    // a model learns to skip notes.
-    pub(crate) library_nudged: Arc<Mutex<std::collections::HashSet<u64>>>,
-    // Cargo runs in a row that hung (killed at the timeout, or reported by libtest as running
-    // for over a minute) since tests last ran to the end. The full hang note is given once; this
-    // count is what the short reminders after it carry, and a run of tests that finishes resets it.
-    pub(crate) hang_count: Arc<Mutex<usize>>,
+    // Which library notes failed builds have already been given, and how many hangs in a row
+    // there have been (`build_notes::BuildNudges`): a note goes out once per error set.
+    pub(crate) build_nudges: Arc<Mutex<build_notes::BuildNudges>>,
     // Timers the model has set on itself (`crate::timers`). Here rather than on the agent
     // because the tool that arms them runs on this struct; the agent and the frontends
     // reach them through `take_due_timers` and `next_timer_wake`.
@@ -212,8 +207,7 @@ impl MyMcpServer {
             checkpoints: Arc::new(Mutex::new(Vec::new())),
             background: Arc::new(Mutex::new(BackgroundJobs::default())),
             library_root,
-            library_nudged: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            hang_count: Arc::new(Mutex::new(0)),
+            build_nudges: Arc::new(Mutex::new(build_notes::BuildNudges::default())),
             timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
             crates_client: crate::tools::crates::rust_api_client(),
             web_client: crate::tools::web::browser_client(),

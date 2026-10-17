@@ -40,11 +40,7 @@ static ERROR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^error(\[E\d{4}\])
 
 /// Whether a command runs cargo at all, whatever the subcommand.
 pub(crate) fn runs_cargo(command: &str) -> bool {
-    command.split_whitespace().any(|word| {
-        let program = word.trim_matches('"');
-        let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
-        program == "cargo" || program == "cargo.exe"
-    })
+    command.split_whitespace().any(super::build_notes::is_cargo_program)
 }
 
 /// The output with the lines that never matter left out, and a note saying what went, or the

@@ -264,9 +264,6 @@ const BACKGROUND_OUTPUT_CAP: usize = 256 * 1024;
 // rather than at the end — see truncate_middle for why.
 const MAX_OUTPUT: usize = 30000;
 
-// The fingerprint every hang shares in `library_nudged`, so the full hang note goes out once per
-// hang however it was caught, and finished tests can clear it for the next one.
-const HANG_KEY: &str = "runtime:hang";
 
 // Build the shell invocation for a command line.
 //
@@ -609,68 +606,7 @@ impl MyMcpServer {
     // failed its tests, hung, or was killed at the timeout gets the one that names the symptom.
     fn library_note_for_build(&self, command: &str, output: &str, cwd: Option<&str>, timed_out: bool) -> Option<String> {
         let root = self.library_root.as_ref()?;
-        if !crate::library::is_cargo_build(command) {
-            return None;
-        }
-        let errors = crate::library::compile_errors(output);
-        let trouble = crate::library::test_trouble(output);
-        if errors.is_empty() && trouble.failed.is_empty() && trouble.hung.is_empty() && !timed_out {
-            // Tests that ran to the end mean the hang is solved, so a later one is a new
-            // problem: the count starts over and it gets the full note again. Only a test run
-            // counts — a `cargo check` passing between two hanging test runs solves nothing.
-            if output.contains("test result:") {
-                *self.hang_count.lock().unwrap() = 0;
-                self.library_nudged.lock().unwrap().remove(&super::content_hash(HANG_KEY.as_bytes()));
-            }
-            return None;
-        }
-        let hanging = errors.is_empty() && (timed_out || !trouble.hung.is_empty());
-        let hangs = if hanging {
-            let mut count = self.hang_count.lock().unwrap();
-            *count += 1;
-            *count
-        } else {
-            0
-        };
-
-        let library = crate::library::Library::load(root);
-        // The explicit cwd, then a leading `cd <dir> &&` — which is how models usually say
-        // where to build — then the process's own directory.
-        let dir = match cwd.filter(|c| !c.trim().is_empty()) {
-            Some(dir) => PathBuf::from(dir),
-            None => match crate::library::leading_cd(command) {
-                Some(dir) => dir,
-                None => std::env::current_dir().ok()?,
-            },
-        };
-        let dependencies = std::fs::read_to_string(dir.join("Cargo.toml"))
-            .map(|manifest| crate::library::cargo_dependencies(&manifest))
-            .unwrap_or_default();
-        let crates = crate::library::involved_crates(&library.crates(), output, &dependencies);
-        let (note, key) = if errors.is_empty() {
-            let note = crate::library::runtime_failure_note(&crates, &trouble, timed_out)?;
-            // A hang is one symptom however it was caught — a timeout or libtest's warning —
-            // so it is fingerprinted as one; each set of failing tests is another.
-            let key = if hanging { HANG_KEY.to_string() } else { format!("runtime:{}", trouble.failed.join("\n")) };
-            (note, key)
-        } else {
-            let subjects = crate::library::subjects_for_build(&library, &errors, &crates);
-            (crate::library::build_failure_note(&subjects, &errors)?, errors.join("\n"))
-        };
-
-        // Recorded only once there is a note to give, so an error set that got none (no
-        // covered crate involved) does not use up the one it would get later.
-        let fingerprint = super::content_hash(key.as_bytes());
-        if !self.library_nudged.lock().unwrap().insert(fingerprint) {
-            // The full note went out already. A hang alone gets a reminder after it, a line
-            // with the count, on every second hang: often enough not to leave a stuck model
-            // alone for half an hour, rarely enough not to hound one making progress.
-            if hanging && hangs >= 2 && hangs % 2 == 0 {
-                return crate::library::hang_reminder(&crates, hangs);
-            }
-            return None;
-        }
-        Some(note)
+        self.build_nudges.lock().unwrap().note_for(root, command, output, cwd, timed_out)
     }
 
     #[tool(
