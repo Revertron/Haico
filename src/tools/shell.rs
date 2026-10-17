@@ -28,26 +28,35 @@ pub(crate) struct RunCommandParams {
 // A background dev server logs for as long as it runs, so the buffer has to be bounded. The
 // oldest bytes go first — the newest are what anyone is asking about — and `dropped` records
 // how many were discarded so a reader's absolute offset still means something afterwards.
+//
+// A finished command is different: its result is cut to its head and its tail at the end
+// (`truncate_middle`), because a build says what it is doing first and what went wrong
+// last. So its buffer keeps the first `head` bytes for good and drops from just after them
+// instead — the middle that cut would have removed anyway — which is what lets it be
+// bounded at all without losing either end. With a head, `since` is not meaningful and is
+// not used.
 pub(crate) struct OutputBuffer {
     data: Vec<u8>,
     dropped: usize,
     cap: usize,
+    head: usize,
 }
 
 impl OutputBuffer {
     pub(crate) fn new(cap: usize) -> Self {
-        Self {
-            data: Vec::new(),
-            dropped: 0,
-            cap,
-        }
+        Self { data: Vec::new(), dropped: 0, cap, head: 0 }
+    }
+
+    // A buffer that keeps its first `cap / 2` bytes and drops from the middle.
+    pub(crate) fn keeping_head(cap: usize) -> Self {
+        Self { data: Vec::new(), dropped: 0, cap, head: cap / 2 }
     }
 
     fn push(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
         if self.data.len() > self.cap {
             let excess = self.data.len() - self.cap;
-            self.data.drain(..excess);
+            self.data.drain(self.head..self.head + excess);
             self.dropped += excess;
         }
     }
@@ -79,7 +88,10 @@ where
 {
     use tokio::io::AsyncReadExt;
 
-    let mut echoed_to = 0usize;
+    // The line still arriving, echoed once its newline does. Kept here rather than read back
+    // out of the buffer: a buffer bounded by dropping from its middle moves its bytes, and
+    // an offset into it would point at the wrong place once it had.
+    let mut partial: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
 
     loop {
@@ -87,26 +99,21 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-
-        let mut collected = sink.lock().unwrap();
-        collected.push(&chunk[..read]);
+        sink.lock().unwrap().push(&chunk[..read]);
 
         if let Some(echo) = &echo {
-            let data = collected.bytes();
-            while let Some(offset) = data[echoed_to..].iter().position(|&b| b == b'\n') {
-                let end = echoed_to + offset;
-                echo.output(&String::from_utf8_lossy(&data[echoed_to..end]));
-                echoed_to = end + 1;
+            partial.extend_from_slice(&chunk[..read]);
+            while let Some(end) = partial.iter().position(|&b| b == b'\n') {
+                echo.output(&String::from_utf8_lossy(&partial[..end]));
+                partial.drain(..=end);
             }
         }
     }
 
     // A final line with no trailing newline (a progress bar, a prompt) still deserves showing.
     if let Some(echo) = &echo {
-        let collected = sink.lock().unwrap();
-        let data = collected.bytes();
-        if echoed_to < data.len() {
-            echo.output(&String::from_utf8_lossy(&data[echoed_to..]));
+        if !partial.is_empty() {
+            echo.output(&String::from_utf8_lossy(&partial));
         }
     }
 }
@@ -316,6 +323,12 @@ const BACKGROUND_OUTPUT_CAP: usize = 256 * 1024;
 // rather than at the end — see truncate_middle for why.
 const MAX_OUTPUT: usize = 30000;
 
+// How much of a running command's output is held, per stream: 1 MB a command, the user's
+// choice. Over thirty times what the model is shown, so the head-and-tail cut at the end
+// still works from plenty; it used to be unbounded, and a chatty command left to run for its
+// whole hour held everything it ever printed.
+const RUN_OUTPUT_CAP: usize = 512 * 1024;
+
 
 // Build the shell invocation for a command line.
 //
@@ -475,8 +488,8 @@ impl MyMcpServer {
         // process exits can deadlock: a command that fills the pipe buffer blocks forever
         // waiting for someone to read it.
         let echo = crate::progress::current();
-        let stdout_buf = Arc::new(Mutex::new(OutputBuffer::new(usize::MAX)));
-        let stderr_buf = Arc::new(Mutex::new(OutputBuffer::new(usize::MAX)));
+        let stdout_buf = Arc::new(Mutex::new(OutputBuffer::keeping_head(RUN_OUTPUT_CAP)));
+        let stderr_buf = Arc::new(Mutex::new(OutputBuffer::keeping_head(RUN_OUTPUT_CAP)));
         let stdout_task = child
             .stdout
             .take()
@@ -1050,6 +1063,39 @@ serde = \"1\"
         (!result.is_error.unwrap_or(false), result_text(&result))
     }
 
+
+    #[test]
+    fn a_finished_commands_buffer_keeps_both_ends_and_drops_the_middle() {
+        // A build says what it is doing first and what went wrong last, so both ends stay.
+        let mut buffer = OutputBuffer::keeping_head(10);
+        buffer.push(b"START");
+        buffer.push(b"middle-middle-");
+        buffer.push(b"END");
+        assert_eq!(buffer.bytes(), b"STARTe-END");
+        assert_eq!(buffer.dropped(), 12);
+        assert_eq!(buffer.total(), 22);
+    }
+
+    #[tokio::test]
+    async fn a_command_longer_than_the_cap_still_echoes_every_line() {
+        // Echo works from the chunks, not from the buffer, so dropping the middle of what is
+        // stored cannot shift or lose a line on screen.
+        let lines: String = (0..2000).map(|n| format!("line {n:05} {}\n", "x".repeat(40))).collect();
+        let bytes: &'static [u8] = Box::leak(lines.into_bytes().into_boxed_slice());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(Mutex::new(OutputBuffer::keeping_head(4096)));
+        let ((), _) = crate::progress::reporting(&tx, async {
+            pump_output(bytes, crate::progress::current(), sink.clone()).await;
+        })
+        .await;
+        let echoed = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event, crate::turn::AgentEvent::Notice(crate::turn::Notice::CommandOutput(_))))
+            .count();
+        assert_eq!(echoed, 2000);
+        assert_eq!(sink.lock().unwrap().bytes().len(), 4096);
+        assert!(sink.lock().unwrap().bytes().starts_with(b"line 00000"));
+        assert!(sink.lock().unwrap().bytes().ends_with(b"line 01999 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"));
+    }
 
     #[test]
     fn output_buffer_drops_the_oldest_and_keeps_offsets_meaningful() {
