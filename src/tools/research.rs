@@ -45,11 +45,12 @@ const LOOKUP_BUDGET: usize = 10;
 // a model that answers with an empty message loops forever.
 const MAX_ROUNDS: usize = LOOKUP_BUDGET + 2;
 
-// How much of one page the sub-agent is shown. `web_get` already caps a page at 64 KB,
-// which is right for the main model reading one page deliberately and far too much here:
-// every round re-sends every page read so far, so ten full pages make each round slower than
-// the last, on a question that usually turns on one paragraph.
-const MAX_PAGE_CHARS: usize = 8000;
+// How much of one page the sub-agent is shown: as much as `web_get` returns at all, 64 KB,
+// the user's choice. It used to be 8000, which kept each round cheap — every round re-sends
+// every page read so far — but hid the answer whenever it was further down a long page,
+// with no way to read on. The cost is the other way round now: ten full pages are ~160k
+// tokens re-sent each round, more than a 131k window holds.
+const MAX_PAGE_CHARS: usize = 64 * 1024;
 
 
 #[derive(Serialize, Deserialize, JsonSchema)]
