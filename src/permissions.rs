@@ -188,6 +188,9 @@ pub(crate) fn runs_arbitrary_code(segment: &str) -> bool {
     else {
         return false;
     };
+    if is_script_file_name(program) {
+        return true;
+    }
     let program = program
         .rsplit(['/', '\\'])
         .next()
@@ -195,6 +198,24 @@ pub(crate) fn runs_arbitrary_code(segment: &str) -> bool {
         .to_lowercase();
 
     INTERPRETERS.contains(&program.as_str())
+}
+
+// Extensions the shell hands to an interpreter when the file itself is the program.
+//
+// `G:\Temp\test.bat` names no interpreter, yet runs whatever the agent wrote into it a moment
+// earlier — the same as `cmd /c test.bat`. Without this it got "allow all 'test.bat'", which
+// approves every later rewrite of that file, and the reviewer was shown only the path.
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "bat", "cmd", "ps1", "psm1", "vbs", "js", "mjs", "cjs", "ts", "sh", "bash", "zsh", "py", "pyw",
+    "pl", "rb", "php",
+];
+
+// Whether a program token is a script file run directly, judged by its extension alone: the
+// gate has to decide before the file exists, and a script yet to be written is no safer.
+pub(crate) fn is_script_file_name(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && SCRIPT_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
 
 // The identifying prefix of one command: the program, plus its subcommand where the program
@@ -452,6 +473,12 @@ mod tests {
         // Ordinary programs stay prefix-scoped, or every build would ask again.
         assert!(!runs_arbitrary_code("cargo build"));
         assert!(!runs_arbitrary_code("git status"));
+        // A script run by its own path is an interpreter invocation without the name.
+        assert!(runs_arbitrary_code("G:\\Temp\\haico-71e6c67c\\test.bat"));
+        assert!(runs_arbitrary_code(".\\build.PS1 -Release"));
+        assert!(runs_arbitrary_code("./run.sh"));
+        assert!(!runs_arbitrary_code("cargo.exe build"));
+        assert!(!runs_arbitrary_code(".bashrc"));
 
         let keys_for = |command: &str| match gate_for(&ws(), "run_command", &json!({"command": command})) {
             Gate::Ask { keys, label } => (keys, label),
@@ -470,6 +497,9 @@ mod tests {
         // The screenshot case: a script file, not inline code.
         let (file_keys, _) = keys_for("powershell -ExecutionPolicy Bypass -File .\test3.ps1");
         assert!(!file_keys.iter().any(|k| k == "run_command:powershell"), "got: {:?}", file_keys);
+        // Nor "allow all 'test.bat'", which would cover whatever the agent writes there next.
+        let (bat_keys, _) = keys_for("G:\\Temp\\test.bat");
+        assert_eq!(bat_keys, vec!["run_command:exact:G:\\Temp\\test.bat".to_string()]);
         // Never the bare interpreter: that would wave through every future script.
         assert!(!keys.iter().any(|k| k == "run_command:powershell"), "got: {:?}", keys);
 

@@ -8,7 +8,7 @@
 
 use crate::trace::Caller;
 use crate::llm::LMStudioClient;
-use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
+use crate::permissions::{gate_for, runs_arbitrary_code, is_script_file_name, command_segments, Gate, AUTO_ALLOWED_TOOLS};
 use crate::diff::file_change_diff;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, Result};
@@ -262,8 +262,16 @@ pub(crate) fn referenced_script(command: &str) -> Option<PathBuf> {
         if !runs_arbitrary_code(&segment) {
             continue;
         }
-        for token in segment.split_whitespace().skip(1) {
-            let token = token.trim_matches(['"', '\''].as_slice());
+        // `test.bat` run directly: the program is the script. Missed while only arguments
+        // were looked at, and the reviewer, shown just a path, rightly refused.
+        let mut tokens = segment.split_whitespace().map(|t| t.trim_matches(['"', '\''].as_slice()));
+        if let Some(program) = tokens.next() {
+            let path = PathBuf::from(program);
+            if is_script_file_name(program) && path.is_file() {
+                return Some(path);
+            }
+        }
+        for token in tokens {
             if token.starts_with('-') || token.is_empty() {
                 continue;
             }
@@ -785,7 +793,15 @@ mod tests {
         // A script that does not exist yet cannot be read, and must not break the call.
         assert_eq!(referenced_script("python nope-not-here.py"), None);
 
+        // The screenshot case: a .bat run by its own path, no interpreter named.
+        let batch = crate::testutil::scratch("test.bat", "@echo off\ndel /s /q C:\\Users\n");
+        let command = format!("{} --quiet", batch.display());
+        assert_eq!(referenced_script(&command).as_deref(), Some(batch.as_path()));
+        let evidence = build_evidence("run_command", &json!({"command": command}));
+        assert!(evidence.contains("del /s /q"), "got: {}", evidence);
+
         let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&batch);
     }
 
     #[test]
