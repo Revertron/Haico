@@ -756,3 +756,94 @@ mod wording_tests {
         assert!(verb.starts_with(|c: char| c.is_uppercase()));
     }
 }
+
+#[cfg(test)]
+mod presenter_tests {
+    use super::*;
+    use crate::out;
+    use crate::tools::TodoItem;
+    use serde_json::json;
+
+    // What the presenter printed for these events, escapes and all.
+    fn shown(events: Vec<AgentEvent>) -> String {
+        let _capture = out::capture_guard();
+        out::start_capture();
+        let mut presenter = Presenter::new();
+        for event in events {
+            presenter.show(event);
+        }
+        out::take_capture()
+    }
+
+    #[test]
+    fn a_tool_result_shows_its_first_line_and_keeps_the_rest_folded() {
+        let text = shown(vec![AgentEvent::ToolResult { text: "\n  first line\nsecond\nthird".into(), failed: false }]);
+        assert!(text.contains("first line"), "got: {text:?}");
+        // Folded away, not lost: the fold is collapsed by default, so the rest is not on
+        // screen — and an empty first line is skipped rather than shown as a blank row.
+        assert!(!text.contains("second"), "got: {text:?}");
+    }
+
+    #[test]
+    fn a_failed_tool_result_is_shown_in_red() {
+        let red = crossterm::style::SetForegroundColor(crossterm::style::Color::Red).to_string();
+        let failed = shown(vec![AgentEvent::ToolResult { text: "error[E0308]: mismatched types".into(), failed: true }]);
+        assert!(failed.contains(&red), "got: {failed:?}");
+        let passed = shown(vec![AgentEvent::ToolResult { text: "ok".into(), failed: false }]);
+        assert!(!passed.contains(&red), "got: {passed:?}");
+    }
+
+    #[test]
+    fn a_lookup_and_a_command_report_their_steps_indented_under_the_call() {
+        let text = shown(vec![
+            Notice::LookupStep("Searching: tokio select".into()).into(),
+            Notice::CommandOutput("   Compiling haico v0.2.27\r".into()).into(),
+        ]);
+        let plain = crate::util::strip_ansi(&text);
+        assert!(plain.contains("  Searching: tokio select"), "got: {plain:?}");
+        // A carriage return a command ended its line with is not drawn.
+        assert!(plain.contains("  │    Compiling haico v0.2.27\n"), "got: {plain:?}");
+    }
+
+    #[test]
+    fn a_lookup_answer_is_shown_whole_under_its_label() {
+        let text = crate::util::strip_ansi(&shown(vec![
+            Notice::LookupAnswer { label: "Library answer", answer: "Use biased; to poll in order.".into() }.into(),
+        ]));
+        assert!(text.contains("Library answer: Use biased; to poll in order."), "got: {text:?}");
+    }
+
+    #[test]
+    fn the_plan_is_printed_when_there_is_no_box_to_pin_it_above() {
+        // A test has no input region, which is the piped session's case.
+        let todos = vec![
+            TodoItem { task: "write the parser".into(), status: "completed".into() },
+            TodoItem { task: "test it".into(), status: "in_progress".into() },
+        ];
+        let text = shown(vec![Notice::PlanUpdated(todos).into()]);
+        assert!(text.contains("[x] write the parser"), "got: {text:?}");
+        assert!(text.contains("[»] test it"), "got: {text:?}");
+    }
+
+    #[test]
+    fn a_session_that_was_not_saved_is_an_error_the_user_sees() {
+        let text = shown(vec![Notice::SessionNotSaved("could not write session.json".into()).into()]);
+        assert!(text.contains("[error] the session was not saved: could not write session.json"), "got: {text:?}");
+    }
+
+    #[test]
+    fn the_permission_question_names_what_the_call_will_do() {
+        assert_eq!(
+            permission_description("write_file", &json!({"file_path": "a.rs", "content": "12345"}), None),
+            "Write 5 bytes to file: a.rs"
+        );
+        assert_eq!(
+            permission_description("edit", &json!({"file_path": "a.rs", "old_string": "x", "new_string": "y", "replace_all": true}), None),
+            "Edit file (replace all 'x'->'y') in a.rs"
+        );
+        assert_eq!(
+            permission_description("web_search", &json!({"query": "axum routing"}), None),
+            "Search the web for: 'axum routing'"
+        );
+    }
+}
