@@ -305,36 +305,37 @@ pub(crate) fn parse_config() -> Result<Config> {
     // Priority: command-line arg > environment variable > default.
     // Only what the command line or environment actually supplied. The rest is resolved
     // once the model is known, because a model's own section outranks the file's top level.
-    let context_arg = matches
-        .opt_str("context")
-        .or_else(|| env::var("HAICO_CONTEXT").ok())
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|tokens| *tokens > 0);
+    let context_arg = match matches.opt_str("context") {
+        Some(value) => number::<usize>(Some(value), "--context", true)?,
+        None => number::<usize>(env::var("HAICO_CONTEXT").ok(), "HAICO_CONTEXT", true)?,
+    };
+    let temperature_arg = number::<f64>(matches.opt_str("temperature"), "--temperature", false)?;
+    let max_tokens_arg = number::<u64>(matches.opt_str("max-tokens"), "--max-tokens", true)?;
+    let top_p_arg = number::<f64>(matches.opt_str("top-p"), "--top-p", false)?;
+    let top_k_arg = number::<u64>(matches.opt_str("top-k"), "--top-k", false)?;
+    let min_p_arg = number::<f64>(matches.opt_str("min-p"), "--min-p", false)?;
+    let repeat_penalty_arg = number::<f64>(matches.opt_str("repeat-penalty"), "--repeat-penalty", false)?;
 
-    let temperature_arg = matches
-        .opt_str("temperature")
-        .and_then(|value| value.trim().parse::<f64>().ok());
+    // The environment wins so a terminal that cannot cope with the alternate screen can be
+    // worked around without editing the config file. Empty is unset, as for any variable.
+    let tui = match env::var("HAICO_TUI").ok().as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some("fullscreen") => Tui::Fullscreen,
+        Some("inline") => Tui::Inline,
+        Some(other) => anyhow::bail!("HAICO_TUI must be 'fullscreen' or 'inline', got '{other}'"),
+        None => file_config.tui.unwrap_or_default(),
+    };
+    let mouse = match env::var("HAICO_MOUSE").ok().as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some("off") => Mouse::Off,
+        Some("scroll") => Mouse::Scroll,
+        Some(other) => anyhow::bail!("HAICO_MOUSE must be 'off' or 'scroll', got '{other}'"),
+        None => file_config.mouse.unwrap_or_default(),
+    };
 
-    let max_tokens_arg = matches
-        .opt_str("max-tokens")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0);
-
-    let top_p_arg = matches
-        .opt_str("top-p")
-        .and_then(|value| value.trim().parse::<f64>().ok());
-    let top_k_arg = matches
-        .opt_str("top-k")
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let min_p_arg = matches
-        .opt_str("min-p")
-        .and_then(|value| value.trim().parse::<f64>().ok());
-    let repeat_penalty_arg = matches
-        .opt_str("repeat-penalty")
-        .and_then(|value| value.trim().parse::<f64>().ok());
-
-    let file_tui = file_config.tui;
-    let file_mouse = file_config.mouse;
+    // Made absolute here, while the current directory is still the one the command was
+    // typed in: `--dir` moves the process before the trace is opened, and a script that
+    // says `--trace runs.jsonl` means the runs.jsonl beside it, not one inside every
+    // project it visits. `--system-prompt` gets this for free by being read above.
+    let absolute = |path: String| env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path));
 
     Ok(Config {
         llm_url,
@@ -361,36 +362,30 @@ pub(crate) fn parse_config() -> Result<Config> {
         // A blank task is treated as none, rather than starting a run with nothing to do
         // that the model would fill by inventing a task of its own.
         prompt: matches.opt_str("p").filter(|task| !task.trim().is_empty()),
-        // Made absolute here, while the current directory is still the one the command was
-        // typed in: `--dir` moves the process before the trace is opened, and a script that
-        // says `--trace runs.jsonl` means the runs.jsonl beside it, not one inside every
-        // project it visits. `--system-prompt` gets this for free by being read above.
-        trace: matches.opt_str("trace").map(|path| {
-            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
-        }),
-        trace_lib: matches.opt_str("trace-lib").map(|path| {
-            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
-        }),
-        trace_research: matches.opt_str("trace-research").map(|path| {
-            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
-        }),
-        trace_gaps: matches.opt_str("trace-gaps").map(|path| {
-            env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or_else(|_| PathBuf::from(&path))
-        }),
+        trace: matches.opt_str("trace").map(absolute),
+        trace_lib: matches.opt_str("trace-lib").map(absolute),
+        trace_research: matches.opt_str("trace-research").map(absolute),
+        trace_gaps: matches.opt_str("trace-gaps").map(absolute),
         dir: matches.opt_str("d").map(PathBuf::from),
-        // The environment wins so a terminal that cannot cope with the alternate screen
-        // can be worked around without editing the config file.
-        tui: match env::var("HAICO_TUI").ok().as_deref().map(str::trim) {
-            Some("fullscreen") => Tui::Fullscreen,
-            Some("inline") => Tui::Inline,
-            _ => file_tui.unwrap_or_default(),
-        },
-        mouse: match env::var("HAICO_MOUSE").ok().as_deref().map(str::trim) {
-            Some("off") => Mouse::Off,
-            Some("scroll") => Mouse::Scroll,
-            _ => file_mouse.unwrap_or_default(),
-        },
+        tui,
+        mouse,
     })
+}
+
+// A number from the command line or the environment, `from` naming which, so a value that
+// does not parse says so. These used to be dropped without a word — `--temperature abc`
+// ran at the server's temperature, `--context 0` at the default window — where the config
+// file refuses a mistyped key outright, and a setting asked for and silently not applied
+// is the worse of the two. `positive` is for the ones where zero means nothing.
+fn number<T: std::str::FromStr + PartialEq + Default>(raw: Option<String>, from: &str, positive: bool) -> Result<Option<T>> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<T>() {
+        Ok(value) if positive && value == T::default() => anyhow::bail!("{from} must be more than 0"),
+        Ok(value) => Ok(Some(value)),
+        Err(_) => anyhow::bail!("{from} expects a number, got '{}'", raw.trim()),
+    }
 }
 
 // Project instruction files, in the order they are looked for. The first one found wins;
@@ -1091,9 +1086,9 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
     }
 }
 
-// A saved conversation. Versioned so a later format change can be recognized and declined
-// rather than deserializing into something subtly wrong.
-
+// Assumed context window when none is configured. Override with --context / HAICO_CONTEXT;
+// a hard-coded guess would either nag constantly on a large window or warn too late on a
+// small one.
 pub(crate) const DEFAULT_CONTEXT_TOKENS: usize = 131_072;
 
 // Fraction of the window at which compaction is worth suggesting. Late enough not to nag,
@@ -1242,6 +1237,23 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[test]
+    fn a_number_that_does_not_parse_is_an_error_not_a_default() {
+        use super::number;
+
+        assert_eq!(number::<f64>(Some(" 0.7 ".into()), "--temperature", false).unwrap(), Some(0.7));
+        assert_eq!(number::<f64>(None, "--temperature", false).unwrap(), None);
+        // A blank value is no value, as an empty variable is an unset one.
+        assert_eq!(number::<usize>(Some("  ".into()), "HAICO_CONTEXT", true).unwrap(), None);
+
+        let error = number::<f64>(Some("abc".into()), "--temperature", false).unwrap_err();
+        assert_eq!(error.to_string(), "--temperature expects a number, got 'abc'");
+        // Where zero means nothing it is refused, and where it is a setting it is kept.
+        let error = number::<usize>(Some("0".into()), "--context", true).unwrap_err();
+        assert_eq!(error.to_string(), "--context must be more than 0");
+        assert_eq!(number::<f64>(Some("0".into()), "--temperature", false).unwrap(), Some(0.0));
+    }
 
     fn config_with(toml_text: &str) -> crate::Config {
         crate::Config {

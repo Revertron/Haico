@@ -18,6 +18,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// A saved conversation. Versioned so a later format change can be recognized and declined
+// rather than deserializing into something subtly wrong.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SavedSession {
     pub(crate) version: u32,
