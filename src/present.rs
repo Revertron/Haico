@@ -152,12 +152,12 @@ impl Presenter {
                     crate::out::foldable(preview.trim_end_matches('\n'), &diff);
                 }
             }
-            AgentEvent::ToolResult(result) => {
+            AgentEvent::ToolResult { text, failed } => {
                 // The summary is the row that used to be all there was: the
                 // first line, whole. The result itself is kept behind it now
                 // rather than thrown away, and Ctrl+O opens it.
-                if let Some(line) = tool_result_line(&result) {
-                    crate::out::foldable(&line, &result);
+                if let Some(line) = tool_result_line(&text, failed) {
+                    crate::out::foldable(&line, &text);
                 }
             }
             AgentEvent::Finished { elapsed } => {

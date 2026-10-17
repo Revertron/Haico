@@ -462,7 +462,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             show(handle, move |ui| code_line(ui, text.trim()));
         }
         AgentEvent::ToolDiff(diff) => show(handle, move |ui| diff_block(ui, &diff)),
-        AgentEvent::ToolResult(result) => show(handle, move |ui| block(ui, &result)),
+        AgentEvent::ToolResult { text, failed } => show(handle, move |ui| tool_result(ui, &text, failed)),
         // The row above the terminal's input box has no counterpart here; the
         // busy label already says what is running.
         AgentEvent::DidTool { .. } => {}
@@ -1016,6 +1016,15 @@ fn code_line(ui: &mut UI, text: &str) {
 /// whitespace is content here, so a diff keeps its leading `+`/`-` alignment and
 /// a code block keeps its indentation, and the band makes the whole thing read
 /// as one box rather than a stack of tinted strips.
+/// A tool's output, under a line saying so when the tool reported a failure — the band
+/// looks the same either way, and a refused edit should not read as a result.
+fn tool_result(ui: &mut UI, text: &str, failed: bool) {
+    if failed {
+        line(ui, "the tool reported a failure:", Tone::Error);
+    }
+    block(ui, text);
+}
+
 fn block(ui: &mut UI, text: &str) {
     let element = rich("", CODE);
     if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
@@ -1643,7 +1652,7 @@ mod tests {
                 code_line(ui, format!("{name} {summary}").trim());
             }
             AgentEvent::ToolDiff(diff) => diff_block(ui, &diff),
-            AgentEvent::ToolResult(result) => block(ui, &result),
+            AgentEvent::ToolResult { text, failed } => tool_result(ui, &text, failed),
             AgentEvent::Notice(notice) => {
                 let (text, tone) = describe(notice);
                 line(ui, &text, tone);
@@ -1719,7 +1728,7 @@ mod tests {
                 arguments: json!({ "file_path": "src/main.rs" }),
                 auto_note: None,
             },
-            AgentEvent::ToolResult("fn main() {\n    let xs = vec![1, 2, 3];\n}".into()),
+            AgentEvent::ToolResult { text: "fn main() {\n    let xs = vec![1, 2, 3];\n}".into(), failed: false },
             AgentEvent::ToolDiff(crate::diff::generate_diff(
                 "src/main.rs",
                 "    let xs = vec![1];\n",

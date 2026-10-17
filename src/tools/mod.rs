@@ -421,7 +421,7 @@ impl MyMcpServer {
             })
             .collect();
 
-        Ok(ToolOutput { text, images })
+        Ok(ToolOutput { text, images, failed: result.is_error.unwrap_or(false) })
     }
 }
 
@@ -529,6 +529,10 @@ pub(crate) struct ToolOutput {
     pub(crate) text: String,
     /// `(mime type, base64 data)`, in the order the tool produced them.
     pub(crate) images: Vec<(String, String)>,
+    /// The tool said the call failed — a refused edit, a build that did not compile.
+    /// Dropped for as long as this was text and pictures only, so nothing past this
+    /// point could tell a failure from a success without reading the words.
+    pub(crate) failed: bool,
 }
 
 // MCP server handler: wires the existing tool_router to handle list_tools/call_tool.

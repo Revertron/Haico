@@ -1848,7 +1848,7 @@ async fn sub_agent_reply(agent: &mut Agent, tx: &EventSink, link: &TurnLink, arg
         };
     };
     let _ = tx.send(AgentEvent::DidTool { name: SUB_AGENT.to_string(), arguments: arguments.clone() });
-    let _ = tx.send(AgentEvent::ToolResult(report.clone()));
+    let _ = tx.send(AgentEvent::ToolResult { text: report.clone(), failed: false });
     report.into()
 }
 
@@ -1922,8 +1922,9 @@ async fn gated_call(
 
     let tool_result = result.unwrap_or_else(|e| {
         let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
-        crate::tools::ToolOutput { text: format!("Error: {}", e), images: Vec::new() }
+        crate::tools::ToolOutput { text: format!("Error: {}", e), images: Vec::new(), failed: true }
     });
+    let failed = tool_result.failed;
 
     // Held for after the round rather than answered here. A picture cannot go in the
     // `role: "tool"` reply — that message may carry text and nothing else, and a server
@@ -1956,7 +1957,7 @@ async fn gated_call(
     // exception: a summary here would repeat the answer's first line immediately
     // underneath the answer.
     if !answer_shown {
-        let _ = tx.send(AgentEvent::ToolResult(tool_result.clone()));
+        let _ = tx.send(AgentEvent::ToolResult { text: tool_result.clone(), failed });
     }
 
     if repaired.is_empty() {
@@ -3503,6 +3504,26 @@ mod turn_tests {
             agent.messages.last().unwrap()["reasoning_content"].as_str(),
             reported.as_deref()
         );
+    }
+
+    /// A tool that reports a failure says so in the event, not only in its wording, so a
+    /// frontend can show a refused call as one.
+    #[tokio::test]
+    async fn a_failed_tool_call_is_reported_as_failed() {
+        let _capture = out::capture_guard();
+        const READ_MISSING: &str = r#"{"choices":[{"message":{"role":"assistant","content":"",
+            "tool_calls":[{"id":"r1","type":"function","function":{"name":"read","arguments":"{\"file_path\":\"no-such-file-anywhere.rs\"}"}}]}}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+
+        let (_, events) = run_and_watch(&[READ_MISSING, FINAL], "go", Mode::Normal, Reasoning::Keep).await;
+        let failed: Vec<bool> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { failed, .. } => Some(*failed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, [true]);
     }
 
     /// Cancellation is a message, not a dropped future — see

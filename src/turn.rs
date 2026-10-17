@@ -384,8 +384,10 @@ pub(crate) enum AgentEvent {
     /// The change a file-writing call is about to make, as a whole diff. Whether
     /// to show a few lines of it or all of it is a question about the display.
     ToolDiff(crate::diff::Diff),
-    /// A finished tool's output, whole.
-    ToolResult(String),
+    /// A finished tool's output, whole, and whether the tool said the call failed —
+    /// a refused edit or a build that did not compile, shown as one rather than told
+    /// apart by its wording.
+    ToolResult { text: String, failed: bool },
     /// A tool ran, whatever it returned. Separate from [`Self::ToolResult`]
     /// because it is sent even for the tools whose result is not shown, and
     /// because it feeds different chrome: the row above the input box, which says

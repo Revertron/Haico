@@ -862,7 +862,9 @@ pub(crate) fn change_preview(diff: &str) -> Option<String> {
 // One line of what a tool gave back. The repeated identical result is usually the clearest
 // evidence that a model is stuck, so it belongs in the log next to the call.
 
-pub(crate) fn tool_result_line(text: &str) -> Option<String> {
+// Red when the tool said the call failed, so a broken build stands out from the dim rows
+// of the ones that worked without its first line having to say so.
+pub(crate) fn tool_result_line(text: &str, failed: bool) -> Option<String> {
     let first = text
         .lines()
         .map(str::trim)
@@ -877,12 +879,8 @@ pub(crate) fn tool_result_line(text: &str) -> Option<String> {
     // mismatched types" is the half that names the error, and the file and line it wants
     // are in the half that used to be dropped.
     let first = strip_project_prefix(first);
-    Some(format!(
-        "{}    {}{}",
-        SetForegroundColor(crate::out::DIM),
-        first,
-        ResetColor
-    ))
+    let color = if failed { Color::Red } else { crate::out::DIM };
+    Some(format!("{}    {}{}", SetForegroundColor(color), first, ResetColor))
 }
 
 #[cfg(test)]
