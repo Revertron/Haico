@@ -51,9 +51,6 @@ const MAX_ROUNDS: usize = LOOKUP_BUDGET + 2;
 // the last, on a question that usually turns on one paragraph.
 const MAX_PAGE_CHARS: usize = 8000;
 
-// How long the returned answer may be. A research call that hands back three pages of prose
-// has just moved the context problem rather than solved it.
-const MAX_ANSWER_CHARS: usize = 4000;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ResearchParams {
@@ -345,9 +342,10 @@ impl MyMcpServer {
 
     // Show the answer, and shape the text the main model receives.
     fn finish(&self, question: &str, answer: &str, sources: &[String]) -> String {
-        // Whole, before the cut below — the library's reason.
+        // Never cut, for the library's reason: an answer stopped mid-way is worse than a long
+        // one, and the model acts on the half it got. It used to be cut at 4000 characters.
+        let answer = answer.trim();
         crate::trace::research_answer(question, answer, sources);
-        let answer = truncate_at_boundary(answer.trim(), MAX_ANSWER_CHARS);
         crate::debug::log("research answer", answer);
 
         crate::progress::answer("Got answer", answer);

@@ -38,8 +38,6 @@ pub(crate) const MAX_SECTION_CHARS: usize = 8000;
 /// How many sections one search returns.
 const SEARCH_HITS: usize = 8;
 
-/// How much of an article's summary the index carries per line.
-const MAX_SUMMARY_CHARS: usize = 200;
 
 // BM25's two knobs, at the values every implementation defaults to.
 const K1: f64 = 1.2;
@@ -477,7 +475,8 @@ pub(crate) fn parse_article(id: String, text: &str) -> Article {
                 .unwrap_or("")
                 .to_string()
         });
-    let summary = one_line(&summary, MAX_SUMMARY_CHARS);
+    // Whole: a summary cut short is one the librarian cannot judge the article by.
+    let summary = crate::util::flatten(&summary);
 
     Article {
         id,
@@ -701,6 +700,13 @@ mod tests {
 # tokio::select!\n\nIntro text.\n\n## Cancellation\n\nThe losing branches are dropped.\n\n\
 ```rust\n# hidden doc line\nlet x = 1;\n```\n\n## Loops\n\nUse `biased;` to poll in order.\n\n\
 ### Borrowing in loops\n\nPin the future with tokio::pin! before the loop.\n";
+
+    #[test]
+    fn a_long_summary_is_kept_whole() {
+        let summary = format!("{}and the part that says when it applies.", "Covers a great deal of ground ".repeat(20));
+        let article = parse_article("tokio/long".into(), &format!("---\nsummary: {}\n---\n# Long\n\nx\n", summary));
+        assert_eq!(article.summary, summary);
+    }
 
     #[test]
     fn an_article_is_split_at_its_headings_and_not_inside_code() {

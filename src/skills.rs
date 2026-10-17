@@ -29,10 +29,6 @@ pub(crate) const PROJECT_SKILL_DIRS: &[&str] = &[".haico/skills", ".agents/skill
 
 const SKILL_FILE: &str = "SKILL.md";
 
-/// A description is the one part of a skill sent on every request, so it is capped. Longer
-/// than a memory's, because a good one names both what the skill does and when to use it,
-/// and cutting it before the "when" would throw away the half that matters.
-const MAX_DESCRIPTION_CHARS: usize = 300;
 
 /// A `SKILL.md` is meant to be a page or two; anything past this is cut and said to be.
 /// The same cap the instruction files get — both are instructions arriving whole.
@@ -257,8 +253,11 @@ pub(crate) fn front_value(front: &str, key: &str) -> Option<String> {
     None
 }
 
+// A description is the one part of a skill sent on every request, and it is sent whole. A
+// good one names both what the skill does and when to use it, and a cut one — it used to be
+// capped at 300 characters — loses the "when", which is the half the model picks it by.
 fn one_line(text: &str) -> String {
-    crate::util::one_line(text, MAX_DESCRIPTION_CHARS)
+    crate::util::flatten(text)
 }
 
 #[cfg(test)]
@@ -270,6 +269,17 @@ mod tests {
         let dir = root.join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(SKILL_FILE), text).unwrap();
+    }
+
+    #[test]
+    fn a_long_description_is_kept_whole() {
+        // The "use it when" comes last, and it is the half the model picks a skill by.
+        let description = format!("{} Use it when the release is tagged.", "Does many things. ".repeat(40));
+        let dir = TempDir::new("skills-long");
+        write_skill(dir.path(), "release", &format!("---\ndescription: {}\n---\n\nbody\n", description));
+        let skills = discover(&[dir.path().to_path_buf()]);
+        assert_eq!(skills[0].description, crate::util::flatten(&description));
+        assert!(skills[0].description.ends_with("Use it when the release is tagged."));
     }
 
     #[test]
