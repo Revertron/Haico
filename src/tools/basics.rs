@@ -4,7 +4,6 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use chrono;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(crate) struct CalculatorParams {

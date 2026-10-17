@@ -159,9 +159,7 @@ pub(crate) async fn apply_reasoning(
     policy: Reasoning,
     threshold: usize,
 ) -> Option<ReasoningOutcome> {
-    let Some(original) = reasoning_text(message) else {
-        return None;
-    };
+    let original = reasoning_text(message)?;
 
     match policy {
         Reasoning::Keep => None,
@@ -180,9 +178,7 @@ pub(crate) async fn apply_reasoning(
                 return None;
             }
 
-            let Some(summary) = compress_trace(client, original).await else {
-                return None;
-            };
+            let summary = compress_trace(client, original).await?;
             let after = estimate_reasoning_tokens(&summary);
             message[REASONING_KEY] = json!(summary);
             Some(ReasoningOutcome::Compressed { before, after })

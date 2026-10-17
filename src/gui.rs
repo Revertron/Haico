@@ -444,7 +444,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             };
             show(handle, move |ui| set_label(ui, STATUS, &text));
         }
-        AgentEvent::ReplyStart => show(handle, |ui| close_open(ui)),
+        AgentEvent::ReplyStart => show(handle, close_open),
         // Settled before the id is taken away, so the reply's last block is laid
         // out as finished markdown rather than left provisional.
         AgentEvent::ReplyEnd => show(handle, |ui| {
@@ -987,9 +987,7 @@ fn with_rich<R>(ui: &mut UI, id: &str, f: impl FnOnce(&RichText) -> R) -> Option
 fn line(ui: &mut UI, text: &str, tone: Tone) {
     let element = rich("", PROSE);
     if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
-        let mut style = SpanStyle::default();
-        style.color = tone.color();
-        view.push(text, style);
+        view.push(text, SpanStyle { color: tone.color(), ..SpanStyle::default() });
     }
     append(ui, element);
 }
@@ -1628,7 +1626,7 @@ mod tests {
         let pixmap = render_to_pixmap(&ui, w, h, 1.0, &palette, &registry).expect("pixmap");
         let data = pixmap.data();
         let first = [data[0], data[1], data[2], data[3]];
-        let drew = data.chunks_exact(4).any(|px| px != first);
+        let drew = data.as_chunks::<4>().0.iter().any(|px| *px != first);
 
         // Written where a person can look at it, because "it rendered" and "it
         // rendered correctly" are different questions and only one of them can
@@ -1875,14 +1873,11 @@ mod tests {
         let data = pixmap.data();
         let first = [data[0], data[1], data[2], data[3]];
         assert!(
-            data.chunks_exact(4).any(|px| px != first),
+            data.as_chunks::<4>().0.iter().any(|px| *px != first),
             "the settings form rendered blank"
         );
         pixmap.save_png(std::env::temp_dir().join("haico-gui-settings.png")).unwrap();
     }
-
-    /// Menu ids resolve to the commands they name, including the model items
-    /// whose ids carry the model name in them.
 
     /// The icons have to be served, parse as SVG, and be *visible* on the dark
     /// skin the window opens with.
@@ -2344,6 +2339,8 @@ mod tests {
         assert_eq!(titles.iter().filter(|t| *t == MENU_MODEL).count(), 1);
     }
 
+    /// Menu ids resolve to the commands they name, including the model items
+    /// whose ids carry the model name in them.
     #[test]
     fn menu_items_map_to_commands() {
         assert!(matches!(command_for(MENU_SETTINGS), Some(Command::OpenSettings)));

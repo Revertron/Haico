@@ -225,7 +225,7 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
             if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
                 let queued = link.queued();
                 draw(
-                    &mut io.editor,
+                    &io.editor,
                     &Chrome {
                         mode: link.mode(),
                         busy: Some(label.as_str()),

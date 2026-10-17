@@ -97,9 +97,7 @@ pub(crate) async fn select_interactive(
 
         match key_event.code {
             KeyCode::Up => {
-                if selected_index > 0 {
-                    selected_index -= 1;
-                }
+                selected_index = selected_index.saturating_sub(1);
             }
             KeyCode::Down => {
                 if selected_index < models.len() - 1 {

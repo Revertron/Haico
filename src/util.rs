@@ -418,7 +418,7 @@ mod tests {
         assert!(cut.ends_with("tail"), "the payload was snapped away: {:?}", cut);
 
         // Multi-byte characters are never split.
-        let wide: String = std::iter::repeat("привет\n").take(500).collect();
+        let wide: String = std::iter::repeat_n("привет\n", 500).collect();
         let cut = truncate_middle(&wide, 301);
         assert!(cut.contains("привет"));
     }

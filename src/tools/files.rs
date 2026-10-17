@@ -128,7 +128,7 @@ pub(crate) fn glob_matches(matcher: &globset::GlobMatcher, path: &std::path::Pat
     matcher.is_match(path)
         || path
             .file_name()
-            .map_or(false, |name| matcher.is_match(std::path::Path::new(name)))
+            .is_some_and(|name| matcher.is_match(std::path::Path::new(name)))
 }
 
 // Walk a tree the way a code search is expected to: honoring .gitignore (plus global and
@@ -176,7 +176,7 @@ pub(crate) fn walk_source_files(
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
 
@@ -768,35 +768,33 @@ impl MyMcpServer {
 
         match fs::read_dir(&path) {
             Ok(dir_entries) => {
-                for entry in dir_entries {
-                    if let Ok(entry) = entry {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        let metadata = entry.metadata().ok();
+                for entry in dir_entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    let metadata = entry.metadata().ok();
 
-                        let entry_type = if entry.path().is_dir() {
-                            "DIR "
-                        } else {
-                            "FILE"
-                        };
+                    let entry_type = if entry.path().is_dir() {
+                        "DIR "
+                    } else {
+                        "FILE"
+                    };
 
-                        let size = metadata
-                            .as_ref()
-                            .map(|m| m.len())
-                            .map(|s| {
-                                if s < 1024 {
-                                    format!("{} B", s)
-                                } else if s < 1024 * 1024 {
-                                    format!("{:.1} KB", s as f64 / 1024.0)
-                                } else if s < 1024 * 1024 * 1024 {
-                                    format!("{:.1} MB", s as f64 / (1024.0 * 1024.0))
-                                } else {
-                                    format!("{:.1} GB", s as f64 / (1024.0 * 1024.0 * 1024.0))
-                                }
-                            })
-                            .unwrap_or_else(|| "?".to_string());
+                    let size = metadata
+                        .as_ref()
+                        .map(|m| m.len())
+                        .map(|s| {
+                            if s < 1024 {
+                                format!("{} B", s)
+                            } else if s < 1024 * 1024 {
+                                format!("{:.1} KB", s as f64 / 1024.0)
+                            } else if s < 1024 * 1024 * 1024 {
+                                format!("{:.1} MB", s as f64 / (1024.0 * 1024.0))
+                            } else {
+                                format!("{:.1} GB", s as f64 / (1024.0 * 1024.0 * 1024.0))
+                            }
+                        })
+                        .unwrap_or_else(|| "?".to_string());
 
-                        entries.push(format!("{} {:>10}  {}", entry_type, size, file_name));
-                    }
+                    entries.push(format!("{} {:>10}  {}", entry_type, size, file_name));
                 }
             }
             Err(e) => {

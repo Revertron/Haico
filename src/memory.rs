@@ -116,8 +116,7 @@ fn parse(stem: &str, text: &str) -> Memory {
     let mut description = front
         .lines()
         .filter_map(|line| line.split_once(':'))
-        .filter(|(key, _)| key.trim() == "description")
-        .last()
+        .rfind(|(key, _)| key.trim() == "description")
         .map(|(_, value)| one_line(value))
         .unwrap_or_default();
 

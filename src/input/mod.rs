@@ -47,14 +47,11 @@ impl Keys {
         // A plain thread rather than a task: `event::read` blocks, and blocking a
         // tokio worker would stall every other future on that thread. It ends when
         // the receiver goes, which is when the process is on its way out anyway.
-        std::thread::spawn(move || loop {
-            match event::read() {
-                Ok(event) => {
-                    if sender.send(event).is_err() {
-                        break;
-                    }
+        std::thread::spawn(move || {
+            while let Ok(event) = event::read() {
+                if sender.send(event).is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
         });
         Keys { events }
@@ -197,6 +194,7 @@ pub(crate) async fn read_text(keys: &mut Keys, editor: &mut Editor, prompt: &str
 
 // The main prompt: the full bottom of the screen, and the one key that means something
 // only here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_command(
     keys: &mut Keys,
     editor: &mut Editor,
@@ -516,7 +514,7 @@ mod tests {
             for status in ["", "m", "a-model-with-a-long-name  ctx 97%"] {
                 let bar = status_bar(Mode::Auto, status, width);
                 assert!(
-                    crate::out::visible_width(&bar) <= width - 1,
+                    crate::out::visible_width(&bar) < width,
                     "width {} overflowed with {:?}: {:?}",
                     width,
                     status,

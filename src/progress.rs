@@ -40,23 +40,29 @@ pub(crate) async fn reporting<F: Future>(tx: &EventSink, call: F) -> (F::Output,
     .await
 }
 
+// Said to the turn listening, if one is. A frontend that has gone away is no reason for a
+// tool to stop, so a failed send is dropped as quietly as an absent scope.
+fn tell(notice: Notice) {
+    let _ = SINK.try_with(|sink| {
+        let _ = sink.tx.send(notice.into());
+    });
+}
+
 /// One step of a call's own loop: a search, a page, a section read.
 pub(crate) fn step(line: impl Into<String>) {
-    let _ = SINK.try_with(|sink| sink.tx.send(Notice::LookupStep(line.into()).into()));
+    tell(Notice::LookupStep(line.into()));
 }
 
 /// The answer a call's loop arrived at, shown whole as it lands.
 pub(crate) fn answer(label: &'static str, answer: &str) {
-    let _ = SINK.try_with(|sink| {
-        sink.answered.set(true);
-        sink.tx.send(Notice::LookupAnswer { label, answer: answer.to_string() }.into())
-    });
+    let _ = SINK.try_with(|sink| sink.answered.set(true));
+    tell(Notice::LookupAnswer { label, answer: answer.to_string() });
 }
 
 /// The task list as `todo_write` just set it. Whether to show it — the REPL pins it
 /// above the input box already — is the frontend's call.
 pub(crate) fn plan(todos: &[crate::tools::TodoItem]) {
-    let _ = SINK.try_with(|sink| sink.tx.send(Notice::PlanUpdated(todos.to_vec()).into()));
+    tell(Notice::PlanUpdated(todos.to_vec()));
 }
 
 /// The scope's channel, for work the call hands to a task of its own — `run_command`'s

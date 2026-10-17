@@ -470,7 +470,7 @@ impl BuildNudges {
             // with the count, on every second hang: often enough not to leave a stuck model
             // alone for half an hour, rarely enough not to hound one making progress.
             let hangs = self.hang_count;
-            if hanging && hangs >= 2 && hangs % 2 == 0 {
+            if hanging && hangs >= 2 && hangs.is_multiple_of(2) {
                 return hang_reminder(&crates, hangs);
             }
             return None;

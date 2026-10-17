@@ -260,7 +260,7 @@ impl MyMcpServer {
             if calls.is_empty() {
                 let answer = message["content"].as_str().unwrap_or("").trim();
                 if !answer.is_empty() {
-                    return self.finish_library(question, &without_think_block(answer), &sources);
+                    return self.finish_library(question, without_think_block(answer), &sources);
                 }
                 break;
             }

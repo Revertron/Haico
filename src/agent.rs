@@ -2634,7 +2634,10 @@ mod scratch_tests {
 /// being rejected rather than anything visible in this one.
 #[cfg(test)]
 mod turn_tests {
-    #![allow(unused_imports)]
+    // Each test holds `out::capture_guard()` across its awaits on purpose: the guard is
+    // what keeps two tests from writing into one global capture, and each test has a
+    // runtime of its own, so nothing else is waiting on the lock.
+    #![allow(unused_imports, clippy::await_holding_lock)]
     use super::*;
     use crate::ask::*;
     use crate::config::*;

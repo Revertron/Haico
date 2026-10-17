@@ -442,7 +442,7 @@ fn table_rule(left: &str, joint: &str, right: &str, widths: &[usize]) -> String 
         }
         rule.push_str(&"─".repeat(width + 2));
     }
-    let _ = write!(rule, "{}{}\n", right, ResetColor);
+    let _ = writeln!(rule, "{}{}", right, ResetColor);
     rule
 }
 
@@ -485,7 +485,7 @@ fn table_row(cells: &[String], widths: &[usize], aligns: &[Align], header: bool)
                 SetForegroundColor(crate::out::DIM)
             );
         }
-        let _ = write!(rows, "{}\n", ResetColor);
+        let _ = writeln!(rows, "{}", ResetColor);
     }
     rows
 }
@@ -590,9 +590,7 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
         if chars[i] == '`' {
             if let Some(end) = find_closing('`', &chars, i + 1) {
                 let _ = write!(rendered, "{}", SetForegroundColor(Color::Blue));
-                for j in (i + 1)..end {
-                    rendered.push(chars[j]);
-                }
+                rendered.extend(&chars[i + 1..end]);
                 let _ = write!(rendered, "{}", ResetColor);
                 i = end + 1;
                 continue;
@@ -603,9 +601,7 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
         if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_double_closing("**", &chars, i + 2) {
                 let _ = write!(rendered, "{}", SetAttribute(Attribute::Bold));
-                for j in (i + 2)..end {
-                    rendered.push(chars[j]);
-                }
+                rendered.extend(&chars[i + 2..end]);
                 let _ = write!(rendered, "{}", SetAttribute(Attribute::Reset));
                 i = end + 2;
                 continue;
@@ -620,9 +616,7 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
             if !part_of_bold && opens_emphasis(marker, &chars, i) {
                 if let Some(end) = closing_emphasis(marker, &chars, i + 1) {
                     let _ = write!(rendered, "{}", SetForegroundColor(Color::Green));
-                    for j in (i + 1)..end {
-                        rendered.push(chars[j]);
-                    }
+                    rendered.extend(&chars[i + 1..end]);
                     let _ = write!(rendered, "{}", ResetColor);
                     i = end + 1;
                     continue;
@@ -637,16 +631,12 @@ pub(crate) fn render_inline_markdown(line: &str) -> String {
                     if let Some(close_paren) = find_closing(')', &chars, close_bracket + 2) {
                         // Render link text in blue
                         let _ = write!(rendered, "{}", SetForegroundColor(Color::Blue));
-                        for j in (i + 1)..close_bracket {
-                            rendered.push(chars[j]);
-                        }
+                        rendered.extend(&chars[i + 1..close_bracket]);
                         let _ = write!(rendered, "{}", ResetColor);
 
                         // Render URL in dark grey
                         let _ = write!(rendered, "{} (", SetForegroundColor(crate::out::DIM));
-                        for j in (close_bracket + 2)..close_paren {
-                            rendered.push(chars[j]);
-                        }
+                        rendered.extend(&chars[close_bracket + 2..close_paren]);
                         let _ = write!(rendered, "){}", ResetColor);
 
                         i = close_paren + 1;
@@ -680,11 +670,10 @@ fn opens_emphasis(marker: char, chars: &[char], at: usize) -> bool {
     if !next.is_some_and(|ch| !ch.is_whitespace()) {
         return false;
     }
-    if marker == '_' {
-        if at > 0 && chars[at - 1].is_alphanumeric() {
+    if marker == '_'
+        && at > 0 && chars[at - 1].is_alphanumeric() {
             return false;
         }
-    }
     true
 }
 
@@ -707,12 +696,7 @@ fn closing_emphasis(marker: char, chars: &[char], start: usize) -> Option<usize>
 }
 
 pub(crate) fn find_closing(marker: char, chars: &[char], start: usize) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == marker {
-            return Some(i);
-        }
-    }
-    None
+    chars.get(start..)?.iter().position(|&c| c == marker).map(|offset| start + offset)
 }
 
 // Find closing double-character marker (like **)
@@ -723,12 +707,11 @@ pub(crate) fn find_double_closing(marker: &str, chars: &[char], start: usize) ->
         return None;
     }
 
-    for i in start..(chars.len() - 1) {
-        if chars[i] == marker_chars[0] && chars[i + 1] == marker_chars[1] {
-            return Some(i);
-        }
-    }
-    None
+    chars
+        .get(start..)?
+        .windows(2)
+        .position(|pair| pair == marker_chars.as_slice())
+        .map(|offset| start + offset)
 }
 
 // Announce a tool call before it runs.
@@ -844,13 +827,13 @@ pub(crate) fn change_preview(diff: &str) -> Option<String> {
 
     let mut preview = String::new();
     for line in body.iter().take(MAX_LINES) {
-        let _ = write!(preview, "    {}\n", line);
+        let _ = writeln!(preview, "    {}", line);
     }
 
     if body.len() > MAX_LINES {
-        let _ = write!(
+        let _ = writeln!(
             preview,
-            "{}    … {} more line(s){}\n",
+            "{}    … {} more line(s){}",
             SetForegroundColor(crate::out::DIM),
             body.len() - MAX_LINES,
             ResetColor
@@ -1180,7 +1163,7 @@ mod markdown_tests {
         // And nothing was dropped on the way: every word of the long cell is still there.
         let words: String = drawn
             .lines()
-            .flat_map(|line| line.split('│').skip(3).next())
+            .flat_map(|line| line.split('│').nth(3))
             .collect::<Vec<&str>>()
             .join(" ");
         for word in "TOML config parsing built with only parse and serde features".split(' ') {

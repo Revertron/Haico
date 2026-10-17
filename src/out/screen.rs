@@ -463,7 +463,7 @@ impl Screen {
         let mut rows = Vec::with_capacity(height);
         // A transcript shorter than the viewport sits against the bottom, the way a shell
         // leaves one, rather than at the top with the input box stranded in the middle.
-        rows.extend(std::iter::repeat(String::new()).take(content - transcript.len()));
+        rows.extend(std::iter::repeat_n(String::new(), content - transcript.len()));
         rows.extend(transcript);
         if let Some(anchor) = held {
             let index = anchor.seq.saturating_sub(self.dropped) as usize;

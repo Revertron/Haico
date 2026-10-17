@@ -118,15 +118,12 @@ pub(crate) fn visible_width(text: &str) -> usize {
         }
         // CSI sequences run until a byte in @..~; anything else is a two-character
         // escape. Either way none of it lands on the screen.
-        match chars.next() {
-            Some('[') => {
-                for ch in chars.by_ref() {
-                    if ('@'..='~').contains(&ch) {
-                        break;
-                    }
+        if let Some('[') = chars.next() {
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
                 }
             }
-            Some(_) | None => {}
         }
     }
     width

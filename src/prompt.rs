@@ -90,10 +90,10 @@ fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
             .unwrap_or_else(|| "unknown".to_string());
 
         let status = run_git_command(&["status", "--short"])
-            .unwrap_or_else(|| "".to_string());
+            .unwrap_or_default();
 
         let commits = run_git_command(&["log", "--oneline", "-5"])
-            .unwrap_or_else(|| "".to_string());
+            .unwrap_or_default();
 
         (branch, status, commits)
     } else {
@@ -155,6 +155,9 @@ fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
 // None when that leaves nothing to say at all: such a model, with neither file present,
 // gets no system message rather than an empty one.
 
+// Nine arguments, each an input of its own that both callers name: a struct for them would
+// be filled field by field from the same names at both sites, and say nothing more.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_system_prompt(
     custom: Option<&str>,
     model: &str,
