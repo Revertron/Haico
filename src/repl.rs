@@ -27,69 +27,6 @@ use std::path::PathBuf;
 
 
 
-fn print_repl_help() {
-    outln!("Commands:");
-    outln!("  /help              Show this list");
-    outln!("  /plan              Research and propose only; nothing changes until approved");
-    outln!("  /auto              Review each gated call; routine ones run without asking");
-    outln!("  /normal            Back to answering every prompt yourself");
-    outln!("  /add <path>        Let the file tools read and write another directory too");
-    outln!("  /workspace         Show which paths the file tools may touch");
-    outln!("  /cd [path]         Move to another project; with no path, show where you are");
-    outln!("  /mode              Show which of the three is in force");
-    outln!("  /init              Study the project and write its instruction file");
-    outln!("  /tools             List available tools and whether they prompt");
-    outln!("  /model [name]      Switch model and save it as the default; with no name,");
-    outln!("                     pick from the server's list");
-    outln!("  /provider [name]   Switch to another server from the config's providers and");
-    outln!("                     save it as the default; with no name, pick from the list");
-    outln!("  /config            Show the settings in force and where each came from");
-    outln!("  /set [name] [val]  Show or set context, temperature, top_p, top_k, min_p,");
-    outln!("                     repeat_penalty, max_tokens, reasoning_effort or");
-    outln!("                     reasoning_threshold ('/set <name> unset' to undo).");
-    outln!("                     '/temp' and '/effort' are short for '/set temperature'");
-    outln!("                     and '/set reasoning_effort'; '/effort on|off' switch");
-    outln!("                     thinking itself. All last for the session except");
-    outln!("                     'context', which is saved for this model.");
-    outln!("  /bg [stop [id]]    List background jobs, or stop one or all of them");
-    outln!("  /timers [cancel]   List the timers the model set, or cancel one (by id) or all");
-    outln!("  /undo              Revert the last file change made by a tool");
-    outln!("  /todo              Show the current plan, if the model made one");
-    outln!("  /context           Show how much context the conversation is using");
-    outln!("  /reasoning [what]  Keep, compress or drop the model's chain of thought");
-    outln!("  /compact           Replace the history with a summary, freeing context");
-    outln!("  /resume            Load this directory's saved conversation, dropping the current one");
-    outln!("  /clear /new /reset Start over, keeping the system prompt");
-    outln!("  /exit /quit        Leave (Ctrl+D also works)");
-    outln!("  /skills            List the skills the model can load, and where each lives");
-    outln!("  /update-skills     Re-read the skills directories into the system prompt");
-    outln!("  /<skill> [args]    Run a skill by name; the model is shown the list and loads");
-    outln!("                     one on its own when a request matches it");
-    outln!();
-    outln!("In a message:  write @path to send the file with it — relative or absolute,");
-    outln!("               and a file outside the workspace comes into reach with it.");
-    outln!("               A PNG, JPEG, GIF or WEBP goes as a picture, for a model that");
-    outln!("               can see one; a model that cannot will say so.");
-    outln!("At the prompt: up/down for history, Shift+Enter for another line,");
-    outln!("               Ctrl+V or Shift+Insert to paste,");
-    outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
-    outln!("While working: keep typing — Enter queues the message for when the turn");
-    outln!("               ends. Esc interrupts and returns to the prompt.");
-    outln!("Either way:    Ctrl+T cycles the plan panel — windowed, all of it, one line.");
-    outln!("               Ctrl+O opens what the transcript folded away — the full tool");
-    outln!("               output, whole diffs, the reasoning — and folds it back.");
-    outln!("Fullscreen:    the wheel and PageUp/PageDown scroll the transcript; the view");
-    outln!("               stays put while output arrives and follows again at the end.");
-    outln!("               Set tui = \"inline\" in the config, or HAICO_TUI=inline, to go");
-    outln!("               back to the terminal's own scrollback.");
-    outln!("               On Windows the wheel needs Shift held to select text; set");
-    outln!("               mouse = \"off\" to keep plain drag-selection instead.");
-    outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
-    outln!("Skills:         <name>/SKILL.md under .haico/skills, .agents/skills or .claude/skills");
-    outln!("                in the project, or under {}.", crate::store::display("skills"));
-    outln!();
-}
-
 // Raw mode and the alternate screen both have to come off however the program leaves,
 // including the error paths that return early and a panic on its way out. A terminal left
 // in raw mode stops echoing what is typed into it, which looks exactly like a hung shell;
@@ -200,7 +137,10 @@ fn status_line(
 // unmovable: each wrap handed the turn the keyboard, the editor and the queue for
 // the duration. Now the turn narrates itself through a channel and shares three
 // things through a `TurnLink`, and everything below the seam is this function's.
-async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initializing: bool) {
+//
+// A `/compact` runs through here too, for the same reason a turn does: it is minutes on
+// a local model, and run directly from the loop it had no busy bar and no Esc.
+async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
     let link = TurnLink::new(agent.mode);
     let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let mut presenter = Presenter::new();
@@ -232,7 +172,14 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
     let mut streamed = 0usize;
 
     {
-        let turn = run_turn(agent, input, initializing, &tx, &link);
+        let turn = async {
+            match job {
+                Job::Turn { input, initializing } => {
+                    run_turn(agent, &input, initializing, &tx, &link).await;
+                }
+                Job::Compact => compact_on_request(agent, &tx, &link).await,
+            }
+        };
         tokio::pin!(turn);
 
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -251,7 +198,7 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
         macro_rules! drain {
             () => {
                 while let Ok(event) = events.try_recv() {
-                    answer_or_show(&mut presenter, &mut io.keys, event, &link).await;
+                    answer_or_show(&mut presenter, &mut io.keys, event).await;
                 }
             };
         }
@@ -343,7 +290,7 @@ async fn drive_turn(agent: &mut Agent, io: &mut TerminalIo, input: &str, initial
                                 }
                                 _ => {}
                             }
-                            answer_or_show(&mut presenter, &mut io.keys, event, &link).await;
+                            answer_or_show(&mut presenter, &mut io.keys, event).await;
                             dirty = true;
                         }
                         // Every sender is gone, which only happens once the turn has
@@ -434,7 +381,6 @@ async fn answer_or_show(
     presenter: &mut Presenter,
     keys: &mut Option<Keys>,
     event: AgentEvent,
-    link: &TurnLink,
 ) {
     let AgentEvent::Ask(ask) = event else {
         presenter.show(event);
@@ -465,10 +411,6 @@ async fn answer_or_show(
             }
         }
     }
-    // A prompt draws over the input region and leaves the cursor wherever it
-    // finished; the pump redraws on the next pass, and this keeps the scroll
-    // following the end while it does.
-    let _ = link;
 }
 
 // Which model the session starts with: the one configured, else the only one loaded, else
@@ -667,7 +609,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                             if !fired.is_empty() {
                                 outln!("{}", timers_fired(&fired));
                                 let message = timers::message_for(&fired);
-                                drive_turn(&mut agent, &mut io, &message, false).await;
+                                drive(&mut agent, &mut io, Job::turn(message)).await;
                             }
                             continue;
                         }
@@ -699,690 +641,15 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             }
         };
         let input = input.trim();
-
         if input.is_empty() {
             continue;
         }
-
-        if input == "/exit" || input == "/quit" {
-            outln!("Goodbye!");
-            break;
-        }
-
-        if input == "/help" {
-            print_repl_help();
-            continue;
-        }
-
-        if input == "/add" || input.starts_with("/add ") {
-            let requested = input.strip_prefix("/add").unwrap_or("").trim();
-            if requested.is_empty() {
-                outln!("Usage: /add <path>   (a directory to read and write for this session)\n");
-                continue;
-            }
-            match agent.workspace.add(std::path::Path::new(requested)) {
-                Ok(added) => outln!("Added to the workspace: {}\n", display_path(&added)),
-                Err(reason) => outln!("{}\n", reason),
-            }
-            continue;
-        }
-
-        if input == "/workspace" {
-            outln!("Readable and writable:");
-            for root in agent.workspace.writable_roots() {
-                // The scratch directory is in this list and looks like a stray temp path
-                // without the label — it is haico's own, not something the user added.
-                let scratch = agent.workspace.scratch() == Some(root.as_path());
-                let suffix = if scratch { "   (this session's scratch directory)" } else { "" };
-                outln!("  {}{}", display_path(root), suffix);
-            }
-            if agent.workspace.readable_roots().is_empty() {
-                outln!("Readable only: none configured (see 'read_paths' in the config file).");
-            } else {
-                outln!("Readable only:");
-                for root in agent.workspace.readable_roots() {
-                    outln!("  {}", display_path(root));
-                }
-            }
-            // Listed apart from the directories above, because that is what they
-            // are not: the file is in reach and nothing else in its directory is.
-            if !agent.workspace.attached_files().is_empty() {
-                outln!("Single files, named with @ in a message:");
-                for file in agent.workspace.attached_files() {
-                    outln!("  {}", display_path(file));
-                }
-            }
-            outln!("\nAnything else is refused outright, for reads as well as writes.\n");
-            continue;
-        }
-
-        if input == "/cd" || input.starts_with("/cd ") {
-            let requested = input.strip_prefix("/cd").unwrap_or("").trim();
-            if requested.is_empty() {
-                outln!("Working directory: {}\n", display_path(&cwd));
-                continue;
-            }
-            match agent.change_directory(std::path::Path::new(requested)) {
-                Ok(moved) => {
-                    // The project is now the new one — its instructions, its memory, its
-                    // branch, its writable root. What has not moved is the conversation,
-                    // and that is the whole of the reminder: the model is still carrying
-                    // a history about somewhere else.
-                    cwd = moved;
-                    io.editor.set_commands(commands::for_cwd());
-                    outln!("Working directory: {}", display_path(&cwd));
-                    if let Some((name, _)) = &agent.project_context {
-                        outln!("Loaded project context from {}", name);
-                    }
-                    outln!("The conversation came with you — /clear (or /new) to start fresh here.");
-                    // Said after the reminder rather than before it, because it is the
-                    // alternative to it: one throws the history away, the other swaps it
-                    // for the one this directory was left in.
-                    if agent.has_saved_session() {
-                        outln!("A conversation was saved here before — /resume picks it up instead.");
-                    }
-                    outln!();
-                }
-                Err(why) => outln!("{}\n", why),
-            }
-            continue;
-        }
-
-        if matches!(input, "/plan" | "/auto" | "/normal" | "/mode") {
-            let requested = match input {
-                "/plan" => Some(Mode::Plan),
-                "/auto" => Some(Mode::Auto),
-                "/normal" => Some(Mode::Normal),
-                _ => None,
-            };
-            if let Some(requested) = requested {
-                agent.mode = requested;
-            }
-            outln!("Mode: {}\n", agent.mode.describe());
-            if agent.mode == Mode::Auto {
-                // Spelled out, because this is the mode that acts without asking and the
-                // user should know exactly how far that goes before leaving it on.
-                outln!(
-                    "{} reviews each call that would have asked you, with no conversation \
-                     history. Calls it judges routine run on their own, tagged with the \
-                     reason. Anything it refuses — or cannot judge — still comes to you.",
-                    agent.client.model
-                );
-                outln!(
-                    "It is the same model, so treat it as a check against drift and \
-                     mistakes, not as a security boundary.\n"
-                );
-            }
-            continue;
-        }
-
-        if input == "/resume" {
-            if !agent.has_saved_session() {
-                outln!("No saved conversation for this directory.\n");
-                continue;
-            }
-            // Dropped through `clear` rather than by emptying the history here: what goes
-            // with a conversation and what survives it is the core's business, and a
-            // second answer to that question in the frontend is the one that would drift.
-            // The screen goes with it for `/clear`'s reason — the transcript on it belongs
-            // to a conversation that is no longer in the history.
-            out::clear_screen();
-            let _ = agent.clear();
-            match agent.resume() {
-                Ok(restored) => outln!(
-                    "Resumed {} message(s) from {} (model then: {}).\n",
-                    restored.messages, restored.saved_at, restored.model
-                ),
-                Err(e) => outln!("Could not resume: {:#}. The conversation is empty.\n", e),
-            }
-            continue;
-        }
-
-        if input == "/clear" || input == "/new" || input == "/reset" {
-            // What is discarded, what survives and why is `Agent::clear`'s
-            // business. The screen is this frontend's: a transcript of a
-            // conversation that no longer exists goes with it, the way it always
-            // has in the window. What is left here is saying what happened.
-            out::clear_screen();
-            match agent.clear() {
-                ContextReload::Unchanged => {}
-                ContextReload::Reloaded(name) => outln!("Reloaded project context from {}", name),
-                ContextReload::Gone => {
-                    outln!("Project context file is gone; carrying on without it")
-                }
-            }
-            outln!("Conversation cleared.\n");
-            continue;
-        }
-
-        if input == "/tools" {
-            outln!("{} tools available:", agent.server.tool_router.list_all().len());
-            for tool in agent.server.tool_router.list_all() {
-                let gate = if AUTO_ALLOWED_TOOLS.contains(&tool.name.as_ref()) {
-                    "auto"
-                } else {
-                    "asks"
-                };
-                outln!("  {:<14} [{}]", tool.name, gate);
-            }
-            outln!();
-            continue;
-        }
-
-        if input == "/skills" {
-            let found = skills::discover(&skills::roots_for_cwd());
-            if found.is_empty() {
-                outln!("No skills found. Put <name>/SKILL.md under .haico/skills, .agents/skills");
-                outln!("or .claude/skills in the project, or under {}.
-", store::display("skills"));
-            } else {
-                outln!("{} skill(s):", found.len());
-                for skill in &found {
-                    outln!("  /{} — {}", skill.name, skill.description);
-                    outln!("      {}", display_path(&skill.dir));
-                }
-                outln!();
-            }
-            continue;
-        }
-
-        if input == "/update-skills" {
-            let changed = agent.reload_skills();
-            io.editor.set_commands(commands::for_cwd());
-            let count = skills::discover(&skills::roots_for_cwd()).len();
-            if changed {
-                outln!("Skills reloaded: {} available. The system prompt was updated.
-", count);
-            } else {
-                outln!("Skills unchanged: {} available.
-", count);
-            }
-            continue;
-        }
-
-        if input == "/model" || input.starts_with("/model ") {
-            let requested = input.strip_prefix("/model").unwrap_or("").trim().to_string();
-            // Copied out so the borrow ends before agent.client is reassigned below.
-            let llm_url = agent.client.base_url.clone();
-            let token = agent.client.token.clone();
-
-            let chosen = if requested.is_empty() {
-                match fetch_available_models(&llm_url, token.as_deref()).await {
-                    Ok(models) if !models.is_empty() => match pick_model(io.keys.as_mut(), models).await {
-                        Ok(model) => Some(model),
-                        Err(e) => {
-                            outln!("Model selection cancelled: {}\n", e);
-                            None
-                        }
-                    },
-                    Ok(_) => {
-                        outln!("The server reports no available models.\n");
-                        None
-                    }
-                    Err(e) => {
-                        outln!("Could not list models: {:#}\n", e);
-                        None
-                    }
-                }
-            } else {
-                Some(requested)
-            };
-
-            if let Some(model) = chosen {
-                // Everything that is configured per model is re-resolved inside
-                // `switch_model` — the context budget, the sampling, the
-                // reasoning policy, both copies of the client, and the system
-                // message. The conversation itself is kept. It also records the
-                // choice in the config file, which is what comes back here.
-                let kept = agent.switch_model(model.clone());
-
-                outln!(
-                    "Now using model: {}{}",
-                    model,
-                    match kept {
-                        Kept::Config => "  (saved as the default)",
-                        _ => "",
-                    }
-                );
-                if let Kept::Failed(why) = &kept {
-                    outln!("  [warning] not saved as the default: {}", why);
-                }
-                outln!(
-                    "  context {} ({}){}\n",
-                    agent.context_tokens,
-                    agent.settings.context_source,
-                    match agent.settings.temperature.value {
-                        Some(t) => format!(", temperature {}", t),
-                        None => String::new(),
-                    }
-                );
-            }
-            continue;
-        }
-
-        if input == "/provider" || input.starts_with("/provider ") {
-            let requested = input.strip_prefix("/provider").unwrap_or("").trim().to_string();
-            let providers = agent.providers().to_vec();
-            if providers.is_empty() {
-                // Said with the shape to write, since the file is the only way to add one.
-                let path = agent
-                    .config
-                    .config_path
-                    .as_deref()
-                    .map(display_path)
-                    .unwrap_or_else(|| "the config file".to_string());
-                outln!("No providers are configured. List them in {} like this:\n", path);
-                outln!("  version = 1");
-                outln!("  providers = [\"local\", \"lmstudio\"]\n");
-                outln!("  [local]");
-                outln!("  url = \"http://127.0.0.1:11434\"\n");
-                outln!("  [lmstudio]");
-                outln!("  url = \"http://127.0.0.1:1234\"");
-                outln!("  token = \"sk-lm-...\"");
-                outln!("  model = \"qwen2.5:14b\"\n");
-                continue;
-            }
-
-            let chosen = if requested.is_empty() {
-                // The caret starts on the provider in force, so Enter alone changes nothing.
-                let current = agent
-                    .provider()
-                    .and_then(|p| providers.iter().position(|name| name == p))
-                    .unwrap_or(0);
-                match io.keys.as_mut() {
-                    Some(keys) => match select_interactive(keys, "provider", providers, current).await {
-                        Ok(name) => Some(name),
-                        Err(e) => {
-                            outln!("{}\n", e);
-                            None
-                        }
-                    },
-                    None => {
-                        outln!("Choosing a provider needs an interactive terminal; give its name: /provider <name>\n");
-                        None
-                    }
-                }
-            } else if providers.contains(&requested) {
-                Some(requested)
-            } else {
-                outln!(
-                    "There is no provider named '{}'; configured: {}\n",
-                    requested,
-                    providers.join(", ")
-                );
-                None
-            };
-            let Some(name) = chosen else { continue };
-            if agent.provider() == Some(name.as_str()) {
-                outln!("Already using provider: {}\n", name);
-                continue;
-            }
-
-            let Some(section) = agent.provider_section(&name).cloned() else { continue };
-            let url = section.url.clone().unwrap_or_default();
-            let model = match section.model.clone() {
-                Some(model) => model,
-                None => {
-                    let token = section.token.clone().filter(|t| !t.trim().is_empty());
-                    match find_model(&url, token.as_deref(), io.keys.as_mut()).await {
-                        Ok(model) => model,
-                        Err(e) => {
-                            // Nothing has changed yet: the switch happens only with a model
-                            // to switch to, so a server that is down leaves the session on
-                            // the provider that works.
-                            outln!("{:#}\nStill using provider: {}\n", e, agent.provider().unwrap_or("-"));
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            // The conversation is kept, as with /model; the url, token, model and every
-            // per-model setting move with the switch.
-            let kept = agent.switch_provider(&name, model.clone());
-            outln!(
-                "Now using provider: {} at {}, model {}{}",
-                name,
-                url,
-                model,
-                match kept {
-                    Kept::Config => "  (saved as the default)",
-                    _ => "",
-                }
-            );
-            if let Kept::Failed(why) = &kept {
-                outln!("  [warning] not saved as the default: {}", why);
-            }
-            outln!(
-                "  context {} ({})\n",
-                agent.context_tokens,
-                agent.settings.context_source
-            );
-            continue;
-        }
-
-        if input == "/config" {
-            match agent.config.config_path.as_deref() {
-                Some(path) if path.exists() => outln!("Config file: {}", path.display()),
-                Some(path) => outln!("Config file: {} (not created yet)", path.display()),
-                None => outln!("Config file: unavailable (no home directory)"),
-            }
-            outln!("
-In force for '{}':", agent.client.model);
-            outln!("  provider          {}", agent.provider().unwrap_or("-"));
-            outln!("  url               {}", agent.client.base_url);
-            outln!(
-                "  token             {}",
-                if agent.client.token.is_some() { "set" } else { "not set" }
-            );
-            outln!(
-                "  context           {}  [{}]",
-                agent.context_tokens, agent.settings.context_source
-            );
-            outln!("  temperature       {}", agent.settings.temperature.describe());
-            outln!("  top_p             {}", agent.settings.top_p.describe());
-            outln!("  top_k             {}", agent.settings.top_k.describe());
-            outln!("  min_p             {}", agent.settings.min_p.describe());
-            outln!("  repeat_penalty    {}", agent.settings.repeat_penalty.describe());
-            outln!("  max_tokens        {}", agent.settings.max_tokens.describe());
-            outln!("  reasoning_effort  {}", agent.settings.reasoning_effort.describe());
-            // Unset still says more than the bare "-" the request fields share, but for the
-            // opposite reason it used to: it no longer sends anything at all, so what needs
-            // saying is not what it does but what it does not do — inherit the level above.
-            outln!(
-                "  sub_agent_effort  {}",
-                match &agent.settings.sub_agent_effort {
-                    Some(effort) => format!("{}  [config [models]]", effort),
-                    None => "-  [unset (the model's own default, never the level above)]"
-                        .to_string(),
-                }
-            );
-            // Shown as what is actually in force rather than as what the file said, since
-            // /reasoning can have moved it since. The source string is only honest for the
-            // former case, so it is replaced rather than kept when they differ.
-            outln!(
-                "  reasoning         {}{}",
-                agent.reasoning,
-                if agent.reasoning == agent.settings.reasoning() {
-                    format!("  [{}]", agent.settings.reasoning_source())
-                } else {
-                    "  [/reasoning, this session]".to_string()
-                }
-            );
-            outln!(
-                "  system prompt     {}",
-                match (agent.settings.use_system_prompt, &agent.system_prompt) {
-                    (true, _) => "haico's own",
-                    (false, Some(_)) => "off — project instructions only  [config [models]]",
-                    (false, None) => "off — nothing sent  [config [models]]",
-                }
-            );
-            outln!(
-                "\nA '-' means the field is left out of the request, so the server's own \
-                 setting for that model applies."
-            );
-            outln!("Change one for this session with /set <name> <value>.\n");
-            continue;
-        }
-
-        // One command for every sampling knob rather than one command each. "/temp" is kept
-        // as a shorthand for the one that gets touched most.
-        if input == "/set"
-            || input.starts_with("/set ")
-            || input.starts_with("/temp")
-            || input.starts_with("/effort")
-        {
-            // `/temp 0.7` is the shorthand that predates `/set`, kept because it
-            // is what fingers already know. `/effort high` earns the same: it is a
-            // knob that gets changed with the task in hand rather than tuned once.
-            let rest = if let Some(rest) = input.strip_prefix("/temp") {
-                format!("temperature {}", rest.trim())
-            } else if let Some(rest) = input.strip_prefix("/effort") {
-                format!("reasoning_effort {}", rest.trim())
-            } else {
-                input.strip_prefix("/set").unwrap_or("").trim().to_string()
-            };
-            let mut parts = rest.split_whitespace();
-            let name = parts.next().unwrap_or("");
-            let value = parts.next().unwrap_or("");
-
-            // No name: show everything. What each one *is* comes from the agent;
-            // the layout of the listing is this frontend's.
-            if name.is_empty() {
-                for knob in Knob::ALL {
-                    outln!("  {:<20}{}", knob.name(), agent.knob(*knob));
-                }
-                outln!("\nUsage: /set <name> <value>, or /set <name> unset\n");
-                continue;
-            }
-
-            let Some(knob) = Knob::parse(name) else {
-                outln!(
-                    "Unknown setting '{}'. Try: {}.\n",
-                    name,
-                    Knob::ALL.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
-                );
-                continue;
-            };
-
-            // A name with no value asks rather than sets.
-            if value.is_empty() {
-                outln!("  {:<20}{}\n", knob.name(), agent.knob(knob));
-                continue;
-            }
-
-            match agent.set_knob(knob, Some(value)) {
-                Ok(kept) => {
-                    match agent.knob_value(knob) {
-                        // "the config file is updated" rather than calling the value
-                        // shown the saved one: clearing `context` writes too, and what
-                        // it writes is the key's absence, not the number now in force.
-                        Some(now) => outln!(
-                            "{} = {} for this session{}.",
-                            knob.name(),
-                            now,
-                            match kept {
-                                Kept::Config => ", and the config file is updated",
-                                _ => "",
-                            }
-                        ),
-                        None => outln!("{} unset — the server decides again.", knob.name()),
-                    }
-                    if let Kept::Failed(why) = kept {
-                        outln!("  [warning] the config file was not updated: {}", why);
-                    }
-                    outln!();
-                }
-                Err(complaint) => outln!("{}, got '{}'.\n", complaint, value),
-            }
-            continue;
-        }
-
-        if input == "/bg" || input.starts_with("/bg ") {
-            let argument = input.strip_prefix("/bg").unwrap_or("").trim().to_string();
-
-            if argument.is_empty() {
-                let listing: Vec<String> = {
-                    let registry = agent.server.background.lock().unwrap();
-                    registry
-                        .jobs
-                        .iter()
-                        .map(|(id, job)| format!("  {}  [{}]  {}", id, job.status(), job.command))
-                        .collect()
-                };
-                if listing.is_empty() {
-                    outln!("No background jobs.\n");
-                } else {
-                    outln!("Background jobs:\n{}\n", listing.join("\n"));
-                }
-            } else if argument == "stop" {
-                let stopped = agent.server.stop_all_background().await;
-                outln!("Stopped {} job(s).\n", stopped);
-            } else if let Some(id) = argument.strip_prefix("stop ").and_then(|n| n.trim().parse::<u32>().ok()) {
-                let result = agent.server
-                    .background_stop(Parameters(BackgroundStopParams { id: Some(id) }))
-                    .await;
-                match result {
-                    Ok(result) => outln!(
-                        "{}\n",
-                        result
-                            .content
-                            .iter()
-                            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ),
-                    Err(e) => outln!("Could not stop job {}: {:?}\n", id, e),
-                }
-            } else {
-                outln!("Usage: /bg, /bg stop <id>, /bg stop\n");
-            }
-            continue;
-        }
-
-        if input == "/timers" || input.starts_with("/timers ") {
-            let argument = input.strip_prefix("/timers").unwrap_or("").trim();
-            if argument.is_empty() {
-                outln!("{}\n", agent.server.describe_timers());
-            } else if argument == "cancel" {
-                let cancelled = agent.server.timers.lock().unwrap().clear();
-                outln!("Cancelled {} timer(s).\n", cancelled);
-            } else if let Some(id) = argument.strip_prefix("cancel ").and_then(|n| n.trim().parse::<u32>().ok()) {
-                // The model is not told: it finds out from the reminder never arriving, or
-                // from `timer list` if it asks — the same as a background job stopped by /bg.
-                match agent.server.timers.lock().unwrap().cancel(id) {
-                    Some(timer) => outln!("Cancelled timer {} ({}).\n", id, timer.schedule.describe()),
-                    None => outln!("There is no timer {}.\n", id),
-                }
-            } else {
-                outln!("Usage: /timers, /timers cancel <id>, /timers cancel\n");
-            }
-            continue;
-        }
-
-        if input == "/undo" {
-            match agent.server.undo_last() {
-                Ok(what) => outln!("Reverted: {}\n", what),
-                Err(why) => outln!("{}\n", why),
-            }
-            continue;
-        }
-
-        if input == "/todo" {
-            let todos = agent.plan();
-            if todos.is_empty() {
-                outln!("No plan yet.\n");
-            } else {
-                outln!("Plan:");
-                for item in &todos {
-                    let mark = match item.status.as_str() {
-                        "completed" => "x",
-                        "in_progress" => "»",
-                        _ => " ",
-                    };
-                    outln!("  [{}] {}", mark, item.task);
-                }
-                outln!();
-            }
-            continue;
-        }
-
-        if input == "/context" {
-            report_context(
-                &agent.messages,
-                agent.context_used(),
-                agent.context_is_measured(),
-                agent.context_tokens,
-                &agent.reasoning_stats,
-            );
-            continue;
-        }
-
-        // Session-only, like /set: the config file is where a lasting choice belongs, and
-        // the whole point of this one is trying the three against each other on the same
-        // task without editing a file between the runs.
-        if input == "/reasoning" || input.starts_with("/reasoning ") {
-            let rest = input.strip_prefix("/reasoning").unwrap_or("").trim().to_string();
-            if rest.is_empty() {
-                let source = if agent.reasoning == agent.settings.reasoning() {
-                    agent.settings.reasoning_source()
-                } else {
-                    "/reasoning, this session"
-                };
-                outln!("Chain of thought: {}  [{}]", agent.reasoning, source);
-                outln!(
-                    "  keep      send it back to the model with the rest of the history"
-                );
-                outln!(
-                    "  compress  replace it with its hard points once the turn is over"
-                );
-                outln!("  drop      strip it the moment the turn is over");
-                outln!(
-                    "\nCompressing costs one extra request per reply and only runs on a \
-                     trace over ~{} tokens (/set reasoning_threshold).\n",
-                    agent.reasoning_threshold
-                );
-            } else if let Some(chosen) = Reasoning::parse(&rest) {
-                agent.set_reasoning(chosen);
-                outln!("Chain of thought: {} (this session).\n", agent.reasoning);
-            } else {
-                outln!("[error] unknown setting '{}'. Use keep, compress or drop.\n", rest);
-            }
-            continue;
-        }
-
-        if input == "/compact" {
-            let (context_tokens, before) = (agent.context_tokens, agent.context_used());
-            match compact_history(&agent.client, &mut agent.messages, context_tokens, before).await {
-                // The same reclaim as /clear, on the one path that actually shrank the
-                // session. A compaction that failed freed nothing to go with it.
-                Ok(summary) => {
-                    agent.review_cache.clear();
-                    // The history that held anything remembered this session has just
-                    // become a paragraph of notes; the index is now the only thing that
-                    // still knows, so it goes into the prompt here.
-                    agent.refresh_memory();
-                    outln!("{}\n", summary)
-                }
-                Err(e) => outln!("[error] could not compact: {:#}\n", e),
-            }
-            continue;
-        }
-
-        // The one "command" that is not one: /init does not do anything itself, it expands
-        // into a long instruction and runs as an ordinary turn. Written that way so it gets
-        // the tools, the permission prompts and /undo for free — there is nothing about
-        // writing an instruction file that needs its own machinery.
-        let init_instruction;
-        let skill_instruction;
-        let mut initializing = false;
-        let input = if input == "/init" {
-            let target = init_target_file(&cwd);
-            // It ends in write_file, which plan mode strips from the request. Better to say
-            // so now than to have the model research the whole project and then find it
-            // cannot save the result.
-            if agent.mode == Mode::Plan {
-                outln!(
-                    "/init writes {}, which plan mode does not allow. Switch with /normal first.\n",
-                    target
-                );
-                continue;
-            }
-            outln!("Analyzing the project to write {}...\n", target);
-            initializing = true;
-            init_instruction = build_init_prompt(&cwd);
-            init_instruction.as_str()
-        } else if let Some(expanded) = skills::expand_command(&skills::roots_for_cwd(), input) {
-            // `/init`'s trick again: the skill's instructions become the message and run as
-            // an ordinary turn. Built-in commands were all matched above, so a skill that
-            // shares a name with one is still there for the model, just not by typing it.
-            skill_instruction = expanded;
-            skill_instruction.as_str()
-        } else {
-            input
+        let job = match slash_command(&mut agent, &mut io, &mut cwd, input).await {
+            Next::Exit => break,
+            Next::Prompt => continue,
+            Next::Run(job) => job,
         };
-
-        drive_turn(&mut agent, &mut io, input, initializing).await;
+        drive(&mut agent, &mut io, job).await;
     }
 
     if let Some(path) = &io.history_path {
@@ -1398,6 +665,727 @@ In force for '{}':", agent.client.model);
 
     trace::end(None);
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+
+/// What the loop does once a line has been dealt with.
+enum Next {
+    Exit,
+    /// Back to the prompt: the command was answered here.
+    Prompt,
+    Run(Job),
+}
+
+/// Work that runs through the pump, with the input box live and Esc listened for.
+enum Job {
+    Turn { input: String, initializing: bool },
+    Compact,
+}
+
+impl Job {
+    fn turn(input: impl Into<String>) -> Self {
+        Job::Turn { input: input.into(), initializing: false }
+    }
+}
+
+/// Every built-in, one per row of `commands::BUILT_IN`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cmd {
+    Help,
+    Plan,
+    Auto,
+    Normal,
+    Mode,
+    Add,
+    Workspace,
+    Cd,
+    Init,
+    Tools,
+    Model,
+    Provider,
+    Config,
+    Set,
+    Temp,
+    Effort,
+    Bg,
+    Timers,
+    Undo,
+    Todo,
+    Context,
+    Reasoning,
+    Compact,
+    Resume,
+    Clear,
+    Skills,
+    UpdateSkills,
+    Exit,
+}
+
+/// The command a typed name runs, aliases included. The table is what knows the names;
+/// this is what knows the code.
+fn command_for(name: &str) -> Option<Cmd> {
+    Some(match commands::built_in_named(name)?.name {
+        "help" => Cmd::Help,
+        "plan" => Cmd::Plan,
+        "auto" => Cmd::Auto,
+        "normal" => Cmd::Normal,
+        "mode" => Cmd::Mode,
+        "add" => Cmd::Add,
+        "workspace" => Cmd::Workspace,
+        "cd" => Cmd::Cd,
+        "init" => Cmd::Init,
+        "tools" => Cmd::Tools,
+        "model" => Cmd::Model,
+        "provider" => Cmd::Provider,
+        "config" => Cmd::Config,
+        "set" => Cmd::Set,
+        "temp" => Cmd::Temp,
+        "effort" => Cmd::Effort,
+        "bg" => Cmd::Bg,
+        "timers" => Cmd::Timers,
+        "undo" => Cmd::Undo,
+        "todo" => Cmd::Todo,
+        "context" => Cmd::Context,
+        "reasoning" => Cmd::Reasoning,
+        "compact" => Cmd::Compact,
+        "resume" => Cmd::Resume,
+        "clear" => Cmd::Clear,
+        "skills" => Cmd::Skills,
+        "update-skills" => Cmd::UpdateSkills,
+        "exit" => Cmd::Exit,
+        _ => return None,
+    })
+}
+
+/// One line typed at the prompt: a built-in, a skill, or a message for the model.
+async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, input: &str) -> Next {
+    let Some(command) = input.strip_prefix('/') else {
+        return Next::Run(Job::turn(input));
+    };
+    let (name, rest) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
+    let rest = rest.trim();
+
+    let Some(cmd) = command_for(name) else {
+        // A skill's instructions become the message and run as an ordinary turn — `/init`'s
+        // trick. Built-ins were matched first, so a skill sharing a name with one is still
+        // there for the model, just not by typing it. Anything else that starts with a
+        // slash (a path, say) is a message like any other.
+        return Next::Run(Job::turn(
+            skills::expand_command(&skills::roots_for_cwd(), input).unwrap_or_else(|| input.to_string()),
+        ));
+    };
+
+    match cmd {
+        Cmd::Exit => {
+            outln!("Goodbye!");
+            return Next::Exit;
+        }
+        Cmd::Help => print_repl_help(),
+        Cmd::Plan => show_mode(agent, Some(Mode::Plan)),
+        Cmd::Auto => show_mode(agent, Some(Mode::Auto)),
+        Cmd::Normal => show_mode(agent, Some(Mode::Normal)),
+        Cmd::Mode => show_mode(agent, None),
+        Cmd::Add => add_to_workspace(agent, rest),
+        Cmd::Workspace => show_workspace(agent),
+        Cmd::Cd => change_directory(agent, io, cwd, rest),
+        Cmd::Init => return init(agent, cwd),
+        Cmd::Tools => list_tools(agent),
+        Cmd::Model => switch_model(agent, io, rest).await,
+        Cmd::Provider => switch_provider(agent, io, rest).await,
+        Cmd::Config => show_config(agent),
+        // One command for every sampling knob rather than one command each. `/temp 0.7` is
+        // the shorthand that predates `/set`, kept because it is what fingers already know.
+        // `/effort high` earns the same: it is a knob that gets changed with the task in
+        // hand rather than tuned once.
+        Cmd::Set => set_knob(agent, rest),
+        Cmd::Temp => set_knob(agent, &format!("temperature {}", rest)),
+        Cmd::Effort => set_knob(agent, &format!("reasoning_effort {}", rest)),
+        Cmd::Bg => background_jobs(agent, rest).await,
+        Cmd::Timers => timers_command(agent, rest),
+        Cmd::Undo => match agent.server.undo_last() {
+            Ok(what) => outln!("Reverted: {}\n", what),
+            Err(why) => outln!("{}\n", why),
+        },
+        Cmd::Todo => show_todo(agent),
+        Cmd::Context => report_context(
+            &agent.messages,
+            agent.context_used(),
+            agent.context_is_measured(),
+            agent.context_tokens,
+            &agent.reasoning_stats,
+        ),
+        Cmd::Reasoning => reasoning_command(agent, rest),
+        Cmd::Compact => return Next::Run(Job::Compact),
+        Cmd::Resume => resume(agent),
+        Cmd::Clear => clear(agent),
+        Cmd::Skills => list_skills(),
+        Cmd::UpdateSkills => update_skills(agent, io),
+    }
+    Next::Prompt
+}
+
+// The command half from `commands::BUILT_IN`, so a command added there is in the help
+// without anyone remembering to; the keys and the rest by hand, since they are not
+// commands.
+fn print_repl_help() {
+    outln!("Commands:");
+    for command in commands::BUILT_IN {
+        let mut left = format!("/{}", command.name);
+        for alias in command.aliases {
+            left.push_str(&format!(" /{}", alias));
+        }
+        if !command.usage.is_empty() {
+            left.push(' ');
+            left.push_str(command.usage);
+        }
+        outln!("  {:<21} {}", left, command.about);
+        for line in command.more {
+            outln!("  {:<21} {}", "", line);
+        }
+    }
+    outln!("  {:<21} {}", "/<skill> [args]", "Run a skill by name; the model is shown the list and loads");
+    outln!("  {:<21} {}", "", "one on its own when a request matches it");
+    outln!();
+    outln!("In a message:  write @path to send the file with it — relative or absolute,");
+    outln!("               and a file outside the workspace comes into reach with it.");
+    outln!("               A PNG, JPEG, GIF or WEBP goes as a picture, for a model that");
+    outln!("               can see one; a model that cannot will say so.");
+    outln!("At the prompt: up/down for history, Shift+Enter for another line,");
+    outln!("               Ctrl+V or Shift+Insert to paste,");
+    outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
+    outln!("While working: keep typing — Enter queues the message for when the turn");
+    outln!("               ends. Esc interrupts and returns to the prompt.");
+    outln!("Either way:    Ctrl+T cycles the plan panel — windowed, all of it, one line.");
+    outln!("               Ctrl+O opens what the transcript folded away — the full tool");
+    outln!("               output, whole diffs, the reasoning — and folds it back.");
+    outln!("Fullscreen:    the wheel and PageUp/PageDown scroll the transcript; the view");
+    outln!("               stays put while output arrives and follows again at the end.");
+    outln!("               Set tui = \"inline\" in the config, or HAICO_TUI=inline, to go");
+    outln!("               back to the terminal's own scrollback.");
+    outln!("               On Windows the wheel needs Shift held to select text; set");
+    outln!("               mouse = \"off\" to keep plain drag-selection instead.");
+    outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
+    outln!("Skills:         <name>/SKILL.md under .haico/skills, .agents/skills or .claude/skills");
+    outln!("                in the project, or under {}.", crate::store::display("skills"));
+    outln!();
+}
+
+fn show_mode(agent: &mut Agent, requested: Option<Mode>) {
+    if let Some(requested) = requested {
+        agent.mode = requested;
+    }
+    outln!("Mode: {}\n", agent.mode.describe());
+    if agent.mode == Mode::Auto {
+        // Spelled out, because this is the mode that acts without asking and the user
+        // should know exactly how far that goes before leaving it on.
+        outln!(
+            "{} reviews each call that would have asked you, with no conversation \
+             history. Calls it judges routine run on their own, tagged with the \
+             reason. Anything it refuses — or cannot judge — still comes to you.",
+            agent.client.model
+        );
+        outln!(
+            "It is the same model, so treat it as a check against drift and \
+             mistakes, not as a security boundary.\n"
+        );
+    }
+}
+
+fn add_to_workspace(agent: &mut Agent, requested: &str) {
+    if requested.is_empty() {
+        outln!("Usage: /add <path>   (a directory to read and write for this session)\n");
+        return;
+    }
+    match agent.workspace.add(std::path::Path::new(requested)) {
+        Ok(added) => outln!("Added to the workspace: {}\n", display_path(&added)),
+        Err(reason) => outln!("{}\n", reason),
+    }
+}
+
+fn show_workspace(agent: &Agent) {
+    outln!("Readable and writable:");
+    for root in agent.workspace.writable_roots() {
+        // The scratch directory is in this list and looks like a stray temp path without
+        // the label — it is haico's own, not something the user added.
+        let scratch = agent.workspace.scratch() == Some(root.as_path());
+        let suffix = if scratch { "   (this session's scratch directory)" } else { "" };
+        outln!("  {}{}", display_path(root), suffix);
+    }
+    if agent.workspace.readable_roots().is_empty() {
+        outln!("Readable only: none configured (see 'read_paths' in the config file).");
+    } else {
+        outln!("Readable only:");
+        for root in agent.workspace.readable_roots() {
+            outln!("  {}", display_path(root));
+        }
+    }
+    // Listed apart from the directories above, because that is what they are not: the
+    // file is in reach and nothing else in its directory is.
+    if !agent.workspace.attached_files().is_empty() {
+        outln!("Single files, named with @ in a message:");
+        for file in agent.workspace.attached_files() {
+            outln!("  {}", display_path(file));
+        }
+    }
+    outln!("\nAnything else is refused outright, for reads as well as writes.\n");
+}
+
+fn change_directory(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, requested: &str) {
+    if requested.is_empty() {
+        outln!("Working directory: {}\n", display_path(cwd));
+        return;
+    }
+    match agent.change_directory(std::path::Path::new(requested)) {
+        Ok(moved) => {
+            // The project is now the new one — its instructions, its memory, its branch,
+            // its writable root. What has not moved is the conversation, and that is the
+            // whole of the reminder: the model is still carrying a history about somewhere
+            // else.
+            *cwd = moved;
+            io.editor.set_commands(commands::for_cwd());
+            outln!("Working directory: {}", display_path(cwd));
+            if let Some((name, _)) = &agent.project_context {
+                outln!("Loaded project context from {}", name);
+            }
+            outln!("The conversation came with you — /clear (or /new) to start fresh here.");
+            // Said after the reminder rather than before it, because it is the alternative
+            // to it: one throws the history away, the other swaps it for the one this
+            // directory was left in.
+            if agent.has_saved_session() {
+                outln!("A conversation was saved here before — /resume picks it up instead.");
+            }
+            outln!();
+        }
+        Err(why) => outln!("{}\n", why),
+    }
+}
+
+// The one "command" that is not one: /init does not do anything itself, it expands into a
+// long instruction and runs as an ordinary turn. Written that way so it gets the tools, the
+// permission prompts and /undo for free — there is nothing about writing an instruction
+// file that needs its own machinery.
+fn init(agent: &Agent, cwd: &std::path::Path) -> Next {
+    let target = init_target_file(cwd);
+    // It ends in write_file, which plan mode strips from the request. Better to say so now
+    // than to have the model research the whole project and then find it cannot save the
+    // result.
+    if agent.mode == Mode::Plan {
+        outln!("/init writes {}, which plan mode does not allow. Switch with /normal first.\n", target);
+        return Next::Prompt;
+    }
+    outln!("Analyzing the project to write {}...\n", target);
+    Next::Run(Job::Turn { input: build_init_prompt(cwd), initializing: true })
+}
+
+fn list_tools(agent: &Agent) {
+    outln!("{} tools available:", agent.server.tool_router.list_all().len());
+    for tool in agent.server.tool_router.list_all() {
+        let gate = if AUTO_ALLOWED_TOOLS.contains(&tool.name.as_ref()) { "auto" } else { "asks" };
+        outln!("  {:<14} [{}]", tool.name, gate);
+    }
+    outln!();
+}
+
+fn list_skills() {
+    let found = skills::discover(&skills::roots_for_cwd());
+    if found.is_empty() {
+        outln!("No skills found. Put <name>/SKILL.md under .haico/skills, .agents/skills");
+        outln!("or .claude/skills in the project, or under {}.\n", store::display("skills"));
+        return;
+    }
+    outln!("{} skill(s):", found.len());
+    for skill in &found {
+        outln!("  /{} — {}", skill.name, skill.description);
+        outln!("      {}", display_path(&skill.dir));
+    }
+    outln!();
+}
+
+fn update_skills(agent: &mut Agent, io: &mut TerminalIo) {
+    let changed = agent.reload_skills();
+    io.editor.set_commands(commands::for_cwd());
+    let count = skills::discover(&skills::roots_for_cwd()).len();
+    if changed {
+        outln!("Skills reloaded: {} available. The system prompt was updated.\n", count);
+    } else {
+        outln!("Skills unchanged: {} available.\n", count);
+    }
+}
+
+async fn switch_model(agent: &mut Agent, io: &mut TerminalIo, requested: &str) {
+    let chosen = if requested.is_empty() {
+        // Copied out so the borrow ends before agent.client is reassigned below.
+        let llm_url = agent.client.base_url.clone();
+        let token = agent.client.token.clone();
+        match fetch_available_models(&llm_url, token.as_deref()).await {
+            Ok(models) if !models.is_empty() => match pick_model(io.keys.as_mut(), models).await {
+                Ok(model) => model,
+                Err(e) => return outln!("Model selection cancelled: {}\n", e),
+            },
+            Ok(_) => return outln!("The server reports no available models.\n"),
+            Err(e) => return outln!("Could not list models: {:#}\n", e),
+        }
+    } else {
+        requested.to_string()
+    };
+
+    // Everything that is configured per model is re-resolved inside `switch_model` — the
+    // context budget, the sampling, the reasoning policy, both copies of the client, and
+    // the system message. The conversation itself is kept. It also records the choice in
+    // the config file, which is what comes back here.
+    let kept = agent.switch_model(chosen.clone());
+    outln!(
+        "Now using model: {}{}",
+        chosen,
+        match kept {
+            Kept::Config => "  (saved as the default)",
+            _ => "",
+        }
+    );
+    if let Kept::Failed(why) = &kept {
+        outln!("  [warning] not saved as the default: {}", why);
+    }
+    outln!(
+        "  context {} ({}){}\n",
+        agent.context_tokens,
+        agent.settings.context_source,
+        match agent.settings.temperature.value {
+            Some(t) => format!(", temperature {}", t),
+            None => String::new(),
+        }
+    );
+}
+
+async fn switch_provider(agent: &mut Agent, io: &mut TerminalIo, requested: &str) {
+    let providers = agent.providers().to_vec();
+    if providers.is_empty() {
+        // Said with the shape to write, since the file is the only way to add one.
+        let path = agent
+            .config
+            .config_path
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_else(|| "the config file".to_string());
+        outln!("No providers are configured. List them in {} like this:\n", path);
+        outln!("  version = 1");
+        outln!("  providers = [\"local\", \"lmstudio\"]\n");
+        outln!("  [local]");
+        outln!("  url = \"http://127.0.0.1:11434\"\n");
+        outln!("  [lmstudio]");
+        outln!("  url = \"http://127.0.0.1:1234\"");
+        outln!("  token = \"sk-lm-...\"");
+        outln!("  model = \"qwen2.5:14b\"\n");
+        return;
+    }
+
+    let name = if requested.is_empty() {
+        // The caret starts on the provider in force, so Enter alone changes nothing.
+        let current = agent
+            .provider()
+            .and_then(|p| providers.iter().position(|name| name == p))
+            .unwrap_or(0);
+        match io.keys.as_mut() {
+            Some(keys) => match select_interactive(keys, "provider", providers, current).await {
+                Ok(name) => name,
+                Err(e) => return outln!("{}\n", e),
+            },
+            None => {
+                return outln!("Choosing a provider needs an interactive terminal; give its name: /provider <name>\n")
+            }
+        }
+    } else if providers.iter().any(|name| name == requested) {
+        requested.to_string()
+    } else {
+        return outln!("There is no provider named '{}'; configured: {}\n", requested, providers.join(", "));
+    };
+    if agent.provider() == Some(name.as_str()) {
+        return outln!("Already using provider: {}\n", name);
+    }
+
+    let Some(section) = agent.provider_section(&name).cloned() else { return };
+    let url = section.url.clone().unwrap_or_default();
+    let model = match section.model.clone() {
+        Some(model) => model,
+        None => {
+            let token = section.token.clone().filter(|t| !t.trim().is_empty());
+            match find_model(&url, token.as_deref(), io.keys.as_mut()).await {
+                Ok(model) => model,
+                // Nothing has changed yet: the switch happens only with a model to switch
+                // to, so a server that is down leaves the session on the provider that
+                // works.
+                Err(e) => {
+                    return outln!("{:#}\nStill using provider: {}\n", e, agent.provider().unwrap_or("-"))
+                }
+            }
+        }
+    };
+
+    // The conversation is kept, as with /model; the url, token, model and every per-model
+    // setting move with the switch.
+    let kept = agent.switch_provider(&name, model.clone());
+    outln!(
+        "Now using provider: {} at {}, model {}{}",
+        name,
+        url,
+        model,
+        match kept {
+            Kept::Config => "  (saved as the default)",
+            _ => "",
+        }
+    );
+    if let Kept::Failed(why) = &kept {
+        outln!("  [warning] not saved as the default: {}", why);
+    }
+    outln!("  context {} ({})\n", agent.context_tokens, agent.settings.context_source);
+}
+
+fn show_config(agent: &Agent) {
+    match agent.config.config_path.as_deref() {
+        Some(path) if path.exists() => outln!("Config file: {}", path.display()),
+        Some(path) => outln!("Config file: {} (not created yet)", path.display()),
+        None => outln!("Config file: unavailable (no home directory)"),
+    }
+    outln!("\nIn force for '{}':", agent.client.model);
+    outln!("  provider          {}", agent.provider().unwrap_or("-"));
+    outln!("  url               {}", agent.client.base_url);
+    outln!("  token             {}", if agent.client.token.is_some() { "set" } else { "not set" });
+    outln!("  context           {}  [{}]", agent.context_tokens, agent.settings.context_source);
+    outln!("  temperature       {}", agent.settings.temperature.describe());
+    outln!("  top_p             {}", agent.settings.top_p.describe());
+    outln!("  top_k             {}", agent.settings.top_k.describe());
+    outln!("  min_p             {}", agent.settings.min_p.describe());
+    outln!("  repeat_penalty    {}", agent.settings.repeat_penalty.describe());
+    outln!("  max_tokens        {}", agent.settings.max_tokens.describe());
+    outln!("  reasoning_effort  {}", agent.settings.reasoning_effort.describe());
+    // Unset still says more than the bare "-" the request fields share, but for the
+    // opposite reason it used to: it no longer sends anything at all, so what needs saying
+    // is not what it does but what it does not do — inherit the level above.
+    outln!(
+        "  sub_agent_effort  {}",
+        match &agent.settings.sub_agent_effort {
+            Some(effort) => format!("{}  [config [models]]", effort),
+            None => "-  [unset (the model's own default, never the level above)]".to_string(),
+        }
+    );
+    // Shown as what is actually in force rather than as what the file said, since
+    // /reasoning can have moved it since. The source string is only honest for the former
+    // case, so it is replaced rather than kept when they differ.
+    outln!(
+        "  reasoning         {}{}",
+        agent.reasoning,
+        if agent.reasoning == agent.settings.reasoning() {
+            format!("  [{}]", agent.settings.reasoning_source())
+        } else {
+            "  [/reasoning, this session]".to_string()
+        }
+    );
+    outln!(
+        "  system prompt     {}",
+        match (agent.settings.use_system_prompt, &agent.system_prompt) {
+            (true, _) => "haico's own",
+            (false, Some(_)) => "off — project instructions only  [config [models]]",
+            (false, None) => "off — nothing sent  [config [models]]",
+        }
+    );
+    outln!(
+        "\nA '-' means the field is left out of the request, so the server's own \
+         setting for that model applies."
+    );
+    outln!("Change one for this session with /set <name> <value>.\n");
+}
+
+fn set_knob(agent: &mut Agent, rest: &str) {
+    let mut parts = rest.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let value = parts.next().unwrap_or("");
+
+    // No name: show everything. What each one *is* comes from the agent; the layout of the
+    // listing is this frontend's.
+    if name.is_empty() {
+        for knob in Knob::ALL {
+            outln!("  {:<20}{}", knob.name(), agent.knob(*knob));
+        }
+        outln!("\nUsage: /set <name> <value>, or /set <name> unset\n");
+        return;
+    }
+
+    let Some(knob) = Knob::parse(name) else {
+        outln!(
+            "Unknown setting '{}'. Try: {}.\n",
+            name,
+            Knob::ALL.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
+        );
+        return;
+    };
+
+    // A name with no value asks rather than sets.
+    if value.is_empty() {
+        outln!("  {:<20}{}\n", knob.name(), agent.knob(knob));
+        return;
+    }
+
+    match agent.set_knob(knob, Some(value)) {
+        Ok(kept) => {
+            match agent.knob_value(knob) {
+                // "the config file is updated" rather than calling the value shown the
+                // saved one: clearing `context` writes too, and what it writes is the
+                // key's absence, not the number now in force.
+                Some(now) => outln!(
+                    "{} = {} for this session{}.",
+                    knob.name(),
+                    now,
+                    match kept {
+                        Kept::Config => ", and the config file is updated",
+                        _ => "",
+                    }
+                ),
+                None => outln!("{} unset — the server decides again.", knob.name()),
+            }
+            if let Kept::Failed(why) = kept {
+                outln!("  [warning] the config file was not updated: {}", why);
+            }
+            outln!();
+        }
+        Err(complaint) => outln!("{}, got '{}'.\n", complaint, value),
+    }
+}
+
+async fn background_jobs(agent: &Agent, argument: &str) {
+    if argument.is_empty() {
+        let listing: Vec<String> = {
+            let registry = agent.server.background.lock().unwrap();
+            registry
+                .jobs
+                .iter()
+                .map(|(id, job)| format!("  {}  [{}]  {}", id, job.status(), job.command))
+                .collect()
+        };
+        if listing.is_empty() {
+            outln!("No background jobs.\n");
+        } else {
+            outln!("Background jobs:\n{}\n", listing.join("\n"));
+        }
+    } else if argument == "stop" {
+        let stopped = agent.server.stop_all_background().await;
+        outln!("Stopped {} job(s).\n", stopped);
+    } else if let Some(id) = argument.strip_prefix("stop ").and_then(|n| n.trim().parse::<u32>().ok()) {
+        let result = agent.server.background_stop(Parameters(BackgroundStopParams { id: Some(id) })).await;
+        match result {
+            Ok(result) => outln!(
+                "{}\n",
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            Err(e) => outln!("Could not stop job {}: {}\n", id, e.message),
+        }
+    } else {
+        outln!("Usage: /bg, /bg stop <id>, /bg stop\n");
+    }
+}
+
+fn timers_command(agent: &Agent, argument: &str) {
+    if argument.is_empty() {
+        outln!("{}\n", agent.server.describe_timers());
+    } else if argument == "cancel" {
+        let cancelled = agent.server.timers.lock().unwrap().clear();
+        outln!("Cancelled {} timer(s).\n", cancelled);
+    } else if let Some(id) = argument.strip_prefix("cancel ").and_then(|n| n.trim().parse::<u32>().ok()) {
+        // The model is not told: it finds out from the reminder never arriving, or from
+        // `timer list` if it asks — the same as a background job stopped by /bg.
+        match agent.server.timers.lock().unwrap().cancel(id) {
+            Some(timer) => outln!("Cancelled timer {} ({}).\n", id, timer.schedule.describe()),
+            None => outln!("There is no timer {}.\n", id),
+        }
+    } else {
+        outln!("Usage: /timers, /timers cancel <id>, /timers cancel\n");
+    }
+}
+
+fn show_todo(agent: &Agent) {
+    let todos = agent.plan();
+    if todos.is_empty() {
+        outln!("No plan yet.\n");
+        return;
+    }
+    outln!("Plan:");
+    for item in &todos {
+        let mark = match item.status.as_str() {
+            "completed" => "x",
+            "in_progress" => "»",
+            _ => " ",
+        };
+        outln!("  [{}] {}", mark, item.task);
+    }
+    outln!();
+}
+
+// Session-only, like /set: the config file is where a lasting choice belongs, and the whole
+// point of this one is trying the three against each other on the same task without
+// editing a file between the runs.
+fn reasoning_command(agent: &mut Agent, rest: &str) {
+    if rest.is_empty() {
+        let source = if agent.reasoning == agent.settings.reasoning() {
+            agent.settings.reasoning_source()
+        } else {
+            "/reasoning, this session"
+        };
+        outln!("Chain of thought: {}  [{}]", agent.reasoning, source);
+        outln!("  keep      send it back to the model with the rest of the history");
+        outln!("  compress  replace it with its hard points once the turn is over");
+        outln!("  drop      strip it the moment the turn is over");
+        outln!(
+            "\nCompressing costs one extra request per reply and only runs on a \
+             trace over ~{} tokens (/set reasoning_threshold).\n",
+            agent.reasoning_threshold
+        );
+    } else if let Some(chosen) = Reasoning::parse(rest) {
+        agent.set_reasoning(chosen);
+        outln!("Chain of thought: {} (this session).\n", agent.reasoning);
+    } else {
+        outln!("[error] unknown setting '{}'. Use keep, compress or drop.\n", rest);
+    }
+}
+
+fn resume(agent: &mut Agent) {
+    if !agent.has_saved_session() {
+        outln!("No saved conversation for this directory.\n");
+        return;
+    }
+    // Dropped through `clear` rather than by emptying the history here: what goes with a
+    // conversation and what survives it is the core's business, and a second answer to that
+    // question in the frontend is the one that would drift. The screen goes with it for
+    // `/clear`'s reason — the transcript on it belongs to a conversation that is no longer
+    // in the history.
+    out::clear_screen();
+    let _ = agent.clear();
+    match agent.resume() {
+        Ok(restored) => outln!(
+            "Resumed {} message(s) from {} (model then: {}).\n",
+            restored.messages, restored.saved_at, restored.model
+        ),
+        Err(e) => outln!("Could not resume: {:#}. The conversation is empty.\n", e),
+    }
+}
+
+fn clear(agent: &mut Agent) {
+    // What is discarded, what survives and why is `Agent::clear`'s business. The screen is
+    // this frontend's: a transcript of a conversation that no longer exists goes with it,
+    // the way it always has in the window. What is left here is saying what happened.
+    out::clear_screen();
+    match agent.clear() {
+        ContextReload::Unchanged => {}
+        ContextReload::Reloaded(name) => outln!("Reloaded project context from {}", name),
+        ContextReload::Gone => outln!("Project context file is gone; carrying on without it"),
+    }
+    outln!("Conversation cleared.\n");
 }
 
 /// Everything the terminal frontend owns for the length of a session, bundled so
@@ -1424,6 +1412,35 @@ struct TerminalIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_command_the_list_offers_runs_something() {
+        // A suggestion that runs nothing is worse than none: picked, it would go to the
+        // model as a message. Aliases too, since they are what fingers type.
+        for command in commands::BUILT_IN {
+            for spelling in std::iter::once(&command.name).chain(command.aliases) {
+                assert!(command_for(spelling).is_some(), "/{spelling} is offered and runs nothing");
+            }
+        }
+        // An alias runs what its command runs.
+        assert_eq!(command_for("new"), command_for("clear"));
+        assert_eq!(command_for("quit"), Some(Cmd::Exit));
+        // And a name that is not one is left for the skills and the model.
+        assert_eq!(command_for("temperature"), None);
+    }
+
+    #[test]
+    fn the_help_lists_every_command_from_the_table() {
+        let _capture = out::capture_guard();
+        out::start_capture();
+        print_repl_help();
+        let help = out::take_capture();
+        for command in commands::BUILT_IN {
+            assert!(help.contains(&format!("/{}", command.name)), "/help leaves out /{}", command.name);
+            assert!(help.contains(command.about), "/help words /{} differently", command.name);
+        }
+        assert!(help.contains("/clear /new /reset"), "aliases are shown with their command");
+    }
 
     /// The bar earns its row for what varies, so an unset effort is absent rather than
     /// spelled out: a model with no such setting would otherwise carry a word that never

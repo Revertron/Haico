@@ -1,9 +1,10 @@
-//! The REPL's slash commands as data, for the list that opens above the input box once a
-//! `/` is typed.
+//! The REPL's slash commands as data: the list that opens above the input box once a `/`
+//! is typed, the command half of `/help`, and the names `repl::command_for` dispatches on.
 //!
-//! The commands themselves are still the chain of `if input == "/..."` in `main.rs`; this
-//! is only what the list offers. A test reads `main.rs` to check that every name here is
-//! one the chain answers to, since a suggestion that runs nothing is worse than none.
+//! One table for all three, because they were three: the list here, a chain of
+//! `if input == "/..."` that ran the commands, and a hand-written `/help` that had already
+//! drifted from both. A test in `repl.rs` checks every name here runs something, since a
+//! suggestion that runs nothing is worse than none.
 
 use crate::skills;
 use std::path::PathBuf;
@@ -28,49 +29,86 @@ pub(crate) struct Command {
     pub(crate) about: String,
 }
 
-// Kept to one line each — the list cuts them at the edge of the screen. `/help` has the
-// long versions.
-const BUILT_IN: &[(&str, &[&str], Args, &str)] = &[
-    ("help", &[], Args::None, "Show the commands and the keys"),
-    ("plan", &[], Args::None, "Research and propose only; nothing changes until approved"),
-    ("auto", &[], Args::None, "Review each gated call; routine ones run without asking"),
-    ("normal", &[], Args::None, "Back to answering every prompt yourself"),
-    ("mode", &[], Args::None, "Show which mode is in force"),
-    ("add", &[], Args::Required, "Let the file tools read and write another directory too"),
-    ("workspace", &[], Args::None, "Show which paths the file tools may touch"),
-    ("cd", &[], Args::Optional, "Move to another project; with no path, show where you are"),
-    ("init", &[], Args::None, "Study the project and write its instruction file"),
-    ("tools", &[], Args::None, "List available tools and whether they prompt"),
-    ("model", &[], Args::Optional, "Switch model and save it as the default"),
-    ("provider", &[], Args::Optional, "Switch to another server from the config's providers"),
-    ("config", &[], Args::None, "Show the settings in force and where each came from"),
-    ("set", &[], Args::Optional, "Show or set context, temperature and the other knobs"),
-    ("temp", &[], Args::Optional, "Show or set the temperature"),
-    ("effort", &[], Args::Optional, "Show or set the reasoning effort; on|off switch thinking"),
-    ("bg", &[], Args::Optional, "List background jobs, or stop one or all of them"),
-    ("timers", &[], Args::Optional, "List the timers the model set, or cancel them"),
-    ("undo", &[], Args::None, "Revert the last file change made by a tool"),
-    ("todo", &[], Args::None, "Show the current plan, if the model made one"),
-    ("context", &[], Args::None, "Show how much context the conversation is using"),
-    ("reasoning", &[], Args::Optional, "Keep, compress or drop the model's chain of thought"),
-    ("compact", &[], Args::None, "Replace the history with a summary, freeing context"),
-    ("resume", &[], Args::None, "Load this directory's saved conversation"),
-    ("clear", &["new", "reset"], Args::None, "Start over, keeping the system prompt"),
-    ("skills", &[], Args::None, "List the skills the model can load"),
-    ("update-skills", &[], Args::None, "Re-read the skills directories into the system prompt"),
-    ("exit", &["quit"], Args::None, "Leave"),
+pub(crate) struct BuiltIn {
+    pub(crate) name: &'static str,
+    pub(crate) aliases: &'static [&'static str],
+    pub(crate) args: Args,
+    // What follows the name in `/help` — `<path>`, `[name]`.
+    pub(crate) usage: &'static str,
+    // One line — the list cuts it at the edge of the screen.
+    pub(crate) about: &'static str,
+    // What `/help` adds under that line, already wrapped. Empty for most.
+    pub(crate) more: &'static [&'static str],
+}
+
+const fn built_in(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    args: Args,
+    usage: &'static str,
+    about: &'static str,
+    more: &'static [&'static str],
+) -> BuiltIn {
+    BuiltIn { name, aliases, args, usage, about, more }
+}
+
+pub(crate) const BUILT_IN: &[BuiltIn] = &[
+    built_in("help", &[], Args::None, "", "Show the commands and the keys", &[]),
+    built_in("plan", &[], Args::None, "", "Research and propose only; nothing changes until approved", &[]),
+    built_in("auto", &[], Args::None, "", "Review each gated call; routine ones run without asking", &[]),
+    built_in("normal", &[], Args::None, "", "Back to answering every prompt yourself", &[]),
+    built_in("mode", &[], Args::None, "", "Show which mode is in force", &[]),
+    built_in("add", &[], Args::Required, "<path>", "Let the file tools read and write another directory too", &[]),
+    built_in("workspace", &[], Args::None, "", "Show which paths the file tools may touch", &[]),
+    built_in("cd", &[], Args::Optional, "[path]", "Move to another project; with no path, show where you are", &[]),
+    built_in("init", &[], Args::None, "", "Study the project and write its instruction file", &[]),
+    built_in("tools", &[], Args::None, "", "List available tools and whether they prompt", &[]),
+    built_in("model", &[], Args::Optional, "[name]", "Switch model and save it as the default", &[
+        "With no name, pick from the server's list.",
+    ]),
+    built_in("provider", &[], Args::Optional, "[name]", "Switch to another server from the config's providers", &[
+        "Saved as the default; with no name, pick from the list.",
+    ]),
+    built_in("config", &[], Args::None, "", "Show the settings in force and where each came from", &[]),
+    built_in("set", &[], Args::Optional, "[name] [val]", "Show or set context, temperature and the other knobs", &[
+        "The knobs: context, temperature, top_p, top_k, min_p, repeat_penalty,",
+        "max_tokens, reasoning_effort and reasoning_threshold ('/set <name> unset'",
+        "to undo). All last for the session except 'context', which is saved for",
+        "this model.",
+    ]),
+    built_in("temp", &[], Args::Optional, "[val]", "Show or set the temperature", &[]),
+    built_in("effort", &[], Args::Optional, "[level]", "Show or set the reasoning effort; on|off switch thinking", &[]),
+    built_in("bg", &[], Args::Optional, "[stop [id]]", "List background jobs, or stop one or all of them", &[]),
+    built_in("timers", &[], Args::Optional, "[cancel [id]]", "List the timers the model set, or cancel them", &[]),
+    built_in("undo", &[], Args::None, "", "Revert the last file change made by a tool", &[]),
+    built_in("todo", &[], Args::None, "", "Show the current plan, if the model made one", &[]),
+    built_in("context", &[], Args::None, "", "Show how much context the conversation is using", &[]),
+    built_in("reasoning", &[], Args::Optional, "[what]", "Keep, compress or drop the model's chain of thought", &[]),
+    built_in("compact", &[], Args::None, "", "Replace the history with a summary, freeing context", &[]),
+    built_in("resume", &[], Args::None, "", "Load this directory's saved conversation", &[
+        "The conversation in progress is dropped.",
+    ]),
+    built_in("clear", &["new", "reset"], Args::None, "", "Start over, keeping the system prompt", &[]),
+    built_in("skills", &[], Args::None, "", "List the skills the model can load", &[]),
+    built_in("update-skills", &[], Args::None, "", "Re-read the skills directories into the system prompt", &[]),
+    built_in("exit", &["quit"], Args::None, "", "Leave (Ctrl+D also works)", &[]),
 ];
 
+/// The built-in a typed name means, under its own name or an alias.
+pub(crate) fn built_in_named(name: &str) -> Option<&'static BuiltIn> {
+    BUILT_IN.iter().find(|command| command.name == name || command.aliases.contains(&name))
+}
+
 // The built-ins, then the skills under `roots`. A skill named like a built-in is left out:
-// the built-in is matched first in `main.rs`, so typing that name never reaches the skill.
+// the built-in is matched first, so typing that name never reaches the skill.
 pub(crate) fn available(roots: &[PathBuf]) -> Vec<Command> {
     let mut commands: Vec<Command> = BUILT_IN
         .iter()
-        .map(|(name, aliases, args, about)| Command {
-            name: name.to_string(),
-            aliases,
-            args: *args,
-            about: about.to_string(),
+        .map(|command| Command {
+            name: command.name.to_string(),
+            aliases: command.aliases,
+            args: command.args,
+            about: command.about.to_string(),
         })
         .collect();
     for skill in skills::discover(roots) {
@@ -150,20 +188,6 @@ mod tests {
             .into_iter()
             .map(|suggestion| commands[suggestion.index].name.clone())
             .collect()
-    }
-
-    #[test]
-    fn every_built_in_is_a_command_main_answers_to() {
-        let main = include_str!("repl.rs");
-        for (name, aliases, _, _) in BUILT_IN {
-            for spelling in std::iter::once(name).chain(aliases.iter()) {
-                assert!(
-                    main.contains(&format!("\"/{}\"", spelling)),
-                    "/{} is suggested but main.rs never matches it",
-                    spelling
-                );
-            }
-        }
     }
 
     #[test]

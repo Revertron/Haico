@@ -1403,21 +1403,8 @@ async fn autocompact_if_due(
         return None;
     }
 
-    let (context_tokens, before) = (agent.context_tokens, agent.context_used());
-    let compacted = interruptible(
-        tx,
-        link,
-        Waiting::Compacting,
-        compact_history(&agent.client, &mut agent.messages, context_tokens, before),
-    )
-    .await;
-
-    match compacted {
+    match agent.compact(tx, link).await {
         Some(Ok(report)) => {
-            // The same reclaim /compact does, for the same reason: the cache is keyed to a
-            // history that no longer exists.
-            agent.review_cache.clear();
-            agent.refresh_memory();
             let _ = tx.send(Notice::Compacted(report).into());
             // The compacted history ends on the assistant agreeing that it has the notes,
             // and asking for a reply straight after that is asking the model to talk past
@@ -1449,6 +1436,44 @@ async fn autocompact_if_due(
             Some(TurnEnd::Interrupted)
         }
     }
+}
+
+impl Agent {
+    /// Replace the history with notes on it, for `/compact` and for auto mode at the edge
+    /// of the window. `None` means the user interrupted it.
+    ///
+    /// One function for both because the reclaim after it is easy to forget. The review
+    /// cache is keyed to a history that no longer exists, and the history that held
+    /// anything remembered this session has just become a paragraph of notes — the memory
+    /// index is now the only thing that still knows, so it goes into the prompt here. The
+    /// REPL's `/compact` used to make its own call and its own copy of the reclaim, and it
+    /// ran outside the pump, so Esc could not stop it.
+    pub(crate) async fn compact(&mut self, tx: &EventSink, link: &TurnLink) -> Option<anyhow::Result<String>> {
+        let (context_tokens, before) = (self.context_tokens, self.context_used());
+        let compacted = interruptible(
+            tx,
+            link,
+            Waiting::Compacting,
+            compact_history(&self.client, &mut self.messages, context_tokens, before),
+        )
+        .await;
+        // On the one path that actually shrank the session. A compaction that failed
+        // freed nothing to go with it.
+        if let Some(Ok(_)) = &compacted {
+            self.review_cache.clear();
+            self.refresh_memory();
+        }
+        compacted
+    }
+}
+
+/// `/compact`: the compaction, said through `tx` as auto-compaction says it.
+pub(crate) async fn compact_on_request(agent: &mut Agent, tx: &EventSink, link: &TurnLink) {
+    let _ = tx.send(match agent.compact(tx, link).await {
+        Some(Ok(report)) => Notice::Compacted(report).into(),
+        Some(Err(e)) => Notice::CompactionFailed(format!("{:#}", e)).into(),
+        None => Notice::Interrupted.into(),
+    });
 }
 
 /// What to do about a request that failed: `None` asks again, `Some` ends the turn.
