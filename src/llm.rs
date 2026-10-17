@@ -218,10 +218,20 @@ pub(crate) struct LMStudioClient {
 }
 
 
+// Every request to the LLM server says who is asking, so a server's logs (or a proxy in front of
+// it) can tell haico's traffic from another client's.
+const USER_AGENT: &str = concat!("Haico/", env!("CARGO_PKG_VERSION"));
+
+fn http_client() -> reqwest::Client {
+    // Building fails only where `Client::new()` would panic anyway (no TLS backend).
+    reqwest::Client::builder().user_agent(USER_AGENT).build().expect("HTTP client")
+}
+
+
 impl LMStudioClient {
     pub(crate) fn new(base_url: String, model: String, token: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: normalize_base_url(&base_url),
             model,
             token,
@@ -1086,7 +1096,7 @@ pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> 
     }
 
     let base = normalize_base_url(base_url);
-    let client = reqwest::Client::new();
+    let client = http_client();
     let get = |path: &str| {
         let request = client.get(format!("{}{}", base, path));
         match token {
@@ -1155,7 +1165,7 @@ pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> 
 }
 
 pub(crate) async fn fetch_available_models(base_url: &str, token: Option<&str>) -> Result<Vec<String>> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let request = client.get(format!("{}/v1/models", normalize_base_url(base_url)));
     let request = match token {
         Some(token) => request.bearer_auth(token),
@@ -1354,6 +1364,39 @@ mod tests {
 
     // Serve one canned HTTP response on an ephemeral port and hand back its address.
     // Exercises the real reqwest -> SSE-decoding path without contacting anything.
+
+    #[tokio::test]
+    async fn requests_carry_haico_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = "{\"data\":[]}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&head).to_lowercase()
+        });
+
+        fetch_available_models(&url, None).await.unwrap();
+        let head = server.await.unwrap();
+        let expected = format!("user-agent: haico/{}\r\n", env!("CARGO_PKG_VERSION"));
+        assert!(head.contains(&expected), "sent: {}", head);
+    }
 
     #[tokio::test]
     async fn configured_sampling_reaches_the_wire() {
