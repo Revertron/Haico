@@ -18,18 +18,26 @@ use std::path::{Path, PathBuf};
 //
 // Anything not named here is not path-bounded, so it passes straight through: the workspace
 // has nothing to say about a web search or a calculation.
-fn path_argument(tool_name: &str, arguments: &Value) -> Option<(PathBuf, bool)> {
-    let (raw, writes) = match tool_name {
-        "read" => (arguments["file_path"].as_str(), false),
-        "write_file" | "edit" | "multi_edit" => (arguments["file_path"].as_str(), true),
-        "ls" => (arguments["path"].as_str(), false),
-        // Optional for these two, and absent means "the working directory", which is always
-        // allowed — so a missing path is not a denial.
-        "glob_search" | "grep" => (arguments["path"].as_str(), false),
-        _ => return None,
-    };
+//
+// (tool, the argument holding its path, whether the call writes). A table rather than a
+// match so the tests can hold it against the tools' own schemas: a misspelled argument
+// name here reads as "no path given", and a path that is never looked at is a file tool
+// with no boundary at all — the one mistake in this file that fails open.
+pub(crate) const PATH_ARGUMENTS: &[(&str, &str, bool)] = &[
+    ("read", "file_path", false),
+    ("write_file", "file_path", true),
+    ("edit", "file_path", true),
+    ("multi_edit", "file_path", true),
+    ("ls", "path", false),
+    // Optional for these two, and absent means "the working directory", which is always
+    // allowed — so a missing path is not a denial.
+    ("glob_search", "path", false),
+    ("grep", "path", false),
+];
 
-    let raw = raw.map(str::trim).filter(|p| !p.is_empty())?;
+fn path_argument(tool_name: &str, arguments: &Value) -> Option<(PathBuf, bool)> {
+    let &(_, key, writes) = PATH_ARGUMENTS.iter().find(|(tool, _, _)| *tool == tool_name)?;
+    let raw = arguments[key].as_str().map(str::trim).filter(|p| !p.is_empty())?;
     Some((PathBuf::from(raw), writes))
 }
 

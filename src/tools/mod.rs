@@ -146,19 +146,17 @@ pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
 // back to its literal form.
 
 impl MyMcpServer {
-    pub(crate) fn new(
-        llm_client: LMStudioClient,
-        expose_web_fetch: bool,
-        searxng: Option<String>,
-        interactive: bool,
-    ) -> Self {
-        // One router per impl block, merged here. This is what allows the tools to live in
-        // separate files at all.
-        // research before the web tools it wraps: a small model reads the list in order,
-        // and the tool it should reach for first should not be the last one it sees.
-        // sub_agent right after the file tools for the same reason: reading a long log
-        // yourself is the habit it exists to replace, so it is met beside `read`.
-        let mut tool_router = Self::basics_router()
+    // Every tool there is, before `new` takes out the ones a configuration does not offer.
+    // Its own function so the tests can hold the gate lists against all of it.
+    //
+    // One router per impl block, merged here. This is what allows the tools to live in
+    // separate files at all.
+    // research before the web tools it wraps: a small model reads the list in order,
+    // and the tool it should reach for first should not be the last one it sees.
+    // sub_agent right after the file tools for the same reason: reading a long log
+    // yourself is the habit it exists to replace, so it is met beside `read`.
+    pub(crate) fn full_router() -> ToolRouter<Self> {
+        Self::basics_router()
             + Self::files_router()
             + Self::subagent_router()
             + Self::memory_router()
@@ -168,7 +166,16 @@ impl MyMcpServer {
             + Self::web_router()
             + Self::shell_router()
             + Self::crates_router()
-            + Self::timers_router();
+            + Self::timers_router()
+    }
+
+    pub(crate) fn new(
+        llm_client: LMStudioClient,
+        expose_web_fetch: bool,
+        searxng: Option<String>,
+        interactive: bool,
+    ) -> Self {
+        let mut tool_router = Self::full_router();
         // web_get (raw page text) is always available. web_fetch summarizes a page through
         // the LLM and research drives a whole loop through it, so both are exposed only when
         // we know where the LLM lives.
@@ -390,131 +397,18 @@ impl MyMcpServer {
     }
 
 
+    // The REPL's way into a tool, beside rmcp's router for MCP hosts. It cannot simply be
+    // the router: `ToolRouter::call` wants a `RequestContext`, which needs a `Peer`, and
+    // rmcp keeps `Peer::new` to itself — so the dispatch is ours (`dispatch_tools!` below).
+    //
+    // A route `new` removed is refused here as well. The tool bodies used to guard that
+    // themselves, each in its own way, and a model naming a tool it was never offered —
+    // `library` with no articles, `sub_agent` in server mode — reached whichever did not.
     pub(crate) async fn execute_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
-        let result = match name {
-            "calculator" => {
-                let params: CalculatorParams = serde_json::from_value(arguments)?;
-                self.calculator(Parameters(params)).await.map_err(tool_error)?
-            }
-            "get_date" => {
-                self.get_date().await.map_err(tool_error)?
-            }
-            "get_time" => {
-                self.get_time().await.map_err(tool_error)?
-            }
-            "read" => {
-                let params: ReadParams = serde_json::from_value(arguments)?;
-                self.read(Parameters(params)).await.map_err(tool_error)?
-            }
-            "write_file" => {
-                let params: WriteParams = serde_json::from_value(arguments)?;
-                self.write_file(Parameters(params)).await.map_err(tool_error)?
-            }
-            "edit" => {
-                let params: EditParams = serde_json::from_value(arguments)?;
-                self.edit(Parameters(params)).await.map_err(tool_error)?
-            }
-            "glob_search" => {
-                let params: GlobParams = serde_json::from_value(arguments)?;
-                self.glob_search(Parameters(params)).await.map_err(tool_error)?
-            }
-            "grep" => {
-                let params: GrepParams = serde_json::from_value(arguments)?;
-                self.grep(Parameters(params)).await.map_err(tool_error)?
-            }
-            "web_fetch" => {
-                let params: WebFetchParams = serde_json::from_value(arguments)?;
-                self.web_fetch(Parameters(params)).await.map_err(tool_error)?
-            }
-            "web_get" => {
-                let params: WebGetParams = serde_json::from_value(arguments)?;
-                self.web_get(Parameters(params)).await.map_err(tool_error)?
-            }
-            "web_search" => {
-                let params: WebSearchParams = serde_json::from_value(arguments)?;
-                self.web_search(Parameters(params)).await.map_err(tool_error)?
-            }
-            "research" => {
-                let params: ResearchParams = serde_json::from_value(arguments)?;
-                self.research(Parameters(params)).await.map_err(tool_error)?
-            }
-            "library" => {
-                let params: LibraryParams = serde_json::from_value(arguments)?;
-                self.library(Parameters(params)).await.map_err(tool_error)?
-            }
-            "remember" => {
-                let params: RememberParams = serde_json::from_value(arguments)?;
-                self.remember(Parameters(params)).await.map_err(tool_error)?
-            }
-            "recall" => {
-                let params: RecallParams = serde_json::from_value(arguments)?;
-                self.recall(Parameters(params)).await.map_err(tool_error)?
-            }
-            "skill" => {
-                let params: SkillParams = serde_json::from_value(arguments)?;
-                self.skill(Parameters(params)).await.map_err(tool_error)?
-            }
-            "ls" => {
-                let params: LSParams = serde_json::from_value(arguments)?;
-                self.ls(Parameters(params)).await.map_err(tool_error)?
-            }
-            "run_background" => {
-                let params: RunBackgroundParams = serde_json::from_value(arguments)?;
-                self.run_background(Parameters(params)).await.map_err(tool_error)?
-            }
-            "background_output" => {
-                let params: BackgroundOutputParams = serde_json::from_value(arguments)?;
-                self.background_output(Parameters(params)).await.map_err(tool_error)?
-            }
-            "background_stop" => {
-                let params: BackgroundStopParams = serde_json::from_value(arguments)?;
-                self.background_stop(Parameters(params)).await.map_err(tool_error)?
-            }
-            "run_command" => {
-                let params: RunCommandParams = serde_json::from_value(arguments)?;
-                self.run_command(Parameters(params)).await.map_err(tool_error)?
-            }
-            "multi_edit" => {
-                let params: MultiEditParams = serde_json::from_value(arguments)?;
-                self.multi_edit(Parameters(params)).await.map_err(tool_error)?
-            }
-            "todo_write" => {
-                let params: TodoWriteParams = serde_json::from_value(arguments)?;
-                self.todo_write(Parameters(params)).await.map_err(tool_error)?
-            }
-            "ask_user" => {
-                let params: AskUserParams = serde_json::from_value(arguments)?;
-                self.ask_user(Parameters(params)).await.map_err(tool_error)?
-            }
-            "start_plan" => {
-                self.start_plan().await.map_err(tool_error)?
-            }
-            "present_plan" => {
-                let params: PresentPlanParams = serde_json::from_value(arguments)?;
-                self.present_plan(Parameters(params)).await.map_err(tool_error)?
-            }
-            "crate_info" => {
-                let params: CrateInfoParams = serde_json::from_value(arguments)?;
-                self.crate_info(Parameters(params)).await.map_err(tool_error)?
-            }
-            "crate_search" => {
-                let params: CrateSearchParams = serde_json::from_value(arguments)?;
-                self.crate_search(Parameters(params)).await.map_err(tool_error)?
-            }
-            "timer" => {
-                let params: TimerParams = serde_json::from_value(arguments)?;
-                self.timer(Parameters(params)).await.map_err(tool_error)?
-            }
-            "sub_agent" => {
-                let params: SubAgentParams = serde_json::from_value(arguments)?;
-                self.sub_agent(Parameters(params)).await.map_err(tool_error)?
-            }
-            "crate_api" => {
-                let params: CrateApiParams = serde_json::from_value(arguments)?;
-                self.crate_api(Parameters(params)).await.map_err(tool_error)?
-            }
-            _ => return Err(anyhow::anyhow!("Unknown tool: {}", name)),
-        };
+        if !self.tool_router.has_route(name) {
+            return Err(anyhow::anyhow!("Unknown tool: {}", name));
+        }
+        let result = self.dispatch(name, arguments).await?;
 
         // Split the result by kind rather than flattening it to text. Flattening
         // is what this did for as long as every tool returned prose, and it is
@@ -539,6 +433,69 @@ impl MyMcpServer {
 
         Ok(ToolOutput { text, images })
     }
+}
+
+// Every tool, by method name, with the type its arguments deserialize into.
+//
+// Generates `dispatch` (the match `execute_tool` runs) and `DISPATCHED` (the names in it)
+// from one list. The match used to be thirty hand-written arms, and a tool whose `#[tool]`
+// method had no arm worked over MCP and failed in the REPL with "Unknown tool" — nothing
+// compared the two. `DISPATCHED` is what the test against the router reads, so a tool
+// added to a router and not here fails the suite rather than the user.
+macro_rules! dispatch_tools {
+    ($($method:ident($($params:ty)?)),* $(,)?) => {
+        impl MyMcpServer {
+            #[cfg(test)]
+            pub(crate) const DISPATCHED: &'static [&'static str] = &[$(stringify!($method)),*];
+
+            async fn dispatch(&self, name: &str, arguments: Value) -> Result<rmcp::model::CallToolResult> {
+                match name {
+                    $(stringify!($method) => {
+                        $(let arguments: $params = serde_json::from_value(arguments)?;)?
+                        self.$method($(Parameters::<$params>(arguments))?).await.map_err(tool_error)
+                    })*
+                    _ => {
+                        let _ = arguments;
+                        Err(anyhow::anyhow!("Unknown tool: {}", name))
+                    }
+                }
+            }
+        }
+    };
+}
+
+dispatch_tools! {
+    calculator(CalculatorParams),
+    get_date(),
+    get_time(),
+    read(ReadParams),
+    write_file(WriteParams),
+    edit(EditParams),
+    multi_edit(MultiEditParams),
+    glob_search(GlobParams),
+    grep(GrepParams),
+    ls(LSParams),
+    web_fetch(WebFetchParams),
+    web_get(WebGetParams),
+    web_search(WebSearchParams),
+    research(ResearchParams),
+    library(LibraryParams),
+    remember(RememberParams),
+    recall(RecallParams),
+    skill(SkillParams),
+    run_command(RunCommandParams),
+    run_background(RunBackgroundParams),
+    background_output(BackgroundOutputParams),
+    background_stop(BackgroundStopParams),
+    todo_write(TodoWriteParams),
+    ask_user(AskUserParams),
+    start_plan(),
+    present_plan(PresentPlanParams),
+    crate_info(CrateInfoParams),
+    crate_search(CrateSearchParams),
+    crate_api(CrateApiParams),
+    timer(TimerParams),
+    sub_agent(SubAgentParams),
 }
 
 // A tool's `Err`, in the words the model will read.
@@ -739,6 +696,81 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    fn tool_names() -> std::collections::BTreeSet<String> {
+        MyMcpServer::full_router().list_all().into_iter().map(|tool| tool.name.to_string()).collect()
+    }
+
+    #[test]
+    fn every_tool_the_router_offers_is_one_the_repl_can_run() {
+        // A tool missing from `dispatch_tools!` worked for an MCP host and answered
+        // "Unknown tool" in the REPL; one listed there and not routed is dead code.
+        let dispatched: std::collections::BTreeSet<String> =
+            MyMcpServer::DISPATCHED.iter().map(|name| name.to_string()).collect();
+        assert_eq!(tool_names(), dispatched);
+    }
+
+    #[test]
+    fn every_name_on_a_gate_list_is_a_real_tool() {
+        // These lists decide what runs unasked, what plan mode offers, and what the
+        // sub-agents may reach. A name on one that no tool has is a rename nobody carried
+        // through: the renamed tool silently starts prompting, or stops being offered.
+        let tools = tool_names();
+        let lists: [(&str, Vec<&str>); 6] = [
+            ("AUTO_ALLOWED_TOOLS", AUTO_ALLOWED_TOOLS.to_vec()),
+            ("PLAN_MODE_READS", crate::modes::PLAN_MODE_READS.to_vec()),
+            ("PLAN_MODE_DENIES", crate::modes::PLAN_MODE_DENIES.to_vec()),
+            ("SUB_AGENT_TOOLS", crate::subagent::SUB_AGENT_TOOLS.to_vec()),
+            ("RESEARCH_TOOLS", super::research::RESEARCH_TOOLS.to_vec()),
+            (
+                "the tools intercepted by name",
+                vec![crate::ask::ASK_USER, crate::modes::START_PLAN, crate::modes::PRESENT_PLAN, super::subagent::SUB_AGENT],
+            ),
+        ];
+        for (list, names) in lists {
+            for name in names {
+                assert!(tools.contains(name), "{list} names `{name}`, and no tool is called that");
+            }
+        }
+    }
+
+    #[test]
+    fn every_file_tool_is_bounded_by_the_workspace_through_an_argument_it_has() {
+        use crate::workspace::PATH_ARGUMENTS;
+
+        for tool in MyMcpServer::full_router().list_all() {
+            let properties: Vec<&str> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            let bounded = PATH_ARGUMENTS.iter().find(|(name, _, _)| *name == tool.name);
+            // A path the workspace never reads is a file tool with no boundary.
+            if let Some((_, key, _)) = bounded {
+                assert!(properties.contains(key), "`{}` has no `{key}` argument to bound", tool.name);
+            }
+            // And a new tool taking a path has to be listed to be bounded at all.
+            for key in ["file_path", "path"] {
+                if properties.contains(&key) {
+                    assert!(
+                        bounded.is_some_and(|(_, bound, _)| *bound == key),
+                        "`{}` takes a `{key}` the workspace does not check; add it to PATH_ARGUMENTS",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_this_configuration_took_away_is_refused_by_name() {
+        // `test_server` is built as an MCP server, which has no `timer`.
+        let server = test_server();
+        assert!(!server.tool_router.has_route("timer"));
+        let error = server.execute_tool("timer", json!({"action": "list"})).await.unwrap_err();
+        assert!(error.to_string().contains("Unknown tool"), "got: {error}");
+    }
 
     #[test]
     fn a_tool_error_reaches_the_model_as_its_message_alone() {

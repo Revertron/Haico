@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 // The only two tools the sub-agent gets. Named here rather than filtered by "anything web"
 // so that adding a web tool later does not silently widen what research can reach — and so
 // that `research` itself can never appear in its own tool list.
-const RESEARCH_TOOLS: &[&str] = &["web_search", "web_get"];
+pub(crate) const RESEARCH_TOOLS: &[&str] = &["web_search", "web_get"];
 
 // How many lookups — searches and page reads together — one research call may spend.
 const LOOKUP_BUDGET: usize = 10;

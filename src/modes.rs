@@ -65,7 +65,7 @@ impl Mode {
 // The web tools are not in AUTO_ALLOWED_TOOLS because they send content off the machine,
 // and that stays true here: plan mode offers them still carrying their normal prompt.
 // Research is most of what planning is, and cutting it off would make plans worse.
-const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch", "research"];
+pub(crate) const PLAN_MODE_READS: &[&str] = &["web_search", "web_get", "web_fetch", "research"];
 
 // The two tools that move between modes rather than doing anything to the machine. Each
 // is offered only in the mode it leads out of: nothing to enter when already planning,
@@ -83,7 +83,7 @@ pub(crate) const PRESENT_PLAN: &str = "present_plan";
 // cleanup, but it kills a process — a dev server started before planning began is still
 // running, and plan mode has promised that nothing on this machine changes. It rode in on
 // the auto-allow list unnoticed, which is the hazard of a plan mode that reads that list.
-const PLAN_MODE_DENIES: &[&str] = &["remember", "background_stop"];
+pub(crate) const PLAN_MODE_DENIES: &[&str] = &["remember", "background_stop"];
 
 pub(crate) fn plan_mode_allows(tool_name: &str) -> bool {
     if PLAN_MODE_DENIES.contains(&tool_name) {
