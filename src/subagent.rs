@@ -31,7 +31,7 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::{authorize, push_user_note, Agent, LOOP_BREAK, LOOP_NUDGE};
+use crate::agent::{authorize, push_user_note, Agent, LoopGuard, LoopVerdict, MAX_REPEATING_REPLIES};
 use crate::config::autocompact_threshold;
 use crate::prompt::build_sub_agent_prompt;
 use crate::repetition::Repeating;
@@ -59,10 +59,6 @@ pub(crate) const SUB_AGENT_TOOLS: &[&str] = &[
     "get_date",
     "get_time",
 ];
-
-// Replies in a row cut off for repeating themselves before the helper is made to answer
-// instead. The main loop's own figure, for its reason.
-const MAX_REPEATING_REPLIES: usize = 2;
 
 /// Run one task to its report. `None` means the user interrupted it, and the caller owes
 /// its own `tool_call_id` the interrupted reply.
@@ -112,10 +108,11 @@ pub(crate) async fn run_sub_agent(
     let limit = autocompact_threshold(agent.context_tokens);
 
     let mut calls_made = 0usize;
+    // Replies in a row cut off for repeating themselves, against the main loop's own limit:
+    // past it the helper is made to answer instead.
     let mut repeating_replies = 0usize;
-    let mut last_call: Option<(String, String)> = None;
-    let mut run = 0usize;
-    let mut nudged_at = 0usize;
+    // The main loop's identical-call guard, the same type and so keyed the same way.
+    let mut guard = LoopGuard::default();
 
     // Why the loop stopped without a report, said to the helper in the forced request.
     let stop_reason = loop {
@@ -192,20 +189,7 @@ pub(crate) async fn run_sub_agent(
             let id = call["id"].clone();
             let name = call["function"]["name"].as_str().unwrap_or_default().to_string();
             let parsed = parse_tool_arguments(&call["function"]);
-
-            // The main loop's identical-call guard, keyed the same way.
-            let key = match &parsed {
-                Ok(arguments) => arguments.to_string(),
-                Err(_) => call["function"]["arguments"].to_string(),
-            };
-            let this = (name.clone(), key);
-            if last_call.as_ref() == Some(&this) {
-                run += 1;
-            } else {
-                last_call = Some(this);
-                run = 1;
-                nudged_at = 0;
-            }
+            guard.observe(&name, &call["function"], &parsed);
 
             let content = if !offered.contains(&name) {
                 format!(
@@ -256,20 +240,17 @@ pub(crate) async fn run_sub_agent(
             messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
         }
 
-        if run >= LOOP_BREAK {
-            break "You have been making the same call over and over.";
-        }
-        if run >= LOOP_NUDGE && run > nudged_at {
-            nudged_at = run;
-            messages.push(json!({
+        match guard.verdict() {
+            LoopVerdict::Break { .. } => break "You have been making the same call over and over.",
+            LoopVerdict::Nudge { tool, count } => messages.push(json!({
                 "role": "user",
                 "content": format!(
                     "You have made the same '{}' call {} times in a row. Calling it again will \
                      not tell you anything new. Take a different approach, or give your report.",
-                    last_call.as_ref().map(|(name, _)| name.as_str()).unwrap_or_default(),
-                    run
+                    tool, count
                 ),
-            }));
+            })),
+            LoopVerdict::Fine => {}
         }
     };
 
@@ -438,7 +419,7 @@ mod tests {
         let report = run_sub_agent(&mut agent, "task", &tx, &link).await.unwrap();
 
         // LOOP_BREAK identical calls, then the one request that sends no tools.
-        assert_eq!(*served.lock().unwrap(), LOOP_BREAK + 1);
+        assert_eq!(*served.lock().unwrap(), crate::agent::LOOP_BREAK + 1);
         assert!(report.contains("could not produce a report"), "got: {}", report);
         assert!(report.contains("5 tool call(s)"), "got: {}", report);
     }

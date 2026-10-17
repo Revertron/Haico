@@ -316,6 +316,23 @@ thread_local! {
 
     // A scratch file with a unique name, in a directory that goes with the test.
 
+/// A stream whose reasoning restates one paragraph far past the point of being a
+/// loop, then ends — ending is what lets a test show the stream was cut off early
+/// rather than read through. Leaked because `serve_sequence` wants `'static` bodies.
+pub(crate) fn looping_stream() -> &'static str {
+    let paragraph = "So after the registration, run() did NOT print the events line NOR \
+                     loop back. It just... stopped printing. The only explanation is that \
+                     it returned right there, or panicked silently.\\n\\n";
+    let event = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{paragraph}\"}}}}]}}\n\n"
+    );
+    let body = format!(
+        "{}data: {{\"choices\":[{{\"delta\":{{\"content\":\"finished anyway\"}}}}]}}\n\ndata: [DONE]\n\n",
+        event.repeat(300)
+    );
+    Box::leak(body.into_boxed_str())
+}
+
 pub(crate) fn scratch(name: &str, contents: &str) -> std::path::PathBuf {
     SCRATCH_DIR.with(|dir| {
         let path = dir.join(name);

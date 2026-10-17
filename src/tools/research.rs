@@ -195,6 +195,14 @@ impl MyMcpServer {
                 .await
             {
                 Ok(message) => message,
+                // A reply cut off for going round in a loop is not a server that cannot be
+                // reached, which is what it used to be reported as. Whatever was read so far
+                // is still worth an answer, so it goes to the forced one below — the request
+                // with no tools, which is the least likely to loop the same way again.
+                Err(e) if e.downcast_ref::<crate::repetition::Repeating>().is_some() => {
+                    crate::debug::log("research reply repeated itself", &format!("{:#}", e));
+                    break;
+                }
                 Err(e) => {
                     crate::debug::log("research failed", &format!("{:#}", e));
                     return format!(
@@ -227,7 +235,9 @@ impl MyMcpServer {
             // loop lives by. An unanswered id makes the *next* request fail server-side, and
             // here that would strand the loop with no way to say why.
             for call in &calls {
-                let id = call["id"].as_str().unwrap_or_default().to_string();
+                // As the value it came as, the way the main loop answers it: a missing id
+                // stays missing rather than becoming "", which matches nothing either.
+                let id = call["id"].clone();
                 let name = call["function"]["name"]
                     .as_str()
                     .unwrap_or_default()
@@ -467,6 +477,20 @@ mod tests {
         // rather than orphaning its tool_call_id and failing the next request.
         assert_eq!(*served.lock().unwrap(), 2);
         assert!(answer.contains("Research answer for:"), "got: {}", answer);
+        assert!(answer.contains("default_service"), "got: {}", answer);
+    }
+
+    #[tokio::test]
+    async fn a_research_reply_that_loops_is_answered_from_what_was_read() {
+        let bodies: &'static [&'static str] =
+            Box::leak(Box::new([crate::testutil::looping_stream(), ANSWERS]));
+        let (url, served) = crate::testutil::serve_sequence(bodies).await;
+        let answer = server_at(url).run_research("what is the catch-all route in actix-web 4?").await;
+
+        // The loop was cut off, and the next request was the forced answer — not a
+        // "could not be reached", which is what a looping reply used to be told as.
+        assert_eq!(*served.lock().unwrap(), 2);
+        assert!(!answer.contains("could not be reached"), "got: {}", answer);
         assert!(answer.contains("default_service"), "got: {}", answer);
     }
 

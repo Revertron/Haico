@@ -247,6 +247,12 @@ impl MyMcpServer {
                     break;
                 }
                 Ok(Ok(message)) => message,
+                // A looping reply, for research's reason: answered from what was read, not
+                // reported as a librarian that could not be reached.
+                Ok(Err(e)) if e.downcast_ref::<crate::repetition::Repeating>().is_some() => {
+                    crate::debug::log("library reply repeated itself", &format!("{:#}", e));
+                    break;
+                }
                 Ok(Err(e)) => {
                     crate::debug::log("library failed", &format!("{:#}", e));
                     return format!(
@@ -271,7 +277,8 @@ impl MyMcpServer {
             // Every tool_call_id gets a reply, on every path — the main loop's invariant,
             // for the main loop's reason.
             for call in &calls {
-                let id = call["id"].as_str().unwrap_or_default().to_string();
+                // As the value it came as, for research's reason.
+                let id = call["id"].clone();
                 let name = call["function"]["name"].as_str().unwrap_or_default();
 
                 let content = if name != SEARCH && name != READ {
