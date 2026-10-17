@@ -216,6 +216,39 @@ pub(crate) fn modified_time(path: &std::path::Path) -> Option<std::time::SystemT
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+// Replace a file whole or not at all, for haico's own files that exist in one copy.
+//
+// The bytes go to a temporary beside the target and are renamed over it, since a rename
+// within one directory is the step that cannot be seen half-done: a process killed during
+// a plain `fs::write` leaves the file truncated, and for the saved session or the user's
+// config that is the only copy there was. The temporary carries the process id, so two
+// haico processes saving the same file never write into each other's. Not for the file
+// tools — those write the user's files where the user put them, and the checkpoint is
+// what undoes them.
+//
+// A symlink is followed first. Renaming over the link itself would replace it with a plain
+// file, and a config kept in a dotfiles repo and linked into the store would quietly stop
+// being the file the user edits.
+pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let resolved = fs::canonicalize(path).ok().filter(|_| path.is_symlink());
+    let path = resolved.as_deref().unwrap_or(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let written = fs::write(&temporary, bytes)
+        .and_then(|()| fs::rename(&temporary, path))
+        .with_context(|| format!("could not write {}", path.display()));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
 
 // Line endings, and why the file tools have to think about them at all.
 //

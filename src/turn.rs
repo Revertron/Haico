@@ -250,6 +250,9 @@ pub(crate) enum Notice {
     /// be tried again this turn. Carries the percentage of the window.
     CompactionStillLarge(usize),
     CompactionFailed(String),
+    /// The conversation could not be saved at the end of the turn, so `--resume`
+    /// would bring back an older one. Carries the reason.
+    SessionNotSaved(String),
     /// The policy replaced a chain of thought with a summary of it. The figures
     /// say a compression happened; `summary` is what came back, and it travels
     /// with them because by the time this is read the original is gone from the

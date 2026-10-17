@@ -231,6 +231,7 @@ impl Presenter {
                 percent
             ),
             Notice::CompactionFailed(e) => outln!("\n[error] could not compact: {}\n", e),
+            Notice::SessionNotSaved(e) => outln!("\n[error] the session was not saved: {}\n", e),
             // The figures are shown rather than folded: the whole point of
             // compressing is to find out whether it is paying for itself, which
             // cannot be judged from a line hidden by default.

@@ -1986,7 +1986,9 @@ pub(crate) async fn run_turn(
         // The input history is the frontend's and is saved by the pump.
         if let Some(path) = &agent.session_path {
             let todos = agent.plan();
-            save_session(path, &agent.messages, &agent.client.model, &todos);
+            if let Err(e) = save_session(path, &agent.messages, &agent.client.model, &todos) {
+                let _ = tx.send(Notice::SessionNotSaved(format!("{:#}", e)).into());
+            }
         }
 
         end

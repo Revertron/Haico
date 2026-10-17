@@ -36,31 +36,64 @@ pub(crate) const SESSION_FORMAT_VERSION: u32 = 1;
 // disambiguates two projects that happen to share a final component.
 
 pub(crate) fn session_file_path() -> Option<PathBuf> {
-    session_file_path_for(&env::current_dir().ok()?)
+    let cwd = env::current_dir().ok()?;
+    let path = session_file_path_for(&cwd)?;
+    adopt_legacy_session(&cwd, &path);
+    Some(path)
 }
 
 // Split out from session_file_path so it can be exercised without changing the process's
 // working directory, which every other test that walks "." would race against.
 
 pub(crate) fn session_file_path_for(cwd: &std::path::Path) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-
     let store = crate::store::dir()?;
+    Some(store.join("sessions").join(format!("{}-{:016x}.json", session_label(cwd), path_digest(cwd))))
+}
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    cwd.hash(&mut hasher);
-    let digest = hasher.finish();
-
-    let label: String = cwd
-        .file_name()
+fn session_label(cwd: &std::path::Path) -> String {
+    cwd.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "root".to_string())
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .take(40)
-        .collect();
+        .collect()
+}
 
-    Some(store.join("sessions").join(format!("{}-{:016x}.json", label, digest)))
+// The hash in a session's file name, which has to come out the same on every build.
+//
+// It was `DefaultHasher`, whose output the standard library explicitly does not promise to
+// keep between Rust releases: a toolchain upgrade could have moved every project's session
+// to a new name, and `--resume` would have found nothing, with the old file still sitting
+// beside it. FNV-1a is a dozen lines and is defined by its constants, not by a release.
+//
+// Windows paths are compared without regard to case, so they are hashed that way too —
+// `E:\proj` and `e:\proj` are one directory, and were two sessions.
+fn path_digest(cwd: &std::path::Path) -> u64 {
+    let text = cwd.to_string_lossy();
+    let text = if cfg!(windows) { text.to_lowercase() } else { text.into_owned() };
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+// Moves a session saved under the old `DefaultHasher` name to the stable one, once.
+//
+// Without it the switch to a stable hash would itself be the upgrade that loses every
+// session. The old name can only be computed by the toolchain that wrote it, which is why
+// this has to run now, while builds still share that hasher; it can go once there are no
+// sessions left that predate the change. Best-effort: a rename that fails leaves the old
+// file where it was, which is no worse than not trying.
+fn adopt_legacy_session(cwd: &std::path::Path, path: &std::path::Path) {
+    use std::hash::{Hash, Hasher};
+
+    if path.exists() {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    let legacy = path.with_file_name(format!("{}-{:016x}.json", session_label(cwd), hasher.finish()));
+    if legacy != path && legacy.exists() {
+        let _ = fs::rename(&legacy, path);
+    }
 }
 
 // Where the conversation proper starts. The system message is optional — a model can be
@@ -89,10 +122,17 @@ pub(crate) fn set_system_message(messages: &mut Vec<Value>, content: Option<&str
 }
 
 // Persist the conversation so closing the terminal does not lose it.
+//
+// Written beside the file and renamed over it, because this runs after every turn and the
+// file is the only copy: a plain write interrupted by a kill (a second Ctrl+C, a scheduled
+// `-p --resume` stopped by its scheduler) left it truncated, and the next `--resume`
+// answered "could not be read" for the whole conversation. A rename replaces the file
+// whole or not at all. The error is returned rather than dropped, so a session that is
+// not being saved is something the user hears about before they need it.
 
-pub(crate) fn save_session(path: &std::path::Path, messages: &[Value], model: &str, todos: &[TodoItem]) {
+pub(crate) fn save_session(path: &std::path::Path, messages: &[Value], model: &str, todos: &[TodoItem]) -> Result<()> {
     // Skip the system prompt: it is rebuilt on load.
-    let Some(rest) = messages.get(history_start(messages)..) else { return };
+    let Some(rest) = messages.get(history_start(messages)..) else { return Ok(()) };
 
     let session = SavedSession {
         version: SESSION_FORMAT_VERSION,
@@ -105,12 +145,8 @@ pub(crate) fn save_session(path: &std::path::Path, messages: &[Value], model: &s
         todos: todos.to_vec(),
     };
 
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(&session) {
-        let _ = fs::write(path, json);
-    }
+    let json = serde_json::to_string(&session).context("could not serialize the session")?;
+    crate::util::write_atomically(path, json.as_bytes())
 }
 
 
@@ -1366,7 +1402,7 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
             status: "pending".to_string(),
         }];
 
-        save_session(&path, &messages, "some-model", &todos);
+        save_session(&path, &messages, "some-model", &todos).unwrap();
         let restored = load_session(&path).unwrap();
 
         // The system prompt is rebuilt on load, so the saved one must not come back — it
@@ -1440,4 +1476,66 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
         assert!(a.extension().is_some_and(|e| e == "json"));
     }
 
+    #[test]
+    fn the_session_hash_is_fixed_rather_than_whatever_the_toolchain_hashes_to() {
+        use super::path_digest;
+        use std::path::Path;
+
+        // Pinned, because the point is that no release may change it: a different value
+        // here is every user's `--resume` finding nothing. FNV-1a's own published value
+        // for the empty input is the offset basis.
+        assert_eq!(path_digest(Path::new("")), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(path_digest(Path::new("a")), 0xaf63_dc4c_8601_ec8c);
+
+        // One directory spelled in two cases is one directory on Windows.
+        if cfg!(windows) {
+            assert_eq!(path_digest(Path::new(r"E:\Proj")), path_digest(Path::new(r"e:\proj")));
+        }
+    }
+
+    #[test]
+    fn a_session_under_the_old_hash_is_moved_to_the_new_name() {
+        use super::{adopt_legacy_session, session_label};
+        use std::hash::{Hash, Hasher};
+
+        let dir = scratch("legacy-session", "").parent().unwrap().to_path_buf();
+        let cwd = dir.join("project");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cwd.hash(&mut hasher);
+        let legacy = dir.join(format!("{}-{:016x}.json", session_label(&cwd), hasher.finish()));
+        let current = dir.join("project-current.json");
+        let _ = std::fs::remove_file(&current);
+        std::fs::write(&legacy, "{}").unwrap();
+
+        adopt_legacy_session(&cwd, &current);
+        assert!(current.exists());
+        assert!(!legacy.exists());
+
+        // A session already under the new name is never replaced by an old one.
+        std::fs::write(&legacy, "old").unwrap();
+        std::fs::write(&current, "new").unwrap();
+        adopt_legacy_session(&cwd, &current);
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "new");
+        let _ = std::fs::remove_file(&legacy);
+        let _ = std::fs::remove_file(&current);
+    }
+
+    #[test]
+    fn a_session_that_cannot_be_written_says_so() {
+        use crate::save_session;
+
+        // A directory where the file should be: the rename cannot replace it.
+        let dir = scratch("unsaveable", "").parent().unwrap().join("unsaveable-session.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        assert!(save_session(&dir, &messages, "m", &[]).is_err());
+        // …and leaves no temporary behind.
+        let leftovers = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("unsaveable-session.json."))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

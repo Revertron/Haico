@@ -785,11 +785,10 @@ fn edit_config_file(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(
 
     edit(&mut doc)?;
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    fs::write(path, doc.to_string()).with_context(|| format!("could not write {}", path.display()))
+    // Replaced whole, never written in place: a save interrupted halfway through would
+    // otherwise leave the user's hand-written config truncated, and the next start would
+    // refuse it as malformed.
+    crate::util::write_atomically(path, doc.to_string().as_bytes())
 }
 
 // Record the model to start with next time.
