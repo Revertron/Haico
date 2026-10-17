@@ -120,9 +120,15 @@ where
 // so the whole group can be signalled at once.
 
 pub(crate) async fn kill_tree_by_pid(pid: u32) {
+    let _ = tokio::process::Command::from(tree_killer(pid)).status().await;
+}
+
+// The command that kills `pid` and everything under it, shared by the async kill and the
+// one a dropped `run_command` has to make without awaiting.
+fn tree_killer(pid: u32) -> std::process::Command {
     #[cfg(target_os = "windows")]
     let mut killer = {
-        let mut c = tokio::process::Command::new("taskkill");
+        let mut c = std::process::Command::new("taskkill");
         c.args(["/T", "/F", "/PID", &pid.to_string()]);
         c
     };
@@ -130,15 +136,44 @@ pub(crate) async fn kill_tree_by_pid(pid: u32) {
     // Negative pid means "the whole process group", which is why spawn sets one up.
     #[cfg(not(target_os = "windows"))]
     let mut killer = {
-        let mut c = tokio::process::Command::new("kill");
+        let mut c = std::process::Command::new("kill");
         c.args(["-TERM", &format!("-{}", pid)]);
         c
     };
 
     killer
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let _ = killer.status().await;
+    killer
+}
+
+// Kills a `run_command` child's whole tree if the call is dropped before the child is done.
+//
+// Esc in the REPL and Ctrl+C in a `-p` run interrupt a turn by dropping it, and with it the
+// future waiting on the command. Only the timeout path used to kill anything, so an
+// interrupted `cargo test` went on running — holding the build lock, still printing into a
+// pipe nobody read — while the model, told the call was interrupted, started the next one
+// against it. Disarmed once the child has been waited on or killed the ordinary way.
+//
+// Synchronous, because `Drop` cannot await: taskkill and kill each return in milliseconds,
+// which is less than the interrupt itself takes to be noticed.
+struct KillTreeOnDrop {
+    pid: Option<u32>,
+}
+
+impl KillTreeOnDrop {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for KillTreeOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            let _ = tree_killer(pid).status();
+        }
+    }
 }
 
 pub(crate) async fn kill_process_tree(child: &mut tokio::process::Child) {
@@ -418,9 +453,13 @@ impl MyMcpServer {
             builder.current_dir(&dir);
         }
 
+        // The direct child goes with the future even where the tree kill below cannot run;
+        // the guard is what takes everything it spawned with it.
+        builder.kill_on_drop(true);
         let mut child = builder.spawn().map_err(|e| {
             McpError::internal_error(format!("Failed to spawn command: {}", e), None)
         })?;
+        let mut tree = KillTreeOnDrop { pid: child.id() };
 
         // Both pipes are drained concurrently with the wait. Reading them only after the
         // process exits can deadlock: a command that fills the pipe buffer blocks forever
@@ -454,6 +493,9 @@ impl MyMcpServer {
                 None
             }
         };
+        // Exited or killed: nothing left for the guard to do, and a pid that has been
+        // waited on may already belong to some other process.
+        tree.disarm();
 
         // Whatever the command managed to produce is worth returning, timeout or not.
         //
@@ -1359,6 +1401,32 @@ serde = \"1\"
         );
     }
 
+
+    #[tokio::test]
+    async fn an_interrupted_run_command_takes_its_command_with_it() {
+        let server = test_server();
+        let dir = scratch("interrupted-run", "").parent().unwrap().to_path_buf();
+        let marker = dir.join("interrupted-run-finished");
+        let _ = std::fs::remove_file(&marker);
+
+        // Waits three seconds, then leaves a file behind: the file existing afterwards is
+        // the command having outlived the call.
+        let command = if cfg!(windows) {
+            "ping -n 4 127.0.0.1 > NUL && echo done > interrupted-run-finished"
+        } else {
+            "sleep 3 && echo done > interrupted-run-finished"
+        };
+        // Dropped half a second in, the way Esc drops a turn.
+        let call = server.run_command(rmcp::handler::server::wrapper::Parameters(crate::RunCommandParams {
+            command: command.to_string(),
+            timeout: Some(60),
+            cwd: Some(dir.display().to_string()),
+        }));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(500), call).await.is_err());
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(!marker.exists(), "the command went on running after its call was dropped");
+    }
 
     #[tokio::test]
     async fn run_command_gives_the_child_no_stdin_of_its_own() {
