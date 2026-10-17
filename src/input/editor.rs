@@ -660,17 +660,11 @@ fn caret_in(points: &[(usize, usize, usize)], at: usize, width: usize) -> (usize
     }
 }
 
+// The input box needs room for a word and its caret, so it never lays out narrower than this.
 pub(super) fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(80)
-        .max(20)
+    out::terminal_width().max(20)
 }
 
 pub(super) fn terminal_height() -> usize {
-    crossterm::terminal::size()
-        .map(|(_, rows)| rows as usize)
-        .unwrap_or(24)
-        .max(1)
+    out::terminal_height()
 }
-

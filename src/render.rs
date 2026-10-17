@@ -920,9 +920,7 @@ mod diff_tests {
 pub(crate) fn indented_command(command: &str) -> String {
     const MAX: usize = 4000;
     let shown = truncate_at_boundary(command.trim(), MAX);
-    let width = crossterm::terminal::size()
-        .map(|(cols, _)| (cols as usize).saturating_sub(6).max(40))
-        .unwrap_or(100);
+    let width = crate::out::terminal_size().map_or(100, |(columns, _)| columns.saturating_sub(6).max(40));
 
     let mut out = String::new();
     for line in shown.lines() {

@@ -246,10 +246,7 @@ pub(crate) async fn ask_question(
     let mut selected = 0usize;
 
     let answer = loop {
-        let width = crossterm::terminal::size()
-            .map(|(columns, _)| columns as usize)
-            .unwrap_or(80)
-            .max(20);
+        let width = crate::out::terminal_width().max(20);
         let (rows, caret) = dialog_rows(options, selected, width);
         crate::out::set_region(rows, caret, 0);
 

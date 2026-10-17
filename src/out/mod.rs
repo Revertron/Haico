@@ -417,18 +417,21 @@ pub(crate) use screen::*;
 pub(crate) use wrap::*;
 
 
-fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(80)
-        .max(1)
+// The terminal's size in columns and rows, when there is a terminal to ask. Everything that
+// lays something out asks here, rather than each asking crossterm with a fallback of its own;
+// the minimum each one can work with is still its own, since an input box needs more room
+// than a line of transcript does.
+pub(crate) fn terminal_size() -> Option<(usize, usize)> {
+    crossterm::terminal::size().ok().map(|(columns, rows)| (columns as usize, rows as usize))
 }
 
-fn terminal_height() -> usize {
-    crossterm::terminal::size()
-        .map(|(_, rows)| rows as usize)
-        .unwrap_or(24)
-        .max(1)
+// The size with the fallback everything uses when there is no terminal: 80 by 24.
+pub(crate) fn terminal_width() -> usize {
+    terminal_size().map_or(80, |(columns, _)| columns).max(1)
+}
+
+pub(crate) fn terminal_height() -> usize {
+    terminal_size().map_or(24, |(_, rows)| rows).max(1)
 }
 
 

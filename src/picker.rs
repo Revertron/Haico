@@ -73,9 +73,7 @@ pub(crate) async fn select_interactive(
     let mut selected_index = selected_index.min(models.len() - 1);
 
     loop {
-        let (width, height) = crossterm::terminal::size()
-            .map(|(columns, rows)| (columns as usize, rows as usize))
-            .unwrap_or((80, 24));
+        let (width, height) = crate::out::terminal_size().unwrap_or((80, 24));
         // Two rows left to the transcript, so the picker never becomes the whole screen.
         let (rows, caret) =
             picker_rows(noun, &models, selected_index, width.max(20), height.saturating_sub(2));
