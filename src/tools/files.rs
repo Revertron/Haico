@@ -567,83 +567,42 @@ impl MyMcpServer {
 
     #[tool(description = "Use to change part of an existing file — fixing a line, renaming a symbol, or adjusting a value — without rewriting the whole file. Performs exact string replacement. An existing file must be read first. Preserve exact indentation of lines. Prefer editing over creating new files. No emojis unless requested. old_string must be unique or use replace_all. Use replace_all for renaming variables.")]
     pub(crate) async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
-        let file_path = PathBuf::from(&params.0.file_path);
-
-        if !file_path.exists() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "File not found: {}",
-                params.0.file_path
-            ))]));
-        }
-
-        if let Some(refusal) = self.check_may_modify(&file_path) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
-        }
-
+        let (file_path, content, ending) = match self.open_for_edit(&params.0.file_path)? {
+            Ok(opened) => opened,
+            Err(refusal) => return Ok(refusal),
+        };
         if params.0.old_string == params.0.new_string {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "No changes made - old_string and new_string are identical".to_string(),
             )]));
         }
 
-        let on_disk = fs::read_to_string(&file_path).map_err(|e| {
-            McpError::internal_error(format!("Failed to read file: {}", e), None)
-        })?;
-
-        // The model's strings are LF, because that is all `read` ever shows it — see
-        // `with_line_endings`. Match and splice in the file's own ending instead, so a
-        // multi-line old_string is not defeated by a byte the model was never given.
-        // `content` is normalized too: on a file whose endings are already consistent that
-        // is the same bytes back, and on one that is not it is the repair.
-        let ending = dominant_line_ending(&on_disk);
-        let content = with_line_endings(&on_disk, ending);
         let old_string = with_line_endings(&params.0.old_string, ending);
         let new_string = with_line_endings(&params.0.new_string, ending);
-
-        let matches = content.matches(old_string.as_ref()).count();
-
-        if matches == 0 {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "String not found in {}: '{}'",
-                params.0.file_path,
-                truncate_at_boundary(&params.0.old_string, 500)
-            ))]));
-        }
-
-        // The description has always promised "old_string must be unique or use
-        // replace_all", but nothing checked: a string occurring several times silently
-        // edited the first one, which is rarely the one that was meant.
-        if matches > 1 && !params.0.replace_all {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "old_string is not unique: it occurs {} times in {}. Include enough \
-                 surrounding context to identify the one you mean, or pass \
-                 replace_all: true to change all {} of them.",
-                matches, params.0.file_path, matches
-            ))]));
-        }
-
-        let new_content = if params.0.replace_all {
-            content.replace(old_string.as_ref(), &new_string)
-        } else {
-            // Exactly one occurrence, so replacen and find agree.
-            content.replacen(old_string.as_ref(), &new_string, 1)
+        let (new_content, matches) = match replace_once_or_all(&content, &old_string, &new_string, params.0.replace_all) {
+            Ok(replaced) => replaced,
+            Err(Miss::NotFound) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "String not found in {}: '{}'",
+                    params.0.file_path,
+                    truncate_at_boundary(&params.0.old_string, 500)
+                ))]));
+            }
+            Err(Miss::NotUnique(matches)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "old_string is not unique: it occurs {} times in {}. Include enough \
+                     surrounding context to identify the one you mean, or pass \
+                     replace_all: true to change all {} of them.",
+                    matches, params.0.file_path, matches
+                ))]));
+            }
         };
 
-        self.checkpoint(
+        self.save_edit(
             &file_path,
-            format!(
-                "edited {} ({} replacement(s))",
-                params.0.file_path, matches
-            ),
-        );
-
-        fs::write(&file_path, &new_content).map_err(|e| {
-            McpError::internal_error(format!("Failed to write file: {}", e), None)
-        })?;
-
-        // Keep the record current so a follow-up edit is not rejected as stale.
-        self.mark_written(&file_path, new_content.as_bytes());
-
+            &new_content,
+            format!("edited {} ({} replacement(s))", params.0.file_path, matches),
+        )?;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Successfully replaced {} occurrence(s) in {}",
             matches, params.0.file_path
@@ -658,36 +617,20 @@ impl MyMcpServer {
         &self,
         params: Parameters<MultiEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let file_path = PathBuf::from(&params.0.file_path);
-
-        if !file_path.exists() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "File not found: {}",
-                params.0.file_path
-            ))]));
-        }
-
-        if let Some(refusal) = self.check_may_modify(&file_path) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
-        }
-
+        let (file_path, content, ending) = match self.open_for_edit(&params.0.file_path)? {
+            Ok(opened) => opened,
+            Err(refusal) => return Ok(refusal),
+        };
         if params.0.edits.is_empty() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "No edits supplied".to_string(),
             )]));
         }
 
-        let on_disk = fs::read_to_string(&file_path).map_err(|e| {
-            McpError::internal_error(format!("Failed to read file: {}", e), None)
-        })?;
-
-        // Same reason as `edit`: the model's strings are LF whatever the file is.
-        let ending = dominant_line_ending(&on_disk);
-
         // Applied to a working copy first. A partial application would leave the file in a
         // state neither the model nor the user asked for, and the model's next edit would
         // then be matching against text that no longer exists.
-        let mut working = with_line_endings(&on_disk, ending).into_owned();
+        let mut working = content;
         let mut replacements = 0usize;
 
         for (index, edit) in params.0.edits.iter().enumerate() {
@@ -703,53 +646,41 @@ impl MyMcpServer {
 
             let old_string = with_line_endings(&edit.old_string, ending);
             let new_string = with_line_endings(&edit.new_string, ending);
-
-            let matches = working.matches(old_string.as_ref()).count();
-
-            if matches == 0 {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Edit {} of {}: string not found: '{}'. Nothing was written. Remember \
-                     that each edit applies to the result of the ones before it.",
-                    position,
-                    params.0.edits.len(),
-                    truncate_at_boundary(&edit.old_string, 300)
-                ))]));
-            }
-
-            if matches > 1 && !edit.replace_all {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Edit {} of {}: old_string is not unique, it occurs {} times. Nothing \
-                     was written. Add surrounding context, or set replace_all on that edit.",
-                    position,
-                    params.0.edits.len(),
-                    matches
-                ))]));
-            }
-
-            working = if edit.replace_all {
-                working.replace(old_string.as_ref(), &new_string)
-            } else {
-                working.replacen(old_string.as_ref(), &new_string, 1)
+            let matches;
+            (working, matches) = match replace_once_or_all(&working, &old_string, &new_string, edit.replace_all) {
+                Ok(replaced) => replaced,
+                Err(Miss::NotFound) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Edit {} of {}: string not found: '{}'. Nothing was written. Remember \
+                         that each edit applies to the result of the ones before it.",
+                        position,
+                        params.0.edits.len(),
+                        truncate_at_boundary(&edit.old_string, 300)
+                    ))]));
+                }
+                Err(Miss::NotUnique(matches)) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Edit {} of {}: old_string is not unique, it occurs {} times. Nothing \
+                         was written. Add surrounding context, or set replace_all on that edit.",
+                        position,
+                        params.0.edits.len(),
+                        matches
+                    ))]));
+                }
             };
             replacements += matches;
         }
 
-        self.checkpoint(
+        self.save_edit(
             &file_path,
+            &working,
             format!(
                 "multi-edited {} ({} edit(s), {} replacement(s))",
                 params.0.file_path,
                 params.0.edits.len(),
                 replacements
             ),
-        );
-
-        fs::write(&file_path, &working).map_err(|e| {
-            McpError::internal_error(format!("Failed to write file: {}", e), None)
-        })?;
-
-        self.mark_written(&file_path, working.as_bytes());
-
+        )?;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Applied {} edit(s), {} replacement(s), to {}",
             params.0.edits.len(),
@@ -887,6 +818,68 @@ impl MyMcpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
+}
+
+// What `edit` and `multi_edit` share. The two used to be written out twice, down to the
+// read-before-write check and the line-ending translation, and differ only in what they
+// tell the model when a string is not where it was expected — which stays with each.
+impl MyMcpServer {
+    // The file an edit is about to change, read with its line endings made consistent, and
+    // the ending they were made consistent to. The inner `Err` is the refusal the call owes.
+    fn open_for_edit(
+        &self,
+        path: &str,
+    ) -> Result<Result<(PathBuf, String, crate::util::LineEnding), CallToolResult>, McpError> {
+        let file_path = PathBuf::from(path);
+        if !file_path.exists() {
+            return Ok(Err(CallToolResult::error(vec![ContentBlock::text(format!("File not found: {}", path))])));
+        }
+        if let Some(refusal) = self.check_may_modify(&file_path) {
+            return Ok(Err(CallToolResult::error(vec![ContentBlock::text(refusal)])));
+        }
+        let on_disk = fs::read_to_string(&file_path)
+            .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
+
+        // The model's strings are LF, because that is all `read` ever shows it — see
+        // `with_line_endings`. Match and splice in the file's own ending instead, so a
+        // multi-line old_string is not defeated by a byte the model was never given. The
+        // content is normalized too: on a file whose endings are already consistent that is
+        // the same bytes back, and on one that is not it is the repair.
+        let ending = dominant_line_ending(&on_disk);
+        let content = with_line_endings(&on_disk, ending).into_owned();
+        Ok(Ok((file_path, content, ending)))
+    }
+
+    // Write an edit's result, with the checkpoint `/undo` restores and the record that
+    // keeps a follow-up edit from being rejected as stale.
+    fn save_edit(&self, file_path: &std::path::Path, content: &str, description: String) -> Result<(), McpError> {
+        self.checkpoint(file_path, description);
+        fs::write(file_path, content)
+            .map_err(|e| McpError::internal_error(format!("Failed to write file: {}", e), None))?;
+        self.mark_written(file_path, content.as_bytes());
+        Ok(())
+    }
+}
+
+// Why a replacement did not happen.
+enum Miss {
+    NotFound,
+    // How many times it occurs, when it occurs more than once and only one was asked for.
+    NotUnique(usize),
+}
+
+// `old` replaced by `new` in `content`, and how many times. The descriptions have always
+// promised "old_string must be unique or use replace_all", but nothing used to check: a
+// string occurring several times silently edited the first one, which is rarely the one
+// that was meant.
+fn replace_once_or_all(content: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), Miss> {
+    match content.matches(old).count() {
+        0 => Err(Miss::NotFound),
+        matches if matches > 1 && !replace_all => Err(Miss::NotUnique(matches)),
+        matches if replace_all => Ok((content.replace(old, new), matches)),
+        // Exactly one occurrence, so replacen and find agree.
+        matches => Ok((content.replacen(old, new, 1), matches)),
+    }
 }
 
 #[cfg(test)]

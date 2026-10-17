@@ -148,6 +148,58 @@ fn tree_killer(pid: u32) -> std::process::Command {
     killer
 }
 
+// The shell for a command, set up as both `run_command` and `run_background` need it:
+// refused on Windows when it chains with `;`, no stdin, its output piped, its own process
+// group, and started in `cwd` when one is given. `Err` is the reply the call owes instead.
+// The two used to build it each their own way, and a fix to one could miss the other.
+fn shell_builder(command: &str, cwd: Option<&str>) -> Result<tokio::process::Command, CallToolResult> {
+    #[cfg(target_os = "windows")]
+    if chains_with_semicolon(command) {
+        return Err(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
+    }
+
+    let mut builder = shell_command(command);
+    builder
+        // No stdin, and on Windows that is what keeps the terminal working at all.
+        //
+        // Measured in a real console: cmd.exe sets the console input mode to its own idea
+        // of one about ten milliseconds after it starts — ENABLE_PROCESSED_INPUT,
+        // ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT all back on — and never puts back what it
+        // found. So raw mode was off from the first run_command onward while VT input and
+        // the terminal's mouse reporting were both still on, and the next wheel report was
+        // read a line at a time and echoed by the console into the input box as
+        // `^[[<64;65;59M` with nothing reaching haico until Enter. It only does that when
+        // its stdin is the console handle: the same command with no stdin leaves the mode
+        // untouched, and ordinary programs (git, cargo, rustc, taskkill) never touch it at
+        // all, which is what pins this on the shell rather than on them.
+        //
+        // Nothing is lost. A child sharing the console keyboard was already competing with
+        // `Keys` for keystrokes, so a command that prompts could never have been answered
+        // anyway; now it reads EOF and fails at once instead of waiting on a terminal it
+        // cannot have. A background process that blocked on a prompt would hang unseen.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Make the child a process-group leader so a timeout can signal the whole group, not
+    // just the shell. Windows gets the same effect from taskkill /T instead.
+    #[cfg(not(target_os = "windows"))]
+    builder.process_group(0);
+
+    // An explicit directory beats a leading "cd", whose effect ends with the call.
+    if let Some(cwd) = cwd.filter(|c| !c.trim().is_empty()) {
+        let dir = PathBuf::from(cwd);
+        if !dir.is_dir() {
+            return Err(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Working directory not found: {}",
+                cwd
+            ))]));
+        }
+        builder.current_dir(&dir);
+    }
+    Ok(builder)
+}
+
 // Kills a `run_command` child's whole tree if the call is dropped before the child is done.
 //
 // Esc in the REPL and Ctrl+C in a `-p` run interrupt a turn by dropping it, and with it the
@@ -400,55 +452,16 @@ impl MyMcpServer {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(120).min(3600);
 
-        #[cfg(target_os = "windows")]
-        if chains_with_semicolon(&command) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
-        }
         if backgrounds_with_ampersand(&command) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(BACKGROUND_REFUSAL)]));
         }
 
         use std::time::Duration;
 
-        let mut builder = shell_command(&command);
-        builder
-            // No stdin, and on Windows that is what keeps the terminal working at all.
-            //
-            // Measured in a real console: cmd.exe sets the console input mode to its own
-            // idea of one about ten milliseconds after it starts — ENABLE_PROCESSED_INPUT,
-            // ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT all back on — and never puts back what
-            // it found. So raw mode was off from the first run_command onward while VT input
-            // and the terminal's mouse reporting were both still on, and the next wheel
-            // report was read a line at a time and echoed by the console into the input box
-            // as `^[[<64;65;59M` with nothing reaching haico until Enter. It only does that
-            // when its stdin is the console handle: the same command with no stdin leaves
-            // the mode untouched, and ordinary programs (git, cargo, rustc, taskkill) never
-            // touch it at all, which is what pins this on the shell rather than on them.
-            //
-            // Nothing is lost. A child sharing the console keyboard was already competing
-            // with `Keys` for keystrokes, so a command that prompts could never have been
-            // answered anyway; now it reads EOF and fails at once instead of waiting on a
-            // terminal it cannot have. `run_background` has taken the same line all along.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        // Make the child a process-group leader so a timeout can signal the whole group,
-        // not just the shell. Windows gets the same effect from taskkill /T instead.
-        #[cfg(not(target_os = "windows"))]
-        builder.process_group(0);
-
-        // An explicit directory beats a leading "cd", whose effect ends with the call.
-        if let Some(cwd) = params.0.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
-            let dir = PathBuf::from(cwd);
-            if !dir.is_dir() {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Working directory not found: {}",
-                    cwd
-                ))]));
-            }
-            builder.current_dir(&dir);
-        }
+        let mut builder = match shell_builder(&command, params.0.cwd.as_deref()) {
+            Ok(builder) => builder,
+            Err(refusal) => return Ok(refusal),
+        };
 
         // The direct child goes with the future even where the tree kill below cannot run;
         // the guard is what takes everything it spawned with it.
@@ -621,31 +634,10 @@ impl MyMcpServer {
         let command = params.0.command.clone();
         let timeout_secs = params.0.timeout.unwrap_or(30).min(300);
 
-        #[cfg(target_os = "windows")]
-        if chains_with_semicolon(&command) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(SEMICOLON_REFUSAL)]));
-        }
-
-        let mut builder = shell_command(&command);
-        builder
-            // No stdin: a background process that blocks on a prompt would hang unseen.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        #[cfg(not(target_os = "windows"))]
-        builder.process_group(0);
-
-        if let Some(cwd) = params.0.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
-            let dir = PathBuf::from(cwd);
-            if !dir.is_dir() {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Working directory not found: {}",
-                    cwd
-                ))]));
-            }
-            builder.current_dir(&dir);
-        }
+        let mut builder = match shell_builder(&command, params.0.cwd.as_deref()) {
+            Ok(builder) => builder,
+            Err(refusal) => return Ok(refusal),
+        };
 
         let mut child = builder.spawn().map_err(|e| {
             McpError::internal_error(format!("Failed to start command: {}", e), None)
