@@ -405,6 +405,11 @@ async fn converse(
         running.lock().unwrap().take();
         show(&handle, |ui| set_label(ui, BUSY, ""));
     }
+
+    // The REPL and a `-p` run both do this on the way out, and the window has to as
+    // well: a dev server started from it would otherwise outlive it holding a port,
+    // with no window left to stop it from. Nothing is said — the window is gone.
+    agent.server.stop_all_background().await;
 }
 
 /// Hand one event to the window, or answer it if it is a question.
