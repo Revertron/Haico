@@ -386,124 +386,124 @@ impl MyMcpServer {
         let result = match name {
             "calculator" => {
                 let params: CalculatorParams = serde_json::from_value(arguments)?;
-                self.calculator(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.calculator(Parameters(params)).await.map_err(tool_error)?
             }
             "get_date" => {
-                self.get_date().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.get_date().await.map_err(tool_error)?
             }
             "get_time" => {
-                self.get_time().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.get_time().await.map_err(tool_error)?
             }
             "read" => {
                 let params: ReadParams = serde_json::from_value(arguments)?;
-                self.read(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.read(Parameters(params)).await.map_err(tool_error)?
             }
             "write_file" => {
                 let params: WriteParams = serde_json::from_value(arguments)?;
-                self.write_file(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.write_file(Parameters(params)).await.map_err(tool_error)?
             }
             "edit" => {
                 let params: EditParams = serde_json::from_value(arguments)?;
-                self.edit(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.edit(Parameters(params)).await.map_err(tool_error)?
             }
             "glob_search" => {
                 let params: GlobParams = serde_json::from_value(arguments)?;
-                self.glob_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.glob_search(Parameters(params)).await.map_err(tool_error)?
             }
             "grep" => {
                 let params: GrepParams = serde_json::from_value(arguments)?;
-                self.grep(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.grep(Parameters(params)).await.map_err(tool_error)?
             }
             "web_fetch" => {
                 let params: WebFetchParams = serde_json::from_value(arguments)?;
-                self.web_fetch(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.web_fetch(Parameters(params)).await.map_err(tool_error)?
             }
             "web_get" => {
                 let params: WebGetParams = serde_json::from_value(arguments)?;
-                self.web_get(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.web_get(Parameters(params)).await.map_err(tool_error)?
             }
             "web_search" => {
                 let params: WebSearchParams = serde_json::from_value(arguments)?;
-                self.web_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.web_search(Parameters(params)).await.map_err(tool_error)?
             }
             "research" => {
                 let params: ResearchParams = serde_json::from_value(arguments)?;
-                self.research(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.research(Parameters(params)).await.map_err(tool_error)?
             }
             "library" => {
                 let params: LibraryParams = serde_json::from_value(arguments)?;
-                self.library(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.library(Parameters(params)).await.map_err(tool_error)?
             }
             "remember" => {
                 let params: RememberParams = serde_json::from_value(arguments)?;
-                self.remember(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.remember(Parameters(params)).await.map_err(tool_error)?
             }
             "recall" => {
                 let params: RecallParams = serde_json::from_value(arguments)?;
-                self.recall(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.recall(Parameters(params)).await.map_err(tool_error)?
             }
             "skill" => {
                 let params: SkillParams = serde_json::from_value(arguments)?;
-                self.skill(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.skill(Parameters(params)).await.map_err(tool_error)?
             }
             "ls" => {
                 let params: LSParams = serde_json::from_value(arguments)?;
-                self.ls(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.ls(Parameters(params)).await.map_err(tool_error)?
             }
             "run_background" => {
                 let params: RunBackgroundParams = serde_json::from_value(arguments)?;
-                self.run_background(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.run_background(Parameters(params)).await.map_err(tool_error)?
             }
             "background_output" => {
                 let params: BackgroundOutputParams = serde_json::from_value(arguments)?;
-                self.background_output(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.background_output(Parameters(params)).await.map_err(tool_error)?
             }
             "background_stop" => {
                 let params: BackgroundStopParams = serde_json::from_value(arguments)?;
-                self.background_stop(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.background_stop(Parameters(params)).await.map_err(tool_error)?
             }
             "run_command" => {
                 let params: RunCommandParams = serde_json::from_value(arguments)?;
-                self.run_command(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.run_command(Parameters(params)).await.map_err(tool_error)?
             }
             "multi_edit" => {
                 let params: MultiEditParams = serde_json::from_value(arguments)?;
-                self.multi_edit(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.multi_edit(Parameters(params)).await.map_err(tool_error)?
             }
             "todo_write" => {
                 let params: TodoWriteParams = serde_json::from_value(arguments)?;
-                self.todo_write(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.todo_write(Parameters(params)).await.map_err(tool_error)?
             }
             "ask_user" => {
                 let params: AskUserParams = serde_json::from_value(arguments)?;
-                self.ask_user(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.ask_user(Parameters(params)).await.map_err(tool_error)?
             }
             "start_plan" => {
-                self.start_plan().await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.start_plan().await.map_err(tool_error)?
             }
             "present_plan" => {
                 let params: PresentPlanParams = serde_json::from_value(arguments)?;
-                self.present_plan(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.present_plan(Parameters(params)).await.map_err(tool_error)?
             }
             "crate_info" => {
                 let params: CrateInfoParams = serde_json::from_value(arguments)?;
-                self.crate_info(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.crate_info(Parameters(params)).await.map_err(tool_error)?
             }
             "crate_search" => {
                 let params: CrateSearchParams = serde_json::from_value(arguments)?;
-                self.crate_search(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.crate_search(Parameters(params)).await.map_err(tool_error)?
             }
             "timer" => {
                 let params: TimerParams = serde_json::from_value(arguments)?;
-                self.timer(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.timer(Parameters(params)).await.map_err(tool_error)?
             }
             "sub_agent" => {
                 let params: SubAgentParams = serde_json::from_value(arguments)?;
-                self.sub_agent(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.sub_agent(Parameters(params)).await.map_err(tool_error)?
             }
             "crate_api" => {
                 let params: CrateApiParams = serde_json::from_value(arguments)?;
-                self.crate_api(Parameters(params)).await.map_err(|e| anyhow::anyhow!("{:?}", e))?
+                self.crate_api(Parameters(params)).await.map_err(tool_error)?
             }
             _ => return Err(anyhow::anyhow!("Unknown tool: {}", name)),
         };
@@ -531,6 +531,15 @@ impl MyMcpServer {
 
         Ok(ToolOutput { text, images })
     }
+}
+
+// A tool's `Err`, in the words the model will read.
+//
+// Formatted with `{:?}` it reached the model as `ErrorData { code: ErrorCode(-32603),
+// message: "...", data: None }` — a Rust struct dump around the one part that says what
+// went wrong. The code is MCP's to report to a host; the model only needs the message.
+fn tool_error(e: rmcp::ErrorData) -> anyhow::Error {
+    anyhow::anyhow!("{}", e.message)
 }
 
 /// What a tool produced, split by what the conversation can do with each half.
@@ -722,6 +731,12 @@ mod tests {
     use crate::tools::*;
     use crate::util::*;
     use serde_json::json;
+
+    #[test]
+    fn a_tool_error_reaches_the_model_as_its_message_alone() {
+        let error = super::tool_error(rmcp::ErrorData::internal_error("Failed to read image: a.png", None));
+        assert_eq!(error.to_string(), "Failed to read image: a.png");
+    }
 
     #[test]
     fn simplify_schema_drops_nullability_rust_formats_and_the_dialect() {
