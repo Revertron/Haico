@@ -710,27 +710,17 @@ impl LMStudioClient {
             let message = parsed["choices"][0]
                 .get("message")
                 .filter(|m| m.is_object())
-                .cloned()
+                .map(normalize_reply)
                 .context("LLM server returned no message")?;
 
             // Handed to the caller in the same two flavors the streaming path uses, so the
             // REPL has one way of showing a reply rather than one per transport. The whole
             // thing arrives at once here, which is the nature of a server that ignored
             // "stream": true — there was nothing to show earlier.
-            for key in ["reasoning", "reasoning_content"] {
-                if let Some(text) = message
-                    .get(key)
-                    .and_then(|r| r.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    on_chunk(Chunk::Reasoning(text.to_string()));
-                }
+            if let Some(text) = message["reasoning_content"].as_str() {
+                on_chunk(Chunk::Reasoning(text.to_string()));
             }
-            if let Some(text) = message
-                .get("content")
-                .and_then(|c| c.as_str())
-                .filter(|s| !s.is_empty())
-            {
+            if let Some(text) = message["content"].as_str().filter(|s| !s.is_empty()) {
                 on_chunk(Chunk::Content(text.to_string()));
             }
             return Ok((message, Ending::of(&parsed)));
@@ -1022,6 +1012,58 @@ impl StreamAssembler {
 
         message
     }
+}
+
+// A whole reply from a server that ignored "stream", in the shape `into_message` gives a
+// streamed one.
+//
+// It used to be returned as the server sent it, so the history's shape depended on the
+// transport: a server that omitted tool-call ids left `tool_call_id: ""` behind (an id
+// the stream path would have made up), reasoning under `reasoning` was never echoed back
+// under the key the chat templates read, and a reply carrying both keys was shown twice.
+// The rest of haico reads one shape, so both transports produce it.
+fn normalize_reply(raw: &Value) -> Value {
+    let mut message = json!({
+        "role": "assistant",
+        "content": raw["content"].as_str().unwrap_or_default(),
+    });
+
+    let reasoning = ["reasoning_content", "reasoning"]
+        .iter()
+        .find_map(|key| raw[*key].as_str().filter(|text| !text.is_empty()));
+    if let Some(reasoning) = reasoning {
+        message["reasoning_content"] = json!(reasoning);
+    }
+
+    let calls: Vec<Value> = raw["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, call)| {
+            // Kept even without a name, unlike a nameless fragment in the stream: this is
+            // a whole call the server sent, and the turn answers it by saying what was
+            // wrong with it, which a call dropped here could never be told.
+            let name = call["function"]["name"].clone();
+            let id = call["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string);
+            // Some local servers send the arguments as an object rather than as the JSON
+            // text the format specifies; text is what every reader here expects.
+            let arguments = match &call["function"]["arguments"] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            json!({
+                "id": id.unwrap_or_else(|| format!("call_{}", index)),
+                "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            })
+        })
+        .collect();
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    message
 }
 
 // Tool parameter structs
@@ -1763,6 +1805,42 @@ mod tests {
         assert_eq!(message["content"], "plain answer");
         // The caller still gets the text, so the REPL prints it exactly once either way.
         assert_eq!(streamed, "plain answer");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_ignored_stream_comes_back_in_the_streamed_shape() {
+        // No ids on the calls, reasoning under the other key, and arguments as an object:
+        // the three ways a raw message differed from what the stream path builds.
+        let body = concat!(
+            "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,",
+            "\"reasoning\":\"look first\",\"tool_calls\":[",
+            "{\"function\":{\"name\":\"read\",\"arguments\":{\"file_path\":\"a.rs\"}}},",
+            "{\"function\":{\"arguments\":\"{}\"}}]}}]}"
+        );
+        let url = serve_once(body, "application/json").await;
+
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        let mut reasoning = Vec::new();
+        let message = client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |chunk| {
+                if let crate::Chunk::Reasoning(text) = chunk {
+                    reasoning.push(text);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(message["content"], "");
+        assert_eq!(message["reasoning_content"], "look first");
+        assert_eq!(reasoning, ["look first"]);
+        // Each is given the id its reply will need — the nameless one too, since the turn
+        // answers it with what was wrong.
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_0");
+        assert_eq!(calls[1]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"file_path\":\"a.rs\"}");
+        assert!(calls[1]["function"]["name"].is_null());
     }
 
 
