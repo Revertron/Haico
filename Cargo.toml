@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.27"
+version = "0.2.28"
 edition = "2021"
 description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
