@@ -1675,7 +1675,8 @@ pub(crate) async fn run_turn(
                     if tool_name == SUB_AGENT {
                         let task = arguments["task"].as_str().unwrap_or_default().trim().to_string();
                         let content = if task.is_empty() {
-                            "The task was empty. Put the whole task in the 'task' field and                              call sub_agent again."
+                            "The task was empty. Put the whole task in the 'task' field and \
+                             call sub_agent again."
                                 .to_string()
                         } else {
                             let _ = tx.send(AgentEvent::ToolStarted {
@@ -1829,9 +1830,10 @@ pub(crate) async fn run_turn(
                         tool_result
                     } else {
                         format!(
-                            "{tool_result}
-
-[haico] Your `{names}` argument ended with a second copy of                              this call's other arguments written inside its text (`\", \"old_string\": \"...`).                              That copy was cut off before the tool ran, so only the text before it                              was used. End each string argument where its own text ends.",
+                            "{tool_result}\n\n[haico] Your `{names}` argument ended with a second copy of \
+                             this call's other arguments written inside its text (`\", \"old_string\": \"...`). \
+                             That copy was cut off before the tool ran, so only the text before it \
+                             was used. End each string argument where its own text ends.",
                             names = repaired.join("`, `"),
                         )
                     };
