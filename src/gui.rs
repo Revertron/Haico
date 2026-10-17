@@ -264,7 +264,9 @@ pub(crate) fn run(agent: Agent) -> Result<()> {
         fn drop(&mut self) {
             // Stop the turn in flight rather than waiting it out; cancellation
             // lands somewhere the turn chose, with its history balanced.
-            if let Some(link) = self.1.lock().unwrap().take() {
+            // Recovered rather than unwrapped: this runs while `lumio::run` unwinds, and a
+            // panic on a poisoned lock during a panic aborts the process.
+            if let Some(link) = self.1.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
                 link.cancel();
             }
             let _ = self.0.send(Command::Shutdown);
