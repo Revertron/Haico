@@ -168,7 +168,7 @@ impl Presenter {
                 outln!(
                     "\n{}{}{}\n",
                     SetForegroundColor(crate::out::DIM),
-                    crate::turn_summary(crate::get_done_verb(), elapsed, chrono::Local::now()),
+                    turn_summary(get_done_verb(), elapsed, chrono::Local::now()),
                     ResetColor
                 );
             }
@@ -544,4 +544,215 @@ pub(crate) fn report_context(
         outln!("Run /compact to replace the history with a summary.");
     }
     outln!();
+}
+
+pub(crate) fn get_thinking_message() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const MESSAGES: &[&str] = &[
+        // First step
+        "Fancying around…",
+        "Thinking deeply…",
+        "Connecting the dots…",
+        "Pondering possibilities…",
+        "Weighing options…",
+        "Untangling logic…",
+        "Simulating neurons…",
+        "Brewing ideas…",
+        "Scanning the horizon…",
+        "Assembling the puzzle…",
+
+        // Technical / Agent-y
+        "Parsing intent…",
+        "Traversing the graph…",
+        "Running inference…",
+        "Compiling thoughts…",
+        "Optimizing the plan…",
+        "Executing mental threads…",
+        "Querying the knowledge base…",
+        "Running a quick sanity check…",
+        "Bootstrapping context…",
+        "Refining the approach…",
+
+        // Whimsical / Personable
+        "Staring into the void (productively)…",
+        "Consulting the oracle…",
+        "Summoning the code spirits…",
+        "Bribing the compiler…",
+        "Rubber-ducking internally…",
+        "Channeling Ada Lovelace…",
+        "Polishing the crystal ball…",
+        "Negotiating with entropy…",
+        "Warming up the neurons…",
+        "Reticulating splines…",
+
+        // Concise / Dry
+        "Processing…",
+        "Analyzing…",
+        "Evaluating…",
+        "Computing…",
+        "Reasoning…",
+        "Synthesizing…",
+        "Deliberating…",
+        "Calculating…",
+        "Inspecting…",
+        "Contemplating…",
+
+        // Creative / Poetic
+        "Following the thread…",
+        "Tracing constellations…",
+        "Weaving the narrative…",
+        "Tuning the frequency…",
+        "Listening to the silence…",
+        "Reading between the lines…",
+        "Chasing the spark…",
+        "Stirring the cauldron…",
+        "Sharpening the quill…",
+        "Lighting the lantern…",
+    ];
+
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize % MESSAGES.len();
+
+    MESSAGES[idx]
+}
+
+// The verb in the line printed when a turn ends. A companion to the list above: the
+// spinner says what it is doing in the present tense, this says what it did.
+//
+// Every one of these has to read as an intransitive past tense — "Baked for 3m 34s" —
+// so verbs that want an object ("Untangled", "Assembled") stay out however well they
+// fit the spinner.
+pub(crate) fn get_done_verb() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const VERBS: &[&str] = &[
+        // Kitchen
+        "Baked",
+        "Brewed",
+        "Simmered",
+        "Stewed",
+        "Marinated",
+        "Percolated",
+        "Steeped",
+        "Kneaded",
+
+        // Thought
+        "Pondered",
+        "Ruminated",
+        "Cogitated",
+        "Deliberated",
+        "Mused",
+        "Reasoned",
+        "Reflected",
+        "Deduced",
+
+        // Puttering
+        "Noodled",
+        "Tinkered",
+        "Puttered",
+        "Pottered",
+        "Fiddled",
+        "Meandered",
+        "Rummaged",
+        "Foraged",
+
+        // Machinery
+        "Churned",
+        "Whirred",
+        "Hummed",
+        "Ticked",
+        "Crunched",
+        "Toiled",
+        "Labored",
+        "Computed",
+    ];
+
+    let idx = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize % VERBS.len();
+
+    VERBS[idx]
+}
+
+// How long the turn took, in the largest two units that carry information.
+//
+// Seconds are dropped past the hour on purpose: a turn that ran for over an hour is not
+// one anybody is counting seconds on, and "1h 4m 12s" is three numbers to read where two
+// say the same thing.
+pub(crate) fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+// The line that closes a turn: what it did, how long for, and the time it finished at.
+//
+// Both halves earn their place. A turn on a local model can run for minutes with its own
+// start scrolled far off the top of the terminal, so the duration is not recoverable from
+// what is on screen; and a turn that finished while nobody was watching wants a clock
+// time, because a duration alone does not say how stale the answer is.
+pub(crate) fn turn_summary(verb: &str, elapsed: std::time::Duration, finished: chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "✻ {} for {} · done {}",
+        verb,
+        format_elapsed(elapsed),
+        finished.format("%-I:%M %p")
+    )
+}
+
+#[cfg(test)]
+mod wording_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::time::Duration;
+
+    #[test]
+    fn elapsed_uses_two_units_at_most() {
+        assert_eq!(format_elapsed(Duration::from_millis(400)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(12)), "12s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        // The minute boundary keeps the seconds, even when there are none of them: a bare
+        // "1m" reads as a rounded figure where "1m 0s" reads as the measurement it is.
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_elapsed(Duration::from_secs(214)), "3m 34s");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
+        // Past the hour the seconds go, rather than becoming a third number.
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_elapsed(Duration::from_secs(3852)), "1h 4m");
+    }
+
+    #[test]
+    fn summary_reads_as_one_sentence() {
+        let finished = chrono::Local.with_ymd_and_hms(2026, 8, 28, 2, 13, 0).unwrap();
+        assert_eq!(
+            turn_summary("Baked", Duration::from_secs(214), finished),
+            "✻ Baked for 3m 34s · done 2:13 AM"
+        );
+
+        // The hour is unpadded — "2:13 AM", never "02:13 AM" — and the afternoon still
+        // reads on a twelve-hour clock.
+        let finished = chrono::Local.with_ymd_and_hms(2026, 8, 28, 14, 5, 0).unwrap();
+        assert_eq!(
+            turn_summary("Pottered", Duration::from_secs(9), finished),
+            "✻ Pottered for 9s · done 2:05 PM"
+        );
+    }
+
+    #[test]
+    fn every_done_verb_reads_intransitively() {
+        // The list is picked from by clock, so nothing here can check the choice — what it
+        // can check is that whatever comes out slots into the sentence without a space or
+        // a stray capital in the middle of it.
+        let verb = get_done_verb();
+        assert!(!verb.is_empty());
+        assert!(verb.chars().all(|c| c.is_ascii_alphabetic()));
+        assert!(verb.starts_with(|c: char| c.is_uppercase()));
+    }
 }

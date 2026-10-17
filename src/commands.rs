@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn every_built_in_is_a_command_main_answers_to() {
-        let main = include_str!("main.rs");
+        let main = include_str!("repl.rs");
         for (name, aliases, _, _) in BUILT_IN {
             for spelling in std::iter::once(name).chain(aliases.iter()) {
                 assert!(

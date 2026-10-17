@@ -70,7 +70,7 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
         Some(provider) => outln!("Connecting to {} at: {}", provider, config.llm_url),
         None => outln!("Connecting to LLM server at: {}", config.llm_url),
     }
-    let model = crate::choose_model(&config, None).await?;
+    let model = crate::repl::choose_model(&config, None).await?;
 
     let cwd = std::env::current_dir()?;
     let resume = config.resume;

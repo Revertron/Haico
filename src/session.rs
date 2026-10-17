@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn transcript_keeps_the_shape_of_the_session_and_trims_tool_output() {
-        use crate::render_transcript;
+        use crate::session::render_transcript;
 
         let huge = "x".repeat(50_000);
         let messages = vec![
@@ -888,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_replaces_history_without_orphaning_tool_calls() {
-        use crate::{compact_history, estimate_tokens};
+        use crate::session::{compact_history, estimate_tokens};
 
         let body = concat!(
             "{\"choices\":[{\"message\":{\"role\":\"assistant\",",
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn the_compactor_sees_the_task_the_latest_state_and_the_reasons() {
-        use crate::render_transcript;
+        use crate::session::render_transcript;
         let messages = long_session(40, "I chose X because Y.");
         let transcript = render_transcript(&messages, 20_000);
 
@@ -981,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_over_budget_transcript_has_its_largest_thinking_compressed_first() {
-        use crate::compact_history;
+        use crate::session::compact_history;
         // A chatty model: every turn thinks at length. 131k-token window, so a 196 KB budget,
         // and twelve 30 KB traces are well over it.
         let chatty = "Let me think about the handshake ordering again. ".repeat(600);
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn notes_that_continue_the_transcript_are_asked_for_again_and_the_task_is_kept() {
-        use crate::compact_history;
+        use crate::session::compact_history;
         // The p2p_auth run's answer: more transcript, in the transcript's own format.
         let continued = "The remaining errors are: `_inner` needs renaming. Let me fix them.\n\n\
                          [called read — file_path: src/lib.rs; limit: 15]\ntool: use chacha20poly1305::aead;";
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_refuses_rather_than_destroying_history() {
-        use crate::compact_history;
+        use crate::session::compact_history;
 
         // Nothing worth compacting yet: the history must be left alone.
         let url = serve_once("{}", "application/json").await;
@@ -1173,8 +1173,8 @@ mod tests {
         assert_eq!(message["content"], "Done.");
         // Both figures come back, not a sentence: the transcript line and the session
         // totals want different things out of the same result.
-        let before = crate::estimate_reasoning_tokens(&thinking(8_000));
-        let after = crate::estimate_reasoning_tokens("Tried the regex path, too slow.");
+        let before = crate::session::estimate_reasoning_tokens(&thinking(8_000));
+        let after = crate::session::estimate_reasoning_tokens("Tried the regex path, too slow.");
         assert_eq!(note, Some(ReasoningOutcome::Compressed { before, after }));
     }
 
@@ -1335,7 +1335,8 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
 
     #[test]
     fn sessions_round_trip_without_the_stale_system_prompt() {
-        use crate::{load_session, save_session, TodoItem};
+        use crate::session::{load_session, save_session};
+        use crate::tools::TodoItem;
 
         let dir = scratch("anchor4", "").parent().unwrap().to_path_buf();
         let path = dir.join("session.json");
@@ -1395,7 +1396,7 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
         // A future format is declined rather than misread as this one.
         let mut raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        raw["version"] = json!(crate::SESSION_FORMAT_VERSION + 1);
+        raw["version"] = json!(crate::session::SESSION_FORMAT_VERSION + 1);
         std::fs::write(&path, raw.to_string()).unwrap();
         assert!(load_session(&path).is_err());
 
@@ -1409,7 +1410,7 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
 
     #[test]
     fn session_paths_are_per_directory() {
-        use crate::session_file_path_for;
+        use crate::session::session_file_path_for;
         use std::path::Path;
 
         // Two different working directories must not share one saved conversation.
@@ -1477,7 +1478,7 @@ Wait — \"prints the public key in hex\". So keygen         prints pubkey hex. 
 
     #[test]
     fn a_session_that_cannot_be_written_says_so() {
-        use crate::save_session;
+        use crate::session::save_session;
 
         // A directory where the file should be: the rename cannot replace it.
         let dir = scratch("unsaveable", "").parent().unwrap().join("unsaveable-session.json");

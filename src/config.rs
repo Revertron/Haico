@@ -1397,7 +1397,8 @@ mod tests {
 
     #[test]
     fn a_model_can_be_configured_without_haico_s_own_prompt() {
-        use crate::{compose_system_prompt, resolve_settings};
+        use crate::prompt::compose_system_prompt;
+        use crate::config::resolve_settings;
         use crate::workspace::Workspace;
 
         let workspace = Workspace::new(&std::env::current_dir().unwrap(), &[]);

@@ -470,7 +470,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
         // drawn when it starts.
         AgentEvent::ToolCallChunk(_) => {}
         AgentEvent::Finished { elapsed } => {
-            let text = format!("done in {}", crate::format_elapsed(elapsed));
+            let text = format!("done in {}", crate::present::format_elapsed(elapsed));
             show(handle, move |ui| {
                 set_label(ui, BUSY, "");
                 line(ui, &text, Tone::Muted);

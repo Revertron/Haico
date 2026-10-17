@@ -2600,3 +2600,978 @@ mod scratch_tests {
         assert!(!system.contains(&crate::util::display_path(&first)));
     }
 }
+
+/// Tests that drive a whole turn against a fake LLM server. Separate from the
+/// module above because they need a Tokio runtime and the output capture, and
+/// because what they are pinning is different in kind: not a helper's output but
+/// the loop's invariants — the ones whose failure mode is the *next* request
+/// being rejected rather than anything visible in this one.
+#[cfg(test)]
+mod turn_tests {
+    #![allow(unused_imports)]
+    use super::*;
+    use crate::ask::*;
+    use crate::config::*;
+    use crate::llm::*;
+    use crate::modes::*;
+    use crate::out;
+    use crate::{permissions, testutil};
+    use crate::permissions::*;
+    use crate::session::*;
+    use crate::tools::*;
+    use crate::turn::*;
+    use std::env;
+    use serde_json::Value;
+    use crate::testutil::{looping_stream, serve_sequence, test_config};
+
+    /// One turn against `bodies`, returning the agent so the history can be
+    /// inspected, plus how many requests the server actually served.
+    async fn run_one(bodies: &'static [&'static str], input: &str) -> (Agent, usize) {
+        run_one_in(bodies, input, Mode::Normal).await
+    }
+
+    /// As `run_one`, in a chosen mode. Auto mode matters here because it is the
+    /// only one that skips `MAX_TOOL_ROUNDS`, so it is the only one where a
+    /// runaway turn has nothing but the repetition guard to stop it.
+    async fn run_one_in(
+        bodies: &'static [&'static str],
+        input: &str,
+        mode: Mode,
+    ) -> (Agent, usize) {
+        run_and_watch(bodies, input, mode, Reasoning::Keep).await.0
+    }
+
+    /// As `run_one_in`, but also every event the turn emitted.
+    ///
+    /// This is what the event stream bought the tests: the turn is driven with no
+    /// frontend at all — no terminal, no keyboard, no presenter — and what it
+    /// *said* can be asserted on directly instead of inferred from output. An
+    /// `Ask` arriving here is answered by nobody, so its reply channel drops and
+    /// the turn hears a refusal, which is exactly what a test wants: no prompt
+    /// can hang the suite.
+    ///
+    /// The reasoning policy is a parameter for the same reason the mode is: it
+    /// changes what the turn does after a reply rather than what it says to the
+    /// server, so a fixture cannot express it.
+    async fn run_and_watch(
+        bodies: &'static [&'static str],
+        input: &str,
+        mode: Mode,
+        reasoning: Reasoning,
+    ) -> ((Agent, usize), Vec<AgentEvent>) {
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = mode;
+        agent.reasoning = reasoning;
+
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, input, false, &tx, &link).await;
+        agent.mode = link.mode();
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        let count = *served.lock().unwrap();
+        ((agent, count), seen)
+    }
+
+    /// Every `Notice` the turn emitted, in order. The notices are the part of the
+    /// vocabulary that derives `PartialEq`, which is why assertions use them.
+    fn notices(events: &[AgentEvent]) -> Vec<Notice> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `role: "tool"` reply in the history, as `(tool_call_id, content)`.
+    fn tool_replies(messages: &[Value]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .map(|m| {
+                (
+                    m.get("tool_call_id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    m.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// A `--prompt` run decides whether to exit, follow up or report a failure from
+    /// what `run_turn` hands back, so an answer and a failed request must not look
+    /// alike. A server that answers garbage is the failure that needs no timing.
+    #[tokio::test]
+    async fn a_turn_says_whether_it_ended_in_an_answer() {
+        let _capture = out::capture_guard();
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"all done"}}]}"#;
+        let cases: [(&'static [&'static str], TurnEnd); 2] =
+            [(&[FINAL], TurnEnd::Answered), (&["not json"], TurnEnd::Failed)];
+        for (bodies, expected) in cases {
+            let (url, _) = serve_sequence(bodies).await;
+            let cwd = env::current_dir().unwrap();
+            let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+            agent.mode = Mode::Auto;
+            let link = TurnLink::new(agent.mode);
+            let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+            assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, expected, "for {bodies:?}");
+        }
+    }
+
+    /// A timer that comes due while a turn is working joins at the round boundary,
+    /// after the tool replies — the only place a user message may go mid-turn — and
+    /// says it came from a timer. One that is not due yet stays armed.
+    #[tokio::test]
+    async fn a_due_timer_joins_the_turn_after_the_tool_replies() {
+        let _capture = out::capture_guard();
+        let (url, served) = serve_sequence(&[
+            r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"get_date","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"checked"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        {
+            use crate::timers::Schedule;
+            use std::time::{Duration, Instant};
+            let mut timers = agent.server.timers.lock().unwrap();
+            // Set two minutes ago for one minute: due now.
+            let past = Instant::now() - Duration::from_secs(120);
+            timers.add(Schedule::Once(Duration::from_secs(60)), "check the tests", past, chrono::Local::now()).unwrap();
+            timers.add(Schedule::Once(Duration::from_secs(3600)), "much later", Instant::now(), chrono::Local::now()).unwrap();
+        }
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        assert_eq!(*served.lock().unwrap(), 2);
+
+        let roles: Vec<&str> = agent.messages.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user", "assistant"]);
+        let note = agent.messages[4]["content"].as_str().unwrap();
+        assert!(note.starts_with("[Timer 1 fired"), "{note}");
+        assert!(note.ends_with("check the tests"), "{note}");
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(notices(&seen).iter().any(|n| matches!(n, Notice::TimersFired(f) if f.len() == 1 && f[0].id == 1)));
+        let left: Vec<u32> = agent.server.timers.lock().unwrap().list().iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![2]);
+
+        // And they go with the conversation.
+        agent.clear();
+        assert!(agent.server.timers.lock().unwrap().is_empty());
+    }
+
+    /// The invariant that costs the most when it breaks, and shows nothing when
+    /// it does: **every `tool_call_id` must get a `role: "tool"` reply**, on
+    /// every path. An unanswered id is accepted by this request and rejected by
+    /// the *next* one, server-side, which is why it took a release to find and
+    /// why it is worth a test that asserts on the history rather than the screen.
+    ///
+    /// Both malformed shapes are covered at once because both used to `continue`
+    /// past the reply: a call with no function name, and one whose arguments are
+    /// not JSON. Local models emit the second often enough that it was the
+    /// original bug report.
+    #[tokio::test]
+    async fn every_tool_call_id_is_answered_even_when_malformed() {
+        let _capture = out::capture_guard();
+        const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[
+                {"id":"call_no_name","type":"function","function":{"arguments":"{}"}},
+                {"id":"call_bad_args","type":"function","function":{"name":"read","arguments":"not json at all"}}
+            ]}}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"all done"}}]}"#;
+
+        let (agent, served) = run_one(&[MALFORMED, FINAL], "do something").await;
+        let replies = tool_replies(&agent.messages);
+        let ids: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"call_no_name") && ids.contains(&"call_bad_args"),
+            "an id went unanswered — the next request would be rejected. Replies: {replies:?}"
+        );
+
+        // Answered *with something the model can act on*, not merely answered:
+        // the point of replying to a malformed call is to say what was wrong.
+        let bad_args = replies.iter().find(|(id, _)| id == "call_bad_args").unwrap();
+        assert!(
+            bad_args.1.contains("read"),
+            "the reply does not name the tool that failed: {:?}",
+            bad_args.1
+        );
+
+        // And the turn went on to a second request and finished on the answer,
+        // rather than stopping at the malformed round.
+        assert_eq!(served, 2, "the turn did not come back for a final answer");
+        assert_eq!(
+            agent.messages.last().and_then(|m| m.get("content")).and_then(Value::as_str),
+            Some("all done")
+        );
+    }
+
+    /// `@path` in a message puts the file in the message, which is the whole
+    /// point: the turn must reach the model with the contents already there,
+    /// rather than spending a round on a `read` the user has already asked for.
+    #[tokio::test]
+    async fn a_mentioned_file_arrives_in_the_message() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        let dir = testutil::TempDir::new("mention-turn");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "the quick brown fox").unwrap();
+
+        let input = format!("what is in @{}?", file.display());
+        let (agent, served) = run_one(&[ANSWER], &input).await;
+
+        // One request, not two: nothing was fetched by a tool call.
+        assert_eq!(served, 1);
+        let sent = agent
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(sent.contains("the quick brown fox"), "contents missing from: {sent}");
+        // The instruction is still the last thing the model reads, and the
+        // reference it was written as is still in it.
+        assert!(sent.trim_end().ends_with(&input), "the request is not last in: {sent}");
+
+        // Read through the `read` tool, so the file counts as seen and an edit
+        // is not refused for a file the model was just handed.
+        assert!(
+            agent.server.check_may_modify(&file).is_none(),
+            "the mentioned file was not marked read — the saved round is spent re-reading it"
+        );
+    }
+
+    /// A mentioned image cannot go in the text, so the message stops being
+    /// text: `content` becomes the parts array, with the image as a data URL.
+    #[tokio::test]
+    async fn a_mentioned_image_becomes_a_content_part() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        let dir = testutil::TempDir::new("mention-image-turn");
+        let png = dir.join("shot.png");
+        // A signature and some bytes after it: nothing decodes this, and what
+        // is asserted is the shape of the message, not the picture.
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "some prose").unwrap();
+
+        let input = format!("what is in @{} — see also @{}", png.display(), notes.display());
+        let (agent, served) = run_one(&[ANSWER], &input).await;
+        assert_eq!(served, 1);
+
+        let message = agent
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .cloned()
+            .unwrap();
+        let parts = message["content"].as_array().expect("content should be a parts array");
+
+        // The image first, the text last — the request is what the model should
+        // read at the end.
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "not a png data URL: {}",
+            parts[0]["image_url"]["url"]
+        );
+        assert_eq!(parts[1]["type"], "text");
+
+        // The text part still carries the text file and the request itself, so
+        // mixing the two kinds in one message loses neither.
+        let text = parts[1]["text"].as_str().unwrap();
+        assert!(text.contains("some prose"), "the text mention is missing: {text}");
+        assert!(text.trim_end().ends_with(&input), "the request is not last in: {text}");
+
+        // And the base64 is costed as an image rather than as prose. Left alone,
+        // a screenshot reads as hundreds of thousands of tokens and auto mode
+        // starts compacting a history that compaction cannot shrink. Measured
+        // against the same message with a realistic payload in it, since the
+        // twelve-byte one above would pass either way.
+        let mut heavy = message.clone();
+        heavy["content"][0]["image_url"]["url"] =
+            Value::String(format!("data:image/png;base64,{}", "A".repeat(400_000)));
+        let estimate = estimate_tokens(&[heavy]);
+        assert!(
+            estimate < 2000,
+            "a 300 KB image is being counted as {estimate} tokens of text"
+        );
+    }
+
+    /// The first reply after an auto-compaction may not end the turn by calling nothing: on a
+    /// p2p_auth run it was one sentence of intent, and the unattended run exited as finished.
+    #[tokio::test]
+    async fn a_reply_that_calls_nothing_right_after_a_compaction_does_not_end_the_turn() {
+        let _capture = out::capture_guard();
+        let bodies: &'static [&'static str] = &[
+            // The compactor's notes.
+            r#"{"choices":[{"message":{"role":"assistant","content":"Task: x\nCurrent state: tests not run\nNext step: run the tests"}}]}"#,
+            // Intent, and nothing called.
+            r#"{"choices":[{"message":{"role":"assistant","content":"Let me check the current state."}}]}"#,
+            // Sent back, it answers properly.
+            r#"{"choices":[{"message":{"role":"assistant","content":"All tests pass."}}]}"#,
+        ];
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        // Tiny, so the history is over the compaction line on the first round; and a history
+        // with something in it, since one message is nothing to compact.
+        agent.context_tokens = 100;
+        agent.messages.push(serde_json::json!({"role": "user", "content": "build it"}));
+        agent.messages.push(serde_json::json!({"role": "assistant", "content": "Built half of it."}));
+
+        let link = TurnLink::new(Mode::Auto);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        assert_eq!(*served.lock().unwrap(), 3);
+
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last["content"], "All tests pass.");
+        assert!(
+            agent.messages.iter().any(|m| m["role"] == "user"
+                && m["content"].as_str().is_some_and(|c| c.contains("You replied without calling a tool"))),
+            "the note is missing"
+        );
+    }
+
+    /// The size of the history comes from the server's count once one has arrived, plus an
+    /// estimate of only what was added after it; a history that shrank since falls back to
+    /// the estimate with the tools array counted. A p2p_auth run reached 130,820 of 131,072
+    /// tokens on an estimate that still read 107k, so compaction never started.
+    #[tokio::test]
+    async fn the_context_is_sized_by_the_servers_count() {
+        let _capture = out::capture_guard();
+        let (mut agent, _) = run_one(
+            &[r#"{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":50000,"completion_tokens":3,"total_tokens":50003}}"#],
+            "hi",
+        )
+        .await;
+        let measured = agent.measured.expect("the reply's usage was not recorded");
+        assert_eq!(measured.prompt_tokens, 50000);
+        assert!(agent.context_is_measured());
+
+        // Everything after the measured request is estimated on top of the count.
+        let grown = estimate_tokens(&agent.messages) - measured.estimate;
+        assert_eq!(agent.context_used(), 50000 + grown);
+        agent.messages.push(serde_json::json!({"role": "user", "content": "x".repeat(4000)}));
+        assert_eq!(agent.context_used(), 50000 + grown + estimate_tokens(&agent.messages[agent.messages.len() - 1..]));
+
+        // A history that shrank is not the one that was counted.
+        agent.messages.truncate(1);
+        assert!(!agent.context_is_measured());
+        assert_eq!(agent.context_used(), estimate_tokens(&agent.messages) + estimate_tokens(&agent.tools));
+
+        // A server that reports no usage leaves the estimate in charge.
+        let (agent, _) = run_one(&[r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#], "hi").await;
+        assert!(agent.measured.is_none());
+        assert_eq!(agent.context_used(), estimate_tokens(&agent.messages) + estimate_tokens(&agent.tools));
+    }
+
+    /// The edit from the p2p_auth trace: `new_string` carrying a second copy of `old_string`
+    /// after an escaped quote. The file must get only the intended text, and the reply must
+    /// say what was cut, or the model goes on making the same slip.
+    #[tokio::test]
+    async fn an_edit_with_its_old_string_leaked_into_new_string_is_repaired_and_said_to_be() {
+        let _capture = out::capture_guard();
+
+        let dir = testutil::TempDir::new("leaked-edit");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "let (tx, mut rx) = channel(64);\nlet node = 1;\n").unwrap();
+        let path = file.display().to_string();
+
+        let call = |id: &str, name: &str, arguments: serde_json::Value| -> &'static str {
+            Box::leak(
+                format!(
+                    r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+                    "tool_calls":[{{"id":"{id}","type":"function","function":{{"name":"{name}","arguments":{}}}}}]}}}}]}}"#,
+                    serde_json::to_string(&arguments.to_string()).unwrap()
+                )
+                .into_boxed_str(),
+            )
+        };
+        let old = "let (tx, mut rx) = channel(64);";
+        let leaked = format!("let (tx, rx) = channel(64);\", \"old_string\": \"{}\"}}", old);
+        let edit = serde_json::json!({"file_path": path, "new_string": leaked, "old_string": old});
+        let bodies: &'static [&'static str] = Box::leak(Box::new([
+            call("c1", "read", serde_json::json!({"file_path": path})),
+            call("c2", "edit", edit.clone()),
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#,
+        ]));
+        let (url, requests) = serve_sequence(bodies).await;
+
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.workspace.add(dir.path()).unwrap();
+        // Approved up front: in a test nobody answers the prompt, which reads as a refusal.
+        if let permissions::Gate::Ask { keys, .. } = permissions::gate_for(&agent.workspace, "edit", &edit) {
+            agent.permissions.allow(&keys);
+        }
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "fix it", false, &tx, &link).await;
+        assert_eq!(*requests.lock().unwrap(), 3);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let (tx, rx) = channel(64);\nlet node = 1;\n");
+        let reply = agent
+            .messages
+            .iter()
+            .find(|m| m["tool_call_id"] == "c2")
+            .and_then(|m| m["content"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(reply.contains("Your `new_string` argument ended with a second copy"), "{reply}");
+    }
+
+    /// `read` on an image returns the picture, and the picture cannot ride in
+    /// the `role: "tool"` reply — that message may carry text and nothing else.
+    /// So it arrives as a user message, and only once every tool call in the
+    /// round has its reply.
+    #[tokio::test]
+    async fn reading_an_image_puts_it_in_a_user_message_after_the_tool_reply() {
+        let _capture = out::capture_guard();
+
+        let dir = testutil::TempDir::new("read-image");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+
+        // The model asks to read it, then answers. The path is escaped for JSON
+        // because a Windows path is full of backslashes.
+        let call = format!(
+            r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+            "tool_calls":[{{"id":"c1","type":"function","function":{{"name":"read","arguments":{}}}}}]}}}}]}}"#,
+            serde_json::to_string(
+                &serde_json::json!({"file_path": png.display().to_string()}).to_string()
+            )
+            .unwrap()
+        );
+        let (url, requests) = serve_sequence(Box::leak(Box::new([
+            &*Box::leak(call.into_boxed_str()),
+            r#"{"choices":[{"message":{"role":"assistant","content":"a tiny png"}}]}"#,
+        ])))
+        .await;
+
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        // The temp directory is outside the project, so without this the read is
+        // refused by the workspace and never reaches the image path at all.
+        agent.workspace.attach(&png);
+
+        // `read` is on the auto-allowed list, so no prompt stands in the way.
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "look at the screenshot", false, &tx, &link).await;
+        assert_eq!(*requests.lock().unwrap(), 2);
+
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m["role"].as_str()).collect();
+        // system, user, assistant(tool_calls), tool, user(image), assistant
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user", "assistant"]);
+
+        // The tool reply is text and names the file. It must not have become an
+        // array: a server rejects an image part in a tool message outright.
+        let reply = &agent.messages[3];
+        let text = reply["content"].as_str().expect("a tool reply must be a string");
+        assert!(text.contains("PNG"), "the reply does not say what the file is: {text}");
+
+        // And the picture is in the user message that follows it.
+        let parts = agent.messages[4]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(parts[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    /// A model with no vision head rejects the request carrying a picture, and
+    /// every request after it, so the conversation is dead until the picture
+    /// leaves. The turn takes it out once and tries again rather than handing
+    /// back a history that can only fail.
+    #[tokio::test]
+    async fn a_refused_image_is_stripped_and_the_request_retried() {
+        let _capture = out::capture_guard();
+
+        let dir = testutil::TempDir::new("strip-image");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03").unwrap();
+
+        // The server refuses the first request outright, then answers. That is
+        // the shape of a text-only model being handed an image.
+        let (url, served) = serve_sequence(&[
+            "not json, and not a 200 either",
+            r#"{"choices":[{"message":{"role":"assistant","content":"no picture here"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, &format!("look at @{}", png.display()), false, &tx, &link).await;
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            notices(&seen).iter().any(|n| matches!(n, Notice::ImagesStripped(_))),
+            "the retry never happened: {:?}",
+            notices(&seen)
+        );
+        assert_eq!(*served.lock().unwrap(), 2, "the request was not tried a second time");
+
+        // No image left anywhere, and the message that carried one still says
+        // something rather than being emptied.
+        for message in &agent.messages {
+            if let Some(parts) = message["content"].as_array() {
+                assert!(
+                    !parts.iter().any(|p| p["type"] == "image_url"),
+                    "an image survived the strip"
+                );
+                assert!(!parts.is_empty(), "a message was left with no content at all");
+            }
+        }
+        let user = message_text(&agent.messages[1]);
+        assert!(user.contains("removed"), "the model was not told why: {user}");
+    }
+
+    /// A message carrying an image must still reach a text summarizer as
+    /// something, or the turn it began summarizes as though nobody spoke.
+    #[test]
+    fn an_image_message_still_has_text_for_the_summarizer() {
+        let message = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "why is this button grey?"}
+            ]
+        });
+        let text = message_text(&message);
+        assert!(text.contains("why is this button grey?"));
+        assert!(text.contains("[an image]"), "the image left no mark: {text}");
+        assert!(!text.contains("AAAA"), "the base64 reached the summarizer: {text}");
+    }
+
+    /// A mentioned file outside every root comes into reach, and only that file
+    /// does. `/add` widens to a directory because that is what it is asked for;
+    /// a mention is asked about one file, and `@~/.ssh/config` must not hand
+    /// over the keys beside it.
+    #[tokio::test]
+    async fn a_mention_outside_the_workspace_reaches_that_file_alone() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"seen"}}]}"#;
+
+        // Outside the working directory the test agent is built in, which is the
+        // crate root.
+        let dir = testutil::TempDir::new("mention-outside");
+        let named = dir.join("named.txt");
+        let sibling = dir.join("sibling.txt");
+        std::fs::write(&named, "in reach").unwrap();
+        std::fs::write(&sibling, "not in reach").unwrap();
+
+        let (agent, _) = run_one(&[ANSWER], &format!("read @{}", named.display())).await;
+
+        assert!(agent.workspace.may_write(&named), "the named file is still refused");
+        assert!(
+            !agent.workspace.may_read(&sibling),
+            "the mention opened the whole directory, not the one file"
+        );
+        // And the model is told, or it finds out through a refused call instead.
+        // The note is built per request from the workspace, so this is what the
+        // next request would carry rather than what the system prompt holds.
+        let note = agent.workspace.note();
+        assert!(
+            note.contains(&display_path(&absolute_path(&named))),
+            "the attached file is not in the workspace note: {note}"
+        );
+        assert!(
+            !note.contains(&display_path(&absolute_path(&sibling))),
+            "the note names a file that was never attached: {note}"
+        );
+    }
+
+    /// A reply with no tool calls ends the turn on the answer, and the user's
+    /// message and the assistant's both land in the history — the ordinary case,
+    /// asserted so that the interesting ones above have a baseline.
+    #[tokio::test]
+    async fn a_plain_answer_ends_the_turn() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello back"}}]}"#;
+
+        let (agent, served) = run_one(&[ANSWER], "hello").await;
+        assert_eq!(served, 1, "a turn with no tool calls should take one request");
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m.get("role").and_then(Value::as_str)).collect();
+        assert_eq!(roles.last(), Some(&"assistant"));
+        assert!(roles.contains(&"user"));
+        assert!(tool_replies(&agent.messages).is_empty());
+    }
+
+    /// `MAX_TOOL_ROUNDS` is not the only thing stopping a runaway turn, and in
+    /// auto mode it is not applied at all — the guard there is the identical call
+    /// repeated with nothing in between. A server that answers with the same
+    /// tool call forever must therefore still terminate.
+    #[tokio::test]
+    async fn an_identical_call_repeated_forever_still_terminates() {
+        let _capture = out::capture_guard();
+        // `serve_sequence` repeats its last body forever, so this is a model that
+        // never stops asking for the same thing.
+        const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"same","type":"function","function":{"name":"read","arguments":"also not json"}}]}}]}"#;
+
+        let (agent, served) = run_one(&[SAME], "loop forever").await;
+        // The bound is what matters, not its exact value: without one this test
+        // would hang rather than fail.
+        assert!(served > 1, "the loop never came back for a second round");
+        // The claim is specifically that the *repetition* guard stopped it and
+        // not the round cap: `LOOP_BREAK` is 5 against a cap of 50, so a count
+        // in single figures is the identical-call run firing. A range rather
+        // than an exact number, because the nudge rounds are free to move.
+        assert!(
+            served <= 8,
+            "a repeated identical call ran for {served} rounds — that is the round cap \
+             stopping it, not the loop guard"
+        );
+        // However it stopped, every id it made is still answered.
+        let unanswered = agent
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_calls").is_some_and(|c| !c.is_null()))
+            .count()
+            - tool_replies(&agent.messages).len();
+        assert_eq!(unanswered, 0, "a round left its tool call unanswered");
+    }
+
+    /// The same runaway turn in **auto mode**, which is where it actually
+    /// mattered. Auto mode skips `MAX_TOOL_ROUNDS` deliberately — a fixed number
+    /// of rounds is a poor stand-in for "this is going nowhere", and a long job
+    /// that hits it unattended has nobody to say "continue" — so the repetition
+    /// guard is the *only* thing bounding it.
+    ///
+    /// This is the test that found the bug it now guards: the run counter used to
+    /// be incremented after `parse_tool_arguments`, whose error arm `continue`s,
+    /// so a model repeating a call whose arguments are not JSON never advanced
+    /// the run. In normal mode the cap still caught it. In auto mode nothing did,
+    /// and the turn span forever with no user present to stop it. Written second,
+    /// because writing it first would have hung the suite rather than failed.
+    #[tokio::test]
+    async fn auto_mode_still_bounds_a_repeated_malformed_call() {
+        let _capture = out::capture_guard();
+        const SAME: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"same","type":"function","function":{"name":"read","arguments":"still not json"}}]}}]}"#;
+
+        let (agent, served) = run_one_in(&[SAME], "loop forever", Mode::Auto).await;
+        assert!(
+            served <= 8,
+            "auto mode ran {served} rounds of an identical malformed call: with no round 
+             cap there, the repetition guard is all there is and it did not fire"
+        );
+        assert_eq!(
+            agent.messages.iter().filter(|m| m.get("tool_calls").is_some_and(|c| !c.is_null())).count()
+                - tool_replies(&agent.messages).len(),
+            0,
+            "a round left its tool call unanswered"
+        );
+    }
+
+    /// The failure that motivated `repetition`: a model that never calls a tool
+    /// and never finishes, only restates itself, which the tool-call loop guard
+    /// cannot see. The reply is cut off and dropped, the model is shown what it
+    /// was repeating, and the next reply is taken normally. Auto mode, because
+    /// unattended is where it cost the most.
+    #[tokio::test]
+    async fn a_reply_that_repeats_itself_is_dropped_and_the_model_told() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"fixed it"}}]}"#;
+        let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream(), ANSWER]));
+
+        let ((agent, served), events) = run_and_watch(bodies, "debug it", Mode::Auto, Reasoning::Keep).await;
+
+        assert_eq!(served, 2);
+        assert!(
+            notices(&events).iter().any(|n| matches!(n, Notice::Repeating { retrying: true, .. })),
+            "notices: {:?}",
+            notices(&events)
+        );
+        // The looping reply never reached the history: neither its text nor the
+        // content it would have ended on.
+        let history = serde_json::to_string(&agent.messages).unwrap();
+        assert!(!history.contains("finished anyway"), "the looping reply was stored");
+        // Folded into the user's own message, since the loop was the turn's first reply.
+        let user: Vec<&Value> = agent.messages.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(user.len(), 1, "two user messages in a row");
+        let asked = user[0]["content"].as_str().unwrap();
+        assert!(asked.starts_with("debug it") && asked.contains("repeating the same passage"), "{asked}");
+        assert_eq!(agent.messages.last().unwrap()["content"], "fixed it");
+    }
+
+    /// And when telling it does not help, the turn gives up instead of paying
+    /// for the same loop forever — which in auto mode, with no round cap, is
+    /// the only thing that would stop it.
+    #[tokio::test]
+    async fn a_model_that_keeps_repeating_itself_ends_the_turn() {
+        let _capture = out::capture_guard();
+        let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream()]));
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        assert_eq!(run_turn(&mut agent, "debug it", false, &tx, &link).await, TurnEnd::Failed);
+        assert_eq!(*served.lock().unwrap(), 2);
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(notices(&seen).iter().any(|n| matches!(n, Notice::Repeating { retrying: false, .. })));
+    }
+
+    /// A review that ends without a verdict is reported to the model as a
+    /// temporary failure to retry, and the user is not asked: auto mode is for
+    /// walking away. Worded as a refusal it was taken as final — an unattended
+    /// model whose `write_file` met a review cut off at its token cap wrote its
+    /// files through `echo` for the rest of the run — and sent to the prompt, it
+    /// parked the run on a dialog nobody was there to answer.
+    #[tokio::test]
+    async fn a_review_without_a_verdict_is_a_temporary_error_to_retry() {
+        let _capture = out::capture_guard();
+        const CALL: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"cargo --version\"}"}}]}}]}"#;
+        // What a review cut off at its cap comes back as: all reasoning, no answer.
+        const CUT_OFF: &str = r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+        let (url, served) = serve_sequence(&[CALL, CUT_OFF, FINAL]).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        let link = TurnLink::new(agent.mode);
+        // A frontend that is there but never answers, like a REPL whose user went
+        // for coffee: a prompt sent to it would wait forever, so the timeout is
+        // what turns "it asked" into a failure rather than a hung suite.
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        let turn = run_turn(&mut agent, "check the toolchain", false, &tx, &link);
+        tokio::time::timeout(std::time::Duration::from_secs(10), turn)
+            .await
+            .expect("the turn waited on a prompt nobody answered");
+
+        assert_eq!(*served.lock().unwrap(), 3, "call, review, then the reply to the retry note");
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(!seen.iter().any(|e| matches!(e, AgentEvent::Ask(_))), "the user was asked");
+        assert!(
+            notices(&seen).iter().any(|n| matches!(n, Notice::ReviewFailed { tool, .. } if tool == "run_command")),
+            "notices: {:?}",
+            notices(&seen)
+        );
+        let replies = tool_replies(&agent.messages);
+        assert_eq!(replies.len(), 1);
+        let (id, content) = &replies[0];
+        assert_eq!(id, "c1");
+        assert!(
+            content.starts_with("Temporary error while evaluating the 'run_command' call")
+                && content.contains("make the same call again"),
+            "{content}"
+        );
+    }
+
+    /// The turn narrates itself, and this is the assertion that could not be
+    /// written before: driven with no frontend at all, what it *said* is checked
+    /// directly rather than inferred from terminal output.
+    #[tokio::test]
+    async fn a_malformed_call_is_narrated_as_well_as_answered() {
+        let _capture = out::capture_guard();
+        const MALFORMED: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"bad","type":"function","function":{"name":"read","arguments":"nope"}}]}}]}"#;
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+
+        let (_, events) =
+            run_and_watch(&[MALFORMED, FINAL], "go", Mode::Normal, Reasoning::Keep).await;
+        let said = notices(&events);
+        assert!(
+            said.iter().any(|n| matches!(
+                n,
+                Notice::ToolArgumentsInvalid { tool, .. } if tool == "read"
+            )),
+            "the turn did not say which tool had bad arguments: {said:?}"
+        );
+
+        // A reply is opened and closed exactly once per round, on every path.
+        // The presenter's fold and half-rendered markdown line depend on that
+        // pairing, and a missing ReplyEnd leaks a fold into the next round.
+        let starts = events.iter().filter(|e| matches!(e, AgentEvent::ReplyStart)).count();
+        let ends = events.iter().filter(|e| matches!(e, AgentEvent::ReplyEnd)).count();
+        assert_eq!(starts, 2, "two rounds should open two replies");
+        assert_eq!(starts, ends, "every reply must be closed: {starts} opened, {ends} closed");
+
+        // And the turn reported its own end, which is the line the summary is
+        // drawn from.
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Finished { .. })));
+    }
+
+    /// Compression replaces the chain of thought in the history, so the
+    /// transcript is the only place the summary can still be read — which is why
+    /// the notice carries the text as well as the two figures. Reporting a saving
+    /// and nothing else leaves the reader no way to judge whether what survived
+    /// was worth keeping, and the original is gone by then.
+    #[tokio::test]
+    async fn a_compressed_trace_is_reported_with_the_text_that_replaced_it() {
+        let _capture = out::capture_guard();
+        // Well over the 800-token threshold, so the turn spends a request on
+        // compressing it and the second body is the compressor's answer.
+        // `serve_sequence` wants `'static` bodies and a trace this long has to be
+        // built rather than written out, so it is leaked — a test process is the
+        // one place where that costs nothing.
+        let reply: &'static str = Box::leak(
+            format!(
+                "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"Done.\",\
+                 \"reasoning_content\":\"{}\"}}}}]}}",
+                "z".repeat(8_000)
+            )
+            .into_boxed_str(),
+        );
+        const SUMMARY: &str = r#"{"choices":[{"message":{"role":"assistant",
+            "content":"Tried the regex path, too slow."}}]}"#;
+        let bodies: &'static [&'static str] = Box::leak(Box::new([reply, SUMMARY]));
+
+        let ((agent, _), events) =
+            run_and_watch(bodies, "go", Mode::Normal, Reasoning::Compress).await;
+        let said = notices(&events);
+        let reported = said.iter().find_map(|n| match n {
+            Notice::ReasoningCompressed { summary, .. } => Some(summary.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            reported.as_deref(),
+            Some("Tried the regex path, too slow."),
+            "the compression was reported without the text it produced: {said:?}"
+        );
+        // And what was reported is what the history actually carries — the point
+        // of reading it back out of the message rather than passing it alongside
+        // the figures.
+        assert_eq!(
+            agent.messages.last().unwrap()["reasoning_content"].as_str(),
+            reported.as_deref()
+        );
+    }
+
+    /// Cancellation is a message, not a dropped future — see
+    /// `TurnLink::until_cancelled`. Cancelling before the turn starts means it
+    /// stops at its first interruptible point, and the invariant still holds: the
+    /// user message is in the history and nothing is left half-written.
+    #[tokio::test]
+    async fn a_cancelled_turn_stops_without_orphaning_anything() {
+        let _capture = out::capture_guard();
+        const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+
+        let (url, served) = serve_sequence(&[ANSWER]).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        let link = TurnLink::new(agent.mode);
+        // Cancelled up front: `until_cancelled` has to see a flag that was already
+        // set, not only a transition after it subscribed.
+        link.cancel();
+
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "hello", false, &tx, &link).await;
+
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            notices(&seen).contains(&Notice::Interrupted),
+            "a cancelled turn should say so: {:?}",
+            notices(&seen)
+        );
+        assert_eq!(*served.lock().unwrap(), 0, "cancelled before the first request, so none went");
+        // The user's message is there and nothing else is: no assistant message
+        // was pushed, so no tool call can be unanswered.
+        let roles: Vec<&str> =
+            agent.messages.iter().filter_map(|m| m.get("role").and_then(Value::as_str)).collect();
+        assert_eq!(roles.last(), Some(&"user"));
+        assert!(tool_replies(&agent.messages).is_empty());
+    }
+
+    /// Esc during the first of two calls in one reply. The turn used to stop at the
+    /// call it interrupted and leave the second id unanswered, and the next request
+    /// was rejected for it.
+    #[tokio::test]
+    async fn an_interrupt_mid_round_still_answers_every_call_of_the_reply() {
+        let _capture = out::capture_guard();
+        let sleeper = if cfg!(windows) { "ping -n 30 127.0.0.1 > NUL" } else { "sleep 30" };
+        let reply = Box::leak(
+            serde_json::json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "slow", "type": "function", "function": {
+                        "name": "run_command",
+                        "arguments": serde_json::json!({"command": sleeper}).to_string()}},
+                    {"id": "never", "type": "function", "function": {
+                        "name": "get_date", "arguments": "{}"}}
+                ]
+            }}]})
+            .to_string()
+            .into_boxed_str(),
+        );
+        let bodies: &'static [&'static str] = Box::leak(Box::new([&*reply]));
+
+        let (url, served) = serve_sequence(bodies).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        let link = TurnLink::new(agent.mode);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        // The frontend: approve the command, and press Esc once it is running.
+        let frontend = async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Ask(Ask::Permission { reply, .. }) => {
+                        let _ = reply.send(PermissionResponse::Allow);
+                    }
+                    AgentEvent::ToolStarted { name, .. } if name == "run_command" => link.cancel(),
+                    _ => {}
+                }
+            }
+        };
+        let turn = async {
+            let end = run_turn(&mut agent, "go", false, &tx, &link).await;
+            drop(tx);
+            end
+        };
+        let (end, ()) = tokio::join!(turn, frontend);
+
+        assert_eq!(end, TurnEnd::Interrupted);
+        assert_eq!(*served.lock().unwrap(), 1);
+        let replies = tool_replies(&agent.messages);
+        let ids: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["slow", "never"], "every call of the reply needs its reply");
+        assert!(replies[1].1.contains("Not run"), "got: {}", replies[1].1);
+    }
+}

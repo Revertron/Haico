@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn splits_chained_shell_commands() {
-        use crate::command_segments;
+        use crate::permissions::command_segments;
 
         assert_eq!(command_segments("cargo build"), vec!["cargo build"]);
         // The whole point: a chain must not be treated as one approved command.
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn derives_permission_prefixes() {
-        use crate::command_prefix;
+        use crate::permissions::command_prefix;
 
         // Multiplexers keep their subcommand: approving one must not approve the rest.
         assert_eq!(command_prefix("git status --short"), "git status");
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn allow_all_does_not_leak_across_commands() {
-        use crate::{gate_for, Gate, PermissionManager};
+        use crate::permissions::{gate_for, Gate, PermissionManager};
 
         let gate_keys = |command: &str| match gate_for(&ws(), "run_command", &json!({"command": command})) {
             Gate::Ask { keys, .. } => keys,
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_are_auto_allowed_and_writes_are_not() {
-        use crate::{gate_for, Gate};
+        use crate::permissions::{gate_for, Gate};
 
         for tool in ["read", "ls", "grep", "glob_search", "crate_info", "calculator"] {
             assert!(
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn work_outside_the_workspace_is_refused_rather_than_offered() {
-        use crate::{gate_for, Gate};
+        use crate::permissions::{gate_for, Gate};
 
         // Inside the working directory: one shared approval for the whole root.
         let keys_for = |path: &str| match gate_for(&ws(), "edit", &json!({"file_path": path})) {
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn refuses_catastrophic_commands() {
-        use crate::{gate_for, Gate};
+        use crate::permissions::{gate_for, Gate};
 
         let denied = |command: &str| {
             matches!(
