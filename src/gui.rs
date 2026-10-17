@@ -454,7 +454,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
             show(handle, move |ui| stream(ui, OPEN_REASONING, &text, true))
         }
         AgentEvent::ToolStarted { name, arguments, auto_note } => {
-            let summary = crate::render::tool_call_summary(&name, &arguments);
+            let summary = crate::summary::tool_call_summary(&name, &arguments);
             let text = match auto_note {
                 Some(note) => format!("{name} {summary}   ({note})"),
                 None => format!("{name} {summary}"),
@@ -859,11 +859,11 @@ fn describe(notice: Notice) -> (String, Tone) {
         }
         Notice::Refused(reason) => (reason, Tone::Error),
         Notice::ReviewDenied { tool, arguments, reason } => {
-            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            let summary = crate::summary::tool_call_summary(&tool, &arguments);
             (format!("refused by review: {tool} {summary} — {reason}"), Tone::Error)
         }
         Notice::ReviewFailed { tool, arguments, detail } => {
-            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            let summary = crate::summary::tool_call_summary(&tool, &arguments);
             (format!("review gave no verdict: {tool} {summary} — {detail}; the model will retry"), Tone::Warning)
         }
         Notice::PermissionAllowed => ("allowed".into(), Tone::Muted),
@@ -872,7 +872,7 @@ fn describe(notice: Notice) -> (String, Tone) {
             (format!("denied — {alternative}"), Tone::Warning)
         }
         Notice::SubAgentStep { tool, arguments } => {
-            let summary = crate::render::tool_call_summary(&tool, &arguments);
+            let summary = crate::summary::tool_call_summary(&tool, &arguments);
             (format!("↳ {tool} {summary}"), Tone::Muted)
         }
         Notice::LookupStep(step) => (format!("  {step}"), Tone::Muted),
@@ -1639,7 +1639,7 @@ mod tests {
             AgentEvent::ReplyChunk(text) => stream_reply(ui, &text),
             AgentEvent::ReasoningChunk(text) => stream(ui, OPEN_REASONING, &text, true),
             AgentEvent::ToolStarted { name, arguments, .. } => {
-                let summary = crate::render::tool_call_summary(&name, &arguments);
+                let summary = crate::summary::tool_call_summary(&name, &arguments);
                 code_line(ui, format!("{name} {summary}").trim());
             }
             AgentEvent::ToolDiff(diff) => diff_block(ui, &diff),

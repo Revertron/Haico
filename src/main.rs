@@ -27,6 +27,7 @@ mod memory;
 mod mention;
 mod modes;
 mod permissions;
+mod picker;
 mod present;
 mod progress;
 mod prompt;
@@ -38,6 +39,7 @@ mod scratch;
 mod session;
 mod skills;
 mod store;
+mod summary;
 mod subagent;
 #[cfg(test)]
 mod testutil;

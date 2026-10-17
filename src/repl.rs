@@ -14,6 +14,7 @@ use crate::modes::*;
 use crate::permissions::*;
 use crate::present::*;
 use crate::prompt::*;
+use crate::picker::*;
 use crate::render::*;
 use crate::session::*;
 use crate::tools::*;

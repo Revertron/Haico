@@ -1,13 +1,9 @@
-//! Terminal rendering: markdown, diffs, and the model picker.
+//! Terminal rendering: streamed markdown, and the colored lines of the tool log and diffs.
 
 use crate::diff::{Diff, DiffRow, LineKind};
+use crate::summary::{strip_project_prefix, tool_call_summary};
 use crate::util::truncate_at_boundary;
-use crate::input::Keys;
-use anyhow::Result;
-use crossterm::{
-    event::{Event, KeyCode, KeyEventKind},
-    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
-};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use serde_json::Value;
 use std::fmt::Write as _;
 
@@ -735,138 +731,6 @@ pub(crate) fn find_double_closing(marker: &str, chars: &[char], start: usize) ->
     None
 }
 
-// Render text (auto-detect Markdown and render accordingly)
-
-// Case-insensitive substring search over ASCII, working in bytes so a non-ASCII path cannot
-// desync indices the way lowercasing the whole string would.
-fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
-    if n.is_empty() || h.len() < n.len() {
-        return None;
-    }
-    (from..=h.len() - n.len())
-        .find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n) && haystack.is_char_boundary(i))
-}
-
-// Drop the working-directory prefix wherever it appears, so a log line is readable at a
-// glance. Applied to tool results as well as call summaries: a result that echoes the full
-// path back prints the long form directly under the short one, which is just noise.
-//
-// Only the display changes. What the model receives keeps its absolute paths, which are
-// unambiguous and are what it passed in.
-fn strip_project_prefix(text: &str) -> String {
-    let Ok(cwd) = std::env::current_dir() else {
-        return text.to_string();
-    };
-    let cwd = cwd.display().to_string();
-    if cwd.is_empty() {
-        return text.to_string();
-    }
-
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0usize;
-
-    while let Some(start) = find_ascii_ci(text, &cwd, at) {
-        let end = start + cwd.len();
-        let next = text[end..].chars().next();
-
-        // Only a real boundary counts, or a sibling directory whose name merely starts with
-        // the same characters ("nginx-rs1" vs "nginx-rs12") would be mangled.
-        let replacement = match next {
-            Some('\\') | Some('/') => Some(""),
-            None => Some("."),
-            Some(c) if !c.is_alphanumeric() && c != '-' && c != '_' && c != '.' => Some("."),
-            _ => None,
-        };
-
-        let Some(replacement) = replacement else {
-            out.push_str(&text[at..end]);
-            at = end;
-            continue;
-        };
-
-        out.push_str(&text[at..start]);
-        out.push_str(replacement);
-        at = if matches!(next, Some('\\') | Some('/')) {
-            end + 1
-        } else {
-            end
-        };
-    }
-
-    out.push_str(&text[at..]);
-    out
-}
-
-fn short_path(path: &str) -> String {
-    // A missing argument stays absent rather than becoming ".", which would read as the
-    // project root and be actively misleading.
-    if path.is_empty() {
-        return String::new();
-    }
-    strip_project_prefix(path)
-}
-
-// The interesting argument of a tool call, in a few words.
-pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
-    let text = |key: &str| arguments[key].as_str().unwrap_or("").to_string();
-
-    match tool_name {
-        "read" | "write_file" | "edit" | "multi_edit" => short_path(&text("file_path")),
-        "ls" => short_path(&text("path")),
-        "glob_search" => {
-            let base = text("path");
-            if base.is_empty() {
-                text("pattern")
-            } else {
-                format!("{} in {}", text("pattern"), short_path(&base))
-            }
-        }
-        "grep" => {
-            let glob = text("glob");
-            if glob.is_empty() {
-                text("pattern")
-            } else {
-                format!("{}  ({})", text("pattern"), glob)
-            }
-        }
-        "run_command" | "run_background" => strip_project_prefix(&text("command")),
-        "web_fetch" | "web_get" => text("url"),
-        "web_search" | "crate_search" => text("query"),
-        "library" | "research" => text("question"),
-        // The first line only: a task is written to be complete, so it runs long.
-        "sub_agent" => text("task").lines().next().unwrap_or_default().to_string(),
-        "crate_info" | "crate_api" => text("name"),
-        "background_output" | "background_stop" => match arguments["id"].as_u64() {
-            Some(id) => format!("job {}", id),
-            None => "all".to_string(),
-        },
-        "todo_write" => match arguments["todos"].as_array() {
-            Some(todos) => {
-                // Counted through the normalizer because these are the raw arguments: the
-                // tool has not run yet, so a model that wrote "done" or "complete" would
-                // otherwise have its finished list summarized here as 0/4.
-                let done = todos
-                    .iter()
-                    .filter(|t| {
-                        t["status"]
-                            .as_str()
-                            .and_then(crate::tools::normalize_status)
-                            == Some("completed")
-                    })
-                    .count();
-                format!("{}/{} done", done, todos.len())
-            }
-            None => String::new(),
-        },
-        "calculator" => format!(
-            "{} {} {}",
-            arguments["a"], text("operation"), arguments["b"]
-        ),
-        _ => String::new(),
-    }
-}
-
 // Announce a tool call before it runs.
 //
 // Read-only tools are auto-allowed and never prompt, and once "allow all" is answered for
@@ -1048,242 +912,45 @@ mod diff_tests {
     }
 }
 
-#[cfg(test)]
-mod log_tests {
-    use super::{short_path, tool_call_summary};
-    use serde_json::json;
-
-    #[test]
-    fn tool_summaries_name_the_thing_that_matters() {
-        let s = |name: &str, args: serde_json::Value| tool_call_summary(name, &args);
-
-        // The point is spotting a repeat, so the identifying argument has to be there.
-        assert_eq!(
-            s("run_command", json!({"command": "cargo build"})),
-            "cargo build"
-        );
-        assert_eq!(
-            s("grep", json!({"pattern": "fn main", "glob": "*.rs"})),
-            "fn main  (*.rs)"
-        );
-        assert_eq!(s("grep", json!({"pattern": "fn main"})), "fn main");
-        assert_eq!(s("web_search", json!({"query": "axum routing"})), "axum routing");
-        assert_eq!(s("library", json!({"question": "mio: register a listener?"})), "mio: register a listener?");
-        assert_eq!(s("background_stop", json!({"id": 3})), "job 3");
-        assert_eq!(s("background_stop", json!({})), "all");
-        // Either word counts: the arguments have not been through the tool's normalizer.
-        assert_eq!(
-            s("todo_write", json!({"todos": [
-                {"task": "a", "status": "done"}, {"task": "b", "status": "pending"}]})),
-            "1/2 done"
-        );
-        assert_eq!(
-            s("todo_write", json!({"todos": [
-                {"task": "a", "status": "completed"}, {"task": "b", "status": "pending"}]})),
-            "1/2 done"
-        );
-
-        // A tool with nothing worth showing degrades to just its name.
-        assert_eq!(s("get_date", json!({})), "");
-        // Missing arguments must not panic.
-        assert_eq!(s("run_command", json!({})), "");
-        assert_eq!(s("read", json!({})), "");
-    }
-
-    #[test]
-    fn paths_are_shown_relative_to_the_project() {
-        let cwd = std::env::current_dir().unwrap();
-
-        // A long absolute path is what makes a log line unreadable.
-        let inside = cwd.join("src").join("main.rs");
-        let shown = short_path(&inside.display().to_string());
-        assert!(!shown.contains(&cwd.display().to_string()), "got: {}", shown);
-        assert!(shown.ends_with("main.rs"), "got: {}", shown);
-        assert!(shown.starts_with("src"), "got: {}", shown);
-
-        // Outside the project it stays absolute, because that is the notable part.
-        let outside = std::env::temp_dir().join("elsewhere.rs");
-        assert_eq!(short_path(&outside.display().to_string()), outside.display().to_string());
-
-        assert_eq!(short_path(&cwd.display().to_string()), ".");
-        // A missing argument must not turn into the project root.
-        assert_eq!(short_path(""), "");
-    }
-
-    #[test]
-    fn result_lines_lose_the_project_prefix_too() {
-        use super::strip_project_prefix;
-
-        let cwd = std::env::current_dir().unwrap().display().to_string();
-
-        // The reported case: the call line said "write_file test.ps1" and the result line
-        // underneath repeated the whole absolute path.
-        let echoed = format!("Successfully wrote 430 bytes to {}\\test.ps1", cwd);
-        assert_eq!(
-            strip_project_prefix(&echoed),
-            "Successfully wrote 430 bytes to test.ps1"
-        );
-
-        // More than one occurrence in a line, and forward slashes too.
-        let two = format!("copied {}/a.rs to {}/b.rs", cwd, cwd);
-        assert_eq!(strip_project_prefix(&two), "copied a.rs to b.rs");
-
-        // Windows casing varies between what the model passes and the process cwd.
-        if cfg!(windows) {
-            let lowered = format!("wrote {}\\x.rs", cwd.to_lowercase());
-            assert_eq!(strip_project_prefix(&lowered), "wrote x.rs");
-        }
-
-        // A sibling directory that merely starts with the same characters must survive
-        // intact, or the log would point at the wrong project.
-        let sibling = format!("{}2\\other.rs", cwd);
-        assert_eq!(strip_project_prefix(&sibling), sibling);
-
-        // The bare directory becomes ".", and unrelated text is untouched.
-        assert_eq!(strip_project_prefix(&cwd), ".");
-        assert_eq!(strip_project_prefix("nothing to see"), "nothing to see");
-    }
-}
-
-
-// Interactive model selection using arrow keys
-
-// The model list as rows of the bottom region, and which of them the selection is on.
+// Lay a command out so it can actually be read before being approved.
 //
-// This used to clear the terminal and redraw the list at the top of it, by printing the
-// escape for a clear through `out!`. The inline renderer hands such a thing to the
-// terminal and forgets it; the full-screen renderer keeps every line it is given and
-// paints it again whenever that row comes round, so a stored "clear the screen" wiped the
-// frame from the middle of itself and took the input box with it. The region is what both
-// renderers already have for something that belongs on the screen rather than in the
-// transcript — the permission prompt and the plan review are drawn the same way.
-fn picker_rows(
-    noun: &str,
-    models: &[String],
-    selected: usize,
-    width: usize,
-    room: usize,
-) -> (Vec<String>, usize) {
-    let columns = width.saturating_sub(1);
-    // One row goes to the heading; the rest is the list.
-    let body = room.saturating_sub(1).max(1);
+// It used to be cut at 50 characters, which for a generated one-liner meant approving a
+// script sight unseen. Wrapped to the terminal width and indented, with a generous ceiling
+// so a pathological command cannot flood the screen either.
+pub(crate) fn indented_command(command: &str) -> String {
+    const MAX: usize = 4000;
+    let shown = truncate_at_boundary(command.trim(), MAX);
+    let width = crossterm::terminal::size()
+        .map(|(cols, _)| (cols as usize).saturating_sub(6).max(40))
+        .unwrap_or(100);
 
-    // A window around the selection once the list is longer than there is room for, so a
-    // machine with thirty models loaded does not need a screen thirty rows tall.
-    let start = if models.len() <= body {
-        0
-    } else {
-        selected
-            .saturating_sub(body / 2)
-            .min(models.len().saturating_sub(body))
-    };
-    let end = (start + body).min(models.len());
-
-    let mut rows = vec![crate::input::fit(
-        &format!("Select a {noun} — Up/Down to move, Enter to confirm, Esc to cancel"),
-        columns,
-    )];
-    for (offset, model) in models[start..end].iter().enumerate() {
-        let line = if start + offset == selected {
-            format!("> {} <", model)
-        } else {
-            format!("  {}", model)
-        };
-        rows.push(crate::input::fit(&line, columns));
-    }
-
-    (rows, 1 + selected - start)
-}
-
-pub(crate) async fn select_model_interactive(keys: &mut Keys, models: Vec<String>) -> Result<String> {
-    if models.is_empty() {
-        return Err(anyhow::anyhow!("No models available"));
-    }
-    select_interactive(keys, "model", models, 0).await
-}
-
-// The same list for anything else picked by name — a provider, today. `noun` is what the
-// heading and the transcript call the choice; `selected_index` is where the caret starts,
-// which for a provider is the one in force, so Enter alone changes nothing.
-pub(crate) async fn select_interactive(
-    keys: &mut Keys,
-    noun: &str,
-    models: Vec<String>,
-    selected_index: usize,
-) -> Result<String> {
-    if models.is_empty() {
-        return Err(anyhow::anyhow!("Nothing to choose from"));
-    }
-    let mut selected_index = selected_index.min(models.len() - 1);
-
-    loop {
-        let (width, height) = crossterm::terminal::size()
-            .map(|(columns, rows)| (columns as usize, rows as usize))
-            .unwrap_or((80, 24));
-        // Two rows left to the transcript, so the picker never becomes the whole screen.
-        let (rows, caret) =
-            picker_rows(noun, &models, selected_index, width.max(20), height.saturating_sub(2));
-        crate::out::set_region(rows, caret, 0);
-
-        // Read key event
-        let Some(event) = keys.next().await else {
-            crate::out::clear_region();
-            return Err(anyhow::anyhow!("no interactive terminal to pick a {noun}"));
-        };
-        // Anything that is not a keystroke redraws the list at the top of the loop instead
-        // of ending the picker: a window losing focus is not a choice of model.
-        let Event::Key(key_event) = event else {
-            continue;
-        };
-
-        // Only process key press events, ignore key release
-        if key_event.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key_event.code {
-            KeyCode::Up => {
-                if selected_index > 0 {
-                    selected_index -= 1;
+    let mut out = String::new();
+    for line in shown.lines() {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let mut take = truncate_at_boundary(rest, width);
+            if take.is_empty() {
+                take = rest;
+            }
+            // Break at a space when there is one near the end of the line. Splitting through
+            // the middle of a token is legible but jarring, and the whole point here is that
+            // the command can be read. Never break early enough to hide anything.
+            if take.len() < rest.len() {
+                if let Some(space) = take.rfind(' ').filter(|at| *at > width * 3 / 4) {
+                    take = &take[..space + 1];
                 }
             }
-            KeyCode::Down => {
-                if selected_index < models.len() - 1 {
-                    selected_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                // Selection confirmed
-                break;
-            }
-            KeyCode::Esc => {
-                crate::out::clear_region();
-                return Err(anyhow::anyhow!("{} selection cancelled", capitalized(noun)));
-            }
-            _ => {
-                // Ignore other keys
-            }
+            out.push_str("    ");
+            out.push_str(take.trim_end());
+            out.push('\n');
+            rest = rest[take.len()..].trim_start_matches(' ');
         }
     }
-
-    // The list comes off the screen; what was chosen goes into the transcript, which is
-    // where the rest of the session will be looking for it.
-    crate::out::clear_region();
-    outln!("Selected {}: {}\n", noun, models[selected_index]);
-
-    Ok(models[selected_index].clone())
-}
-
-fn capitalized(word: &str) -> String {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
+    if shown.len() < command.trim().len() {
+        out.push_str("    ... [truncated]\n");
     }
+    out.trim_end().to_string()
 }
-
-// Configuration structure
-
 
 #[cfg(test)]
 mod markdown_tests {
@@ -1624,43 +1291,3 @@ mod markdown_tests {
     }
 }
 
-// MCP Server with tools
-// Lay a command out so it can actually be read before being approved.
-//
-// It used to be cut at 50 characters, which for a generated one-liner meant approving a
-// script sight unseen. Wrapped to the terminal width and indented, with a generous ceiling
-// so a pathological command cannot flood the screen either.
-pub(crate) fn indented_command(command: &str) -> String {
-    const MAX: usize = 4000;
-    let shown = truncate_at_boundary(command.trim(), MAX);
-    let width = crossterm::terminal::size()
-        .map(|(cols, _)| (cols as usize).saturating_sub(6).max(40))
-        .unwrap_or(100);
-
-    let mut out = String::new();
-    for line in shown.lines() {
-        let mut rest = line;
-        while !rest.is_empty() {
-            let mut take = truncate_at_boundary(rest, width);
-            if take.is_empty() {
-                take = rest;
-            }
-            // Break at a space when there is one near the end of the line. Splitting through
-            // the middle of a token is legible but jarring, and the whole point here is that
-            // the command can be read. Never break early enough to hide anything.
-            if take.len() < rest.len() {
-                if let Some(space) = take.rfind(' ').filter(|at| *at > width * 3 / 4) {
-                    take = &take[..space + 1];
-                }
-            }
-            out.push_str("    ");
-            out.push_str(take.trim_end());
-            out.push('\n');
-            rest = rest[take.len()..].trim_start_matches(' ');
-        }
-    }
-    if shown.len() < command.trim().len() {
-        out.push_str("    ... [truncated]\n");
-    }
-    out.trim_end().to_string()
-}

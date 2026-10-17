@@ -177,7 +177,7 @@ impl Presenter {
             // `run_command` finished with those arguments.
             AgentEvent::DidTool { name, arguments } => {
                 self.last_activity = Some(
-                    match crate::render::tool_call_summary(&name, &arguments) {
+                    match crate::summary::tool_call_summary(&name, &arguments) {
                         summary if summary.is_empty() => format!("ran {}", name),
                         // For a shell tool the command *is* the thing that ran,
                         // so naming the tool as well would say "run_command" twice.
@@ -346,7 +346,7 @@ impl Presenter {
                 "{}  ↳ {} {}{}",
                 SetForegroundColor(crate::out::DIM),
                 tool,
-                crate::render::tool_call_summary(&tool, &arguments),
+                crate::summary::tool_call_summary(&tool, &arguments),
                 ResetColor
             ),
             Notice::LookupStep(step) => {
