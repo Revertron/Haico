@@ -147,6 +147,7 @@ impl Presenter {
                 // A few lines of the change, with the whole diff behind them —
                 // the terminal's decision, not the turn's. It has a height, and
                 // the fold is what it has instead of scrollback.
+                let diff = crate::render::diff_text(&diff);
                 if let Some(preview) = change_preview(&diff) {
                     crate::out::foldable(preview.trim_end_matches('\n'), &diff);
                 }

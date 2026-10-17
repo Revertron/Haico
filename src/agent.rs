@@ -46,7 +46,7 @@ use crate::prompt::{compose_system_prompt, load_project_context, load_user_conte
 // The one `render` import, and it earns its place: a diff is the *content* of a
 // pending change, which the turn has to compute because only it has the old file.
 // How much of it to show is the frontend's, and that half lives there.
-use crate::render::file_change_diff;
+use crate::diff::file_change_diff;
 use crate::repetition::Repeating;
 use crate::scratch::Scratch;
 use crate::skills;
@@ -994,7 +994,7 @@ pub(crate) async fn authorize(
     let prompted = ask.is_some();
 
     if let Some((gate_keys, allow_all_label)) = ask {
-        let diff_content: Option<String> = file_change_diff(tool_name, arguments);
+        let diff_content = file_change_diff(tool_name, arguments);
 
         // The call itself goes to the frontend, not a sentence about it: how much of a
         // command to show and where the reviewer's objection belongs are rendering

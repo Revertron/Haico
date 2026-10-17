@@ -38,6 +38,7 @@ use lumio::types::rect;
 
 use crate::agent::{run_turn, Agent, Knob};
 use crate::config::Reasoning;
+use crate::diff::{Diff, DiffRow, LineKind};
 use crate::llm::{fetch_available_models, fetch_loaded_models};
 use crate::ask::Answer;
 use crate::modes::{Mode, PlanDecision};
@@ -1022,51 +1023,36 @@ fn block(ui: &mut UI, text: &str) {
 
 /// A diff, colored by what each line does to the file.
 ///
-/// `generate_diff` colors its own lines with SGR, black on a red or green band,
-/// and those escapes reach here as text. Rather than interpret them — which
-/// would tie the window to the terminal's encoding, the coupling the whole seam
-/// exists to avoid — they are stripped like any other, and the color is taken
-/// from the marker the diff already writes in front of every line.
-fn diff_block(ui: &mut UI, diff: &str) {
+/// Drawn from the rows themselves, which say whether each line was removed,
+/// added or kept. The diff used to arrive as the terminal's text, colored with
+/// SGR, and this stripped the escapes and read the eighth character of each line
+/// to guess which was which — the coupling the seam exists to avoid.
+fn diff_block(ui: &mut UI, diff: &Diff) {
     let element = rich("", CODE);
     if let Some(view) = element.borrow().as_any().downcast_ref::<RichText>() {
         view.start_block(BlockStyle::pre().background(0xFF232323).padding(8.0).hanging(20.0));
-        let plain = strip_ansi(diff);
-        for (index, text) in plain.trim_end().lines().enumerate() {
-            if index > 0 {
-                view.push("\n", SpanStyle::default().code());
-            }
+        view.push(&format!("File: {}", diff.file), SpanStyle::default().code());
+        if diff.rows.is_empty() {
+            view.push("\nNo changes", SpanStyle::default().code());
+        }
+        for row in &diff.rows {
+            view.push("\n", SpanStyle::default().code());
             let mut style = SpanStyle::default().code();
-            style.color = match marker(text) {
-                Some('+') => Some(0xFF7FB77F),
-                Some('-') => Some(0xFFD86A6A),
-                _ => None,
+            let text = match row {
+                DiffRow::Gap => "       ...".to_string(),
+                DiffRow::Line { kind, number, text } => {
+                    style.color = match kind {
+                        LineKind::Added => Some(0xFF7FB77F),
+                        LineKind::Removed => Some(0xFFD86A6A),
+                        LineKind::Context => None,
+                    };
+                    format!("{:6} {} {}", number, kind.marker(), text)
+                }
             };
-            view.push(text, style);
+            view.push(&text, style);
         }
     }
     append(ui, element);
-}
-
-/// The `+`/`-`/space a diff line carries after its line number, if it has one.
-///
-/// `generate_diff` writes the number in a six-wide field and then a space, so
-/// the marker is the eighth character — and demanding that exact shape is what
-/// keeps a line of *content* beginning with a minus from being read as a
-/// deletion. Everything else (the `File:` header, the `...` between regions)
-/// simply has no marker.
-fn marker(line: &str) -> Option<char> {
-    let mut chars = line.chars();
-    for _ in 0..6 {
-        let digit = chars.next()?;
-        if !digit.is_ascii_digit() && digit != ' ' {
-            return None;
-        }
-    }
-    if chars.next()? != ' ' {
-        return None;
-    }
-    chars.next()
 }
 
 // The markdown being streamed into the open reply.
@@ -1725,10 +1711,11 @@ mod tests {
                 auto_note: None,
             },
             AgentEvent::ToolResult("fn main() {\n    let xs = vec![1, 2, 3];\n}".into()),
-            AgentEvent::ToolDiff(
-                "--- a/src/main.rs\n+++ b/src/main.rs\n@@\n-    let xs = vec![1];\n+    let xs = vec![1, 2, 3];"
-                    .into(),
-            ),
+            AgentEvent::ToolDiff(crate::diff::generate_diff(
+                "src/main.rs",
+                "    let xs = vec![1];\n",
+                "    let xs = vec![1, 2, 3];\n",
+            )),
             AgentEvent::Notice(Notice::PermissionAllowed),
             AgentEvent::Notice(Notice::LoopNudge { tool: "read".into(), count: 3 }),
             AgentEvent::Notice(Notice::RequestFailed("connection refused".into())),
@@ -2000,19 +1987,15 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// A diff is written for a terminal: `generate_diff` colors its lines with
-    /// SGR, black on a red or green band. The window draws what it is given, so
-    /// an escape left in one arrives as a box for ESC followed by the letters of
-    /// the sequence — which is what the diff in a permission prompt looked like.
+    /// A diff is drawn from its rows: the text the terminal shows without its
+    /// escapes, and the color taken from what each line does to the file.
     ///
     /// Checked against a diff the real function produced, because the point is
-    /// what actually arrives, and because the marker column this reads is one
-    /// that function chooses.
+    /// what actually arrives.
     #[test]
-    fn a_diff_loses_its_escapes_and_keeps_its_markers() {
+    fn a_diff_is_drawn_from_its_rows_in_color() {
         lumio::backend::set_render_backend(RenderBackend::Software);
-        let diff = crate::render::generate_diff("f.rs", "one\ntwo\n", "one\nTWO\n").expect("a diff");
-        assert!(diff.contains('\u{1b}'), "an uncolored diff would prove nothing here");
+        let diff = crate::diff::generate_diff("f.rs", "one\ntwo\n", "one\nTWO\n");
 
         let mut ui = UI::from_xml(LAYOUT, 800, 600, default_typeface(), 1.0).expect("layout");
         diff_block(&mut ui, &diff);
@@ -2055,22 +2038,6 @@ mod tests {
         block(&mut ui, "\u{1b}[32mok\u{1b}[0m 3 passed");
         ui.layout(800, 600, 1.0);
         assert_eq!(last_block(&ui), "ok 3 passed");
-    }
-
-    /// The color comes from the column `generate_diff` writes its marker in, and
-    /// nothing else may claim it — a line of *content* starting with a minus is
-    /// not a deletion, and neither is the header.
-    #[test]
-    fn only_the_diffs_own_marker_column_counts() {
-        assert_eq!(marker("     1 + added"), Some('+'));
-        assert_eq!(marker("     2 - removed"), Some('-'));
-        assert_eq!(marker("     3   unchanged"), Some(' '));
-        assert_eq!(marker("File: src/main.rs"), None);
-        assert_eq!(marker("- not a diff line"), None);
-        assert_eq!(marker("short"), None);
-        // A line that opens with a multibyte character must not be sliced
-        // through the middle of it.
-        assert_eq!(marker("\u{2014} a dash"), None);
     }
 
     fn button_text(ui: &UI, id: &str) -> String {

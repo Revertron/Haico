@@ -10,7 +10,7 @@ use crate::trace::Caller;
 use crate::input::{echo, read_text, Editor, Input, Keys};
 use crate::llm::LMStudioClient;
 use crate::permissions::{gate_for, runs_arbitrary_code, command_segments, Gate, AUTO_ALLOWED_TOOLS};
-use crate::render::file_change_diff;
+use crate::diff::file_change_diff;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
@@ -333,10 +333,10 @@ pub(crate) fn referenced_script(command: &str) -> Option<PathBuf> {
 // Everything the reviewer gets to see about a call.
 
 pub(crate) fn build_evidence(tool_name: &str, arguments: &Value) -> String {
-    // Stripped on the way out, in one place, because everything gathered below was written
-    // for a terminal: the diff arrives full of color escapes, and a script read off disk can
-    // carry its own. The reviewer is a model, and to it an "ESC[38;5;8m" in front of every
-    // line is noise it pays for and has to read past to reach the change itself.
+    // Stripped on the way out, in one place, because a script read off disk can carry color
+    // escapes of its own. The reviewer is a model, and to it an "ESC[38;5;8m" in front of
+    // every line is noise it pays for and has to read past to reach the change itself. (The
+    // diff no longer brings any: it arrives as `Diff::plain`.)
     crate::util::strip_ansi(&gather_evidence(tool_name, arguments))
 }
 
@@ -347,7 +347,7 @@ fn gather_evidence(tool_name: &str, arguments: &Value) -> String {
     // would only repeat the file back a second time.
     if let Some(diff) = file_change_diff(tool_name, arguments) {
         evidence.push_str("\nThe change it would make:\n\n");
-        evidence.push_str(&diff);
+        evidence.push_str(&diff.plain());
         evidence.push('\n');
         return evidence;
     }

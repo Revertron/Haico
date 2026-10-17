@@ -15,6 +15,7 @@ mod ask;
 mod commands;
 mod config;
 mod debug;
+mod diff;
 #[cfg(feature = "gui")]
 mod gui;
 mod headless;
@@ -494,7 +495,8 @@ async fn answer_or_show(
             // The turn sent the call; the sentence above the buttons is made here.
             let description = permission_description(&tool_name, &arguments, review.as_ref());
             let response =
-                ask_about_call(keys.as_mut(), &allow_all_label, &description, diff.as_deref()).await;
+                ask_about_call(keys.as_mut(), &allow_all_label, &description, diff.as_ref().map(diff_text).as_deref())
+                    .await;
             if let Ok(response) = response {
                 let _ = reply.send(response);
             }

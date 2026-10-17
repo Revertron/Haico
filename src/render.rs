@@ -1,162 +1,15 @@
 //! Terminal rendering: markdown, diffs, and the model picker.
 
-use crate::util::{dominant_line_ending, truncate_at_boundary, with_line_endings};
+use crate::diff::{Diff, DiffRow, LineKind};
+use crate::util::truncate_at_boundary;
 use crate::input::Keys;
 use anyhow::Result;
 use crossterm::{
     event::{Event, KeyCode, KeyEventKind},
-    execute,
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
 use serde_json::Value;
-use similar::{ChangeTag, TextDiff};
 use std::fmt::Write as _;
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-
-pub(crate) fn generate_diff(file_path: &str, old_content: &str, new_content: &str) -> Result<String> {
-    let diff = TextDiff::from_lines(old_content, new_content);
-    let mut output = Vec::new();
-
-    writeln!(&mut output, "File: {}", file_path)?;
-
-    const CONTEXT_LINES: usize = 5;
-
-    // First pass: collect all changes with their positions
-    #[derive(Clone)]
-    struct Change {
-        tag: ChangeTag,
-        text: String,
-        old_line: Option<usize>,
-        new_line: Option<usize>,
-    }
-
-    let mut changes = Vec::new();
-    let mut old_line_num = 1;
-    let mut new_line_num = 1;
-
-    for change in diff.iter_all_changes() {
-        let text = change.as_str().unwrap_or("");
-        let text_trimmed = text.trim_end_matches('\n').trim_end_matches('\r').to_string();
-
-        match change.tag() {
-            ChangeTag::Delete => {
-                changes.push(Change {
-                    tag: ChangeTag::Delete,
-                    text: text_trimmed,
-                    old_line: Some(old_line_num),
-                    new_line: None,
-                });
-                old_line_num += 1;
-            }
-            ChangeTag::Insert => {
-                changes.push(Change {
-                    tag: ChangeTag::Insert,
-                    text: text_trimmed,
-                    old_line: None,
-                    new_line: Some(new_line_num),
-                });
-                new_line_num += 1;
-            }
-            ChangeTag::Equal => {
-                changes.push(Change {
-                    tag: ChangeTag::Equal,
-                    text: text_trimmed,
-                    old_line: Some(old_line_num),
-                    new_line: Some(new_line_num),
-                });
-                old_line_num += 1;
-                new_line_num += 1;
-            }
-        }
-    }
-
-    // Second pass: identify change regions
-    let mut change_indices = Vec::new();
-    for (i, change) in changes.iter().enumerate() {
-        if !matches!(change.tag, ChangeTag::Equal) {
-            change_indices.push(i);
-        }
-    }
-
-    if change_indices.is_empty() {
-        writeln!(&mut output, "No changes")?;
-        return Ok(String::from_utf8(output)?);
-    }
-
-    // Group consecutive changes into regions with context
-    let mut regions: Vec<(usize, usize)> = Vec::new();
-    let mut current_start = change_indices[0].saturating_sub(CONTEXT_LINES);
-    let mut current_end = change_indices[0] + CONTEXT_LINES;
-
-    for &idx in &change_indices[1..] {
-        let region_start = idx.saturating_sub(CONTEXT_LINES);
-        let region_end = idx + CONTEXT_LINES;
-
-        // If regions overlap or are adjacent, merge them
-        if region_start <= current_end + 1 {
-            current_end = region_end;
-        } else {
-            // Save current region and start a new one
-            regions.push((current_start, current_end.min(changes.len() - 1)));
-            current_start = region_start;
-            current_end = region_end;
-        }
-    }
-    regions.push((current_start, current_end.min(changes.len() - 1)));
-
-    // Changed lines are written in black on the red or the green behind them
-    let text_color = SetForegroundColor(Color::Black).to_string();
-
-    // Render regions
-    for (region_idx, (start, end)) in regions.iter().enumerate() {
-        if region_idx > 0 {
-            writeln!(&mut output, "       ...")?;
-        }
-
-        for i in *start..=*end {
-            let change = &changes[i];
-            match change.tag {
-                ChangeTag::Delete => {
-                    if let Some(line_num) = change.old_line {
-                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
-                        write!(&mut output, "{:6}", line_num)?;
-                        execute!(&mut output, ResetColor)?;
-                        write!(&mut output, " ")?;
-                        execute!(&mut output, SetBackgroundColor(Color::Red))?;
-                        write!(&mut output, "{}- {}", text_color, change.text)?;
-                        execute!(&mut output, ResetColor)?;
-                        writeln!(&mut output)?;
-                    }
-                }
-                ChangeTag::Insert => {
-                    if let Some(line_num) = change.new_line {
-                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
-                        write!(&mut output, "{:6}", line_num)?;
-                        execute!(&mut output, ResetColor)?;
-                        write!(&mut output, " ")?;
-                        execute!(&mut output, SetBackgroundColor(Color::Green))?;
-                        write!(&mut output, "{}+ {}", text_color, change.text)?;
-                        execute!(&mut output, ResetColor)?;
-                        writeln!(&mut output)?;
-                    }
-                }
-                ChangeTag::Equal => {
-                    if let Some(line_num) = change.old_line {
-                        execute!(&mut output, SetForegroundColor(crate::out::DIM))?;
-                        write!(&mut output, "{:6}", line_num)?;
-                        execute!(&mut output, ResetColor)?;
-                        write!(&mut output, " ")?;
-                        writeln!(&mut output, "  {}", change.text)?;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(String::from_utf8(output)?)
-}
 
 // Markdown as it arrives.
 //
@@ -1078,109 +931,36 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
     line
 }
 
-// What a write is about to do, rendered as a diff.
-//
-// Lifted out of the permission prompt so a pre-approved write can show it as well. With
-// "allow all" answered for write_file, every later file used to arrive as nothing but a
-// path and a byte count — no way to see what had been put in it.
-pub(crate) fn file_change_diff(tool_name: &str, arguments: &Value) -> Option<String> {
-    match tool_name {
-            "write_file" => {
-                let file_path = arguments["file_path"].as_str().unwrap_or("");
-                let new_content = arguments["content"].as_str().unwrap_or("");
-
-                // Check if file exists and read old content
-                if PathBuf::from(file_path).exists() {
-                    if let Ok(old_content) = fs::read_to_string(file_path) {
-                        // As write_file will: the model's content is LF and the file may not
-                        // be, and a preview that did not follow it would report every line
-                        // as changed on a CRLF file.
-                        let ending = dominant_line_ending(&old_content);
-                        generate_diff(
-                            file_path,
-                            &with_line_endings(&old_content, ending),
-                            &with_line_endings(new_content, ending),
-                        )
-                        .ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    // New file - show all as additions
-                    generate_diff(file_path, "", new_content).ok()
-                }
-            }
-            "edit" => {
-                let file_path = arguments["file_path"].as_str().unwrap_or("");
-                let old_string = arguments["old_string"].as_str().unwrap_or("");
-                let new_string = arguments["new_string"].as_str().unwrap_or("");
-                let replace_all = arguments["replace_all"].as_bool().unwrap_or(false);
-
-                // Read current content and generate preview
-                if let Ok(on_disk) = fs::read_to_string(file_path) {
-                    // The same translation `edit` does, for the same reason and so that the
-                    // two agree. Without it the preview searched for an LF old_string in a
-                    // CRLF file, found nothing, and drew "No changes" over an edit that was
-                    // about to fail — the user approved a no-op and got an error.
-                    //
-                    // Both sides of the diff are normalized, so a mixed file's repaired
-                    // endings are not shown as a wall of changed lines around the one change
-                    // the user is actually being asked about.
-                    let ending = dominant_line_ending(&on_disk);
-                    let content = with_line_endings(&on_disk, ending);
-                    let old_string = with_line_endings(old_string, ending);
-                    let new_string = with_line_endings(new_string, ending);
-
-                    let new_content = if replace_all {
-                        content.replace(old_string.as_ref(), &new_string)
-                    } else {
-                        if let Some(pos) = content.find(old_string.as_ref()) {
-                            let mut result = String::with_capacity(content.len());
-                            result.push_str(&content[..pos]);
-                            result.push_str(&new_string);
-                            result.push_str(&content[pos + old_string.len()..]);
-                            result
-                        } else {
-                            content.to_string()
-                        }
-                    };
-                    generate_diff(file_path, &content, &new_content).ok()
-                } else {
-                    None
-                }
-            }
-            "multi_edit" => {
-                let file_path = arguments["file_path"].as_str().unwrap_or("");
-
-                // Same order the tool applies them in, so the preview shows
-                // what will actually land rather than each edit in isolation.
-                if let Ok(on_disk) = fs::read_to_string(file_path) {
-                    let ending = dominant_line_ending(&on_disk);
-                    let content = with_line_endings(&on_disk, ending);
-                    let mut working = content.to_string();
-                    if let Some(edits) = arguments["edits"].as_array() {
-                        for edit in edits {
-                            let old_string = edit["old_string"].as_str().unwrap_or("");
-                            let new_string = edit["new_string"].as_str().unwrap_or("");
-                            if old_string.is_empty() {
-                                continue;
-                            }
-                            let old_string = with_line_endings(old_string, ending);
-                            let new_string = with_line_endings(new_string, ending);
-                            working = if edit["replace_all"].as_bool().unwrap_or(false) {
-                                working.replace(old_string.as_ref(), &new_string)
-                            } else {
-                                working.replacen(old_string.as_ref(), &new_string, 1)
-                            };
-                        }
-                    }
-                    generate_diff(file_path, &content, &working).ok()
-                } else {
-                    None
-                }
-            }
-            _ => None
+// A diff as the terminal shows it: dim line numbers, and the changed lines in black on a
+// red or a green band. The text is `Diff::plain`'s, line for line, with color added.
+pub(crate) fn diff_text(diff: &Diff) -> String {
+    let mut out = format!("File: {}\n", diff.file);
+    if diff.rows.is_empty() {
+        out.push_str("No changes\n");
     }
+    // Changed lines are written in black on the red or the green behind them
+    let black = SetForegroundColor(Color::Black);
+    let number = |n: usize| format!("{}{:6}{} ", SetForegroundColor(crate::out::DIM), n, ResetColor);
+    for row in &diff.rows {
+        let _ = match row {
+            DiffRow::Gap => writeln!(out, "       ..."),
+            DiffRow::Line { kind: LineKind::Context, number: n, text } => writeln!(out, "{}  {}", number(*n), text),
+            DiffRow::Line { kind, number: n, text } => {
+                let band = if *kind == LineKind::Removed { Color::Red } else { Color::Green };
+                writeln!(
+                    out,
+                    "{}{}{}{} {}{}",
+                    number(*n),
+                    SetBackgroundColor(band),
+                    black,
+                    kind.marker(),
+                    text,
+                    ResetColor
+                )
+            }
+        };
+    }
+    out
 }
 
 // Show a diff inline in the log, indented under the call that produced it.
@@ -1249,7 +1029,7 @@ mod diff_tests {
     fn only_the_lines_with_a_background_are_written_in_black() {
         crate::out::own_colors();
         let black = SetForegroundColor(Color::Black).to_string();
-        let diff = generate_diff("a.txt", "keep\none\n", "keep\ntwo\n").unwrap();
+        let diff = diff_text(&crate::diff::generate_diff("a.txt", "keep\none\n", "keep\ntwo\n"));
 
         // Two lines carry it, and they are exactly the two haico paints a background
         // behind: the one removed and the one added. A third would mean the context line
@@ -1261,11 +1041,10 @@ mod diff_tests {
             assert!(colored, "black on an unpainted line: {:?}", line);
         }
 
-        // The color is all it adds: the lines, the numbers and the markers are untouched.
-        let plain = crate::util::strip_ansi(&diff);
-        assert!(plain.contains("     2 - one"), "got {:?}", plain);
-        assert!(plain.contains("     2 + two"), "got {:?}", plain);
-        assert!(plain.contains("     1   keep"), "got {:?}", plain);
+        // The color is all it adds: the lines, the numbers and the markers are exactly the
+        // plain text the reviewer reads.
+        let source = crate::diff::generate_diff("a.txt", "keep\none\n", "keep\ntwo\n");
+        assert_eq!(crate::util::strip_ansi(&diff), source.plain());
     }
 }
 
@@ -1329,107 +1108,6 @@ mod log_tests {
         assert_eq!(short_path(&cwd.display().to_string()), ".");
         // A missing argument must not turn into the project root.
         assert_eq!(short_path(""), "");
-    }
-
-    #[test]
-    fn a_write_can_be_previewed_without_a_permission_prompt() {
-        use super::file_change_diff;
-
-        let dir = std::env::temp_dir().join(format!("haico-diff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("test3.ps1");
-        let path = file.display().to_string();
-
-        // A brand-new file: every line is an addition, which is exactly what you need to
-        // see when "allow all" means no prompt will show it to you.
-        let _ = std::fs::remove_file(&file);
-        let diff = file_change_diff("write_file", &json!({
-            "file_path": path, "content": "line one\nline two\n"
-        }))
-        .expect("a new file still has a diff");
-        assert!(diff.contains("line one"), "got: {}", diff);
-        assert!(diff.contains("line two"), "got: {}", diff);
-
-        // An overwrite shows what actually changed, not the whole file.
-        std::fs::write(&file, "keep\nold value\nkeep too\n").unwrap();
-        let diff = file_change_diff("write_file", &json!({
-            "file_path": path, "content": "keep\nnew value\nkeep too\n"
-        }))
-        .unwrap();
-        assert!(diff.contains("old value"), "got: {}", diff);
-        assert!(diff.contains("new value"), "got: {}", diff);
-
-        // edit and multi_edit preview through the same path.
-        let diff = file_change_diff("edit", &json!({
-            "file_path": path, "old_string": "old value", "new_string": "replaced"
-        }))
-        .unwrap();
-        assert!(diff.contains("replaced"), "got: {}", diff);
-
-        let diff = file_change_diff("multi_edit", &json!({
-            "file_path": path,
-            "edits": [{"old_string": "keep", "new_string": "kept", "replace_all": true}]
-        }))
-        .unwrap();
-        assert!(diff.contains("kept"), "got: {}", diff);
-
-        // Tools that do not touch files have nothing to preview.
-        assert!(file_change_diff("run_command", &json!({"command": "ls"})).is_none());
-        assert!(file_change_diff("read", &json!({"file_path": path})).is_none());
-        // A path that cannot be read must not panic.
-        assert!(file_change_diff("edit", &json!({"file_path": "no/such/file"})).is_none());
-
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(&dir);
-    }
-
-    #[test]
-    fn a_crlf_file_previews_the_change_rather_than_no_changes() {
-        use super::file_change_diff;
-
-        let dir = std::env::temp_dir().join(format!("haico-crlf-diff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("crlf.rs");
-        let path = file.display().to_string();
-        std::fs::write(&file, "fn a() {\r\n    let x = 1;\r\n}\r\n").unwrap();
-
-        // The preview used to search for the model's LF old_string in these CRLF bytes,
-        // find nothing, and fall back to the unchanged file — so it drew "No changes" over
-        // an edit that was about to fail, and the user approved a no-op.
-        let diff = file_change_diff("edit", &json!({
-            "file_path": path,
-            "old_string": "fn a() {\n    let x = 1;\n}",
-            "new_string": "fn a() {\n    let x = 2;\n}",
-        }))
-        .unwrap();
-        assert!(!diff.contains("No changes"), "got: {}", diff);
-        assert!(diff.contains("let x = 2;"), "got: {}", diff);
-
-        // A whole-file rewrite is shown as the one line it changes, not as every line
-        // changing because the model's content is LF and the file is not.
-        let diff = file_change_diff("write_file", &json!({
-            "file_path": path, "content": "fn a() {\n    let x = 3;\n}\n"
-        }))
-        .unwrap();
-        assert!(diff.contains("let x = 3;"), "got: {}", diff);
-        // One line out, one line in — the rest of the file is context. Without the
-        // normalization every line came back changed, because the whole file was being
-        // converted to LF underneath the one edit.
-        let changed = crate::util::strip_ansi(&diff)
-            .lines()
-            .filter(|line| matches!(line.as_bytes().get(7), Some(b'-') | Some(b'+')))
-            .count();
-        assert_eq!(changed, 2, "whole file redrawn: {}", diff);
-
-        let diff = file_change_diff("multi_edit", &json!({
-            "file_path": path,
-            "edits": [{"old_string": "fn a() {\n    let x = 1;", "new_string": "fn a() {\n    let y = 1;"}]
-        }))
-        .unwrap();
-        assert!(diff.contains("let y = 1;"), "got: {}", diff);
-
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub(crate) enum Ask {
         /// through. `None` when there was no reviewer or it approved.
         review: Option<ReviewNote>,
         allow_all_label: String,
-        diff: Option<String>,
+        diff: Option<crate::diff::Diff>,
         reply: oneshot::Sender<PermissionResponse>,
     },
 }
@@ -371,7 +371,7 @@ pub(crate) enum AgentEvent {
     },
     /// The change a file-writing call is about to make, as a whole diff. Whether
     /// to show a few lines of it or all of it is a question about the display.
-    ToolDiff(String),
+    ToolDiff(crate::diff::Diff),
     /// A finished tool's output, whole.
     ToolResult(String),
     /// A tool ran, whatever it returned. Separate from [`Self::ToolResult`]
