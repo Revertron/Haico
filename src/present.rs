@@ -786,6 +786,9 @@ mod presenter_tests {
 
     #[test]
     fn a_failed_tool_result_is_shown_in_red() {
+        // Without it, under NO_COLOR crossterm writes `red` as an empty SGR, which a rendered
+        // line holds only when another test has not already taken the switch.
+        out::own_colors();
         let red = crossterm::style::SetForegroundColor(crossterm::style::Color::Red).to_string();
         let failed = shown(vec![AgentEvent::ToolResult { text: "error[E0308]: mismatched types".into(), failed: true }]);
         assert!(failed.contains(&red), "got: {failed:?}");
