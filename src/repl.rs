@@ -762,6 +762,12 @@ fn command_for(name: &str) -> Option<Cmd> {
     })
 }
 
+/// Whether `/name` reads as an attempt at a command rather than the start of a path:
+/// `/etc/hosts` and `/.config` are not, `/hepl` is.
+fn is_command_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
 /// One line typed at the prompt: a built-in, a skill, or a message for the model.
 async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, input: &str) -> Next {
     let Some(command) = input.strip_prefix('/') else {
@@ -773,11 +779,18 @@ async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf
     let Some(cmd) = command_for(name) else {
         // A skill's instructions become the message and run as an ordinary turn — `/init`'s
         // trick. Built-ins were matched first, so a skill sharing a name with one is still
-        // there for the model, just not by typing it. Anything else that starts with a
-        // slash (a path, say) is a message like any other.
-        return Next::Run(Job::turn(
-            skills::expand_command(&skills::roots_for_cwd(), input).unwrap_or_else(|| input.to_string()),
-        ));
+        // there for the model, just not by typing it.
+        if let Some(expanded) = skills::expand_command(&skills::roots_for_cwd(), input) {
+            return Next::Run(Job::turn(expanded));
+        }
+        // A mistyped command sent on to the model only gets "I have no such command" back,
+        // for a round trip. Something that cannot be a command name (a path, say) is a
+        // message like any other.
+        if is_command_name(name) {
+            outln!("Unknown command: /{} — /help lists them, /skills the skills.\n", name);
+            return Next::Prompt;
+        }
+        return Next::Run(Job::turn(input));
     };
 
     match cmd {
@@ -1428,6 +1441,17 @@ mod tests {
         assert_eq!(command_for("quit"), Some(Cmd::Exit));
         // And a name that is not one is left for the skills and the model.
         assert_eq!(command_for("temperature"), None);
+    }
+
+    #[test]
+    fn only_a_word_after_the_slash_is_taken_for_a_command() {
+        assert!(is_command_name("hepl"));
+        assert!(is_command_name("update-skills"));
+        assert!(is_command_name("my_skill2"));
+        assert!(!is_command_name(""));
+        assert!(!is_command_name("etc/hosts"));
+        assert!(!is_command_name(".config"));
+        assert!(!is_command_name("C:\\temp"));
     }
 
     #[test]
