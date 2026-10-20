@@ -176,7 +176,15 @@ impl Agent {
         client.apply_settings(&settings);
 
         let server = MyMcpServer::new(client.clone(), true, config.searxng.clone(), true);
-        let tools = mcp_tools_to_openai_format(&server);
+        // `--tools` narrows what is offered, not what the server can run: `research` still
+        // drives `web_search` and `web_get` itself when only `research` was asked for.
+        let tools = mcp_tools_to_openai_format(&server)
+            .into_iter()
+            .filter(|tool| {
+                let name = tool["function"]["name"].as_str().unwrap_or_default();
+                config.tools.as_ref().is_none_or(|only| only.iter().any(|n| n == name))
+            })
+            .collect();
 
         let project_context = load_project_context();
         let user_context = load_user_context();
@@ -600,6 +608,11 @@ impl Agent {
     }
 
     /// The plan, as the todo tool last left it.
+    /// Whether the model was offered `name` in this run (`--tools` may have left it out).
+    pub(crate) fn offers(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool["function"]["name"] == name)
+    }
+
     pub(crate) fn plan(&self) -> Vec<crate::tools::TodoItem> {
         self.server.todos.lock().unwrap().clone()
     }
@@ -1714,6 +1727,20 @@ async fn run_one_call(
     // `repair_leaked_arguments`). Said in the tool's reply: a model that is never told
     // keeps making the same slip, and this one made it in half the edits of a run.
     let repaired = repair_leaked_arguments(&mut arguments);
+
+    // Before the calls answered out here, which never reach `authorize`: a small model
+    // calls tools it has seen in its training, not only the ones in the request, and
+    // `--tools` is a promise about what the run may do.
+    if !agent.offers(tool_name) {
+        let names: Vec<&str> = agent.tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        let reason = if names.is_empty() {
+            format!("There is no tool named '{}' in this run, and no tools at all. Answer in text.", tool_name)
+        } else {
+            format!("There is no tool named '{}' in this run. The tools are: {}.", tool_name, names.join(", "))
+        };
+        let _ = tx.send(Notice::Refused(reason.clone()).into());
+        return reason.into();
+    }
 
     // The calls answered out here rather than by a tool body, each because what it needs
     // is the agent's or the frontend's, not the tool server's.
@@ -3020,6 +3047,48 @@ mod turn_tests {
     /// The edit from the p2p_auth trace: `new_string` carrying a second copy of `old_string`
     /// after an escaped quote. The file must get only the intended text, and the reply must
     /// say what was cut, or the model goes on making the same slip.
+    /// `--tools`: only the listed tools are offered, and a call to any other is refused
+    /// by name — `sub_agent` too, which is answered before `authorize` is ever reached.
+    #[tokio::test]
+    async fn a_tool_left_out_by_the_tool_list_is_neither_offered_nor_run() {
+        let _capture = out::capture_guard();
+        let call = |id: &str, name: &str| -> &'static str {
+            Box::leak(
+                format!(
+                    r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+                    "tool_calls":[{{"id":"{id}","type":"function","function":{{"name":"{name}","arguments":"{{\"task\":\"x\"}}"}}}}]}}}}]}}"#
+                )
+                .into_boxed_str(),
+            )
+        };
+        let bodies: &'static [&'static str] = Box::leak(Box::new([
+            call("c1", "get_date"),
+            call("c2", SUB_AGENT),
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#,
+        ]));
+        let (url, requests) = serve_sequence(bodies).await;
+
+        let mut config = test_config(&url);
+        config.tools = Some(vec!["ls".to_string(), "get_time".to_string()]);
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(config, "m".to_string(), &cwd);
+        let mut offered: Vec<&str> = agent.tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        offered.sort();
+        assert_eq!(offered, ["get_time", "ls"]);
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "what day is it", false, &tx, &link).await;
+        assert_eq!(*requests.lock().unwrap(), 3);
+
+        for id in ["c1", "c2"] {
+            let reply = agent.messages.iter().find(|m| m["tool_call_id"] == id).unwrap();
+            let text = reply["content"].as_str().unwrap();
+            assert!(text.starts_with("There is no tool named"), "{text}");
+            assert!(text.contains("get_time") && text.contains("ls"), "{text}");
+        }
+    }
+
     #[tokio::test]
     async fn an_edit_with_its_old_string_leaked_into_new_string_is_repaired_and_said_to_be() {
         let _capture = out::capture_guard();

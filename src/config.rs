@@ -131,6 +131,8 @@ pub(crate) struct Config {
     pub(crate) resume: bool,
     // A task to run unattended in auto mode, exiting when it is done. `None` is the REPL.
     pub(crate) prompt: Option<String>,
+    // The only tools the model is offered, from `--tools`. `None` is all of them.
+    pub(crate) tools: Option<Vec<String>>,
     // Append every model call to this file as JSON lines — see `src/trace.rs`.
     pub(crate) trace: Option<PathBuf>,
     // Append each library lookup to this file as a question-and-answer SFT example.
@@ -169,6 +171,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("", "repeat-penalty", "Repetition penalty (default: leave it to the server)", "VALUE");
     opts.optflag("r", "resume", "Continue this directory's previous conversation");
     opts.optopt("p", "prompt", "Run this task unattended in auto mode, then exit", "TASK");
+    opts.optopt("", "tools", "Offer the model only these tools (comma-separated)", "LIST");
     opts.optopt("", "trace", "Append every model call to FILE as JSON lines, for training data", "FILE");
     opts.optopt("", "trace-lib", "Append each library question and answer to FILE, ready for fine-tuning", "FILE");
     opts.optopt("", "trace-research", "Append each research question and answer to FILE, for curating", "FILE");
@@ -292,6 +295,8 @@ pub(crate) fn parse_config() -> Result<Config> {
     let server = matches.opt_present("server");
     let gui = matches.opt_present("gui");
 
+    let tools = matches.opt_str("tools").map(|list| tool_list(&list)).transpose()?;
+
     // SearxNG instance for web_search, replacing DuckDuckGo when set.
     // Priority: command-line arg > environment variable > none (DuckDuckGo).
     let searxng = matches
@@ -362,6 +367,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         // A blank task is treated as none, rather than starting a run with nothing to do
         // that the model would fill by inventing a task of its own.
         prompt: matches.opt_str("p").filter(|task| !task.trim().is_empty()),
+        tools,
         trace: matches.opt_str("trace").map(absolute),
         trace_lib: matches.opt_str("trace-lib").map(absolute),
         trace_research: matches.opt_str("trace-research").map(absolute),
@@ -370,6 +376,32 @@ pub(crate) fn parse_config() -> Result<Config> {
         tui,
         mouse,
     })
+}
+
+// `--tools read,grep`: the names, checked against every tool haico has. A misspelled one is
+// an error rather than dropped, because the run would otherwise go ahead without the tool
+// it was meant to have. A known tool this run happens not to have (`library` with no
+// articles) is not: the list says what may be offered, not what must exist. An empty list
+// is allowed and offers nothing, for a task that is only text.
+fn tool_list(list: &str) -> Result<Vec<String>> {
+    let known: Vec<String> = crate::tools::MyMcpServer::full_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
+    let names: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    let unknown: Vec<&str> = names.iter().filter(|name| !known.contains(name)).map(String::as_str).collect();
+    if !unknown.is_empty() {
+        let mut known = known;
+        known.sort();
+        anyhow::bail!("--tools: no tool named {}; the tools are: {}", unknown.join(", "), known.join(", "));
+    }
+    Ok(names)
 }
 
 // A number from the command line or the environment, `from` naming which, so a value that
@@ -1186,6 +1218,9 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("not run. A turn that stops with its plan unfinished, on a question, or with an");
     println!("empty reply is sent back to work up to three times. Exit codes: 0 done, 1 a turn");
     println!("failed, 2 still unfinished after the follow-ups, 130 interrupted with Ctrl+C.");
+    println!("
+--tools read,grep,ls offers the model only those tools, in a --prompt run or at the");
+    println!("prompt; a call to any other is refused. The sub-agent gets the same subset.");
     println!("\n--trace appends one JSON object per line: a 'start' line, then every model call —");
     println!("the request exactly as sent (messages, tools, sampling) and the whole reply,");
     println!("reasoning included — tagged with its caller (main, research, reviewer, compressor,");
@@ -1239,6 +1274,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn a_tool_list_names_only_real_tools() {
+        use super::tool_list;
+
+        assert_eq!(tool_list(" read, grep ,,ls").unwrap(), ["read", "grep", "ls"]);
+        assert!(tool_list("").unwrap().is_empty());
+        let error = tool_list("read,raed").unwrap_err().to_string();
+        assert!(error.starts_with("--tools: no tool named raed; the tools are: "), "{error}");
+    }
+
+    #[test]
     fn a_number_that_does_not_parse_is_an_error_not_a_default() {
         use super::number;
 
@@ -1279,6 +1324,7 @@ mod tests {
             config_error: None,
             resume: false,
             prompt: None,
+            tools: None,
             trace: None,
             trace_lib: None,
             trace_research: None,

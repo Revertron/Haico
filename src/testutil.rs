@@ -475,6 +475,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         config_error: None,
         resume: false,
         prompt: None,
+        tools: None,
         trace: None,
         trace_lib: None,
         trace_research: None,
