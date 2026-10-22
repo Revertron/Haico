@@ -904,6 +904,20 @@ pub(crate) async fn authorize(
         return Err(reason.clone());
     }
 
+    // After the boundary, so a file outside it is not even opened to look; before the
+    // reviewer and the prompt, because an edit whose old_string is not in the file fails
+    // whoever says yes. Shown as the call and its failure, as if it had run — it would have
+    // ended exactly so.
+    if let Some(failure) = crate::tools::edit_failure(tool_name, arguments) {
+        let _ = tx.send(AgentEvent::ToolStarted {
+            name: tool_name.to_string(),
+            arguments: arguments.clone(),
+            auto_note: None,
+        });
+        let _ = tx.send(AgentEvent::ToolResult { text: failure.clone(), failed: true });
+        return Err(failure);
+    }
+
     let mut ask = match &gate {
         Gate::Ask { keys, label } if !agent.permissions.is_allowed(keys) => {
             Some((keys.clone(), label.clone()))
@@ -3596,6 +3610,52 @@ mod turn_tests {
             })
             .collect();
         assert_eq!(failed, [true]);
+    }
+
+    /// An edit whose old_string is not in the file fails whoever approves it, so in normal
+    /// mode it is neither put to the user nor run: the call line, its failure, and a reply
+    /// that says loudly the file is unchanged and sends the model back to read it.
+    #[tokio::test]
+    async fn an_edit_that_cannot_apply_fails_without_asking() {
+        let _capture = out::capture_guard();
+        let dir = testutil::TempDir::new("doomed-edit");
+        let file = dir.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let arguments = json!({
+            "file_path": file.display().to_string(),
+            "old_string": "fn main() { println!(\"remembered wrong\"); }",
+            "new_string": "fn main() { todo!() }",
+        });
+        let call = json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
+            {"id":"e1","type":"function","function":{"name":"edit","arguments":arguments.to_string()}}]}}]});
+        const FINAL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+        let bodies: &'static [&'static str] = Box::leak(Box::new([&*call.to_string().leak(), FINAL]));
+
+        let (url, served) = serve_sequence(bodies).await;
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), dir.path());
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        // Bounded, because a prompt nobody answers is exactly the regression: it would wait.
+        tokio::time::timeout(std::time::Duration::from_secs(20), run_turn(&mut agent, "go", false, &tx, &link))
+            .await
+            .expect("the edit was put to the user instead of failing");
+        assert_eq!(*served.lock().unwrap(), 2);
+
+        let mut failed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::Ask(_) => panic!("the user was asked to approve an edit that cannot apply"),
+                AgentEvent::ToolResult { failed: f, .. } => failed.push(f),
+                _ => {}
+            }
+        }
+        assert_eq!(failed, [true]);
+        let replies = tool_replies(&agent.messages);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].1.starts_with("ERROR: the edit was NOT applied"), "{}", replies[0].1);
+        assert!(replies[0].1.contains("read "), "{}", replies[0].1);
+        assert!(!replies[0].1.contains("remembered wrong"), "{}", replies[0].1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {}\n");
     }
 
     /// Cancellation is a message, not a dropped future — see

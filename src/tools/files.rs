@@ -8,6 +8,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData as McpError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -571,31 +572,14 @@ impl MyMcpServer {
             Ok(opened) => opened,
             Err(refusal) => return Ok(refusal),
         };
-        if params.0.old_string == params.0.new_string {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "No changes made - old_string and new_string are identical".to_string(),
-            )]));
-        }
-
-        let old_string = with_line_endings(&params.0.old_string, ending);
-        let new_string = with_line_endings(&params.0.new_string, ending);
-        let (new_content, matches) = match replace_once_or_all(&content, &old_string, &new_string, params.0.replace_all) {
+        let replacement = Replacement {
+            old: &params.0.old_string,
+            new: &params.0.new_string,
+            replace_all: params.0.replace_all,
+        };
+        let (new_content, matches) = match apply_replacements(content, ending, &params.0.file_path, &[replacement]) {
             Ok(replaced) => replaced,
-            Err(Miss::NotFound) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "String not found in {}: '{}'",
-                    params.0.file_path,
-                    truncate_at_boundary(&params.0.old_string, 500)
-                ))]));
-            }
-            Err(Miss::NotUnique(matches)) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "old_string is not unique: it occurs {} times in {}. Include enough \
-                     surrounding context to identify the one you mean, or pass \
-                     replace_all: true to change all {} of them.",
-                    matches, params.0.file_path, matches
-                ))]));
-            }
+            Err(failure) => return Ok(CallToolResult::error(vec![ContentBlock::text(failure)])),
         };
 
         self.save_edit(
@@ -630,46 +614,16 @@ impl MyMcpServer {
         // Applied to a working copy first. A partial application would leave the file in a
         // state neither the model nor the user asked for, and the model's next edit would
         // then be matching against text that no longer exists.
-        let mut working = content;
-        let mut replacements = 0usize;
-
-        for (index, edit) in params.0.edits.iter().enumerate() {
-            let position = index + 1;
-
-            if edit.old_string == edit.new_string {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Edit {} makes no change: old_string and new_string are identical. \
-                     Nothing was written.",
-                    position
-                ))]));
-            }
-
-            let old_string = with_line_endings(&edit.old_string, ending);
-            let new_string = with_line_endings(&edit.new_string, ending);
-            let matches;
-            (working, matches) = match replace_once_or_all(&working, &old_string, &new_string, edit.replace_all) {
-                Ok(replaced) => replaced,
-                Err(Miss::NotFound) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Edit {} of {}: string not found: '{}'. Nothing was written. Remember \
-                         that each edit applies to the result of the ones before it.",
-                        position,
-                        params.0.edits.len(),
-                        truncate_at_boundary(&edit.old_string, 300)
-                    ))]));
-                }
-                Err(Miss::NotUnique(matches)) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Edit {} of {}: old_string is not unique, it occurs {} times. Nothing \
-                         was written. Add surrounding context, or set replace_all on that edit.",
-                        position,
-                        params.0.edits.len(),
-                        matches
-                    ))]));
-                }
-            };
-            replacements += matches;
-        }
+        let edits: Vec<Replacement> = params
+            .0
+            .edits
+            .iter()
+            .map(|edit| Replacement { old: &edit.old_string, new: &edit.new_string, replace_all: edit.replace_all })
+            .collect();
+        let (working, replacements) = match apply_replacements(content, ending, &params.0.file_path, &edits) {
+            Ok(replaced) => replaced,
+            Err(failure) => return Ok(CallToolResult::error(vec![ContentBlock::text(failure)])),
+        };
 
         self.save_edit(
             &file_path,
@@ -866,6 +820,106 @@ enum Miss {
     NotUnique(usize),
 }
 
+// One replacement of `edit` or `multi_edit`, borrowed from the call's arguments.
+struct Replacement<'a> {
+    old: &'a str,
+    new: &'a str,
+    replace_all: bool,
+}
+
+// The edits applied in order to `content` (already in the file's own line endings), with the
+// total number of replacements — or the reply to the model when one of them cannot apply.
+//
+// The reply leads with the outcome in capitals and says nothing else of substance. It used to
+// be "String not found in src/main.rs: '<the old_string, 500 bytes of it>'": no word of
+// failure, since `is_error` never reaches an OpenAI-style tool message, and a block of the
+// model's own code that a small model read as its edit having landed. Gemma met it twice in a
+// row and then summed up the task as done. What fixes a miss is the file as it is now, so the
+// reply sends the model to read it rather than echoing what it remembered wrong.
+fn apply_replacements(
+    content: String,
+    ending: crate::util::LineEnding,
+    path: &str,
+    edits: &[Replacement],
+) -> Result<(String, usize), String> {
+    let failed = format!("ERROR: the edit was NOT applied. {} is unchanged.", path);
+    let mut working = content;
+    let mut replacements = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        // Which edit, when there are several to tell apart.
+        let which = match edits.len() {
+            1 => String::new(),
+            count => format!(" of edit {} of {}", index + 1, count),
+        };
+        if edit.old == edit.new {
+            return Err(format!(
+                "{failed} old_string and new_string{which} are identical, so there is nothing to change."
+            ));
+        }
+        let old = with_line_endings(edit.old, ending);
+        let new = with_line_endings(edit.new, ending);
+        let matches;
+        (working, matches) = match replace_once_or_all(&working, &old, &new, edit.replace_all) {
+            Ok(replaced) => replaced,
+            Err(Miss::NotFound) => {
+                // Only a later edit can be defeated by an earlier one in the same call.
+                let earlier = match index {
+                    0 => "",
+                    _ => " Each edit applies to the result of the ones before it.",
+                };
+                return Err(format!(
+                    "{failed} old_string{which} does not match the file's current text.{earlier} \
+                     Do not retry from memory: read {path} again first, then copy old_string \
+                     from what read shows, exactly, with its indentation."
+                ));
+            }
+            Err(Miss::NotUnique(count)) => {
+                return Err(format!(
+                    "{failed} old_string{which} occurs {count} times in it. Read {path} again and \
+                     include enough surrounding lines to pick out the one you mean, or set \
+                     replace_all to change all {count}."
+                ));
+            }
+        };
+        replacements += matches;
+    }
+    Ok((working, replacements))
+}
+
+/// The reply an `edit` or `multi_edit` call is going to get when it cannot apply to the
+/// file as it is now; `None` when it can, or when only the tool can tell.
+///
+/// Asked before the call is gated. A miss used to go through the auto-mode reviewer and the
+/// prompt like any edit, drawn as "No changes" — the reviewer approved it as harmless and
+/// the user was asked to approve nothing, all for an error. It fails the same whoever says
+/// yes, so nobody is asked.
+pub(crate) fn edit_failure(tool_name: &str, arguments: &Value) -> Option<String> {
+    let path = arguments["file_path"].as_str()?;
+    let edits: Vec<Replacement> = match tool_name {
+        "edit" => vec![replacement_in(arguments)?],
+        "multi_edit" => arguments["edits"].as_array()?.iter().map(replacement_in).collect::<Option<_>>()?,
+        _ => return None,
+    };
+    if edits.is_empty() {
+        return None;
+    }
+    // Read and normalized as `open_for_edit` does, so the two cannot disagree.
+    let on_disk = fs::read_to_string(path).ok()?;
+    let ending = dominant_line_ending(&on_disk);
+    let content = with_line_endings(&on_disk, ending).into_owned();
+    apply_replacements(content, ending, path, &edits).err()
+}
+
+// One replacement out of a call's raw arguments; `None` for a malformed one, which the
+// tool's own argument check reports better than this could.
+fn replacement_in(arguments: &Value) -> Option<Replacement<'_>> {
+    Some(Replacement {
+        old: arguments["old_string"].as_str()?,
+        new: arguments["new_string"].as_str()?,
+        replace_all: arguments["replace_all"].as_bool().unwrap_or(false),
+    })
+}
+
 // `old` replaced by `new` in `content`, and how many times. The descriptions have always
 // promised "old_string must be unique or use replace_all", but nothing used to check: a
 // string occurring several times silently edited the first one, which is rarely the one
@@ -960,6 +1014,30 @@ mod tests {
     }
 
 
+    #[test]
+    fn edit_failure_answers_only_for_an_edit_that_cannot_apply() {
+        let path = scratch("doomed.rs", "fn a() {}\r\nfn b() {}\r\n");
+        let file_path = path.display().to_string();
+
+        // One that applies is left to the gates — CRLF included, as `edit` matches it.
+        let fine = json!({"file_path": file_path, "old_string": "fn a() {}\nfn b() {}", "new_string": "fn c() {}"});
+        assert_eq!(edit_failure("edit", &fine), None);
+        assert_eq!(edit_failure("write_file", &json!({"file_path": file_path, "content": ""})), None);
+
+        let missing = json!({"file_path": file_path, "old_string": "fn z() {}", "new_string": "fn c() {}"});
+        let failure = edit_failure("edit", &missing).unwrap();
+        assert!(failure.starts_with("ERROR: the edit was NOT applied"), "{}", failure);
+        assert!(!failure.contains("fn z"), "the model's own string is echoed back: {}", failure);
+
+        // In a multi_edit the failing edit is named, and an earlier one counts.
+        let edits = json!({"file_path": file_path, "edits": [
+            {"old_string": "fn a() {}", "new_string": "fn x() {}"},
+            {"old_string": "fn a() {}", "new_string": "fn y() {}"},
+        ]});
+        let failure = edit_failure("multi_edit", &edits).unwrap();
+        assert!(failure.contains("edit 2 of 2") && failure.contains("ones before it"), "{}", failure);
+    }
+
     #[tokio::test]
     async fn edit_refuses_a_non_unique_old_string() {
         let server = test_server();
@@ -969,7 +1047,7 @@ mod tests {
         // "= 1;" appears twice: silently editing the first one is the bug being fixed.
         let (ok, message) = try_edit(&server, &path, "= 1;", "= 9;", false).await;
         assert!(!ok, "expected a refusal, got: {}", message);
-        assert!(message.contains("not unique"), "got: {}", message);
+        assert!(message.contains("NOT applied"), "got: {}", message);
         assert!(message.contains("occurs 2 times"), "got: {}", message);
         // The file is untouched.
         assert_eq!(
@@ -1334,14 +1412,14 @@ mod tests {
         )
         .await;
         assert!(!ok);
-        assert!(out.contains("Edit 2 of 2"), "got: {}", out);
-        assert!(out.contains("Nothing was written"), "got: {}", out);
+        assert!(out.contains("edit 2 of 2"), "got: {}", out);
+        assert!(out.contains("NOT applied") && out.contains("read "), "got: {}", out);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         // Non-unique strings are refused per-edit, same as `edit`.
         let (ok, out) = try_multi_edit(&server, &path, vec![("fn ", "pub fn ", false)]).await;
         assert!(!ok);
-        assert!(out.contains("not unique"), "got: {}", out);
+        assert!(out.contains("occurs"), "got: {}", out);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         // ...and replace_all is the way through.
