@@ -482,7 +482,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         None
     };
 
-    outln!("          Welcome to Haico!");
+    outln!("{:^37}", concat!("Welcome to Haico v", env!("CARGO_PKG_VERSION"), "!"));
     outln!("=====================================\n");
     if let Some(notice) = starter_config_notice(&config) {
         outln!("{}", notice);
