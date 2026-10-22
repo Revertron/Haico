@@ -1208,6 +1208,17 @@ fn show_config(agent: &Agent) {
         }
     );
     outln!(
+        "  extra_body        {}",
+        if agent.settings.extra_body.is_empty() {
+            "-".to_string()
+        } else {
+            serde_json::Value::Object(agent.settings.extra_body.clone()).to_string()
+        }
+    );
+    // Names only: a header here is as likely as not a key of some kind.
+    let headers: Vec<&str> = agent.settings.extra_headers.keys().map(|name| name.as_str()).collect();
+    outln!("  extra_headers     {}", if headers.is_empty() { "-".to_string() } else { headers.join(", ") });
+    outln!(
         "\nA '-' means the field is left out of the request, so the server's own \
          setting for that model applies."
     );

@@ -230,6 +230,50 @@ LM_API_TOKEN=sk-lm-... haico --url http://127.0.0.1:1234
 Without a token, an authenticated server answers every request with `401`, and Haico says so
 directly.
 
+### Extra request fields and headers
+
+Some services accept more than the standard API. OpenRouter, for example, has
+[provider routing](https://openrouter.ai/docs/guides/routing/provider-selection), and other
+services and servers have options of their own. `extra_body` is merged into every request body
+as written, and `extra_headers` is sent with every request:
+
+```toml
+[openrouter]
+url   = "https://openrouter.ai/api/v1"
+token = "sk-or-..."
+
+[openrouter.extra_body.provider]
+order           = ["cerebras", "groq"]
+allow_fallbacks = false
+data_collection = "deny"
+
+[openrouter.extra_headers]
+"HTTP-Referer" = "https://example.com"
+"X-Title"      = "haico"
+
+[models."qwen/qwen3-coder".extra_body]
+provider = { only = ["cerebras/fp8"] }    # narrows the provider's routing for this model
+```
+
+Both are accepted at the top level, in a provider's section and in a model's section. Tables
+merge key by key, with the model's values overriding the provider's and the provider's
+overriding the top level. Any other value, an array included, replaces the lower one whole. Header
+names are matched without regard to case, and an `Authorization` header here replaces the one
+built from `token`. The same fields and headers go with the sub-agents' requests too (reviewer,
+research, summaries), so routing such as `data_collection = "deny"` covers everything Haico
+sends. Haico doesn't check the contents; the server does.
+
+Some keys are refused when the config loads:
+- `model`, `messages`, `tools`, `tool_choice`, `stream` and `stream_options`, which Haico sets
+  itself.
+- `temperature`, `max_tokens`, `top_p`, `top_k`, `min_p`, `repeat_penalty` and
+  `reasoning_effort`, which have settings of their own.
+- The headers `Content-Type`, `Content-Length`, `Transfer-Encoding` and `Host`.
+
+Template variables in `extra_body.chat_template_kwargs` are kept: the thinking switch from
+`reasoning_effort` is added next to them. `/config` shows the merged body, but only the header
+names, because a header may carry a key.
+
 ---
 
 ## Web search

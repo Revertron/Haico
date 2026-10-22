@@ -74,7 +74,7 @@ exposing web_get (raw page text) and hiding web_fetch (summarization).");
 
     // --model is optional here: with none given we omit the "model" field from requests,
     // so the LLM server uses whatever model it already has loaded.
-    let model = config.model.unwrap_or_default();
+    let model = config.model.clone().unwrap_or_default();
     if config.url_supplied && model.is_empty() {
         eprintln!("[haico] no --model given; using the model already loaded on the LLM server.");
     }
@@ -85,7 +85,13 @@ exposing web_get (raw page text) and hiding web_fetch (summarization).");
         None => {}
     }
 
-    let lm_client = LMStudioClient::new(config.llm_url, model, config.token);
+    // Only the extra fields and headers from the resolved settings: they say where and how
+    // the summarizer's requests may be served (OpenRouter's `data_collection`, say), which
+    // matters as much here as in the REPL.
+    let settings = config::resolve_settings(&config, &model);
+    let mut lm_client = LMStudioClient::new(config.llm_url, model, config.token);
+    lm_client.extra_body = settings.extra_body;
+    lm_client.extra_headers = settings.extra_headers;
     let server = MyMcpServer::new(lm_client, config.url_supplied, config.search, false);
 
     eprintln!("[haico] MCP server ready; serving over stdio.");

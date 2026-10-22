@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use getopts::Options;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -491,6 +493,101 @@ pub(crate) struct ModelSettingsFile {
     // per-model one.
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
+    // Merged over the provider's and the top level's: see `ExtraBody`.
+    pub(crate) extra_body: Option<ExtraBody>,
+    pub(crate) extra_headers: Option<ExtraHeaders>,
+}
+
+// Fields merged into every request body as they stand, for what a server takes beyond the
+// OpenAI API: OpenRouter's `provider` routing object alone has a dozen keys, and the next
+// service has its own. Typed fields would trail every one of them, so the table is the
+// server's to check — `deny_unknown_fields` stops at its border on purpose.
+//
+// Layered top level, then provider, then model, merged rather than picked: tables merge key
+// by key, anything else (arrays included) is replaced whole, so a model's `provider.only`
+// narrows the provider's routing without restating the rest of it.
+//
+// Refused at load, with the line: the fields haico builds the request out of, which a
+// bundle could only break, and those with a typed setting of their own — a temperature
+// in two places would leave /set changing the one that is not sent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ExtraBody(pub(crate) Map<String, Value>);
+
+const OWNED_BODY_KEYS: &[&str] = &["model", "messages", "tools", "tool_choice", "stream", "stream_options"];
+const TYPED_BODY_KEYS: &[&str] = &[
+    "temperature", "max_tokens", "top_p", "top_k", "min_p", "repeat_penalty", "reasoning_effort",
+];
+
+impl<'de> Deserialize<'de> for ExtraBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let map = Map::<String, Value>::deserialize(deserializer)?;
+        for key in map.keys() {
+            if OWNED_BODY_KEYS.contains(&key.as_str()) {
+                return Err(D::Error::custom(format!("extra_body cannot set `{key}`: haico sets it itself")));
+            }
+            if TYPED_BODY_KEYS.contains(&key.as_str()) {
+                return Err(D::Error::custom(format!(
+                    "extra_body cannot set `{key}`: it is a setting of its own, write `{key} = ...` beside extra_body"
+                )));
+            }
+        }
+        // toml hands a date to serde as a table under a private key, which would reach the
+        // server as that table; no request field is a TOML date, so it is a mistake to say.
+        fn holds_date(value: &Value) -> bool {
+            match value {
+                Value::Object(map) => map.contains_key("$__toml_private_datetime") || map.values().any(holds_date),
+                Value::Array(items) => items.iter().any(holds_date),
+                _ => false,
+            }
+        }
+        if map.values().any(holds_date) {
+            return Err(D::Error::custom("extra_body cannot hold a date; quote it to send it as a string"));
+        }
+        Ok(ExtraBody(map))
+    }
+}
+
+// Merge `over` into `base`: tables key by key, everything else replaced.
+pub(crate) fn merge_body(base: &mut Map<String, Value>, over: &Map<String, Value>) {
+    for (key, value) in over {
+        match (base.get_mut(key), value) {
+            (Some(Value::Object(inner)), Value::Object(value)) => merge_body(inner, value),
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+// Headers sent with every chat request, layered like `ExtraBody` (a later layer's value
+// replaces the earlier one's, names compared without case). OpenRouter's attribution
+// headers are the usual case. Sent after the token, so an `Authorization` here replaces the
+// bearer one — for a proxy that wants another scheme. Checked at load, since a name or
+// value reqwest refuses would otherwise fail every request with no line to point at.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExtraHeaders(pub(crate) HeaderMap);
+
+// Describe the body, which haico writes as JSON; a bundle changing them could only break it.
+const OWNED_HEADERS: &[&str] = &["content-type", "content-length", "transfer-encoding", "host"];
+
+impl<'de> Deserialize<'de> for ExtraHeaders {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = std::collections::BTreeMap::<String, String>::deserialize(deserializer)?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in raw {
+            let parsed = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| D::Error::custom(format!("extra_headers: `{name}` is not a valid header name")))?;
+            if OWNED_HEADERS.contains(&parsed.as_str()) {
+                return Err(D::Error::custom(format!("extra_headers cannot set `{name}`: haico sets it itself")));
+            }
+            let value = HeaderValue::from_str(&value)
+                .map_err(|_| D::Error::custom(format!("extra_headers: the value of `{name}` is not a valid header value")))?;
+            headers.insert(parsed, value);
+        }
+        Ok(ExtraHeaders(headers))
+    }
 }
 
 // the config file (see `crate::store`), so the usual invocation is just `haico`.
@@ -545,6 +642,8 @@ pub(crate) struct FileConfig {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
+    pub(crate) extra_body: Option<ExtraBody>,
+    pub(crate) extra_headers: Option<ExtraHeaders>,
 
     #[serde(default)]
     pub(crate) models: std::collections::HashMap<String, ModelSettingsFile>,
@@ -559,6 +658,10 @@ pub(crate) struct ProviderFile {
     pub(crate) url: Option<String>,
     pub(crate) token: Option<String>,
     pub(crate) model: Option<String>,
+    // The natural home for both: routing and attribution are a property of the service,
+    // whichever model it is serving.
+    pub(crate) extra_body: Option<ExtraBody>,
+    pub(crate) extra_headers: Option<ExtraHeaders>,
 }
 
 impl FileConfig {
@@ -576,7 +679,7 @@ pub(crate) const CONFIG_VERSION: u32 = 1;
 const RESERVED_KEYS: &[&str] = &[
     "version", "providers", "provider", "url", "token", "model", "searxng", "tinyfish",
     "system_prompt", "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
-    "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "models",
+    "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "extra_body", "extra_headers", "models",
 ];
 
 // Parse the text of a config file. The error is the message to show, without the path,
@@ -741,6 +844,11 @@ version = 1
 # url = "http://127.0.0.1:11434"
 # token = "..."
 # model = "qwen2.5:14b"
+# Fields and headers sent with every request as they stand, for what a server takes
+# beyond the usual API — here OpenRouter's routing and attribution. Both also go at the
+# top level and in a model's section; tables merge, the model's winning.
+# extra_body = { provider = { order = ["cerebras", "groq"], data_collection = "deny" } }
+# extra_headers = { "X-Title" = "haico" }
 
 [models."tiel-coder-35b-a3b-mtp"]
 context = 131072
@@ -1061,6 +1169,10 @@ pub(crate) struct ResolvedSettings {
     // overrides it for the session, and the default has to be the same in both places.
     pub(crate) reasoning_setting: Setting<Reasoning>,
     pub(crate) reasoning_threshold_setting: Setting<usize>,
+    // The three layers merged into one, empty when none sets anything. No provenance: a
+    // merge has no single layer to name.
+    pub(crate) extra_body: Map<String, Value>,
+    pub(crate) extra_headers: HeaderMap,
 }
 
 impl ResolvedSettings {
@@ -1099,7 +1211,27 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
 
     let context = pick(config.context_arg, per_model.context, config.file.context);
 
+    // The provider in force, which `switch_provider` sets before it re-resolves.
+    let section = config.provider.as_deref().and_then(|name| config.file.provider_sections.get(name));
+    let mut extra_body = Map::new();
+    let mut extra_headers = HeaderMap::new();
+    let layers = [
+        (config.file.extra_body.as_ref(), config.file.extra_headers.as_ref()),
+        (section.and_then(|s| s.extra_body.as_ref()), section.and_then(|s| s.extra_headers.as_ref())),
+        (per_model.extra_body.as_ref(), per_model.extra_headers.as_ref()),
+    ];
+    for (body, headers) in layers {
+        if let Some(body) = body {
+            merge_body(&mut extra_body, &body.0);
+        }
+        for (name, value) in headers.iter().flat_map(|h| h.0.iter()) {
+            extra_headers.insert(name.clone(), value.clone());
+        }
+    }
+
     ResolvedSettings {
+        extra_body,
+        extra_headers,
         context_tokens: context.value.unwrap_or(DEFAULT_CONTEXT_TOKENS),
         context_source: if context.value.is_some() {
             context.source
@@ -1210,6 +1342,13 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("\nA file without `version` is read the old way, with url, token and model at the");
     println!("top level; those are refused there once providers are listed. --url, --token and");
     println!("--model still override the provider's own, one by one.");
+    println!("\n  [openrouter.extra_body.provider]    # merged into every request body");
+    println!("  order = [\"cerebras\", \"groq\"]");
+    println!("  [openrouter.extra_headers]           # sent with every request");
+    println!("  \"X-Title\" = \"haico\"");
+    println!("\nextra_body and extra_headers go at the top level, in a provider's section and in");
+    println!("a model's; tables merge key by key, the model's over the provider's over the top");
+    println!("level's. Fields haico sets itself, or has a setting for, are refused.");
     println!("\n  [models.\"qwen2.5:14b\"]");
     println!("  context        = 32768");
     println!("  temperature    = 0.2");
@@ -1898,6 +2037,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(why.contains("line 6"), "no line in {why:?}");
+    }
+
+    const EXTRAS: &str = "version = 1\nproviders = [\"or\", \"lm\"]\n\
+        extra_headers = { \"X-Title\" = \"haico\", \"HTTP-Referer\" = \"https://top\" }\n\
+        [extra_body]\nusage = { include = true }\nprovider = { sort = \"price\" }\n\n\
+        [or]\nurl = \"https://openrouter.ai/api/v1\"\n\n\
+        [or.extra_body.provider]\norder = [\"cerebras\", \"groq\"]\ndata_collection = \"deny\"\n\n\
+        [or.extra_headers]\n\"http-referer\" = \"https://or\"\n\n\
+        [lm]\nurl = \"http://h:1234\"\n\n\
+        [models.\"qwen\".extra_body]\nprovider = { order = [\"groq\"] }\n";
+
+    // Tables merge key by key through the layers, model over provider over top level, and
+    // anything else — an array included — is replaced whole. Header names meet without case.
+    #[test]
+    fn extra_body_and_headers_merge_through_the_layers() {
+        use crate::resolve_settings;
+        let mut config = config_with("");
+        config.file = parse_file_config(EXTRAS).unwrap();
+        config.provider = Some("or".to_string());
+
+        let qwen = resolve_settings(&config, "qwen");
+        assert_eq!(
+            Value::Object(qwen.extra_body),
+            json!({
+                "usage": {"include": true},
+                "provider": {"sort": "price", "order": ["groq"], "data_collection": "deny"},
+            })
+        );
+        assert_eq!(qwen.extra_headers["x-title"], "haico");
+        assert_eq!(qwen.extra_headers["http-referer"], "https://or");
+        assert_eq!(qwen.extra_headers.len(), 2);
+
+        let other = resolve_settings(&config, "other");
+        assert_eq!(other.extra_body["provider"]["order"], json!(["cerebras", "groq"]));
+
+        // Another provider's bundle stays with it.
+        config.provider = Some("lm".to_string());
+        let on_lm = resolve_settings(&config, "other");
+        assert_eq!(on_lm.extra_body["provider"], json!({"sort": "price"}));
+        assert_eq!(on_lm.extra_headers["http-referer"], "https://top");
+
+        let bare = resolve_settings(&config_with(""), "any");
+        assert!(bare.extra_body.is_empty() && bare.extra_headers.is_empty());
+    }
+
+    // What haico builds the request from, or has a setting for, is refused on its line
+    // rather than sent: a bundle `stream` breaks the reply, and a bundle `temperature`
+    // would leave /set changing a value that is never sent.
+    #[test]
+    fn extra_body_and_headers_refuse_what_haico_owns() {
+        let refused = |text: &str, says: &str| {
+            let why = parse_file_config(text).expect_err(text);
+            assert!(why.contains(says), "{text:?} was refused for {why:?}, not {says:?}");
+        };
+        refused("[extra_body]\nstream = false\n", "haico sets it itself");
+        refused("[models.\"m\".extra_body]\ntemperature = 0.1\n", "write `temperature = ...`");
+        refused("extra_body = { when = 1979-05-27 }\n", "cannot hold a date");
+        refused("extra_body = 5\n", "invalid type");
+        refused("[extra_headers]\n\"Content-Type\" = \"text/plain\"\n", "haico sets it itself");
+        refused("[extra_headers]\n\"bad name\" = \"x\"\n", "not a valid header name");
+        refused("[extra_headers]\nx = \"a\\nb\"\n", "not a valid header value");
+        refused("[extra_headers]\nx = 1\n", "invalid type");
+        refused("version = 1\nproviders = [\"extra_body\"]\n[extra_body]\nurl = \"u\"\n", "cannot be called");
+
+        let why = parse_file_config(
+            "version = 1\nproviders = [\"or\"]\n\n[or]\nurl = \"u\"\n\n[or.extra_body]\nmessages = []\n",
+        )
+        .unwrap_err();
+        // On the bundle's header: the check sees the table whole, not the key.
+        assert!(why.contains("line 7"), "no line in {why:?}");
+    }
+
+    // /model writes into a provider whose bundle is a sub-table of its own, and leaves the
+    // bundle as it was.
+    #[test]
+    fn saving_a_model_keeps_the_provider_s_bundle() {
+        let path = scratch("save-with-extras.toml", EXTRAS);
+        save_provider_model(&path, "or", "qwen").unwrap();
+        let parsed = load_file_config(Some(&path));
+        let or = &parsed.provider_sections["or"];
+        assert_eq!(or.model.as_deref(), Some("qwen"));
+        assert_eq!(or.extra_body.as_ref().unwrap().0["provider"]["data_collection"], "deny");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

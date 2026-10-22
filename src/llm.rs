@@ -212,6 +212,11 @@ pub(crate) struct LMStudioClient {
     // The level a sub-agent's own conversation asks for, straight from the config. Read
     // only by `for_sub_agent` — the main conversation never sends this one.
     pub(crate) sub_agent_effort: Option<String>,
+    // The config's `extra_body` and `extra_headers`, merged for the model in use. Carried
+    // to the sub-agents unchanged: they talk to the same service, and a reviewer routed
+    // past the user's `data_collection = "deny"` would be the leak the setting is there for.
+    pub(crate) extra_body: serde_json::Map<String, Value>,
+    pub(crate) extra_headers: reqwest::header::HeaderMap,
     // `RETRY_DELAYS`, except in tests: a test serving one failure wants to see that failure,
     // not a minute of retries against a server that has gone. Tests of retrying set their own.
     pub(crate) retry_delays: Vec<Duration>,
@@ -244,6 +249,8 @@ impl LMStudioClient {
             reasoning_effort: None,
             enable_thinking: None,
             sub_agent_effort: None,
+            extra_body: serde_json::Map::new(),
+            extra_headers: reqwest::header::HeaderMap::new(),
             retry_delays: if cfg!(test) { Vec::new() } else { RETRY_DELAYS.to_vec() },
         }
     }
@@ -294,6 +301,19 @@ impl LMStudioClient {
         self.enable_thinking = thinking_switch(self.reasoning_effort.as_deref());
         // Not applied to this client's own requests — `for_sub_agent` is what reads it.
         self.sub_agent_effort = settings.sub_agent_effort.clone();
+        self.extra_body = settings.extra_body.clone();
+        self.extra_headers = settings.extra_headers.clone();
+    }
+
+    // The config's extra fields, before anything else is set: what follows owns its own
+    // keys (the config refuses those in the bundle), and `set_thinking` adds its own to a
+    // `chat_template_kwargs` the bundle may have started.
+    pub(crate) fn set_extra(&self, body: &mut Value) {
+        if let Some(body) = body.as_object_mut() {
+            for (key, value) in &self.extra_body {
+                body.insert(key.clone(), value.clone());
+            }
+        }
     }
 
     // How much to think. Its own method rather than part of `set_sampling` because the
@@ -313,11 +333,17 @@ impl LMStudioClient {
         // takes `reasoning_effort` low/medium/xhigh itself — ever saw it. On and off are
         // `enable_thinking`; a level is `reasoning_effort`, never "on"/"off", which that
         // template refuses with an exception.
-        if let Some(enable_thinking) = self.enable_thinking {
-            body["chat_template_kwargs"] = json!({ "enable_thinking": enable_thinking });
-        } else if let Some(reasoning_effort) = &self.reasoning_effort {
-            body["chat_template_kwargs"] = json!({ "reasoning_effort": reasoning_effort });
+        let (key, value) = match (self.enable_thinking, &self.reasoning_effort) {
+            (Some(enable_thinking), _) => ("enable_thinking", json!(enable_thinking)),
+            (None, Some(reasoning_effort)) => ("reasoning_effort", json!(reasoning_effort)),
+            (None, None) => return,
+        };
+        // Added to, not replaced: the config's `extra_body` may have put kwargs of its own
+        // there. One that is not a table is replaced, since indexing into it would panic.
+        if !body["chat_template_kwargs"].is_object() {
+            body["chat_template_kwargs"] = json!({});
         }
+        body["chat_template_kwargs"][key] = value;
     }
 
     // Add the sampling fields that are actually configured, and only those.
@@ -346,12 +372,14 @@ impl LMStudioClient {
         self.set_thinking(body);
     }
 
-    // Attach the bearer token, when one is configured.
+    // Attach the bearer token, when one is configured, and the config's extra headers after
+    // it — `headers` replaces a name already set, so an `Authorization` there wins.
     pub(crate) fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.token {
+        let req = match &self.token {
             Some(token) => req.bearer_auth(token),
             None => req,
-        }
+        };
+        req.headers(self.extra_headers.clone())
     }
 
     // Add the "model" field to a request body, unless no model is configured.
@@ -465,6 +493,9 @@ impl LMStudioClient {
         if let Some(max_tokens) = max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        // Unlike the sampling, the extra fields are sent: they say where and how the request
+        // may be served, which holds for a review as much as for the conversation.
+        self.set_extra(&mut body);
         self.set_model(&mut body);
         // Every caller of this is a sub-agent, and every one of them reaches it through a
         // `for_sub_agent` copy — so what this sends is the sub-agent's thinking, never the
@@ -550,6 +581,7 @@ impl LMStudioClient {
             "tool_choice": "auto",
             "stream": true
         });
+        self.set_extra(&mut body);
         self.set_model(&mut body);
         self.set_sampling(&mut body);
 
@@ -750,6 +782,7 @@ impl LMStudioClient {
         let mut body = json!({
             "messages": messages
         });
+        self.set_extra(&mut body);
         self.set_model(&mut body);
         self.set_sampling(&mut body);
 
@@ -1446,6 +1479,103 @@ mod tests {
         let head = server.await.unwrap();
         let expected = format!("user-agent: haico/{}\r\n", env!("CARGO_PKG_VERSION"));
         assert!(head.contains(&expected), "sent: {}", head);
+    }
+
+    fn extra_settings() -> crate::ResolvedSettings {
+        let mut settings = settings_of(None, None, None, None, None, None);
+        settings.reasoning_effort.value = Some("low".to_string());
+        settings.extra_body = json!({
+            "provider": {"order": ["cerebras"], "data_collection": "deny"},
+            "chat_template_kwargs": {"preserve_thinking": true},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        settings.extra_headers.insert("x-title", "haico".parse().unwrap());
+        settings.extra_headers.insert(reqwest::header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        settings
+    }
+
+    // The config's bundle goes out with the conversation, and the thinking switch is added
+    // to its template kwargs rather than replacing them.
+    #[tokio::test]
+    async fn extra_body_reaches_the_streamed_request() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let (url, captured) = serve_once_capturing(sse, "text/event-stream").await;
+        let mut client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        client.apply_settings(&extra_settings());
+        client
+            .chat_completion_streaming(Caller::Main, vec![], vec![], |_| {})
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_str(&captured.lock().unwrap()).expect("a JSON request body");
+        assert_eq!(sent["provider"], json!({"order": ["cerebras"], "data_collection": "deny"}));
+        assert_eq!(
+            sent["chat_template_kwargs"],
+            json!({"preserve_thinking": true, "reasoning_effort": "low"})
+        );
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["model"], "m");
+    }
+
+    // And with the plain completions every sub-agent makes, headers included: a reviewer
+    // routed past `data_collection = "deny"` is the leak the setting is there to stop. The
+    // configured Authorization replaces the token's.
+    #[tokio::test]
+    async fn extra_body_and_headers_reach_a_sub_agent_s_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+            let length: usize = head
+                .split("content-length:")
+                .nth(1)
+                .and_then(|rest| rest.split('\r').next())
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while request.len() < head_end + length {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            (head, String::from_utf8_lossy(&request[head_end..]).to_string())
+        });
+
+        let mut client = crate::LMStudioClient::new(url, "m".to_string(), Some("sk-token".to_string()));
+        client.apply_settings(&extra_settings());
+        let reply = client
+            .for_sub_agent()
+            .chat_completion_plain(Caller::Reviewer, vec![json!({"role": "user", "content": "hi"})], None)
+            .await
+            .unwrap();
+        assert_eq!(reply, "ok");
+
+        let (head, body) = server.await.unwrap();
+        assert!(head.contains("x-title: haico\r\n"), "sent: {head}");
+        assert!(head.contains("authorization: basic abc\r\n"), "sent: {head}");
+        assert!(!head.contains("bearer"), "the token's header was sent as well: {head}");
+        let sent: Value = serde_json::from_str(&body).expect("a JSON request body");
+        assert_eq!(sent["provider"]["data_collection"], "deny");
+        // The sub-agent's own effort is unset, so only the bundle's kwargs remain.
+        assert_eq!(sent["chat_template_kwargs"], json!({"preserve_thinking": true}));
+        assert_eq!(sent["temperature"], 0.0);
     }
 
     #[tokio::test]
