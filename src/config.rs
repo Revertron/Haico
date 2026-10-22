@@ -104,7 +104,7 @@ pub(crate) struct Config {
     // silently falling back to the REPL, which would look like the flag worked.
     pub(crate) gui: bool,
     pub(crate) url_supplied: bool,
-    pub(crate) searxng: Option<String>,
+    pub(crate) search: Option<crate::tools::SearchBackend>,
     // The model's context window, in tokens. Only used to tell the user how close the
     // conversation is to filling it; haico never truncates on its own.
     // Model-dependent settings as given on the command line or in the environment. Kept
@@ -162,6 +162,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("m", "model", "Model name (skip model selection)", "MODEL");
     opts.optopt("t", "token", "API token for servers with authentication enabled", "TOKEN");
     opts.optopt("", "searxng", "Base URL of a SearxNG instance to search through instead of DuckDuckGo", "URL");
+    opts.optopt("", "tinyfish", "Tinyfish Search API key, to search through Tinyfish instead of DuckDuckGo", "KEY");
     opts.optopt("", "context", "Model context window in tokens, for the /context report (default: 131072)", "TOKENS");
     opts.optopt("", "temperature", "Sampling temperature (default: leave it to the server)", "VALUE");
     opts.optopt("", "max-tokens", "Cap on tokens generated per reply (default: leave it to the server)", "N");
@@ -297,14 +298,13 @@ pub(crate) fn parse_config() -> Result<Config> {
 
     let tools = matches.opt_str("tools").map(|list| tool_list(&list)).transpose()?;
 
-    // SearxNG instance for web_search, replacing DuckDuckGo when set.
-    // Priority: command-line arg > environment variable > none (DuckDuckGo).
-    let searxng = matches
-        .opt_str("searxng")
-        .or_else(|| env::var("SEARXNG_URL").ok())
-        .or_else(|| file_config.searxng.clone())
-        .map(|url| url.trim().trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty());
+    // SearxNG instance or Tinyfish key for web_search, replacing DuckDuckGo when set.
+    // Priority: command-line arg > environment variable > config file > none (DuckDuckGo).
+    let search = search_backend([
+        (matches.opt_str("searxng"), matches.opt_str("tinyfish"), "--searxng and --tinyfish"),
+        (env::var("SEARXNG_URL").ok(), env::var("TINYFISH_API_KEY").ok(), "SEARXNG_URL and TINYFISH_API_KEY"),
+        (file_config.searxng.clone(), file_config.tinyfish.clone(), "searxng and tinyfish in the config file"),
+    ])?;
 
     // The model's context window, used only to report how full the conversation is.
     // Priority: command-line arg > environment variable > default.
@@ -351,7 +351,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         server,
         gui,
         url_supplied,
-        searxng,
+        search,
         context_arg,
         temperature_arg,
         max_tokens_arg,
@@ -402,6 +402,31 @@ fn tool_list(list: &str) -> Result<Vec<String>> {
         anyhow::bail!("--tools: no tool named {}; the tools are: {}", unknown.join(", "), known.join(", "));
     }
     Ok(names)
+}
+
+// The search backend from (searxng, tinyfish, what to call the pair) per layer, highest
+// first. The first layer to give either value decides, so `--tinyfish` outranks a
+// `searxng` in the file. An empty value still decides, for DuckDuckGo: `--searxng ""` has
+// always been the way to switch off a configured instance for one run. Both in one layer
+// is an error, since which one was meant is not ours to guess.
+fn search_backend<const N: usize>(
+    layers: [(Option<String>, Option<String>, &str); N],
+) -> Result<Option<crate::tools::SearchBackend>> {
+    use crate::tools::SearchBackend;
+    for (searxng, tinyfish, names) in layers {
+        if searxng.is_none() && tinyfish.is_none() {
+            continue;
+        }
+        let searxng = searxng.map(|url| url.trim().trim_end_matches('/').to_string()).filter(|url| !url.is_empty());
+        let tinyfish = tinyfish.map(|key| key.trim().to_string()).filter(|key| !key.is_empty());
+        return match (searxng, tinyfish) {
+            (Some(_), Some(_)) => anyhow::bail!("{names} are both set; web_search can use only one of them"),
+            (Some(url), None) => Ok(Some(SearchBackend::Searxng(url))),
+            (None, Some(key)) => Ok(Some(SearchBackend::Tinyfish(key))),
+            (None, None) => Ok(None),
+        };
+    }
+    Ok(None)
 }
 
 // A number from the command line or the environment, `from` naming which, so a value that
@@ -495,6 +520,7 @@ pub(crate) struct FileConfig {
     pub(crate) token: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) searxng: Option<String>,
+    pub(crate) tinyfish: Option<String>,
     pub(crate) system_prompt: Option<String>,
 
     // Directories the file tools may read but never write, on top of the working
@@ -548,8 +574,8 @@ pub(crate) const CONFIG_VERSION: u32 = 1;
 // The top-level keys of the file itself, which a provider may not be named after: its
 // section would be taken for the setting, or the setting for its section.
 const RESERVED_KEYS: &[&str] = &[
-    "version", "providers", "provider", "url", "token", "model", "searxng", "system_prompt",
-    "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
+    "version", "providers", "provider", "url", "token", "model", "searxng", "tinyfish",
+    "system_prompt", "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
     "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "models",
 ];
 
@@ -675,6 +701,8 @@ version = 1
 
 # Search through a SearxNG instance instead of DuckDuckGo.
 # searxng = "http://127.0.0.1:8888"
+# Or through the Tinyfish Search API, with your key (only one of the two).
+# tinyfish = "your-api-key"
 
 # Replaces haico's own system prompt: the text itself, or a path to a file holding it.
 # system_prompt = "path/to/prompt.txt"
@@ -702,7 +730,7 @@ version = 1
 # reasoning_threshold = 800
 
 # Per-model settings, keyed by the name the server reports. Takes every setting above
-# except providers, provider, searxng, system_prompt, read_paths, tui and mouse, plus:
+# except providers, provider, searxng, tinyfish, system_prompt, read_paths, tui and mouse, plus:
 #   use_system_prompt = false     for a model trained with instructions of its own
 #   sub_agent_effort = "low"      reasoning_effort for research, review and summaries
 
@@ -1165,6 +1193,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  LLM_URL       LLM server URL (overridden by --url)");
     println!("  LM_API_TOKEN  API token for authenticated servers (overridden by --token)");
     println!("  SEARXNG_URL   SearxNG instance for web_search (overridden by --searxng)");
+    println!("  TINYFISH_API_KEY Tinyfish key for web_search (overridden by --tinyfish)");
     println!("  HAICO_CONTEXT Model context window in tokens (overridden by --context)");
     println!("  HAICO_DEBUG   Set to 1 to append diagnostics to {}", crate::store::display("debug.log"));
     println!("\nConfig file: {} — supplies defaults for all of the above,", crate::store::display("config.toml"));
@@ -1249,6 +1278,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  {} --token sk-lm-...              # Server with authentication enabled", program);
     println!("  LM_API_TOKEN=sk-lm-... {}         # Token via environment variable", program);
     println!("  {} --searxng http://127.0.0.1:8080  # Search via SearxNG instead of DuckDuckGo", program);
+    println!("  {} --tinyfish YOUR-KEY            # Search via Tinyfish instead of DuckDuckGo", program);
     println!("  {} --context 32768                # Warn about /compact sooner on a small window", program);
     println!("  {} --resume                       # Continue this directory's last conversation", program);
     println!("  {} -p \"Update dependencies and commit\"  # Run one task unattended, then exit", program);
@@ -1300,6 +1330,35 @@ mod tests {
         assert_eq!(number::<f64>(Some("0".into()), "--temperature", false).unwrap(), Some(0.0));
     }
 
+    #[test]
+    fn search_backend_is_decided_by_the_highest_layer_that_names_one() {
+        use crate::tools::SearchBackend;
+        let some = |s: &str| Some(s.to_string());
+
+        // The command line's key outranks the file's instance.
+        let chosen = search_backend([
+            (None, some(" key "), "cli"),
+            (None, None, "env"),
+            (some("http://127.0.0.1:8888/"), None, "file"),
+        ]);
+        assert!(matches!(chosen.unwrap(), Some(SearchBackend::Tinyfish(key)) if key == "key"));
+
+        // A lower layer is asked when the higher ones are silent; the slash is trimmed.
+        let chosen = search_backend([(None, None, "cli"), (some("http://127.0.0.1:8888/"), None, "env")]);
+        assert!(matches!(chosen.unwrap(), Some(SearchBackend::Searxng(url)) if url == "http://127.0.0.1:8888"));
+
+        // An empty value decides too: DuckDuckGo, whatever the file says.
+        let chosen = search_backend([(some(""), None, "cli"), (None, some("key"), "file")]);
+        assert!(chosen.unwrap().is_none());
+
+        // Both in one layer is refused, naming the pair.
+        let error = search_backend([(some("http://x"), some("key"), "--searxng and --tinyfish")])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--searxng and --tinyfish"), "{error}");
+    }
+
     fn config_with(toml_text: &str) -> crate::Config {
         crate::Config {
             llm_url: "http://127.0.0.1:1234".to_string(),
@@ -1310,7 +1369,7 @@ mod tests {
             server: false,
             gui: false,
             url_supplied: false,
-            searxng: None,
+            search: None,
             context_arg: None,
             temperature_arg: None,
             max_tokens_arg: None,

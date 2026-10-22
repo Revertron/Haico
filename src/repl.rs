@@ -496,8 +496,10 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         Some(provider) => outln!("Connecting to {} at: {}", provider, config.llm_url),
         None => outln!("Connecting to LLM server at: {}", config.llm_url),
     }
-    if let Some(searxng) = &config.searxng {
-        outln!("Searching through SearxNG at: {}", searxng);
+    match &config.search {
+        Some(SearchBackend::Searxng(url)) => outln!("Searching through SearxNG at: {}", url),
+        Some(SearchBackend::Tinyfish(_)) => outln!("Searching through Tinyfish"),
+        None => {}
     }
 
     let selected_model = match choose_model(&config, keys.as_mut()).await {

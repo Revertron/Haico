@@ -175,7 +175,7 @@ impl Agent {
         let settings = resolve_settings(&config, &client.model);
         client.apply_settings(&settings);
 
-        let server = MyMcpServer::new(client.clone(), true, config.searxng.clone(), true);
+        let server = MyMcpServer::new(client.clone(), true, config.search.clone(), true);
         // `--tools` narrows what is offered, not what the server can run: `research` still
         // drives `web_search` and `web_get` itself when only `research` was asked for.
         let tools = mcp_tools_to_openai_format(&server)

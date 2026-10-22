@@ -79,12 +79,14 @@ exposing web_get (raw page text) and hiding web_fetch (summarization).");
         eprintln!("[haico] no --model given; using the model already loaded on the LLM server.");
     }
 
-    if let Some(searxng) = &config.searxng {
-        eprintln!("[haico] web_search will query SearxNG at {}.", searxng);
+    match &config.search {
+        Some(SearchBackend::Searxng(url)) => eprintln!("[haico] web_search will query SearxNG at {}.", url),
+        Some(SearchBackend::Tinyfish(_)) => eprintln!("[haico] web_search will query Tinyfish."),
+        None => {}
     }
 
     let lm_client = LMStudioClient::new(config.llm_url, model, config.token);
-    let server = MyMcpServer::new(lm_client, config.url_supplied, config.searxng, false);
+    let server = MyMcpServer::new(lm_client, config.url_supplied, config.search, false);
 
     eprintln!("[haico] MCP server ready; serving over stdio.");
     let running = server

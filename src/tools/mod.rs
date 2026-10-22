@@ -49,9 +49,9 @@ pub(crate) struct MyMcpServer {
     // LRU cache of the last ~10 fetched pages, keyed by (upgraded) URL. Shared across
     // clones via Arc so web_fetch and web_get (and the REPL) hit the same cache.
     pub(crate) cache: Arc<Mutex<LruCache<String, FetchResult>>>,
-    // Base URL of a SearxNG instance (--searxng / SEARXNG_URL). When set, web_search goes
-    // through it instead of DuckDuckGo.
-    pub(crate) searxng: Option<String>,
+    // A SearxNG instance or a Tinyfish key (--searxng / --tinyfish). When set, web_search
+    // goes through it instead of DuckDuckGo.
+    pub(crate) search: Option<SearchBackend>,
     // Files this session has seen, and what was true of them when it saw them. `edit` and
     // `write_file` consult this so a model cannot rewrite a file it has never looked at, or
     // one that changed underneath it since it looked. Shared across clones via Arc.
@@ -164,7 +164,7 @@ impl MyMcpServer {
     pub(crate) fn new(
         llm_client: LMStudioClient,
         expose_web_fetch: bool,
-        searxng: Option<String>,
+        search: Option<SearchBackend>,
         interactive: bool,
     ) -> Self {
         let mut tool_router = Self::full_router();
@@ -201,7 +201,7 @@ impl MyMcpServer {
             tool_router,
             llm_client,
             cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
-            searxng,
+            search,
             seen_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
             checkpoints: Arc::new(Mutex::new(Vec::new())),

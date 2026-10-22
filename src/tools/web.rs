@@ -242,8 +242,19 @@ pub(crate) fn resolve_result_url(href: Option<&str>, display_text: &str) -> Stri
     }
 }
 
-// One parsed search result. Both backends (DuckDuckGo and SearxNG) produce these, and
-// format_search_results renders them, so the tool's output looks the same either way.
+// What web_search goes through instead of DuckDuckGo, chosen at start-up from --searxng
+// or --tinyfish (or their environment and config equivalents). Unset means DuckDuckGo.
+
+#[derive(Clone)]
+pub(crate) enum SearchBackend {
+    // Base URL of a SearxNG instance, without the trailing slash.
+    Searxng(String),
+    // A Tinyfish Search API key.
+    Tinyfish(String),
+}
+
+// One parsed search result. Every backend (DuckDuckGo, SearxNG, Tinyfish) produces these,
+// and format_search_results renders them, so the tool's output looks the same either way.
 
 pub(crate) struct SearchResult {
     pub(crate) title: String,
@@ -394,6 +405,111 @@ pub(crate) async fn searxng_search(
     Ok(CallToolResult::success(vec![ContentBlock::text(
         format_search_results(query, &results),
     )]))
+}
+
+pub(crate) const TINYFISH_URL: &str = "https://api.search.tinyfish.ai";
+
+// The Tinyfish Search API's answer. Only the fields we render are declared; `date` comes
+// with news and with some web results.
+
+#[derive(Deserialize)]
+pub(crate) struct TinyfishResponse {
+    #[serde(default)]
+    pub(crate) results: Vec<TinyfishResult>,
+}
+
+
+#[derive(Deserialize)]
+pub(crate) struct TinyfishResult {
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) snippet: String,
+    #[serde(default)]
+    pub(crate) date: Option<String>,
+}
+
+// Search through the Tinyfish Search API (--tinyfish / TINYFISH_API_KEY). `endpoint` is
+// TINYFISH_URL outside the tests.
+//
+// One request, one page of results: every page is a request against the key's rate limit
+// (30 a minute by default), and a model asking for more than a page is rarely helped by
+// the second one.
+//
+// As with SearxNG there is no fallback to DuckDuckGo: the key was given deliberately, so
+// a rejected key or a spent allowance is reported, and says which, because the model can
+// do nothing about either and the user can.
+
+pub(crate) async fn tinyfish_search(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<CallToolResult, McpError> {
+    let response = client
+        .get(format!("{}?query={}", endpoint, urlencoding::encode(query)))
+        .header("X-API-Key", api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("Failed to reach Tinyfish search: {}", e), None)
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        McpError::internal_error(format!("Failed to read response body: {}", e), None)
+    })?;
+
+    if !status.is_success() {
+        let reason = match status.as_u16() {
+            401 => "the API key was rejected. Check --tinyfish, TINYFISH_API_KEY or `tinyfish` \
+                    in the config."
+                .to_string(),
+            402 => "the free daily allowance is used up and the wallet is empty.".to_string(),
+            429 => "too many searches in the last minute; wait a minute before searching again."
+                .to_string(),
+            // Anything else is passed on as the service said it. Capped, because a proxy in
+            // front of the API may answer with a whole HTML page.
+            _ => truncate_at_boundary(body.trim(), 1000).to_string(),
+        };
+        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "Tinyfish search failed (HTTP {}): {}",
+            status.as_u16(),
+            reason
+        ))]));
+    }
+
+    let parsed = serde_json::from_str::<TinyfishResponse>(&body).map_err(|e| {
+        McpError::internal_error(format!("Tinyfish returned an unreadable answer: {}", e), None)
+    })?;
+
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        format_search_results(query, &tinyfish_results(parsed, max_results)),
+    )]))
+}
+
+
+// The date leads the snippet: a model judging whether a page is current has nothing else
+// to go on before opening it.
+
+pub(crate) fn tinyfish_results(response: TinyfishResponse, max_results: usize) -> Vec<SearchResult> {
+    response
+        .results
+        .into_iter()
+        .take(max_results)
+        .map(|r| SearchResult {
+            title: r.title,
+            url: r.url,
+            snippet: match r.date.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                Some(date) => format!("[{}] {}", date, r.snippet),
+                None => r.snippet,
+            },
+        })
+        .collect()
 }
 
 // Scrape SearxNG's "simple" theme result page. Results are <article class="result">, with
@@ -599,14 +715,21 @@ impl MyMcpServer {
     }
 
 
-    #[tool(description = "Use when the snippets alone will answer you — search the web by keywords and get back titles, URLs and snippets, using DuckDuckGo (or a configured SearxNG instance). If the snippets settle it, you are done. If they do not, and you are about to start opening the results one by one, stop and call research with the question instead: it does the searching and the reading and hands back the answer, without the pages landing in your context.")]
+    #[tool(description = "Use when the snippets alone will answer you — search the web by keywords and get back titles, URLs and snippets, using DuckDuckGo (or the configured SearxNG or Tinyfish). If the snippets settle it, you are done. If they do not, and you are about to start opening the results one by one, stop and call research with the question instead: it does the searching and the reading and hands back the answer, without the pages landing in your context.")]
     pub(crate) async fn web_search(&self, params: Parameters<WebSearchParams>) -> Result<CallToolResult, McpError> {
         let query = params.0.query.clone();
         let max_results = params.0.max_results.unwrap_or(10);
 
-        // A configured SearxNG instance replaces DuckDuckGo entirely.
-        if let Some(base_url) = &self.searxng {
-            return searxng_search(&self.web_client, base_url, &query, max_results).await;
+        // A configured backend replaces DuckDuckGo entirely.
+        match &self.search {
+            Some(SearchBackend::Searxng(base_url)) => {
+                return searxng_search(&self.web_client, base_url, &query, max_results).await;
+            }
+            Some(SearchBackend::Tinyfish(api_key)) => {
+                return tinyfish_search(&self.web_client, TINYFISH_URL, api_key, &query, max_results)
+                    .await;
+            }
+            None => {}
         }
 
         // URL encode the query
@@ -823,6 +946,77 @@ mod tests {
         assert!(blocked_reason(StatusCode::OK, &other).is_none());
     }
 
+
+    // Answers one request with `response` verbatim (status line and all) and hands back the
+    // request head, so a test can see the query string and the key header.
+    async fn serve_raw(response: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = head.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            *sink.lock().unwrap() = String::from_utf8_lossy(&request).to_string();
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        (format!("http://{}", addr), head)
+    }
+
+    #[tokio::test]
+    async fn tinyfish_search_sends_the_key_and_renders_the_results() {
+        const RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 342\r\nConnection: close\r\n\r\n{\"query\":\"rust async\",\"results\":[{\"position\":1,\"site_name\":\"rust-lang.org\",\"title\":\"Async Book\",\"snippet\":\"Asynchronous programming in Rust.\",\"url\":\"https://rust-lang.github.io/async-book/\",\"date\":\"2026-01-02\"},{\"position\":2,\"site_name\":\"tokio.rs\",\"title\":\"Tokio\",\"snippet\":\"A runtime.\",\"url\":\"https://tokio.rs/\"}],\"total_results\":2,\"page\":0}";
+        let (url, head) = serve_raw(RESPONSE).await;
+
+        let result = super::tinyfish_search(&reqwest::Client::new(), &url, "secret", "rust async", 10)
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_ne!(result.is_error, Some(true), "{text}");
+        assert!(text.contains("(2 results)"), "{text}");
+        assert!(text.contains("1. Async Book\n   URL: https://rust-lang.github.io/async-book/\n   [2026-01-02] Asynchronous"), "{text}");
+        assert!(text.contains("2. Tokio\n   URL: https://tokio.rs/\n   A runtime."), "{text}");
+
+        let head = head.lock().unwrap().to_lowercase();
+        assert!(head.starts_with("get /?query=rust%20async "), "{head}");
+        assert!(head.contains("x-api-key: secret\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn tinyfish_search_names_a_rejected_key() {
+        const RESPONSE: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (url, _head) = serve_raw(RESPONSE).await;
+
+        let result = super::tinyfish_search(&reqwest::Client::new(), &url, "wrong", "q", 10).await.unwrap();
+        let text = result_text(&result);
+        assert_eq!(result.is_error, Some(true), "{text}");
+        assert!(text.contains("HTTP 401") && text.contains("API key was rejected"), "{text}");
+    }
+
+    #[test]
+    fn tinyfish_results_stop_at_max_results() {
+        let response: super::TinyfishResponse = serde_json::from_value(json!({
+            "results": [
+                {"title": "a", "url": "https://a/", "snippet": "first", "date": " "},
+                {"title": "b", "url": "https://b/", "snippet": "second"},
+            ]
+        }))
+        .unwrap();
+        let results = super::tinyfish_results(response, 1);
+        assert_eq!(results.len(), 1);
+        // A blank date adds nothing to the snippet.
+        assert_eq!(results[0].snippet, "first");
+    }
 
     #[test]
     fn parses_searxng_html_results() {

@@ -34,7 +34,7 @@ and a context budget measured by the server's own token count.
 - **Shell** – `run_command` with a timeout (up to an hour), and `run_background` /
   `background_output` / `background_stop` for servers and long builds. Cargo output is shortened
   before the model sees it, never dropping an error.
-- **Web** – `web_search` (DuckDuckGo, or your own SearxNG), `web_get` (a page as clean text),
+- **Web** – `web_search` (DuckDuckGo, your own SearxNG, or Tinyfish), `web_get` (a page as clean text),
   `web_fetch` (a page summarized by the LLM).
 - **Rust crates** – `crate_info`, `crate_search` and `crate_api` look up crates.io and docs.rs.
 - **Sub-agents** – `research` answers a question from the web in its own conversation, and
@@ -126,7 +126,7 @@ version = 1
 providers = ["lmstudio", "ollama"]
 provider  = "lmstudio"              # the one to start with (default: the first)
 
-searxng    = "http://127.0.0.1:8888"
+searxng    = "http://127.0.0.1:8888"  # or tinyfish = "your-api-key", not both
 read_paths = ["C:/src/shared-lib"]  # readable by the file tools, never writable
 tui        = "fullscreen"           # or "inline"
 mouse      = "scroll"               # or "off"
@@ -168,6 +168,7 @@ window set with `/set context`. Other `/set` changes last for the session.
 -t, --token TOKEN         API token for servers with authentication enabled
 -s, --system-prompt TEXT  System prompt (string or path to text file)
     --searxng URL         SearxNG instance to search through instead of DuckDuckGo
+    --tinyfish KEY        Tinyfish Search API key, to search through Tinyfish instead
     --context TOKENS      Model context window in tokens (default: 131072)
     --temperature VALUE   Sampling settings; each is left to the server unless given
     --max-tokens N
@@ -195,6 +196,7 @@ window set with `/set context`. Other `/set` changes last for the session.
 | `LLM_URL` | LLM server URL (overridden by `--url`) |
 | `LM_API_TOKEN` | API token for authenticated servers (overridden by `--token`) |
 | `SEARXNG_URL` | SearxNG instance for `web_search` (overridden by `--searxng`) |
+| `TINYFISH_API_KEY` | Tinyfish key for `web_search` (overridden by `--tinyfish`) |
 | `HAICO_CONTEXT` | Model context window in tokens (overridden by `--context`) |
 | `HAICO_TUI` | `inline` or `fullscreen`, overriding `tui` |
 | `HAICO_DEBUG` | Set to `1` to append diagnostics to `debug.log` in the data directory |
@@ -247,6 +249,18 @@ search:
 Without it, Haico falls back to scraping the HTML result page, which works but depends on
 SearxNG's markup. Most *public* instances sit behind an anti-bot challenge that blocks both;
 a self-hosted instance is the reliable option.
+
+### Searching through Tinyfish
+
+The [Tinyfish Search API](https://docs.tinyfish.ai/search-api) is the hosted alternative:
+pass your API key with `--tinyfish` (or `TINYFISH_API_KEY`, or `tinyfish` in the config).
+Like SearxNG it replaces DuckDuckGo entirely. Each search is one request for one page of
+results. A rejected key (`401`), a spent allowance (`402`) and the rate limit (`429`, 30
+searches a minute by default) are each reported as such.
+
+Only one of `searxng` and `tinyfish` may be set at a time. The command line outranks the
+environment, which outranks the config file, so `--tinyfish` overrides a `searxng` in the
+file, and `--searxng ""` switches back to DuckDuckGo for one run.
 
 ---
 
