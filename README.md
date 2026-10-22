@@ -15,6 +15,7 @@ and a context budget measured by the server's own token count.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
+- [Web search](#web-search)
 - [Using the REPL](#using-the-repl)
 - [Unattended runs](#unattended-runs)
 - [Project instructions and memory](#project-instructions-and-memory)
@@ -34,8 +35,9 @@ and a context budget measured by the server's own token count.
 - **Shell** – `run_command` with a timeout (up to an hour), and `run_background` /
   `background_output` / `background_stop` for servers and long builds. Cargo output is shortened
   before the model sees it, never dropping an error.
-- **Web** – `web_search` (DuckDuckGo, your own SearxNG, or Tinyfish), `web_get` (a page as clean text),
-  `web_fetch` (a page summarized by the LLM).
+- **Web** – `web_search` through one of three backends — DuckDuckGo (no setup), your own
+  [SearxNG](#searxng), or the hosted [Tinyfish Search API](#tinyfish) — plus `web_get` (a page
+  as clean text) and `web_fetch` (a page summarized by the LLM).
 - **Rust crates** – `crate_info`, `crate_search` and `crate_api` look up crates.io and docs.rs.
 - **Sub-agents** – `research` answers a question from the web in its own conversation, and
   `sub_agent` reads the long log or the big file for the model; only their answers enter the main
@@ -52,6 +54,7 @@ and a context budget measured by the server's own token count.
 - **Sessions** – conversations are saved per directory and continued with `--resume`;
   `/compact` (or automatic compaction near the context limit) replaces the history with notes.
 - **Unattended runs** – `-p "task"` runs one task in auto mode and exits with a status code.
+- **Tool subsets** – `--tools read,grep,ls` offers the model only the tools you list.
 - **Tracing** – every model call recorded as JSON lines, for building training data.
 - **MCP Server Mode** – the same tools over the Model Context Protocol.
 
@@ -178,6 +181,7 @@ window set with `/set context`. Other `/set` changes last for the session.
     --repeat-penalty VALUE
 -r, --resume              Continue this directory's previous conversation
 -p, --prompt TASK         Run this task unattended in auto mode, then exit
+    --tools LIST          Offer the model only these tools (comma-separated)
 -d, --dir DIR             Work in DIR instead of the current directory
     --trace FILE          Append every model call to FILE as JSON lines
     --trace-lib FILE      Append each library question and answer to FILE
@@ -227,14 +231,32 @@ LM_API_TOKEN=sk-lm-... haico --url http://127.0.0.1:1234
 Without a token, an authenticated server answers every request with `401`, and Haico says so
 directly.
 
-### Searching through SearxNG
+---
 
-`web_search` uses DuckDuckGo by default, which throttles and eventually answers with a
-bot-detection challenge. Point `--searxng` (or `searxng` in the config) at a
-[SearxNG](https://docs.searxng.org/) instance — your own, ideally — to search through it
-instead. Pass the instance's base URL; Haico appends `/search` itself. When set, SearxNG
-replaces DuckDuckGo entirely: there is no fallback between the two, so a failing instance is
-reported rather than silently worked around.
+## Web search
+
+`web_search` goes through exactly one backend, chosen at startup (SearxNG and Tinyfish are named
+in the startup banner):
+
+| Backend | How to choose it | Good for |
+| --- | --- | --- |
+| DuckDuckGo | the default; nothing to set | trying Haico out — it throttles and eventually answers with a bot-detection challenge |
+| [SearxNG](#searxng) | `--searxng URL`, `SEARXNG_URL`, or `searxng = "..."` | a self-hosted metasearch engine with no limits but your own |
+| [Tinyfish](#tinyfish) | `--tinyfish KEY`, `TINYFISH_API_KEY`, or `tinyfish = "..."` | a hosted API, with no server to run |
+
+Whichever is set replaces DuckDuckGo entirely: there is no fallback between backends, so a
+failing one is reported rather than silently worked around. Only one of `searxng` and
+`tinyfish` may be set at a time. The command line outranks the environment, which outranks the
+config file, so `--tinyfish` overrides a `searxng` in the file, and `--searxng ""` switches back
+to DuckDuckGo for one run.
+
+All three feed the same tools: the model searches with `web_search`, and `research` uses it to
+find pages before reading them in its own conversation. The backend changes nothing else.
+
+### SearxNG
+
+Point `--searxng` (or `searxng` in the config) at a [SearxNG](https://docs.searxng.org/)
+instance — your own, ideally. Pass the instance's base URL; Haico appends `/search` itself.
 
 Haico asks for JSON first, which SearxNG does **not** enable by default. Add it to the
 instance's `settings.yml`:
@@ -250,17 +272,19 @@ Without it, Haico falls back to scraping the HTML result page, which works but d
 SearxNG's markup. Most *public* instances sit behind an anti-bot challenge that blocks both;
 a self-hosted instance is the reliable option.
 
-### Searching through Tinyfish
+### Tinyfish
 
-The [Tinyfish Search API](https://docs.tinyfish.ai/search-api) is the hosted alternative:
-pass your API key with `--tinyfish` (or `TINYFISH_API_KEY`, or `tinyfish` in the config).
-Like SearxNG it replaces DuckDuckGo entirely. Each search is one request for one page of
-results. A rejected key (`401`), a spent allowance (`402`) and the rate limit (`429`, 30
-searches a minute by default) are each reported as such.
+The [Tinyfish Search API](https://docs.tinyfish.ai/search-api) is the hosted option: pass your
+API key with `--tinyfish` (or `TINYFISH_API_KEY`, or `tinyfish` in the config). Keep the key
+out of your shell history with the environment variable:
 
-Only one of `searxng` and `tinyfish` may be set at a time. The command line outranks the
-environment, which outranks the config file, so `--tinyfish` overrides a `searxng` in the
-file, and `--searxng ""` switches back to DuckDuckGo for one run.
+```bash
+TINYFISH_API_KEY=your-key haico
+```
+
+Each search is one request for one page of results. A rejected key (`401`), a spent allowance
+(`402`) and the rate limit (`429`, 30 searches a minute by default) are each reported to the
+model as such.
 
 ---
 
@@ -309,6 +333,9 @@ need approval of the exact command line.
 | `/resume`, `/clear` | Load this directory's saved conversation; start over |
 | `/exit` | Leave (Ctrl+D also works) |
 
+Typing `/` opens a list of matching commands and skills above the input box. A mistyped command
+is answered with "Unknown command" instead of being sent to the model.
+
 ### In a message and at the keyboard
 
 - `@path` attaches a file to your message, so the model does not spend a round reading it.
@@ -341,6 +368,20 @@ three times. Exit codes: `0` done, `1` a turn failed, `2` still unfinished after
 
 A fresh `-p` run does not save its conversation, so a scheduled run never replaces the one you
 left in that directory; `-p --resume` continues that conversation and saves it.
+
+### Limiting the tools
+
+`--tools` offers the model only the tools you list, in a `-p` run or in the REPL:
+
+```bash
+haico -p "Explain how config.rs resolves settings" --tools read,grep,glob_search,ls
+```
+
+A call to any other tool is refused and the model is told which tools it has; the `sub_agent`
+gets the same subset. A misspelled name stops the run with the list of real ones, and an empty
+list (`--tools ""`) offers no tools at all, for a task that is only text. The list narrows what
+the model is offered, not what Haico runs on its behalf: `--tools research` still lets the
+research sub-agent search and read pages.
 
 ---
 
