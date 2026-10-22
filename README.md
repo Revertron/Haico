@@ -7,8 +7,8 @@ and editing files, running commands and builds, searching the web. The same bina
 as a **stdio MCP server**, exposing those tools to other MCP hosts.
 
 It is built for models that run on your own GPU: tool descriptions written for small models,
-sub-agents that keep long pages and logs out of the main history, loop and repetition guards,
-and a context budget measured by the server's own token count.
+sub-agents that keep long pages and logs out of the main history, loop and repetition guards.
+It's designed primarily for efficient coding in Rust, but maybe used for other languages and environments too.
 
 ## Table of Contents
 - [Features](#features)
@@ -29,27 +29,26 @@ and a context budget measured by the server's own token count.
 
 ## Features
 
-- **File tools** – `read`, `write_file`, `edit`, `multi_edit`, `glob_search`, `grep`, `ls`. A file
-  must be read before it is modified, and a file changed on disk since is refused until it is read
-  again. Every change can be reverted with `/undo`, byte for byte.
+- **File tools** – `read`, `write_file`, `edit`, `multi_edit`, `glob_search`, `grep`, `ls`.
+  Every change can be reverted with `/undo`, byte for byte.
 - **Shell** – `run_command` with a timeout (up to an hour), and `run_background` /
   `background_output` / `background_stop` for servers and long builds. Cargo output is shortened
   before the model sees it, never dropping an error.
-- **Web** – `web_search` through one of three backends — DuckDuckGo (no setup), your own
+- **Web** – `web_search` through one of three backends — DuckDuckGo (default), your own
   [SearxNG](#searxng), or the hosted [Tinyfish Search API](#tinyfish) — plus `web_get` (a page
-  as clean text) and `web_fetch` (a page summarized by the LLM).
-- **Rust crates** – `crate_info`, `crate_search` and `crate_api` look up crates.io and docs.rs.
-- **Sub-agents** – `research` answers a question from the web in its own conversation, and
-  `sub_agent` reads the long log or the big file for the model; only their answers enter the main
+  as clean text) and `web_fetch` (a page summarized by the same LLM).
+- **Rust crates info** – `crate_info`, `crate_search` and `crate_api` look up crates.io and docs.rs.
+- **Integrated sub-agents** – introduced to save context, `research` answers a question from the web in its own context,
+  and universal `sub_agent` reads the long log or the big file for the model; only their answers enter the main
   history.
-- **Modes** – *normal* (you approve each risky call), *plan* (read-only until you approve a
-  plan), and *auto* (a second, history-free copy of the model reviews each call).
+- **The library** – also a sub-agent, your own articles about the crates you build on, any topics like APIs,
+  answered from by a librarian sub-agent and suggested automatically when a build fails.
+- **Modes** – *manual* (you approve each risky call), *plan* (read-only until you approve a
+  plan), and *auto* (a second, context-free copy of the model with specially tuned system-prompt reviews each call).
 - **Planning** – `todo_write` keeps a visible task list; `ask_user` lets the model ask you a
   question with choices.
 - **Project memory** – facts about the project that outlive a conversation (`remember`, `recall`).
 - **Skills** – reusable instructions in the `SKILL.md` format other coding agents use.
-- **The library** – your own articles about the crates you build on, answered from by a
-  librarian sub-agent and suggested automatically when a build fails.
 - **Timers** – the model can remind itself later: once, every N seconds, or on a cron schedule.
 - **Sessions** – conversations are saved per directory and continued with `--resume`;
   `/compact` (or automatic compaction near the context limit) replaces the history with notes.
@@ -67,7 +66,7 @@ and a context budget measured by the server's own token count.
 - An OpenAI-compatible LLM server: **Ollama**, **LM Studio**, **llama-server**, or similar.
 
 ```bash
-git clone https://github.com/Revertron/haico.git
+git clone https://github.com/Revertron/Haico.git
 cd haico
 cargo build --release
 ```
@@ -86,7 +85,7 @@ and needs the Lumio GUI library checked out next to this repository (`../Lumio`)
 haico
 
 # LM Studio, with a model chosen up front
-haico --url http://127.0.0.1:1234 --model qwen2.5:14b
+haico --url http://127.0.0.1:1234 --model tiel-coder-35b-a3b-mtp
 
 # Continue the conversation you left in this directory
 haico --resume
@@ -142,13 +141,13 @@ model = "qwen2.5:14b"               # the model to start with on this server
 [ollama]
 url = "http://127.0.0.1:11434"
 
-[models."qwen2.5:14b"]
-context          = 32768
-temperature      = 0.2
+[models."tiel-coder-35b-a3b-mtp"]
+context          = 131072
+temperature      = 0.3
 top_p            = 0.95
 top_k            = 40
 min_p            = 0.05
-repeat_penalty   = 1.1
+repeat_penalty   = 1.05
 reasoning_effort = "high"   # sent to the server as-is; "on"/"off" toggle thinking
 sub_agent_effort = "low"    # the same for Haico's own sub-agents
 reasoning        = "keep"   # keep | compress | drop the chain of thought after a turn
@@ -533,7 +532,7 @@ Build a release binary and register Haico in LM Studio's `mcp.json` (Program ▸
   "mcpServers": {
     "haico": {
       "command": "C:\\path\\to\\haico\\target\\release\\haico.exe",
-      "args": ["--server", "--url", "http://127.0.0.1:1234", "--model", "qwen2.5:14b"],
+      "args": ["--server", "--url", "http://127.0.0.1:1234", "--model", "tiel-coder-35b-a3b-mtp"],
       "env": { "LM_API_TOKEN": "sk-lm-..." }
     }
   }
@@ -554,7 +553,12 @@ the LLM server requires a token.
   answer from.
 
 ---
+## Contribution
+
+Any pull requests created in this repo without prior conversation with the author of Haico and his approval are rejected.
+
+---
 
 ## License
 
-This project is licensed under the **MIT License**.
+This project is licensed under the **MIT OR Apache-2.0 License**.
