@@ -871,8 +871,8 @@ pub(crate) const LOOP_BREAK: usize = 5;
 
 /// What a call that may run carries with it to the call line.
 pub(crate) struct Cleared {
-    /// Why it runs unasked, when the auto-mode reviewer is the one who said yes.
-    pub(crate) auto_note: Option<String>,
+    /// The call went up for review, so it is on screen already, diff and verdict included.
+    pub(crate) announced: bool,
     /// The user was prompted, and the prompt has already shown the diff.
     pub(crate) prompted: bool,
 }
@@ -885,13 +885,15 @@ pub(crate) struct Cleared {
 /// in. A function rather than a block of `run_turn` because the sub-agent
 /// (`crate::subagent`) makes calls too, and a call made one level down is still a
 /// call on this machine: the same boundary, the same prompt, the same reviewer.
-/// Two copies of this would be two answers to "may this run".
+/// Two copies of this would be two answers to "may this run". `nested` says which of
+/// the two is asking, which matters only to how a review is drawn.
 pub(crate) async fn authorize(
     agent: &mut Agent,
     tx: &EventSink,
     link: &TurnLink,
     tool_name: &str,
     arguments: &Value,
+    nested: bool,
 ) -> std::result::Result<Cleared, String> {
     // Decide what this specific call needs: nothing (read-only), the user's consent under
     // a narrowly scoped key, or an outright refusal. The mode has the first word — plan
@@ -912,7 +914,7 @@ pub(crate) async fn authorize(
         let _ = tx.send(AgentEvent::ToolStarted {
             name: tool_name.to_string(),
             arguments: arguments.clone(),
-            auto_note: None,
+            announced: false,
         });
         let _ = tx.send(AgentEvent::ToolResult { text: failure.clone(), failed: true });
         return Err(failure);
@@ -945,14 +947,19 @@ pub(crate) async fn authorize(
     //
     // Only a review the user interrupted with Esc still reaches the prompt: that is the
     // one outcome that proves somebody is there.
-    // Why the call is running unasked, and what to add to the prompt when it still has to
-    // be asked. Only one is ever set.
-    let mut auto_note: Option<String> = None;
-    let mut review_note: Option<ReviewNote> = None;
+    let mut announced = false;
     if link.mode() == Mode::Auto && ask.is_some() {
-        // Transient: a review takes seconds, and a silent pause reads as a hang. Erased
-        // once it lands, because the outcome belongs on the call line below — left
-        // standing, every single call would cost two lines of log to say one thing.
+        // The call goes on screen before the verdict rather than after it: a review takes
+        // seconds, and the reader can see what is being judged while it is. Every path out
+        // of the review below sends exactly one verdict to land under it.
+        announced = true;
+        let _ = tx.send(AgentEvent::ReviewStarted {
+            name: tool_name.to_string(),
+            arguments: arguments.clone(),
+            nested,
+            diff: file_change_diff(tool_name, arguments),
+            cached: agent.review_cache.remembers(tool_name, arguments),
+        });
         let verdict = interruptible(
             tx,
             link,
@@ -969,23 +976,11 @@ pub(crate) async fn authorize(
 
         match verdict {
             Some(Ok(Verdict { allow: true, reason, cached })) => {
-                // Marked, so reading back through a run still tells apart a call the
-                // reviewer weighed from one it merely recognized.
-                auto_note = Some(match cached {
-                    true => format!("cached — {}", reason),
-                    false => reason,
-                });
+                let _ = tx.send(Notice::ReviewAllowed { reason, cached }.into());
                 ask = None;
             }
             Some(Ok(Verdict { allow: false, reason, .. })) => {
-                let _ = tx.send(
-                    Notice::ReviewDenied {
-                        tool: tool_name.to_string(),
-                        arguments: arguments.clone(),
-                        reason: reason.clone(),
-                    }
-                    .into(),
-                );
+                let _ = tx.send(Notice::ReviewDenied { reason: reason.clone() }.into());
                 return Err(format!(
                     "Permission denied: this call was refused as unsafe ({}). It was not run. \
                      Do not retry it as is. Reach the goal a safer way if there is one; \
@@ -994,15 +989,7 @@ pub(crate) async fn authorize(
                 ));
             }
             Some(Err(e)) => {
-                let detail = format!("{:#}", e);
-                let _ = tx.send(
-                    Notice::ReviewFailed {
-                        tool: tool_name.to_string(),
-                        arguments: arguments.clone(),
-                        detail,
-                    }
-                    .into(),
-                );
+                let _ = tx.send(Notice::ReviewFailed { detail: format!("{:#}", e) }.into());
                 return Err(format!(
                     "Temporary error while evaluating the '{}' call, so it was not run. \
                      Nothing is known to be wrong with the call itself: make the same call \
@@ -1011,7 +998,7 @@ pub(crate) async fn authorize(
                 ));
             }
             None => {
-                review_note = Some(ReviewNote::Interrupted);
+                let _ = tx.send(Notice::ReviewInterrupted.into());
             }
         }
     }
@@ -1032,7 +1019,6 @@ pub(crate) async fn authorize(
         let answered = ask_frontend(tx, |reply| Ask::Permission {
             tool_name: tool_name.to_string(),
             arguments: arguments.clone(),
-            review: review_note.clone(),
             allow_all_label: allow_all_label.clone(),
             diff: diff_content.clone(),
             reply,
@@ -1070,7 +1056,7 @@ pub(crate) async fn authorize(
         }
     }
 
-    Ok(Cleared { auto_note, prompted })
+    Ok(Cleared { announced, prompted })
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,7 +1865,7 @@ async fn sub_agent_reply(agent: &mut Agent, tx: &EventSink, link: &TurnLink, arg
     let _ = tx.send(AgentEvent::ToolStarted {
         name: SUB_AGENT.to_string(),
         arguments: arguments.clone(),
-        auto_note: None,
+        announced: false,
     });
     let Some(report) = run_sub_agent(agent, &task, tx, link).await else {
         let _ = tx.send(Notice::Interrupted.into());
@@ -1903,7 +1889,7 @@ async fn gated_call(
     repaired: &[String],
     seen_images: &mut Vec<Value>,
 ) -> CallReply {
-    let Cleared { auto_note, prompted } = match authorize(agent, tx, link, tool_name, &arguments).await {
+    let Cleared { announced, prompted } = match authorize(agent, tx, link, tool_name, &arguments, false).await {
         Ok(cleared) => cleared,
         Err(refusal) => return refusal.into(),
     };
@@ -1914,15 +1900,15 @@ async fn gated_call(
     let _ = tx.send(AgentEvent::ToolStarted {
         name: tool_name.to_string(),
         arguments: arguments.clone(),
-        auto_note: auto_note.clone(),
+        announced,
     });
 
     // The diff belongs under the call line, not before it, and it has to appear on every
     // path that skipped the prompt — a pre-approved write and now an auto-approved one both
     // used to arrive as a path and a byte count, with no way to see what went into the
     // file. Convenience should cost the prompt, not the oversight. Suppressed only when the
-    // prompt itself already showed the same diff a moment ago.
-    if !prompted {
+    // prompt or the review already showed the same diff a moment ago.
+    if !prompted && !announced {
         if let Some(diff) = file_change_diff(tool_name, &arguments) {
             let _ = tx.send(AgentEvent::ToolDiff(diff));
         }
@@ -3496,8 +3482,13 @@ mod turn_tests {
             seen.push(event);
         }
         assert!(!seen.iter().any(|e| matches!(e, AgentEvent::Ask(_))), "the user was asked");
+        // The call went on screen before the review, and the verdict landed under it.
         assert!(
-            notices(&seen).iter().any(|n| matches!(n, Notice::ReviewFailed { tool, .. } if tool == "run_command")),
+            seen.iter().any(|e| matches!(e, AgentEvent::ReviewStarted { name, cached: false, .. } if name == "run_command")),
+            "the call was not put up for review"
+        );
+        assert!(
+            notices(&seen).iter().any(|n| matches!(n, Notice::ReviewFailed { .. })),
             "notices: {:?}",
             notices(&seen)
         );

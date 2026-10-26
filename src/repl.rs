@@ -368,7 +368,7 @@ fn describe_waiting(waiting: &Waiting) -> String {
         Waiting::Model => get_thinking_message().to_string(),
         Waiting::Compacting => "Compacting context…".to_string(),
         Waiting::CompressingReasoning => "Compressing reasoning…".to_string(),
-        Waiting::ReviewingCall => "🤖 Reviewing tool call…".to_string(),
+        Waiting::ReviewingCall => "⁇ Reviewing tool call…".to_string(),
         Waiting::Tool(name) => format!("{}…", name),
     }
 }
@@ -401,9 +401,9 @@ async fn answer_or_show(
                 let _ = reply.send(answer);
             }
         }
-        Ask::Permission { tool_name, arguments, review, allow_all_label, diff, reply } => {
+        Ask::Permission { tool_name, arguments, allow_all_label, diff, reply } => {
             // The turn sent the call; the sentence above the buttons is made here.
-            let description = permission_description(&tool_name, &arguments, review.as_ref());
+            let description = permission_description(&tool_name, &arguments);
             let response =
                 ask_about_call(keys.as_mut(), &allow_all_label, &description, diff.as_ref().map(diff_text).as_deref())
                     .await;

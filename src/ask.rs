@@ -235,7 +235,7 @@ pub(crate) async fn ask_question(
     options: &[String],
 ) -> Result<Answer> {
     outln!(
-        "\n❓ {}{}{}",
+        "\n{}? {}{}",
         SetAttribute(Attribute::Bold),
         question,
         SetAttribute(Attribute::Reset)
@@ -326,7 +326,7 @@ pub(crate) async fn ask_permission(
     description: &str,
     diff: Option<&str>,
 ) -> Result<PermissionResponse> {
-    outln!("🔒 Allow this tool usage?");
+    outln!("⚑ Allow this tool usage?");
     outln!("{}\n", description);
 
     if let Some(diff_content) = diff {
@@ -398,7 +398,7 @@ pub(crate) async fn ask_permission(
 // like it.
 
 pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecision> {
-    outln!("\n📋 Proposed plan\n");
+    outln!("\n≡ Proposed plan\n");
     // Rendered rather than printed raw: plans come back as markdown, and an unrendered
     // one is a wall of asterisks exactly when it most needs reading.
     out!("{}", crate::render::render_markdown(plan));

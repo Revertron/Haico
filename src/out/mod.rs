@@ -840,6 +840,40 @@ pub(crate) fn foldable(summary: &str, detail: &str) {
     end_fold();
 }
 
+// A line that stands in for an outcome not known yet — "Reviewing tool call…" — and the
+// handle `settle` replaces it through once it is.
+pub(crate) struct Mark(u64);
+
+// Write a line that will be replaced, and say where it went.
+//
+// `None`, and nothing written, under the inline renderer: a line handed to the terminal
+// cannot be taken back, so the outcome is simply written when it arrives. That is also
+// what a `--prompt` log wants — the verdict, not a line saying one was coming.
+pub(crate) fn placeholder(text: &str) -> Option<Mark> {
+    let mut state = lock();
+    state.screen.as_ref()?;
+    ensure_line_start_locked(&mut state);
+    state.emit(&format!("{}\n", text));
+    state.screen.as_ref().and_then(Screen::last_seq).map(Mark)
+}
+
+// Replace the placeholder with what it was waiting for — or, when there is none to
+// replace (the inline renderer, a `/clear` in between, a placeholder that has scrolled out
+// of the buffer), write the line after whatever is there now.
+pub(crate) fn settle(mark: Option<Mark>, text: &str) {
+    let mut state = lock();
+    let replaced = match (&mut state.screen, mark) {
+        (Some(screen), Some(Mark(seq))) => screen.replace(seq, text),
+        _ => false,
+    };
+    if replaced {
+        state.screen_paint();
+    } else {
+        ensure_line_start_locked(&mut state);
+        state.emit(&format!("{}\n", text));
+    }
+}
+
 // Show the detail instead of the summaries, or the other way about.
 //
 // The view goes back to following: what is on the screen has just changed height by a great
@@ -1720,5 +1754,75 @@ mod tests {
         // And the screen is a working one again rather than a dead end.
         screen.write("after\n");
         assert_eq!(screen.dump(40), "after\n");
+    }
+
+    // ---- replacing a line ----
+
+    // By sequence number, not "the last line": what landed below the placeholder while it
+    // waited stays where it is.
+    #[test]
+    fn a_placeholder_is_replaced_where_it_is_with_later_lines_left_alone() {
+        let mut screen = screen_with(&["→ run_command  cargo build"]);
+        screen.write("⁇ Reviewing tool call…\n");
+        let seq = screen.last_seq().expect("a line was written");
+        screen.write("  Searching: something\n");
+
+        assert!(screen.replace(seq, "✓ Allowed: builds the project"));
+
+        assert_eq!(
+            screen.rows(40, 20),
+            vec!["→ run_command  cargo build", "✓ Allowed: builds the project", "  Searching: something"]
+        );
+    }
+
+    // A placeholder that is no longer there is reported rather than standing in for some
+    // other line: `/clear` in between, or the buffer having dropped it off the front.
+    #[test]
+    fn a_line_that_is_gone_is_not_replaced() {
+        let mut screen = screen_with(&["waiting"]);
+        let seq = screen.last_seq().unwrap();
+        screen.forget();
+        screen.write("after the clear\n");
+        assert!(!screen.replace(seq, "verdict"));
+        assert_eq!(screen.rows(40, 20), vec!["after the clear"]);
+
+        let mut screen = super::Screen::new();
+        screen.write("first\n");
+        let first = screen.last_seq().unwrap();
+        for index in 0..super::SCROLLBACK_LINES {
+            screen.write(&format!("line {}\n", index));
+        }
+        assert!(!screen.replace(first, "verdict"));
+    }
+
+    // The colors the line inherited from the one above survive the rewrite, and the colors
+    // the next line inherits come from the new text, not the old.
+    #[test]
+    fn a_replaced_line_keeps_what_it_inherited_and_passes_on_what_it_leaves_open() {
+        let mut screen = super::Screen::new();
+        screen.write("\u{1b}[31mred\n");
+        screen.write("waiting\n");
+        let seq = screen.last_seq().unwrap();
+
+        assert!(screen.replace(seq, "done\u{1b}[0m"));
+        screen.write("plain\n");
+
+        let rows = screen.rows(40, 20);
+        assert_eq!(rows[1], "\u{1b}[31mdone\u{1b}[0m", "{:?}", rows);
+        assert_eq!(rows[2], "plain", "{:?}", rows);
+    }
+
+    // The inline renderer cannot take a row back, so there is no placeholder to replace and
+    // the outcome is simply written when it arrives.
+    #[test]
+    fn inline_a_placeholder_writes_nothing_and_the_outcome_is_written_on_its_own() {
+        let _guard = super::capture_guard();
+        super::start_capture();
+
+        let mark = super::placeholder("Reviewing tool call…");
+        assert!(mark.is_none());
+        super::settle(mark, "Allowed: fine");
+
+        assert_eq!(super::take_capture(), "Allowed: fine\n");
     }
 }

@@ -455,14 +455,30 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
         AgentEvent::ReasoningChunk(text) => {
             show(handle, move |ui| stream(ui, OPEN_REASONING, &text, true))
         }
-        AgentEvent::ToolStarted { name, arguments, auto_note } => {
+        // Drawn already, by the review it went through.
+        AgentEvent::ToolStarted { announced: true, .. } => {}
+        AgentEvent::ToolStarted { name, arguments, announced: false } => {
             let summary = crate::summary::tool_call_summary(&name, &arguments);
-            let text = match auto_note {
-                Some(note) => format!("{name} {summary}   ({note})"),
-                None => format!("{name} {summary}"),
-            };
+            let text = format!("{name} {summary}");
             show(handle, move |ui| code_line(ui, text.trim()));
         }
+        // The call and what it would change, ahead of the verdict, which arrives as a
+        // notice of its own. Nothing stands in for the wait in the transcript: the busy
+        // label already says the call is being reviewed.
+        AgentEvent::ReviewStarted { name, arguments, nested, diff, .. } => {
+            let summary = crate::summary::tool_call_summary(&name, &arguments);
+            show(handle, move |ui| {
+                if nested {
+                    line(ui, &format!("↳ {name} {summary}"), Tone::Muted);
+                } else {
+                    code_line(ui, format!("{name} {summary}").trim());
+                }
+                if let Some(diff) = &diff {
+                    diff_block(ui, diff);
+                }
+            });
+        }
+        AgentEvent::Notice(Notice::SubAgentStep { announced: true, .. }) => {}
         AgentEvent::ToolDiff(diff) => show(handle, move |ui| diff_block(ui, &diff)),
         AgentEvent::ToolResult { text, failed } => show(handle, move |ui| tool_result(ui, &text, failed)),
         // The row above the terminal's input box has no counterpart here; the
@@ -547,13 +563,13 @@ fn ask_in_window(handle: &UiHandle, ask: Ask) {
                 });
             });
         }
-        Ask::Permission { tool_name, arguments, review, allow_all_label, diff, reply } => {
+        Ask::Permission { tool_name, arguments, allow_all_label, diff, reply } => {
             // The description is built by `present.rs`, which is the terminal's
             // renderer — reused deliberately, because it is the one piece of
             // wording both frontends genuinely want the same. If a GUI ever wants
             // it laid out differently, this is the line that changes.
             let description =
-                crate::present::permission_description(&tool_name, &arguments, review.as_ref());
+                crate::present::permission_description(&tool_name, &arguments);
             show(handle, move |ui| {
                 // What is being asked goes in the transcript, where a diff gets
                 // the preformatted block the window already renders well and can
@@ -860,20 +876,21 @@ fn describe(notice: Notice) -> (String, Tone) {
             (format!("could not ask {what}: {detail}"), Tone::Error)
         }
         Notice::Refused(reason) => (reason, Tone::Error),
-        Notice::ReviewDenied { tool, arguments, reason } => {
-            let summary = crate::summary::tool_call_summary(&tool, &arguments);
-            (format!("refused by review: {tool} {summary} — {reason}"), Tone::Error)
+        Notice::ReviewAllowed { reason, cached: false } => (format!("allowed by review — {reason}"), Tone::Muted),
+        Notice::ReviewAllowed { reason, cached: true } => {
+            (format!("allowed by review, remembered — {reason}"), Tone::Muted)
         }
-        Notice::ReviewFailed { tool, arguments, detail } => {
-            let summary = crate::summary::tool_call_summary(&tool, &arguments);
-            (format!("review gave no verdict: {tool} {summary} — {detail}; the model will retry"), Tone::Warning)
+        Notice::ReviewDenied { reason } => (format!("refused by review — {reason}"), Tone::Error),
+        Notice::ReviewFailed { detail } => {
+            (format!("review gave no verdict — {detail}; the model will retry"), Tone::Warning)
         }
+        Notice::ReviewInterrupted => ("review interrupted — asking you".into(), Tone::Muted),
         Notice::PermissionAllowed => ("allowed".into(), Tone::Muted),
         Notice::PermissionAllowedAll(label) => (label, Tone::Muted),
         Notice::PermissionDenied { alternative } => {
             (format!("denied — {alternative}"), Tone::Warning)
         }
-        Notice::SubAgentStep { tool, arguments } => {
+        Notice::SubAgentStep { tool, arguments, .. } => {
             let summary = crate::summary::tool_call_summary(&tool, &arguments);
             (format!("↳ {tool} {summary}"), Tone::Muted)
         }
@@ -1647,7 +1664,7 @@ mod tests {
             }
             AgentEvent::ReplyChunk(text) => stream_reply(ui, &text),
             AgentEvent::ReasoningChunk(text) => stream(ui, OPEN_REASONING, &text, true),
-            AgentEvent::ToolStarted { name, arguments, .. } => {
+            AgentEvent::ToolStarted { name, arguments, .. } | AgentEvent::ReviewStarted { name, arguments, .. } => {
                 let summary = crate::summary::tool_call_summary(&name, &arguments);
                 code_line(ui, format!("{name} {summary}").trim());
             }
@@ -1726,7 +1743,7 @@ mod tests {
             AgentEvent::ToolStarted {
                 name: "read".into(),
                 arguments: json!({ "file_path": "src/main.rs" }),
-                auto_note: None,
+                announced: false,
             },
             AgentEvent::ToolResult { text: "fn main() {\n    let xs = vec![1, 2, 3];\n}".into(), failed: false },
             AgentEvent::ToolDiff(crate::diff::generate_diff(
@@ -2379,8 +2396,11 @@ mod tests {
             Notice::PlanRejected,
             Notice::AskFailed { what: "w", detail: "d".into() },
             Notice::Refused("r".into()),
-            Notice::ReviewDenied { tool: "t".into(), arguments: json!({}), reason: "r".into() },
-            Notice::ReviewFailed { tool: "t".into(), arguments: json!({}), detail: "d".into() },
+            Notice::ReviewAllowed { reason: "r".into(), cached: false },
+            Notice::ReviewAllowed { reason: "r".into(), cached: true },
+            Notice::ReviewDenied { reason: "r".into() },
+            Notice::ReviewFailed { detail: "d".into() },
+            Notice::ReviewInterrupted,
             Notice::PermissionAllowed,
             Notice::PermissionAllowedAll("l".into()),
             Notice::PermissionDenied { alternative: "a".into() },

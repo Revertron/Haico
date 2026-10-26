@@ -97,6 +97,10 @@ pub(super) enum Kind {
 pub(super) struct Line {
     pub(super) text: String,
     pub(super) kind: Kind,
+    // How many bytes at the front of `text` are the colors inherited from the line before.
+    // A line rewritten later keeps them: they are what the line before left open, and
+    // that has not changed.
+    pub(super) carried: usize,
 }
 
 // Where the top of the viewport sits when the view is being held back.
@@ -199,6 +203,7 @@ impl Screen {
         let carried = std::mem::take(&mut self.carry);
         self.carry = open_colors(&carried, &line);
         self.lines.push_back(Line {
+            carried: carried.len(),
             text: carried + &line,
             kind: self.writing,
         });
@@ -206,6 +211,41 @@ impl Screen {
             self.lines.pop_front();
             self.dropped += 1;
         }
+    }
+
+    // The sequence number of the newest finished line, if there is one.
+    pub(super) fn last_seq(&self) -> Option<u64> {
+        (!self.lines.is_empty()).then(|| self.dropped + self.lines.len() as u64 - 1)
+    }
+
+    // Rewrite a finished line in place, or say it is no longer here: cleared by `/clear`,
+    // or fallen off the front of the buffer. By sequence number rather than "the last
+    // line", because whatever was waiting on the outcome is not the only thing writing —
+    // a step of a lookup, a timer, a queued message can land below the line in between.
+    //
+    // The new text has to close its own colors, as the old one did: the lines after it
+    // were stored with whatever the old one left open, and they are not rewritten.
+    pub(super) fn replace(&mut self, seq: u64, text: &str) -> bool {
+        let Some(index) = seq
+            .checked_sub(self.dropped)
+            .map(|index| index as usize)
+            .filter(|&index| index < self.lines.len())
+        else {
+            return false;
+        };
+        // One logical line stays one: a newline here would be a line without a sequence
+        // number of its own.
+        let text = text_and_color(text).replace('\n', " ");
+        let last = index + 1 == self.lines.len();
+        let line = &mut self.lines[index];
+        let carried = line.text[..line.carried].to_string();
+        line.text = carried.clone() + &text;
+        // The last finished line is the one whose colors the next line will inherit, and
+        // nothing has stored them yet: the unfinished line takes them only when it ends.
+        if last {
+            self.carry = open_colors(&carried, &text);
+        }
+        true
     }
 
     // Throw the transcript away.

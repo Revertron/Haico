@@ -5,14 +5,24 @@
 //! side of the seam and never from the core, so terminal knowledge cannot follow
 //! the loop when the loop moves.
 
-use crossterm::style::{Attribute, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 
 use crate::input::{echo, PROMPT};
 use crate::render::{change_preview, tool_call_line, tool_result_line, MarkdownStream};
 use serde_json::Value;
 
 use crate::render::indented_command;
-use crate::turn::{AgentEvent, Notice, ReviewNote};
+use crate::turn::{AgentEvent, Notice};
+
+/// A review on screen, waiting for its verdict.
+struct Review {
+    /// The "Reviewing tool call…" row the verdict replaces, when there is one to
+    /// replace: none for a remembered verdict, which has no wait to show, and none
+    /// under the inline renderer, which cannot take a row back.
+    mark: Option<crate::out::Mark>,
+    /// Under the call it belongs to: a step of the sub-agent's sits one level deeper.
+    indent: &'static str,
+}
 
 /// Renders events, and owns the state rendering needs: the markdown stream, and
 /// whether anything has been put on screen for the reply in progress.
@@ -34,6 +44,7 @@ pub(crate) struct Presenter {
     /// thing that actually happened, rather than an empty row. Chrome, so the
     /// pump reads it rather than the presenter drawing it.
     last_activity: Option<String>,
+    review: Option<Review>,
 }
 
 impl Presenter {
@@ -43,7 +54,29 @@ impl Presenter {
             streamed_any: false,
             streamed_thinking: false,
             last_activity: None,
+            review: None,
         }
+    }
+
+    /// Put the reviewer's verdict where the review said it would go. `dim` for the
+    /// outcomes that let the call go on, which are not news; a refusal is. The icon
+    /// alone takes `color`, so the outcome reads at a glance down a long run while
+    /// the reason keeps the color of the line it is on.
+    fn verdict(&mut self, icon: &str, color: Option<Color>, text: &str, dim: bool) {
+        let Review { mark, indent } = self.review.take().unwrap_or(Review { mark: None, indent: "    " });
+        // One row, however the reviewer worded it: a placeholder is one logical line and
+        // is replaced by one. Not clipped — this is the whole account of why consent was
+        // spent, or refused, on the user's behalf.
+        let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let base = if dim { SetForegroundColor(crate::out::DIM).to_string() } else { String::new() };
+        let icon = match color {
+            // Back to the line's own color after it, not to the terminal's default: on a
+            // dim line that would leave the reason in full white.
+            Some(color) => format!("{}{}{}{}", SetForegroundColor(color), icon, ResetColor, base),
+            None => icon.to_string(),
+        };
+        let line = format!("{}{}{} {}{}", base, indent, icon, text, ResetColor);
+        crate::out::settle(mark, &line);
     }
 
     /// The row above the input box: the last thing that happened.
@@ -140,18 +173,34 @@ impl Presenter {
                     crate::out::ensure_line_start();
                 }
             }
-            AgentEvent::ToolStarted { name, arguments, auto_note } => {
-                outln!("{}", tool_call_line(&name, &arguments, auto_note.as_deref()));
+            // Already on screen when the review put it there.
+            AgentEvent::ToolStarted { announced: true, .. } => {}
+            AgentEvent::ToolStarted { name, arguments, announced: false } => {
+                outln!("{}", tool_call_line(&name, &arguments));
             }
-            AgentEvent::ToolDiff(diff) => {
-                // A few lines of the change, with the whole diff behind them —
-                // the terminal's decision, not the turn's. It has a height, and
-                // the fold is what it has instead of scrollback.
-                let diff = crate::render::diff_text(&diff);
-                if let Some(preview) = change_preview(&diff) {
-                    crate::out::foldable(preview.trim_end_matches('\n'), &diff);
+            AgentEvent::ReviewStarted { name, arguments, nested, diff, cached } => {
+                if nested {
+                    outln!("{}", sub_agent_step_line(&name, &arguments));
+                } else {
+                    outln!("{}", tool_call_line(&name, &arguments));
                 }
+                // Before the verdict, not after: the change is what is being judged.
+                if let Some(diff) = diff {
+                    show_diff(&diff);
+                }
+                let indent = if nested { "      " } else { "    " };
+                let mark = match cached {
+                    true => None,
+                    false => crate::out::placeholder(&format!(
+                        "{}{}⁇ Reviewing tool call…{}",
+                        SetForegroundColor(crate::out::DIM),
+                        indent,
+                        ResetColor
+                    )),
+                };
+                self.review = Some(Review { mark, indent });
             }
+            AgentEvent::ToolDiff(diff) => show_diff(&diff),
             AgentEvent::ToolResult { text, failed } => {
                 // The summary is the row that used to be all there was: the
                 // first line, whole. The result itself is kept behind it now
@@ -292,7 +341,7 @@ impl Presenter {
             }
             Notice::ToolFailed(e) => outln!("[ERROR] Tool execution failed: {}", e),
             Notice::PlanModeEntered => {
-                outln!("\n📋 Plan mode — investigating before changing anything.\n")
+                outln!("\n≡ Plan mode — investigating before changing anything.\n")
             }
             Notice::PlanApproved { auto: false } => outln!("\n✓ Plan approved — starting work.\n"),
             Notice::PlanApproved { auto: true } => {
@@ -305,15 +354,27 @@ impl Presenter {
             Notice::AskFailed { what, detail } => {
                 outln!("\n[error] could not ask {}: {}", what, detail)
             }
-            Notice::Refused(reason) => outln!("\n⛔ {}\n", reason),
-            Notice::ReviewDenied { tool, arguments, reason } => {
-                outln!("{}", tool_call_line(&tool, &arguments, None));
-                outln!("⛔ Refused by review: {}\n", reason)
+            Notice::Refused(reason) => outln!("\n✘ {}\n", reason),
+            Notice::ReviewAllowed { reason, cached } => {
+                let how = if cached { "Allowed (cached)" } else { "Allowed" };
+                self.verdict("✓", Some(Color::Green), &format!("{}: {}", how, reason), true)
             }
-            Notice::ReviewFailed { tool, arguments, detail } => {
-                outln!("{}", tool_call_line(&tool, &arguments, None));
-                outln!("⚠ Review gave no verdict ({}): not run, the model will retry\n", detail)
+            // The blank row after these is the one a refusal always had: the call
+            // ends here, and the model's next move starts a new paragraph.
+            Notice::ReviewDenied { reason } => {
+                self.verdict("✘", Some(Color::Red), &format!("Refused by review: {}", reason), false);
+                outln!();
             }
+            Notice::ReviewFailed { detail } => {
+                self.verdict(
+                    "⚠",
+                    Some(Color::Yellow),
+                    &format!("Review gave no verdict ({}): not run, the model will retry", detail),
+                    false,
+                );
+                outln!();
+            }
+            Notice::ReviewInterrupted => self.verdict("↪", None, "Review interrupted: asking you", true),
             Notice::PermissionAllowed => outln!("✓ Permission granted for this request\n"),
             Notice::PermissionAllowedAll(label) => outln!("✓ {}\n", label),
             Notice::PermissionDenied { alternative } => {
@@ -342,13 +403,10 @@ impl Presenter {
             ),
             // Indented under the sub_agent call line, and dim like research's own
             // progress: these are the steps of one call, not calls of their own.
-            Notice::SubAgentStep { tool, arguments } => outln!(
-                "{}  ↳ {} {}{}",
-                SetForegroundColor(crate::out::DIM),
-                tool,
-                crate::summary::tool_call_summary(&tool, &arguments),
-                ResetColor
-            ),
+            Notice::SubAgentStep { announced: true, .. } => {}
+            Notice::SubAgentStep { tool, arguments, announced: false } => {
+                outln!("{}", sub_agent_step_line(&tool, &arguments))
+            }
             Notice::LookupStep(step) => {
                 outln!("{}  {}{}", SetForegroundColor(crate::out::DIM), step, ResetColor)
             }
@@ -424,18 +482,37 @@ impl Presenter {
     }
 }
 
+/// A few lines of the change, with the whole diff behind them — the terminal's
+/// decision, not the turn's. It has a height, and the fold is what it has instead
+/// of scrollback.
+fn show_diff(diff: &crate::diff::Diff) {
+    let diff = crate::render::diff_text(diff);
+    if let Some(preview) = change_preview(&diff) {
+        crate::out::foldable(preview.trim_end_matches('\n'), &diff);
+    }
+}
+
+/// One of the sub-agent's calls: indented under the `sub_agent` call line, and dim
+/// like research's own progress, because it is a step of one call rather than a
+/// call of its own.
+fn sub_agent_step_line(tool: &str, arguments: &Value) -> String {
+    format!(
+        "{}  ↳ {} {}{}",
+        SetForegroundColor(crate::out::DIM),
+        tool,
+        crate::summary::tool_call_summary(tool, arguments),
+        ResetColor
+    )
+}
+
 /// The sentence a permission prompt puts above the buttons.
 ///
 /// Rendering, not policy: the turn sends the call it wants to make and this
-/// decides how to say it — how much of a command to show, whether a byte count
-/// or a diff is the useful summary, and where the reviewer's objection goes.
-/// It lived in the turn loop until the event stream gave it somewhere better.
-pub(crate) fn permission_description(
-    tool_name: &str,
-    arguments: &Value,
-    review: Option<&ReviewNote>,
-) -> String {
-    let mut description = match tool_name {
+/// decides how to say it — how much of a command to show, and whether a byte
+/// count or a diff is the useful summary. It lived in the turn loop until the
+/// event stream gave it somewhere better.
+pub(crate) fn permission_description(tool_name: &str, arguments: &Value) -> String {
+    match tool_name {
         "web_search" => {
             let query = arguments["query"].as_str().unwrap_or("unknown");
             format!("Search the web for: '{}'", query)
@@ -476,17 +553,7 @@ pub(crate) fn permission_description(
             format!("Execute command:\n{}", indented_command(command))
         }
         _ => format!("Execute '{}' tool", tool_name),
-    };
-
-    // Why the reviewer gave no verdict goes inside the prompt rather than on a
-    // line of its own: it is the reason this prompt is being shown at all.
-    if let Some(review) = review {
-        let line = match review {
-            ReviewNote::Interrupted => "🤖 Review interrupted.".to_string(),
-        };
-        description.push_str(&format!("\n\n{}", line));
     }
-    description
 }
 
 /// The line a timer firing leaves in the transcript, in place of the echo a typed
@@ -496,7 +563,7 @@ pub(crate) fn timers_fired(fired: &[crate::timers::Fired]) -> String {
     fired
         .iter()
         .map(|f| {
-            let head = format!("⏰ Timer {} ({}): ", f.id, f.schedule.describe());
+            let head = format!("◷ Timer {} ({}): ", f.id, f.schedule.describe());
             echo(&head, &f.prompt)
         })
         .collect::<Vec<_>>()
@@ -834,18 +901,91 @@ mod presenter_tests {
         assert!(text.contains("[error] the session was not saved: could not write session.json"), "got: {text:?}");
     }
 
+    fn reviewed(nested: bool, cached: bool) -> AgentEvent {
+        AgentEvent::ReviewStarted {
+            name: "run_command".into(),
+            arguments: json!({"command": "cargo build"}),
+            nested,
+            diff: None,
+            cached,
+        }
+    }
+
+    // The call is on screen before the verdict and is not drawn again when it starts;
+    // the verdict sits under it. Inline there is no placeholder to replace, so the
+    // verdict is the only row the review adds.
+    #[test]
+    fn a_reviewed_call_is_shown_once_with_its_verdict_under_it() {
+        let text = crate::util::strip_ansi(&shown(vec![
+            reviewed(false, false),
+            Notice::ReviewAllowed { reason: "builds the project".into(), cached: false }.into(),
+            AgentEvent::ToolStarted {
+                name: "run_command".into(),
+                arguments: json!({"command": "cargo build"}),
+                announced: true,
+            },
+        ]));
+        assert_eq!(text.matches("cargo build").count(), 1, "got: {text:?}");
+        let call = text.find("→ run_command").expect("no call line");
+        let verdict = text.find("    ✓ Allowed: builds the project").expect("no verdict");
+        assert!(call < verdict, "got: {text:?}");
+        assert!(!text.contains("Reviewing"), "got: {text:?}");
+    }
+
+    // The icon carries the outcome's color and the reason goes back to the line's own:
+    // dim after an allow, the plain text color after a refusal.
+    #[test]
+    fn the_verdict_icon_is_green_for_an_allow_and_red_for_a_refusal() {
+        // Under NO_COLOR crossterm would write the colors as empty SGRs; see
+        // `a_failed_tool_result_is_shown_in_red`.
+        out::own_colors();
+        let green = SetForegroundColor(Color::Green).to_string();
+        let red = SetForegroundColor(Color::Red).to_string();
+        let dim = SetForegroundColor(out::DIM).to_string();
+
+        let allowed = shown(vec![
+            reviewed(false, false),
+            Notice::ReviewAllowed { reason: "fine".into(), cached: false }.into(),
+        ]);
+        assert!(allowed.contains(&format!("{green}✓{ResetColor}{dim} Allowed: fine")), "got: {allowed:?}");
+
+        let denied = shown(vec![reviewed(false, false), Notice::ReviewDenied { reason: "no".into() }.into()]);
+        assert!(denied.contains(&format!("{red}✘{ResetColor} Refused by review: no")), "got: {denied:?}");
+    }
+
+    #[test]
+    fn a_remembered_verdict_says_so() {
+        let text = crate::util::strip_ansi(&shown(vec![
+            reviewed(false, true),
+            Notice::ReviewAllowed { reason: "seen before".into(), cached: true }.into(),
+        ]));
+        assert!(text.contains("✓ Allowed (cached): seen before"), "got: {text:?}");
+    }
+
+    // A step of the sub-agent's is drawn as a step, and its verdict one level deeper.
+    #[test]
+    fn a_reviewed_sub_agent_step_is_indented_under_the_call() {
+        let text = crate::util::strip_ansi(&shown(vec![
+            reviewed(true, false),
+            Notice::ReviewDenied { reason: "not in the workspace".into() }.into(),
+        ]));
+        assert!(text.contains("  ↳ run_command cargo build\n"), "got: {text:?}");
+        assert!(text.contains("\n      ✘ Refused by review: not in the workspace\n"), "got: {text:?}");
+        assert!(!text.contains("→"), "got: {text:?}");
+    }
+
     #[test]
     fn the_permission_question_names_what_the_call_will_do() {
         assert_eq!(
-            permission_description("write_file", &json!({"file_path": "a.rs", "content": "12345"}), None),
+            permission_description("write_file", &json!({"file_path": "a.rs", "content": "12345"})),
             "Write 5 bytes to file: a.rs"
         );
         assert_eq!(
-            permission_description("edit", &json!({"file_path": "a.rs", "old_string": "x", "new_string": "y", "replace_all": true}), None),
+            permission_description("edit", &json!({"file_path": "a.rs", "old_string": "x", "new_string": "y", "replace_all": true})),
             "Edit file (replace all 'x'->'y') in a.rs"
         );
         assert_eq!(
-            permission_description("web_search", &json!({"query": "axum routing"}), None),
+            permission_description("web_search", &json!({"query": "axum routing"})),
             "Search the web for: 'axum routing'"
         );
     }

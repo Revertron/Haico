@@ -461,6 +461,14 @@ impl ReviewCache {
     pub(crate) fn clear(&mut self) {
         self.allowed.clear();
     }
+
+    // Whether this call's verdict is already known. Asked before the review goes on screen,
+    // so a call recognized at once is not shown waiting for a verdict it already has.
+    // `judge_tool_call` looks again; the evidence is built twice on a miss, which costs a
+    // diff against a review that costs a model round trip.
+    pub(crate) fn remembers(&self, tool_name: &str, arguments: &Value) -> bool {
+        self.allowed.contains_key(&build_evidence(tool_name, arguments))
+    }
 }
 
 // Ask the reviewer about one call.

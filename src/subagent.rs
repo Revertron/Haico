@@ -205,12 +205,16 @@ pub(crate) async fn run_sub_agent(
                     ),
                     Ok(mut arguments) => {
                         repair_leaked_arguments(&mut arguments);
-                        match authorize(agent, tx, link, &name, &arguments).await {
+                        match authorize(agent, tx, link, &name, &arguments, true).await {
                             Err(refusal) => refusal,
-                            Ok(_) => {
+                            Ok(cleared) => {
                                 let _ = tx.send(
-                                    Notice::SubAgentStep { tool: name.clone(), arguments: arguments.clone() }
-                                        .into(),
+                                    Notice::SubAgentStep {
+                                        tool: name.clone(),
+                                        arguments: arguments.clone(),
+                                        announced: cleared.announced,
+                                    }
+                                    .into(),
                                 );
                                 calls_made += 1;
                                 // In a progress scope like the main loop's calls, so a

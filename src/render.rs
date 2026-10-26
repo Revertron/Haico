@@ -720,12 +720,10 @@ pub(crate) fn find_double_closing(marker: &str, chars: &[char], start: usize) ->
 // run_command nothing prompts either — so without this the only visible sign of a model
 // going in circles was a repeated "Fancying around..." and a long wait. Seeing the same
 // call scroll past ten times is what makes a loop obvious while it is still cheap to stop.
-// `note` explains why a call that would normally have stopped to ask is running anyway.
-// It rides on the call line rather than a line of its own, so a run that was never
-// interrupted still reads as one line per call — and so the reason is impossible to miss
-// while scrolling back through what was allowed on the user's behalf.
+// Why a call that would normally have stopped to ask is running anyway is the reviewer's
+// verdict, on a row of its own under this one (`present.rs`).
 
-pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&str>) -> String {
+pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value) -> String {
     let summary = tool_call_summary(tool_name, arguments);
     let mut line = String::new();
 
@@ -765,14 +763,6 @@ pub(crate) fn tool_call_line(tool_name: &str, arguments: &Value, note: Option<&s
         } else {
             let _ = write!(line, "  {}", summary);
         }
-    }
-    if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
-        // Not clipped either, and for a sharper reason than the command: this is the whole
-        // account the user gets of why consent was spent on their behalf, on a call that
-        // would otherwise have stopped to ask them. A verdict cut off mid-sentence keeps
-        // the part that restates the call and loses the part that justifies it.
-        let note: String = note.split_whitespace().collect::<Vec<_>>().join(" ");
-        let _ = write!(line, "  (allowed by auto analyzer: {})", note);
     }
     let _ = write!(line, "{}", ResetColor);
     line

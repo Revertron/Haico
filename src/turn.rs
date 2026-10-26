@@ -200,27 +200,10 @@ pub(crate) enum Ask {
     Permission {
         tool_name: String,
         arguments: Value,
-        /// What the auto-mode reviewer said, when it declined to wave this
-        /// through. `None` when there was no reviewer or it approved.
-        review: Option<ReviewNote>,
         allow_all_label: String,
         diff: Option<crate::diff::Diff>,
         reply: oneshot::Sender<PermissionResponse>,
     },
-}
-
-/// Why a gated call reached the user despite auto mode being on.
-///
-/// A reviewer's no never gets here — it refuses the call on its own (see
-/// [`Notice::ReviewDenied`]) — and neither does a review that failed to produce a
-/// verdict, which is reported to the model as a temporary error to retry (see
-/// [`Notice::ReviewFailed`]): auto mode is for walking away, and a prompt nobody is
-/// there to answer parks the whole run. What is left is the user pressing Esc
-/// during a review, which is the one case that proves somebody is there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReviewNote {
-    /// Esc arrived while the review was running.
-    Interrupted,
 }
 
 /// Something that happened during a turn, worth one line and carrying no
@@ -278,14 +261,24 @@ pub(crate) enum Notice {
     /// The gate refused the call outright, with no prompt: outside the workspace,
     /// or a write in plan mode.
     Refused(String),
-    /// The auto-mode reviewer judged the call unsafe, and it was refused without
-    /// asking. The call travels with the reason, because the user reading back
-    /// through an unattended run needs to see what was stopped, not only why.
-    ReviewDenied { tool: String, arguments: Value, reason: String },
-    /// The auto-mode reviewer gave no verdict (cut off at its token cap, an
-    /// unreadable reply, a server error). The call was not run, and the model was
-    /// told to make it again rather than the user being asked.
-    ReviewFailed { tool: String, arguments: Value, detail: String },
+    /// The verdicts on a call put up by [`AgentEvent::ReviewStarted`], exactly one
+    /// per review. They name no call: it is already on screen, right above.
+    ///
+    /// The reviewer allowed the call, and it runs unasked. `cached` when the
+    /// verdict was remembered rather than reached: a remembered allow carries the
+    /// same weight, but reading back through a long run, it matters whether the
+    /// reviewer looked at something or recognized it.
+    ReviewAllowed { reason: String, cached: bool },
+    /// The reviewer judged the call unsafe, and it was refused without asking.
+    ReviewDenied { reason: String },
+    /// The reviewer gave no verdict (cut off at its token cap, an unreadable
+    /// reply, a server error). The call was not run, and the model was told to
+    /// make it again rather than the user being asked: auto mode is for walking
+    /// away, and a prompt nobody is there to answer parks the whole run.
+    ReviewFailed { detail: String },
+    /// Esc arrived during the review. The one outcome that proves somebody is
+    /// there, so this one goes on to the permission prompt.
+    ReviewInterrupted,
     PermissionAllowed,
     /// Allowed for the rest of the session, under the narrow key it resolved to.
     /// Carries the label so the frontend says what was actually granted.
@@ -299,7 +292,8 @@ pub(crate) enum Notice {
     /// The sub-agent is about to run one of its own calls, which has cleared every
     /// gate. Its own kind rather than `ToolStarted`, because it is one step inside
     /// a call that is already on screen, not a call of the conversation's.
-    SubAgentStep { tool: String, arguments: Value },
+    /// `announced` as on `ToolStarted`: the step was put up for review already.
+    SubAgentStep { tool: String, arguments: Value, announced: bool },
     /// One lookup inside a tool that runs a loop of its own — research's searches and
     /// pages, the librarian's sections (see `crate::progress`). Worded by the tool,
     /// because what a step was is the tool's to say.
@@ -375,11 +369,28 @@ pub(crate) enum AgentEvent {
     /// markdown stream mid-line, a fold) has exactly one place to close it.
     ReplyEnd,
     /// A tool is about to run. The arguments are the arguments, not a rendering
-    /// of them; `auto_note` is auto mode's reason, when it approved this call.
+    /// of them. `announced` when [`Self::ReviewStarted`] already put this call on
+    /// screen, with its diff, so it is not drawn a second time; still sent, because
+    /// "it runs now" is news of its own.
     ToolStarted {
         name: String,
         arguments: Value,
-        auto_note: Option<String>,
+        announced: bool,
+    },
+    /// The auto-mode reviewer is about to judge a call, which goes on screen now
+    /// rather than once it is cleared: the reader sees what is being judged while it
+    /// is, and the verdict — one of the `Notice::Review*` — lands under it.
+    ReviewStarted {
+        name: String,
+        arguments: Value,
+        /// One of the sub-agent's calls rather than the conversation's, drawn as a
+        /// step of the call already on screen.
+        nested: bool,
+        /// The change a file-writing call would make: the thing being judged.
+        diff: Option<crate::diff::Diff>,
+        /// The verdict is remembered and follows at once, so there is no wait to
+        /// show.
+        cached: bool,
     },
     /// The change a file-writing call is about to make, as a whole diff. Whether
     /// to show a few lines of it or all of it is a question about the display.
