@@ -334,6 +334,13 @@ impl Out {
 // not part of any theme, so 245 is a mid gray on a black screen and on a white one alike.
 pub(crate) const DIM: crossterm::style::Color = crossterm::style::Color::AnsiValue(245);
 
+// The band behind the user's own messages, so they stand apart from the replies when
+// scrolling back. Exact RGB rather than a palette slot: it is meant to sit a few shades off
+// the background, and a theme's idea of "dark gray" can land on the background itself.
+// The full-screen renderer fills a row to the right edge in this color (`screen::band_fill`)
+// and in no other, which is why it is one named color and not any background.
+pub(crate) const USER_BAND: crossterm::style::Color = crossterm::style::Color::Rgb { r: 55, g: 55, b: 55 };
+
 const ENTER_ALT: &str = "\x1b[?1049h";
 const LEAVE_ALT: &str = "\x1b[?1049l";
 
@@ -1391,6 +1398,32 @@ mod tests {
         let mut capture = Some(String::new());
         screen.paint(&rows, (0, 0), &mut capture, size);
         capture.unwrap_or_default()
+    }
+
+    // The user's band reaches the right edge on every row of a wrapped message, and the
+    // diff's bands, the same shape in another color, still stop where their text does.
+    #[test]
+    fn only_the_user_band_is_filled_to_the_edge() {
+        use crossterm::style::{Color, ResetColor, SetBackgroundColor};
+        use crossterm::terminal::{Clear, ClearType};
+        // Under NO_COLOR crossterm would write the band as an empty SGR; see
+        // `a_failed_tool_result_is_shown_in_red`.
+        super::own_colors();
+        let message = crate::input::echo_message("> ", "the quick brown fox jumps over the lazy dog");
+        let removed = format!("{}- gone{}", SetBackgroundColor(Color::Red), ResetColor);
+        let mut screen = screen_with(&[&message, &removed]);
+        let painted = frame(&mut screen, &[], (20, 10));
+
+        let fill = format!("{}\x1b[0m", Clear(ClearType::UntilNewLine));
+        let band = SetBackgroundColor(super::USER_BAND).to_string();
+        // Every row of the wrapped message is filled, and only those rows.
+        let message_rows = screen.rows(19, 10).iter().filter(|row| row.contains(&band)).count();
+        assert!(message_rows >= 3, "the message should have wrapped: {} rows", message_rows);
+        assert_eq!(painted.matches(&fill).count(), message_rows, "got {:?}", painted);
+        assert!(!painted.contains(&format!("gone{}", Clear(ClearType::UntilNewLine))), "got {:?}", painted);
+
+        // And it is filled on the way back to the terminal's scrollback too.
+        assert_eq!(screen.dump(19).matches(&fill).count(), message_rows);
     }
 
     // The point of keeping lines logical rather than as the rows they were last shown as:

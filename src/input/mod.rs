@@ -158,6 +158,17 @@ pub(crate) fn echo(prompt: &str, text: &str) -> String {
         .join("\n")
 }
 
+// `echo` on the user's band, for a message sent to the model, so it stands apart from the
+// replies around it. Each line opens and closes the band itself: a line that left it open
+// would hand it to whatever is written next.
+pub(crate) fn echo_message(prompt: &str, text: &str) -> String {
+    echo(prompt, text)
+        .split('\n')
+        .map(|line| format!("{}{}{}", SetBackgroundColor(out::USER_BAND), line, ResetColor))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // Read one entry with nothing else going on. The editor is redrawn after every
 // keystroke, which is cheap: it is a handful of rows, and the writer only touches the
 // ones below the transcript.

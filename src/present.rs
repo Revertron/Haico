@@ -7,7 +7,7 @@
 
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 
-use crate::input::{echo, PROMPT};
+use crate::input::{echo, echo_message, PROMPT};
 use crate::render::{change_preview, tool_call_line, tool_result_line, MarkdownStream};
 use serde_json::Value;
 
@@ -473,7 +473,7 @@ impl Presenter {
                     &format!("  the server said: {}", detail),
                 );
             }
-            Notice::QueuedSent(text) => outln!("{}", echo(PROMPT, &text)),
+            Notice::QueuedSent(text) => outln!("{}", echo_message(PROMPT, &text)),
             Notice::TimersFired(fired) => outln!("{}", timers_fired(&fired)),
             Notice::ProjectContextReloaded(name) => {
                 outln!("\nLoaded project context from {}", name)

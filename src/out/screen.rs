@@ -2,6 +2,7 @@
 //! built, scrolled by anchor, folded by line kind.
 
 use super::*;
+use crossterm::style::SetBackgroundColor;
 
 // The row that says the view is being held back, and by how much.
 //
@@ -39,6 +40,23 @@ pub(crate) fn wrap_rows(line: &str, width: usize) -> Vec<String> {
         open = open_colors(&open, row);
     }
     rows
+}
+
+// A row of the user's band, without its closing resets, or `None` for any other row.
+//
+// A background only covers the cells written, so a message echoed on the band would end
+// in a ragged edge at the end of its text. The row cannot be padded when it is stored —
+// lines are wrapped per frame, and padding for one width is wrong at the next — so the
+// fill happens here instead, by erasing to the end of the row while the band is still on.
+// Only for `USER_BAND`: the diff's red and green bands have the same shape and are meant
+// to stop where their text does.
+pub(super) fn band_fill(row: &str) -> Option<&str> {
+    let mut text = row;
+    while let Some(rest) = text.strip_suffix("\x1b[0m") {
+        text = rest;
+    }
+    let band = SetBackgroundColor(USER_BAND).to_string();
+    open_colors("", text).contains(&band).then_some(text)
 }
 
 // Everything in a stored line except the parts that move the cursor or clear the screen.
@@ -544,11 +562,21 @@ impl Screen {
                 continue;
             }
             frame.push_str(&MoveTo(0, row as u16).to_string());
-            frame.push_str(text);
-            // A row that ends with a color still open would paint it across everything the
-            // clear touches, all the way to the right edge.
-            frame.push_str("\x1b[0m");
-            frame.push_str(&Clear(ClearType::UntilNewLine).to_string());
+            match band_fill(text) {
+                // The one row that is meant to paint its color across the clear.
+                Some(text) => {
+                    frame.push_str(text);
+                    frame.push_str(&Clear(ClearType::UntilNewLine).to_string());
+                    frame.push_str("\x1b[0m");
+                }
+                None => {
+                    frame.push_str(text);
+                    // A row that ends with a color still open would paint it across
+                    // everything the clear touches, all the way to the right edge.
+                    frame.push_str("\x1b[0m");
+                    frame.push_str(&Clear(ClearType::UntilNewLine).to_string());
+                }
+            }
         }
         frame.push_str(&MoveTo(caret.1 as u16, caret.0 as u16).to_string());
         frame.push_str(&Show.to_string());
@@ -576,6 +604,18 @@ impl Screen {
     // rather than left to the terminal, so what lands in the scrollback is what was on
     // the screen.
     pub(super) fn dump(&self, width: usize) -> String {
+        // The band filled to the edge here as well, or the user's messages would come out
+        // of the alternate screen ragged.
+        let rows = |line: &str| {
+            wrap_rows(line, width)
+                .into_iter()
+                .map(|row| match band_fill(&row) {
+                    Some(text) => format!("{}{}\x1b[0m", text, Clear(ClearType::UntilNewLine)),
+                    None => row,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let mut out = String::new();
         for line in &self.lines {
             // What was on the screen is what goes into the scrollback: a detail that was
@@ -583,11 +623,11 @@ impl Screen {
             if !self.shows(line.kind) {
                 continue;
             }
-            out.push_str(&wrap_rows(&line.text, width).join("\n"));
+            out.push_str(&rows(&line.text));
             out.push('\n');
         }
         if !self.open.is_empty() && self.shows(self.writing) {
-            out.push_str(&wrap_rows(&(self.carry.clone() + &self.open), width).join("\n"));
+            out.push_str(&rows(&(self.carry.clone() + &self.open)));
             out.push('\n');
         }
         out

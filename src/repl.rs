@@ -579,7 +579,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             // It waited above the bar for as long as it was unsent. Now that it is the
             // prompt, it becomes a plain line of the transcript like anything else typed.
             let text = io.queued.remove(0);
-            outln!("{}", echo(PROMPT, &text));
+            outln!("{}", echo_message(PROMPT, &text));
             text
         } else {
             match io.keys.as_mut() {
@@ -619,7 +619,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                         // The finished entry becomes a plain line of the transcript, so
                         // the conversation reads as one when scrolled back.
                         Input::Text(text) => {
-                            outln!("{}", echo(PROMPT, &text));
+                            outln!("{}", echo_message(PROMPT, &text));
                             text
                         }
                         // Ctrl+C at the prompt abandons the half-typed line, not the
