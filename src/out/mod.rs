@@ -933,6 +933,13 @@ pub(crate) fn follow() {
     }
 }
 
+// Whether `scroll` does anything, for a prompt deciding whether to offer it. Under the inline
+// renderer the terminal's own scrollback is the way back, and a hint naming keys that do
+// nothing there would be a lie.
+pub(crate) fn scrollable() -> bool {
+    lock().screen.is_some()
+}
+
 // How tall the transcript area is, for a caller working out what a page of it is.
 pub(crate) fn viewport_rows() -> usize {
     let state = lock();

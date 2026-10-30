@@ -286,7 +286,7 @@ pub(crate) fn plan_rows(
 // button reporting; under the inline renderer the terminal keeps the wheel to itself and
 // `out::scroll` does nothing anyway. Home and End are already the editor's, so paging is
 // on PageUp and PageDown, which nothing else wanted.
-pub(super) fn scroll_rows(event: &Event) -> Option<isize> {
+pub(crate) fn scroll_rows(event: &Event) -> Option<isize> {
     // A page is a screenful less two rows, so a couple of lines of context carry over and
     // the reader can see where they were.
     let page = || out::viewport_rows().saturating_sub(2).max(1) as isize;

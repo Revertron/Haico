@@ -9,7 +9,7 @@
 //! `Keys`, and the tool body runs in both the REPL and an MCP server, where there is
 //! nobody on the other end at all.
 
-use crate::input::{echo, read_text, Editor, Input, Keys};
+use crate::input::{echo, read_text, scroll_rows, Editor, Input, Keys};
 use crate::modes::PlanDecision;
 use crate::permissions::PermissionResponse;
 use anyhow::{anyhow, Result};
@@ -333,16 +333,23 @@ pub(crate) async fn ask_permission(
         outln!("{}", diff_content);
     }
 
-    outln!("1. Allow once");
-    outln!("2. {}", allow_all_label);
-    outln!("3. Reject and provide alternative");
-    crate::out::flush();
+    // Pinned below the transcript, for the plan's reason: a diff taller than the screen has
+    // to be scrollable while the answer waits, and the answers must not scroll away with it.
+    let choices = ["Allow once", allow_all_label, "Reject and provide alternative"];
 
     let response = loop {
+        let width = crate::out::terminal_width().max(20);
+        crate::out::set_region(choice_rows(&choices, width), 0, 0);
+
         let Some(event) = keys.next().await else {
             // The keyboard reader is gone, which is not consent.
+            crate::out::clear_region();
             return Err(anyhow!("no interactive terminal to ask for permission"));
         };
+        if let Some(delta) = scroll_rows(&event) {
+            crate::out::scroll(delta);
+            continue;
+        }
 
         // Only a closed channel means nobody is there to answer. Everything else that can
         // arrive here is not an answer but is not an absent user either, and matching the
@@ -359,16 +366,16 @@ pub(crate) async fn ask_permission(
             continue;
         }
 
-        match key_event.code {
-            KeyCode::Char('1') => {
-                break PermissionResponse::Allow;
-            }
-            KeyCode::Char('2') => {
-                break PermissionResponse::AllowAll;
-            }
-            KeyCode::Char('3') => {
-                outln!("3\n");
-
+        let choice = match key_event.code {
+            KeyCode::Char(digit @ '1'..='3') => digit as usize - '1' as usize,
+            // Invalid key, continue waiting
+            _ => continue,
+        };
+        settle_choice(&choices, choice);
+        match choice {
+            0 => break PermissionResponse::Allow,
+            1 => break PermissionResponse::AllowAll,
+            _ => {
                 let mut editor = Editor::new(Vec::new());
                 let alternative = match read_text(keys, &mut editor, "> ").await {
                     Input::Text(text) => text,
@@ -380,10 +387,6 @@ pub(crate) async fn ask_permission(
 
                 break PermissionResponse::Reject(alternative.trim().to_string());
             }
-            _ => {
-                // Invalid key, continue waiting
-                continue;
-            }
         }
     };
 
@@ -394,8 +397,49 @@ pub(crate) async fn ask_permission(
     Ok(response)
 }
 
-// Show a plan and ask what to do with it. Here for the permission prompt's reason, and laid out
-// like it.
+// Same order as the permission prompt: the approvals first, the refusal last, so the key that
+// means "no" is in the same place in both.
+const PLAN_CHOICES: [&str; 3] = [
+    "Approve and start work",
+    "Approve and enable auto mode (routine calls run without asking)",
+    "Send back corrections",
+];
+
+// A prompt's numbered choices as physical rows, wrapped for the region's reason (see `wrap`).
+// Shared by the plan and permission prompts, which pin them below what they ask about so that
+// can be scrolled while the choices stay put.
+fn choice_rows(choices: &[&str], width: usize) -> Vec<String> {
+    let width = width.saturating_sub(1).max(20);
+    let mut rows = Vec::new();
+    for (index, choice) in choices.iter().enumerate() {
+        let first = format!("{}. ", index + 1);
+        let rest = " ".repeat(first.chars().count());
+        rows.extend(wrap(choice, width, &first, &rest));
+    }
+    let keys = format!("1–{} to answer", choices.len());
+    let hint = match crate::out::scrollable() {
+        true => format!("{keys}, PgUp/PgDn or the wheel to scroll"),
+        false => keys,
+    };
+    for row in wrap(&hint, width, "  ", "  ") {
+        rows.push(format!("{}{}{}", SetForegroundColor(crate::out::DIM), row, ResetColor));
+    }
+    rows
+}
+
+// Take the pinned choices down and leave the one taken in the transcript in their place. The
+// last choice is the refusal in both prompts, and a tick beside it would read as consent.
+//
+// The view goes back to the end first: the answer is written there, and a view still held
+// back on the plan or the diff would not show it.
+fn settle_choice(choices: &[&str], choice: usize) {
+    crate::out::clear_region();
+    crate::out::follow();
+    let mark = if choice + 1 == choices.len() { "✗" } else { "✓" };
+    outln!("  {} {}\n", mark, choices[choice]);
+}
+
+// Show a plan and ask what to do with it. Here for the permission prompt's reason.
 
 pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecision> {
     outln!("\n≡ Proposed plan\n");
@@ -403,17 +447,23 @@ pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecis
     // one is a wall of asterisks exactly when it most needs reading.
     out!("{}", crate::render::render_markdown(plan));
     outln!();
-    // Same shape as the permission prompt: the approvals first, the refusal last, so the
-    // key that means "no" is in the same place in both.
-    outln!("1. Approve and start work");
-    outln!("2. Approve and enable auto mode (routine calls run without asking)");
-    outln!("3. Send back corrections");
-    crate::out::flush();
 
+    // Pinned in the region rather than printed, so they stay on screen while the plan is
+    // scrolled: a plan taller than the screen used to leave only its tail and the choices
+    // visible, with every key but 1–3 swallowed, so the start of it could not be read
+    // before deciding on it.
     let decision = loop {
+        let width = crate::out::terminal_width().max(20);
+        crate::out::set_region(choice_rows(&PLAN_CHOICES, width), 0, 0);
+
         let Some(event) = keys.next().await else {
+            crate::out::clear_region();
             return Err(anyhow!("no interactive terminal to review the plan"));
         };
+        if let Some(delta) = scroll_rows(&event) {
+            crate::out::scroll(delta);
+            continue;
+        }
         // A focus change or a resize is not a decision, but it is not a missing terminal
         // either; see the permission prompt for the failure that motivated the split.
         let Event::Key(key) = event else {
@@ -422,11 +472,15 @@ pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecis
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match key.code {
-            KeyCode::Char('1') => break PlanDecision::Approve,
-            KeyCode::Char('2') => break PlanDecision::ApproveWithAuto,
-            KeyCode::Char('3') => {
-                outln!("3\n");
+        let choice = match key.code {
+            KeyCode::Char(digit @ '1'..='3') => digit as usize - '1' as usize,
+            _ => continue,
+        };
+        settle_choice(&PLAN_CHOICES, choice);
+        match choice {
+            0 => break PlanDecision::Approve,
+            1 => break PlanDecision::ApproveWithAuto,
+            _ => {
                 const PROMPT: &str = "What should change? > ";
                 let mut editor = Editor::new(Vec::new());
                 let feedback = match read_text(keys, &mut editor, PROMPT).await {
@@ -438,7 +492,6 @@ pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecis
                 outln!("{}", echo(PROMPT, &feedback));
                 break PlanDecision::Revise(feedback.trim().to_string());
             }
-            _ => continue,
         }
     };
 
@@ -508,6 +561,17 @@ mod tests {
         let reply = reply_for(&Answer::Dismissed, &offered);
         assert!(reply.contains("Decide it yourself"), "got: {}", reply);
         assert!(reply.contains("do not ask again"), "got: {}", reply);
+    }
+
+    #[test]
+    fn pinned_choices_fit_a_narrow_terminal() {
+        // Pinned in the region like the question dialog, so they owe it physical rows too.
+        const WIDTH: usize = 30;
+        let rows = choice_rows(&PLAN_CHOICES, WIDTH);
+        for row in &rows {
+            assert!(visible_width(row) < WIDTH, "{:?} is {} wide", row, visible_width(row));
+        }
+        assert!(rows[0].starts_with("1. Approve"), "got: {:?}", rows[0]);
     }
 
     #[test]
