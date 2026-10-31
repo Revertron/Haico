@@ -1070,13 +1070,6 @@ pub(crate) async fn authorize(
 // signal, and it is what guards auto mode.
 const MAX_TOOL_ROUNDS: usize = 50;
 
-// Replies in a row that were cut off for repeating themselves (see `repetition`). In a row,
-// not per turn: an auto-mode turn lives for hours, and a model that fell into a loop once,
-// was told, and went on to do an hour of real work has earned the same second chance the
-// next time. Two in a row means the nudge is not landing, and a third try would most likely
-// be the same loop at the same cost.
-pub(crate) const MAX_REPEATING_REPLIES: usize = 2;
-
 /// The identical-call guard: the (tool, arguments) pair called last, and how long the
 /// unbroken run of it is.
 ///
@@ -1167,6 +1160,10 @@ struct TurnState {
     // Set once the image recovery has run, so a failure that has nothing to do with images
     // cannot make the turn retry forever.
     stripped_images: bool,
+    // Replies in a row cut off for repeating themselves (see `repetition`), against
+    // `repetition_retries`. In a row, not per turn: an auto-mode turn lives for hours, and a
+    // model that fell into a loop once and went on to do an hour of real work has earned the
+    // same retries the next time.
     repeating_replies: usize,
 }
 
@@ -1499,27 +1496,16 @@ fn recover_from_failed_request(
     // The stream was cut off because the reply had gone into a loop. The partial reply is
     // dropped, exactly as an interrupt drops one — it is the loop, and half a tool call in
     // the history is worse than none. The history is as consistent as it was before the
-    // request, so asking again is safe; asking again *unchanged* would mostly get the same
-    // loop back, which is why the model is shown what it was repeating first.
+    // request, so the same request goes out again, unchanged: no seed is sent, so the server
+    // rolls a new one, and a loop is mostly bad luck in the sampling. A note to the model
+    // would change the request instead, costing the prefix cache and leaving the history
+    // with a remark about a reply that is no longer in it.
     if let Some(repeating) = e.downcast_ref::<Repeating>() {
         state.repeating_replies += 1;
-        let retrying = state.repeating_replies < MAX_REPEATING_REPLIES;
-        let _ = tx.send(Notice::Repeating { passage: repeating.passage.clone(), retrying }.into());
-        if !retrying {
-            return Some(TurnEnd::Failed);
-        }
-        push_user_note(
-            &mut agent.messages,
-            &format!(
-                "Your previous reply was cut off and discarded because it had \
-                 started repeating the same passage over and over:\n\n> {}\n\n\
-                 Do not go back over that reasoning again. Decide on one \
-                 concrete next step and take it now — call a tool, try a \
-                 different approach, or say plainly what you are stuck on.",
-                repeating.passage
-            ),
-        );
-        return None;
+        let of = agent.settings.repetition_retries();
+        let retry = (state.repeating_replies <= of).then_some((state.repeating_replies, of));
+        let _ = tx.send(Notice::Repeating { passage: repeating.passage.clone(), retry }.into());
+        return if retry.is_some() { None } else { Some(TurnEnd::Failed) };
     }
 
     // An image in the history is the one failure this can back out of, and the only one
@@ -3395,11 +3381,11 @@ mod turn_tests {
 
     /// The failure that motivated `repetition`: a model that never calls a tool
     /// and never finishes, only restates itself, which the tool-call loop guard
-    /// cannot see. The reply is cut off and dropped, the model is shown what it
-    /// was repeating, and the next reply is taken normally. Auto mode, because
-    /// unattended is where it cost the most.
+    /// cannot see. The reply is cut off and dropped, the same request goes out
+    /// again for a fresh seed, and the next reply is taken normally. Auto mode,
+    /// because unattended is where it cost the most.
     #[tokio::test]
-    async fn a_reply_that_repeats_itself_is_dropped_and_the_model_told() {
+    async fn a_reply_that_repeats_itself_is_dropped_and_asked_for_again() {
         let _capture = out::capture_guard();
         const ANSWER: &str = r#"{"choices":[{"message":{"role":"assistant","content":"fixed it"}}]}"#;
         let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream(), ANSWER]));
@@ -3408,7 +3394,10 @@ mod turn_tests {
 
         assert_eq!(served, 2);
         assert!(
-            notices(&events).iter().any(|n| matches!(n, Notice::Repeating { retrying: true, .. })),
+            notices(&events).iter().any(|n| matches!(
+                n,
+                Notice::Repeating { retry: Some((1, crate::config::DEFAULT_REPETITION_RETRIES)), .. }
+            )),
             "notices: {:?}",
             notices(&events)
         );
@@ -3416,35 +3405,39 @@ mod turn_tests {
         // content it would have ended on.
         let history = serde_json::to_string(&agent.messages).unwrap();
         assert!(!history.contains("finished anyway"), "the looping reply was stored");
-        // Folded into the user's own message, since the loop was the turn's first reply.
+        // Nothing was said to the model about it: the request was sent again as it was.
         let user: Vec<&Value> = agent.messages.iter().filter(|m| m["role"] == "user").collect();
         assert_eq!(user.len(), 1, "two user messages in a row");
-        let asked = user[0]["content"].as_str().unwrap();
-        assert!(asked.starts_with("debug it") && asked.contains("repeating the same passage"), "{asked}");
+        assert_eq!(user[0]["content"], "debug it");
         assert_eq!(agent.messages.last().unwrap()["content"], "fixed it");
     }
 
-    /// And when telling it does not help, the turn gives up instead of paying
-    /// for the same loop forever — which in auto mode, with no round cap, is
-    /// the only thing that would stop it.
+    /// A model that loops on every roll ends the turn once the retries are used
+    /// up, instead of paying for the same loop forever — which in auto mode, with
+    /// no round cap, is the only thing that would stop it. With 0 retries the
+    /// first loop ends it.
     #[tokio::test]
     async fn a_model_that_keeps_repeating_itself_ends_the_turn() {
-        let _capture = out::capture_guard();
-        let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream()]));
-        let (url, served) = serve_sequence(bodies).await;
-        let cwd = env::current_dir().unwrap();
-        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
-        agent.mode = Mode::Auto;
-        let link = TurnLink::new(agent.mode);
-        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        for retries in [None, Some(0), Some(1)] {
+            let _capture = out::capture_guard();
+            let bodies: &'static [&'static str] = Box::leak(Box::new([looping_stream()]));
+            let (url, served) = serve_sequence(bodies).await;
+            let cwd = env::current_dir().unwrap();
+            let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+            agent.settings.repetition_retries_setting = crate::Setting { value: retries, source: "test" };
+            agent.mode = Mode::Auto;
+            let link = TurnLink::new(agent.mode);
+            let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
 
-        assert_eq!(run_turn(&mut agent, "debug it", false, &tx, &link).await, TurnEnd::Failed);
-        assert_eq!(*served.lock().unwrap(), 2);
-        let mut seen = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            seen.push(event);
+            assert_eq!(run_turn(&mut agent, "debug it", false, &tx, &link).await, TurnEnd::Failed);
+            let expected = retries.unwrap_or(crate::config::DEFAULT_REPETITION_RETRIES) + 1;
+            assert_eq!(*served.lock().unwrap(), expected, "retries: {retries:?}");
+            let mut seen = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                seen.push(event);
+            }
+            assert!(notices(&seen).iter().any(|n| matches!(n, Notice::Repeating { retry: None, .. })));
         }
-        assert!(notices(&seen).iter().any(|n| matches!(n, Notice::Repeating { retrying: false, .. })));
     }
 
     /// A review that ends without a verdict is reported to the model as a

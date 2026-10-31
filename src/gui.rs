@@ -909,11 +909,11 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::LoopBroken { tool, count } => {
             (format!("stopped: '{tool}' called {count} times in a row"), Tone::Warning)
         }
-        Notice::Repeating { passage, retrying: true } => (
-            format!("the reply kept repeating itself, so it was dropped — telling the model: \"{passage}\""),
+        Notice::Repeating { passage, retry: Some((retry, of)) } => (
+            format!("the reply kept repeating itself, so it was dropped — asking again ({retry} of {of}): \"{passage}\""),
             Tone::Warning,
         ),
-        Notice::Repeating { passage, retrying: false } => {
+        Notice::Repeating { passage, retry: None } => {
             (format!("stopped: the model kept repeating itself: \"{passage}\""), Tone::Warning)
         }
         Notice::Retrying { error, retry, of, delay } => (
@@ -2410,8 +2410,8 @@ mod tests {
             Notice::PlanUpdated(Vec::new()),
             Notice::LoopNudge { tool: "t".into(), count: 3 },
             Notice::LoopBroken { tool: "t".into(), count: 5 },
-            Notice::Repeating { passage: "p".into(), retrying: true },
-            Notice::Repeating { passage: "p".into(), retrying: false },
+            Notice::Repeating { passage: "p".into(), retry: Some((1, 3)) },
+            Notice::Repeating { passage: "p".into(), retry: None },
             Notice::Retrying { error: "e".into(), retry: 1, of: 5, delay: std::time::Duration::from_secs(2) },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: false },
             Notice::FileAttached { path: "p".into(), lines: 3, outside: true },

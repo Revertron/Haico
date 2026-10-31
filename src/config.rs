@@ -493,6 +493,10 @@ pub(crate) struct ModelSettingsFile {
     // per-model one.
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
+    // How many times in a row a reply cut off for repeating itself is asked for again, as
+    // the same request; 0 stops the turn on the first one. Layered per model because
+    // falling into loops is a habit of a model, and of its quantization.
+    pub(crate) repetition_retries: Option<usize>,
     // Merged over the provider's and the top level's: see `ExtraBody`.
     pub(crate) extra_body: Option<ExtraBody>,
     pub(crate) extra_headers: Option<ExtraHeaders>,
@@ -642,6 +646,7 @@ pub(crate) struct FileConfig {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning: Option<Reasoning>,
     pub(crate) reasoning_threshold: Option<usize>,
+    pub(crate) repetition_retries: Option<usize>,
     pub(crate) extra_body: Option<ExtraBody>,
     pub(crate) extra_headers: Option<ExtraHeaders>,
 
@@ -679,7 +684,7 @@ pub(crate) const CONFIG_VERSION: u32 = 1;
 const RESERVED_KEYS: &[&str] = &[
     "version", "providers", "provider", "url", "token", "model", "searxng", "tinyfish",
     "system_prompt", "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
-    "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "extra_body", "extra_headers", "models",
+    "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "repetition_retries", "extra_body", "extra_headers", "models",
 ];
 
 // Parse the text of a config file. The error is the message to show, without the path,
@@ -831,6 +836,10 @@ version = 1
 # (summarized, once longer than reasoning_threshold tokens) or "drop".
 # reasoning = "keep"
 # reasoning_threshold = 800
+# A reply that starts repeating itself is cut off and dropped, and the same request sent
+# again for another roll of the dice, up to this many times in a row; 0 stops the turn
+# and says so instead.
+# repetition_retries = 3
 
 # Per-model settings, keyed by the name the server reports. Takes every setting above
 # except providers, provider, searxng, tinyfish, system_prompt, read_paths, tui and mouse, plus:
@@ -1169,6 +1178,8 @@ pub(crate) struct ResolvedSettings {
     // overrides it for the session, and the default has to be the same in both places.
     pub(crate) reasoning_setting: Setting<Reasoning>,
     pub(crate) reasoning_threshold_setting: Setting<usize>,
+    // Read through `repetition_retries` below, for the default.
+    pub(crate) repetition_retries_setting: Setting<usize>,
     // The three layers merged into one, empty when none sets anything. No provenance: a
     // merge has no single layer to name.
     pub(crate) extra_body: Map<String, Value>,
@@ -1196,6 +1207,12 @@ impl ResolvedSettings {
         self.reasoning_threshold_setting
             .value
             .unwrap_or(DEFAULT_REASONING_THRESHOLD)
+    }
+
+    pub(crate) fn repetition_retries(&self) -> usize {
+        self.repetition_retries_setting
+            .value
+            .unwrap_or(DEFAULT_REPETITION_RETRIES)
     }
 }
 
@@ -1275,6 +1292,11 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
             per_model.reasoning_threshold,
             config.file.reasoning_threshold,
         ),
+        repetition_retries_setting: pick(
+            None,
+            per_model.repetition_retries,
+            config.file.repetition_retries,
+        ),
     }
 }
 
@@ -1296,6 +1318,12 @@ pub(crate) const COMPACT_HINT_FRACTION: f64 = 0.75;
 // model, lower it on a fast one.
 
 pub(crate) const DEFAULT_REASONING_THRESHOLD: usize = 800;
+
+// Retries of a reply cut off for repeating itself, in a row. Not 0: a loop is usually bad
+// luck in the sampling rather than a dead end, and the same request with a fresh seed most
+// often comes back clean. Not more: each loop costs the minutes it took to write 800 bytes
+// twice, and a model that loops on every roll is not going to stop on the fifth.
+pub(crate) const DEFAULT_REPETITION_RETRIES: usize = 3;
 
 
 pub(crate) fn compact_hint_threshold(context_tokens: usize) -> usize {
@@ -1361,6 +1389,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  use_system_prompt = false  # send only the project's own instructions");
     println!("  reasoning      = \"keep\"    # keep | compress | drop the chain of thought");
     println!("  reasoning_threshold = 800  # tokens of thinking before compressing is worth it");
+    println!("  repetition_retries = 3     # resends of a reply cut off in a loop; 0 stops");
     println!("\nreasoning decides what happens to a thinking model's chain of thought once its");
     println!("turn is over. 'keep' sends it back with the rest of the history, which is what");
     println!("llama.cpp's --reasoning-preserve is for; 'drop' strips it, as most clients do;");

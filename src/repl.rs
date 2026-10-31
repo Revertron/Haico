@@ -1200,6 +1200,14 @@ fn show_config(agent: &Agent) {
         }
     );
     outln!(
+        "  repetition_retries {}  [{}]",
+        agent.settings.repetition_retries(),
+        match agent.settings.repetition_retries_setting.value {
+            Some(_) => agent.settings.repetition_retries_setting.source,
+            None => "built-in default",
+        }
+    );
+    outln!(
         "  system prompt     {}",
         match (agent.settings.use_system_prompt, &agent.system_prompt) {
             (true, _) => "haico's own",

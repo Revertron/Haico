@@ -31,7 +31,7 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::{authorize, push_user_note, Agent, LoopGuard, LoopVerdict, MAX_REPEATING_REPLIES};
+use crate::agent::{authorize, Agent, LoopGuard, LoopVerdict};
 use crate::config::autocompact_threshold;
 use crate::prompt::build_sub_agent_prompt;
 use crate::repetition::Repeating;
@@ -108,8 +108,8 @@ pub(crate) async fn run_sub_agent(
     let limit = autocompact_threshold(agent.context_tokens);
 
     let mut calls_made = 0usize;
-    // Replies in a row cut off for repeating themselves, against the main loop's own limit:
-    // past it the helper is made to answer instead.
+    // Replies in a row cut off for repeating themselves, against `repetition_retries`, as in
+    // the main loop: past it the helper is made to answer instead.
     let mut repeating_replies = 0usize;
     // The main loop's identical-call guard, the same type and so keyed the same way.
     let mut guard = LoopGuard::default();
@@ -142,21 +142,13 @@ pub(crate) async fn run_sub_agent(
                 message
             }
             Err(e) => {
+                // The same request again, unchanged, for a fresh seed: the main loop's reason.
                 if let Some(repeating) = e.downcast_ref::<Repeating>() {
                     repeating_replies += 1;
-                    if repeating_replies >= MAX_REPEATING_REPLIES {
+                    if repeating_replies > agent.settings.repetition_retries() {
+                        crate::debug::log("sub-agent kept repeating itself", &repeating.passage);
                         break "Your replies keep repeating themselves.";
                     }
-                    push_user_note(
-                        &mut messages,
-                        &format!(
-                            "Your previous reply was cut off and discarded because it had \
-                             started repeating the same passage over and over:\n\n> {}\n\n\
-                             Decide on one concrete next step and take it now, or give your \
-                             report.",
-                            repeating.passage
-                        ),
-                    );
                     continue;
                 }
                 crate::debug::log("sub-agent failed", &format!("{:#}", e));

@@ -384,11 +384,13 @@ impl Presenter {
                 "\n[stopped: '{}' was called {} times in a row with the same arguments]\n",
                 tool, count
             ),
-            Notice::Repeating { passage, retrying } => {
-                if retrying {
-                    outln!("\n[repeating itself: reply cut off and dropped — telling the model]");
-                } else {
-                    outln!("\n[stopped: the model kept repeating itself]");
+            Notice::Repeating { passage, retry } => {
+                match retry {
+                    Some((retry, of)) => outln!(
+                        "\n[repeating itself: reply cut off and dropped — asking again ({} of {})]",
+                        retry, of
+                    ),
+                    None => outln!("\n[stopped: the model kept repeating itself]"),
                 }
                 outln!("  \"{}\"\n", passage);
             }

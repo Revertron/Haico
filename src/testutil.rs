@@ -439,6 +439,7 @@ pub(crate) fn settings_of(
         use_system_prompt: true,
         reasoning_setting: at(None),
         reasoning_threshold_setting: at(None),
+        repetition_retries_setting: at(None),
         extra_body: serde_json::Map::new(),
         extra_headers: reqwest::header::HeaderMap::new(),
     }

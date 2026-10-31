@@ -307,9 +307,10 @@ pub(crate) enum Notice {
     /// `todo_write` set the task list.
     PlanUpdated(Vec<crate::tools::TodoItem>),
     /// A reply was cut off mid-stream for going round in a loop, and dropped.
-    /// `retrying` says whether the model has been told and asked again, or the
-    /// turn has given up; `passage` is a line of what kept coming back.
-    Repeating { passage: String, retrying: bool },
+    /// `retry` is `Some((n, of))` when the same request is being sent again, the
+    /// n-th time in a row of at most `of`, and `None` when the turn has given up;
+    /// `passage` is a line of what kept coming back.
+    Repeating { passage: String, retry: Option<(usize, usize)> },
     /// The request failed on the server's side (a 5xx, a rate limit, an error in the
     /// middle of the stream, a dropped connection) and will be sent again after `delay`.
     /// Any part of the reply already shown belonged to the failed attempt and was dropped.
