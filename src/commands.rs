@@ -63,6 +63,11 @@ pub(crate) const BUILT_IN: &[BuiltIn] = &[
     built_in("cd", &[], Args::Optional, "[path]", "Move to another project; with no path, show where you are", &[]),
     built_in("init", &[], Args::None, "", "Study the project and write its instruction file", &[]),
     built_in("tools", &[], Args::None, "", "List available tools and whether they prompt", &[]),
+    built_in("mcp", &[], Args::Optional, "[reconnect <name>]", "List the MCP servers and their tools, or restart one", &[
+        "Servers come from mcp.json in the data directory and .haico/mcp.json",
+        "in the project. 'reconnect' also asks again about a project server",
+        "that was not approved.",
+    ]),
     built_in("model", &[], Args::Optional, "[name]", "Switch model and save it as the default", &[
         "With no name, pick from the server's list.",
     ]),

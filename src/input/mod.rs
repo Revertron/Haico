@@ -215,6 +215,9 @@ pub(crate) async fn read_command(
     todos: &[TodoItem],
     plan: &mut PlanView,
     wake: Option<std::time::Instant>,
+    // Something outside the keyboard has news for the prompt — today the MCP servers
+    // finishing loading. Answered with `Wake` like a timer, and the caller looks.
+    news: impl std::future::Future<Output = ()>,
 ) -> Input {
     // Made once rather than per keystroke: typing must not keep pushing the deadline back.
     let deadline = async {
@@ -224,6 +227,7 @@ pub(crate) async fn read_command(
         }
     };
     tokio::pin!(deadline);
+    tokio::pin!(news);
     loop {
         draw(
             editor,
@@ -242,6 +246,7 @@ pub(crate) async fn read_command(
         let event = tokio::select! {
             event = keys.next() => event,
             _ = &mut deadline => return Input::Wake,
+            _ = &mut news => return Input::Wake,
         };
         let Some(event) = event else {
             return Input::Eof;

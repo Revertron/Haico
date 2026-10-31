@@ -457,6 +457,45 @@ async fn find_model(url: &str, token: Option<&str>, keys: Option<&mut Keys>) -> 
     pick_model(keys, models).await
 }
 
+/// Read both mcp.json files, ask about each project server nobody has approved yet, and
+/// start the servers in the background. Whatever happens after this arrives as the hub's
+/// notices, printed by `print_mcp_notices` while the prompt waits.
+///
+/// Asked here, before the first prompt, because a server is a process: by the time a turn
+/// wanted its tools it would be too late to have asked. With no keyboard (piped input) an
+/// unapproved server is skipped, and the hub says so.
+async fn start_mcp_servers(agent: &Agent, keys: Option<&mut Keys>, cwd: &std::path::Path) {
+    let mut startup = crate::mcp::Startup::load(cwd);
+    if let Some(keys) = keys {
+        for server in startup.unapproved() {
+            outln!();
+            for line in crate::mcp::approval_lines(&server) {
+                outln!("{}", line);
+            }
+            let choices = vec!["Approve and start".to_string(), "Skip for now".to_string()];
+            let answer = crate::picker::select_interactive(keys, "answer", choices, 0).await;
+            if answer.is_ok_and(|a| a.starts_with("Approve")) {
+                if let Err(e) = startup.approve(&server) {
+                    outln!("Could not save the approval ({:#}); it holds for this session only.", e);
+                }
+            }
+        }
+    }
+    startup.start(&agent.server.mcp);
+    print_mcp_notices(agent);
+}
+
+/// Print what the MCP servers have to say since the last time.
+fn print_mcp_notices(agent: &Agent) {
+    for notice in agent.server.mcp.take_notices() {
+        if notice.is_problem() {
+            outln!("⚠ {}", notice.text());
+        } else {
+            outln!("{}", notice.text());
+        }
+    }
+}
+
 /// The REPL, from the banner to the last background job stopped.
 pub(crate) async fn run(config: Config) -> Result<()> {
     // From here on the keyboard is read a key at a time rather than a line at a time,
@@ -550,6 +589,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         );
     }
 
+    start_mcp_servers(&agent, keys.as_mut(), &cwd).await;
+
     // Line editing and history. The editor holds what is being typed; the writer keeps
     // it pinned to the bottom of the screen and prints everything else above it.
     let history_path = history_file_path();
@@ -582,15 +623,21 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             outln!("{}", echo_message(PROMPT, &text));
             text
         } else {
+            // Whatever the MCP servers said while the last turn ran, or since the prompt
+            // last woke for them.
+            print_mcp_notices(&agent);
             match io.keys.as_mut() {
                 Some(keys) => {
-                    let status = status_line(
+                    let mut status = status_line(
                         agent.provider(),
                         agent.model(),
                         agent.reasoning_effort(),
                         agent.context_used(),
                         agent.context_tokens,
                     );
+                    if let Some((loading, total)) = agent.server.mcp.loading() {
+                        status.push_str(&format!(" • MCP {}/{}", total - loading, total));
+                    }
                     let plan = agent.plan();
                     match read_command(
                         keys,
@@ -601,6 +648,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                         &plan,
                         &mut io.plan_view,
                         agent.server.next_timer_wake(),
+                        agent.server.mcp.changed(),
                     )
                     .await
                     {
@@ -665,6 +713,9 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     if stopped > 0 {
         outln!("Stopped {} background job(s).", stopped);
     }
+    // The MCP servers' processes go too. The Job Object would take them with haico's
+    // exit anyway on Windows; this is the clean close, and the only one elsewhere.
+    agent.server.mcp.stop_all();
 
     trace::end(None);
     Ok(())
@@ -708,6 +759,7 @@ enum Cmd {
     Cd,
     Init,
     Tools,
+    Mcp,
     Model,
     Provider,
     Config,
@@ -742,6 +794,7 @@ fn command_for(name: &str) -> Option<Cmd> {
         "cd" => Cmd::Cd,
         "init" => Cmd::Init,
         "tools" => Cmd::Tools,
+        "mcp" => Cmd::Mcp,
         "model" => Cmd::Model,
         "provider" => Cmd::Provider,
         "config" => Cmd::Config,
@@ -807,9 +860,10 @@ async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf
         Cmd::Mode => show_mode(agent, None),
         Cmd::Add => add_to_workspace(agent, rest),
         Cmd::Workspace => show_workspace(agent),
-        Cmd::Cd => change_directory(agent, io, cwd, rest),
+        Cmd::Cd => change_directory(agent, io, cwd, rest).await,
         Cmd::Init => return init(agent, cwd),
         Cmd::Tools => list_tools(agent),
+        Cmd::Mcp => mcp_command(agent, io, cwd, rest).await,
         Cmd::Model => switch_model(agent, io, rest).await,
         Cmd::Provider => switch_provider(agent, io, rest).await,
         Cmd::Config => show_config(agent),
@@ -950,7 +1004,7 @@ fn show_workspace(agent: &Agent) {
     outln!("\nAnything else is refused outright, for reads as well as writes.\n");
 }
 
-fn change_directory(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, requested: &str) {
+async fn change_directory(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, requested: &str) {
     if requested.is_empty() {
         outln!("Working directory: {}\n", display_path(cwd));
         return;
@@ -974,6 +1028,9 @@ fn change_directory(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf, r
             if agent.has_saved_session() {
                 outln!("A conversation was saved here before — /resume picks it up instead.");
             }
+            // `Agent::change_directory` stopped the last project's servers; these are this
+            // one's, asked about and started the way they are at startup.
+            start_mcp_servers(agent, io.keys.as_mut(), cwd).await;
             outln!();
         }
         Err(why) => outln!("{}\n", why),
@@ -1004,6 +1061,84 @@ fn list_tools(agent: &Agent) {
         outln!("  {:<14} [{}]", tool.name, gate);
     }
     outln!();
+}
+
+/// `/mcp`: every configured server, what state it is in, and each tool with how it is
+/// gated. `/mcp reconnect <name>` restarts one, and asks first about a project server that
+/// was never approved — this is how a server skipped at startup gets a second chance.
+async fn mcp_command(agent: &Agent, io: &mut TerminalIo, cwd: &std::path::Path, argument: &str) {
+    use crate::mcp::{ReadOnly, State};
+
+    let hub = &agent.server.mcp;
+    if let Some(name) = argument.strip_prefix("reconnect").map(str::trim) {
+        if name.is_empty() {
+            outln!("Usage: /mcp reconnect <name>\n");
+            return;
+        }
+        let unapproved = hub.status().into_iter().any(|s| s.name == name && s.state == State::NotApproved);
+        if unapproved {
+            let (Some(server), Some(keys)) = (hub.config(name), io.keys.as_mut()) else {
+                outln!("\"{}\" needs approval, and there is no keyboard to ask on.\n", name);
+                return;
+            };
+            for line in crate::mcp::approval_lines(&server) {
+                outln!("{}", line);
+            }
+            let choices = vec!["Approve and start".to_string(), "Skip for now".to_string()];
+            let answer = crate::picker::select_interactive(keys, "answer", choices, 0).await;
+            if !answer.is_ok_and(|a| a.starts_with("Approve")) {
+                return;
+            }
+            if let Err(e) = crate::mcp::trust::Trust::from_store().approve(cwd, &server.name, &server.fingerprint) {
+                outln!("Could not save the approval ({:#}); it holds for this session only.", e);
+            }
+        }
+        match hub.reconnect(name) {
+            Ok(()) => print_mcp_notices(agent),
+            Err(e) => outln!("{}\n", e),
+        }
+        return;
+    }
+    if !argument.is_empty() {
+        outln!("Usage: /mcp [reconnect <name>]\n");
+        return;
+    }
+
+    let servers = hub.status();
+    if servers.is_empty() {
+        outln!("No MCP servers. Add them to {} or", store::display("mcp.json"));
+        outln!("{} in Claude Code's format.\n", display_path(&crate::mcp::config::project_path(cwd)));
+        return;
+    }
+    for server in &servers {
+        let state = match &server.state {
+            State::Loading => "loading".to_string(),
+            State::Ready => format!("{} tool(s)", server.tools.len()),
+            State::Failed(error) => format!("failed: {}", error),
+            State::Disabled => "disabled".to_string(),
+            State::NotApproved => "not approved — /mcp reconnect to ask".to_string(),
+        };
+        outln!("{} ({}) — {}", server.name, server.scope.label(), state);
+        outln!("    {}", server.target);
+        if server.state == State::Ready {
+            for tool in &server.tools {
+                let gate = if tool.auto_allow { "auto" } else { "asks" };
+                let read_only = match tool.read_only {
+                    Some(ReadOnly::Hint) => ", read-only (server)",
+                    Some(ReadOnly::Config) => ", read-only (mcp.json)",
+                    None => "",
+                };
+                outln!("    {} [{}{}]", tool.name, gate, read_only);
+            }
+        }
+        if matches!(server.state, State::Failed(_)) && !server.stderr.is_empty() {
+            outln!("    stderr:");
+            for line in &server.stderr {
+                outln!("      {}", line);
+            }
+        }
+    }
+    outln!("Tools join the conversation at the start of the next turn; read-only ones are offered in plan mode.\n");
 }
 
 fn list_skills() {

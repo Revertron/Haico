@@ -24,6 +24,7 @@ mod llm;
 #[cfg(feature = "gui")]
 mod markdown;
 mod memory;
+mod mcp;
 mod mention;
 mod modes;
 mod permissions;

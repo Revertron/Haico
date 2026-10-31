@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2021"
 description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
@@ -22,7 +22,18 @@ lumio-gui = { version = "0.7", optional = true, features = ["backend-software"] 
 # streaming renderer in render.rs, which emits escapes rather than structure and
 # is not reusable here — see plan.md 11.4.
 pulldown-cmark = { version = "0.13", optional = true, default-features = false }
-rmcp = { version = "3.4.0", features = ["transport-io"] }
+# The server side (`--server`) needs only stdio. The rest is haico as an MCP *client*, for
+# the servers listed in mcp.json: child processes and streamable HTTP, the two transports
+# that file format names.
+rmcp = { version = "3.4.0", features = [
+    "transport-io",
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+# rmcp spawns stdio servers through this; named directly for the wrappers it applies: a Job
+# Object on Windows, so `npx`'s node grandchildren die with the server, and kill-on-drop.
+process-wrap = { version = "10", features = ["tokio1"] }
 reqwest = { version = "0.13", features = ["json", "gzip", "deflate", "brotli", "zstd", "cookies"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -79,3 +90,8 @@ terminput-crossterm = "0.4"
 # forwarding the key to haico instead of acting on it. Pasting therefore has to be done
 # here, which means reading the clipboard.
 clipboard-win = "5"
+# The one flag an MCP server's process is started with: CREATE_NO_WINDOW. Without it the
+# child shares haico's console, and `npx.cmd` runs through cmd.exe, which rewrites the
+# console mode haico's VT input depends on. Same version process-wrap uses, so its
+# `CreationFlags` wrapper takes the type.
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

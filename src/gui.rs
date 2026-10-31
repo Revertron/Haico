@@ -309,6 +309,26 @@ async fn converse(
 ) {
     show(&handle, |ui| line(ui, "Ready. Type below, then Send or Ctrl+Enter.", Tone::Muted));
 
+    // The MCP servers, in the background. Their notices go straight to the window from a
+    // task of their own: this thread blocks on the input channel while idle, so it could
+    // not pass them on until the next thing was typed. A project server nobody approved is
+    // skipped — the window has no dialog for it yet, and the notice says where to ask.
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::mcp::Startup::load(&cwd).start(&agent.server.mcp);
+        let hub = agent.server.mcp.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            loop {
+                for notice in hub.take_notices() {
+                    let tone = if notice.is_problem() { Tone::Warning } else { Tone::Muted };
+                    let text = notice.text();
+                    show(&handle, move |ui| line(ui, &text, tone));
+                }
+                hub.changed().await;
+            }
+        });
+    }
+
     // The model list, fetched once so the Model menu can offer it.
     //
     // Every model the server knows, not only the loaded ones. The REPL's picker
@@ -413,6 +433,7 @@ async fn converse(
     // well: a dev server started from it would otherwise outlive it holding a port,
     // with no window left to stop it from. Nothing is said — the window is gone.
     agent.server.stop_all_background().await;
+    agent.server.mcp.stop_all();
 }
 
 /// Hand one event to the window, or answer it if it is a question.

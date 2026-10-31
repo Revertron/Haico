@@ -95,6 +95,14 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
             Err(e) => outln!("Could not resume: {:#}. Starting fresh.", e),
         }
     }
+    // Waited for, unlike at the REPL: this run sends its first request once and has no
+    // later turn for a slow server's tools to join. Bounded by each server's startup
+    // timeout. Unapproved project servers are skipped — there is nobody to ask, and an
+    // unattended run is the last place to start a command a cloned repository supplied.
+    crate::mcp::Startup::load(&cwd).start(&agent.server.mcp);
+    print_mcp_notices(&agent);
+    agent.server.mcp.wait_loaded().await;
+    print_mcp_notices(&agent);
     outln!("Running unattended in {} (auto mode).\n", display_path(&cwd));
 
     let mut input = first_message(&cwd, &task);
@@ -104,7 +112,10 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     let mut follow_ups = 0;
     let code = loop {
         outln!("{}", echoed);
-        match drive(&mut agent, &input).await {
+        let ended = drive(&mut agent, &input).await;
+        // A server lost mid-run, or one whose tool list changed.
+        print_mcp_notices(&agent);
+        match ended {
             TurnEnd::Answered => {}
             TurnEnd::Interrupted => break EXIT_INTERRUPTED,
             TurnEnd::Failed => {
@@ -145,7 +156,15 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     if stopped > 0 {
         outln!("Stopped {} background job(s).", stopped);
     }
+    agent.server.mcp.stop_all();
     Ok(code)
+}
+
+fn print_mcp_notices(agent: &Agent) {
+    for notice in agent.server.mcp.take_notices() {
+        let mark = if notice.is_problem() { "⚠ " } else { "" };
+        outln!("{}{}", mark, notice.text());
+    }
 }
 
 /// The task as the model first sees it. A task that names a skill (`/release 1.2`)

@@ -81,6 +81,9 @@ pub(crate) struct MyMcpServer {
     // One client for the web tools, for the same reason; its cookies are kept for
     // `web::COOKIE_LIFETIME`, not for the session.
     pub(crate) web_client: reqwest::Client,
+    // The external MCP servers from mcp.json (`crate::mcp`). Empty until a frontend starts
+    // them, and never started in server mode: see that module's header.
+    pub(crate) mcp: crate::mcp::Hub,
 }
 
 // A file's contents immediately before a tool changed it.
@@ -211,6 +214,7 @@ impl MyMcpServer {
             timers: Arc::new(Mutex::new(crate::timers::Timers::default())),
             crates_client: crate::tools::crates::rust_api_client(),
             web_client: crate::tools::web::browser_client(),
+            mcp: crate::mcp::Hub::default(),
         }
     }
 
@@ -395,6 +399,10 @@ impl MyMcpServer {
     // themselves, each in its own way, and a model naming a tool it was never offered —
     // `library` with no articles, `sub_agent` in server mode — reached whichever did not.
     pub(crate) async fn execute_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
+        // An external server's tool. Its result is already in this shape.
+        if name.starts_with(crate::mcp::PREFIX) && !self.tool_router.has_route(name) {
+            return self.mcp.call(name, arguments).await;
+        }
         if !self.tool_router.has_route(name) {
             return Err(anyhow::anyhow!("Unknown tool: {}", name));
         }

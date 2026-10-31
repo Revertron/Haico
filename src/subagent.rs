@@ -80,9 +80,18 @@ pub(crate) async fn run_sub_agent(
 
     // The mode's own list first: in plan mode `run_command` is not offered here either,
     // and a tool the helper cannot see is one it does not spend a round on.
-    let tools: Vec<Value> = crate::modes::tools_for_mode(link.mode(), &agent.tools)
+    //
+    // Every MCP tool the mode offers comes along. Unlike haico's write tools they are not
+    // left out: each call still meets `authorize`, so one that writes asks exactly as it
+    // would have one level up, and the user's servers are often the very thing the task is
+    // about (query this database, read that tracker).
+    let tools: Vec<Value> = agent
+        .request_tools(link.mode())
         .into_iter()
-        .filter(|tool| SUB_AGENT_TOOLS.contains(&tool["function"]["name"].as_str().unwrap_or_default()))
+        .filter(|tool| {
+            let name = tool["function"]["name"].as_str().unwrap_or_default();
+            SUB_AGENT_TOOLS.contains(&name) || name.starts_with(crate::mcp::PREFIX)
+        })
         .collect();
     let offered: Vec<String> = tools
         .iter()

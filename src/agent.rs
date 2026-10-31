@@ -96,6 +96,11 @@ pub(crate) struct Agent {
     pub(crate) server: MyMcpServer,
     /// The tool array sent with every request, built once from the router.
     pub(crate) tools: Vec<Value>,
+    /// The external MCP servers' tools, as of the start of this turn (`refresh_mcp_tools`).
+    /// A snapshot rather than asked of the hub each round: servers finish loading in the
+    /// background, and a tool list that grew between two rounds of one turn would change
+    /// the cached prefix and hand the model tools mid-task.
+    pub(crate) mcp_tools: Vec<crate::mcp::McpTool>,
     pub(crate) settings: ResolvedSettings,
     /// Pulled out of `settings` because `/context` is not the only thing that
     /// sets it and the value in force has to outlive a re-resolve.
@@ -195,6 +200,7 @@ impl Agent {
         // Before the prompt, not after: the prompt names the scratch directory, and the
         // file tools can only write there because the workspace was told about it.
         let scratch = Scratch::new();
+        server.mcp.set_spill_dir(scratch.path());
         let mut workspace = Workspace::new(cwd, &config.file.read_paths);
         allow_user_skills(&mut workspace);
         workspace.set_scratch(scratch.path());
@@ -220,6 +226,7 @@ impl Agent {
             client,
             server,
             tools,
+            mcp_tools: Vec::new(),
             settings,
             context_tokens,
             reasoning,
@@ -317,6 +324,7 @@ impl Agent {
         // so replacing the system message in it would be work thrown away.
         self.scratch.renew();
         self.workspace.set_scratch(self.scratch.path());
+        self.server.mcp.set_spill_dir(self.scratch.path());
         // Reloaded with the project's instructions, and for the same reason: anything
         // the last conversation remembered is about to be the only trace of it left.
         self.memory_index = memory::index_for_cwd();
@@ -401,6 +409,12 @@ impl Agent {
         // `clear`, which keeps them — clearing a conversation does not move the boundary
         // they were given inside of.
         self.permissions = PermissionManager::new();
+
+        // The servers too: a project's `.haico/mcp.json` was approved for that project, and
+        // its tools answer questions about it. The frontend starts the new directory's set,
+        // since starting one may mean asking the user about it.
+        self.server.mcp.stop_all();
+        self.mcp_tools.clear();
 
         self.workspace.set_cwd(&target);
         self.project_context = load_project_context();
@@ -594,7 +608,10 @@ impl Agent {
         let estimate = estimate_tokens(&self.messages);
         match self.measured {
             Some(Measured { prompt_tokens, estimate: then }) if estimate >= then => prompt_tokens + (estimate - then),
-            _ => estimate + estimate_tokens(&self.tools),
+            _ => {
+                let mcp: Vec<Value> = self.mcp_tools.iter().map(|t| t.schema.clone()).collect();
+                estimate + estimate_tokens(&self.tools) + estimate_tokens(&mcp)
+            }
         }
     }
 
@@ -610,7 +627,39 @@ impl Agent {
     /// The plan, as the todo tool last left it.
     /// Whether the model was offered `name` in this run (`--tools` may have left it out).
     pub(crate) fn offers(&self, name: &str) -> bool {
-        self.tools.iter().any(|tool| tool["function"]["name"] == name)
+        self.tools.iter().any(|tool| tool["function"]["name"] == name) || self.mcp_tool(name).is_some()
+    }
+
+    /// An external server's tool by the name the model calls it, as of this turn.
+    pub(crate) fn mcp_tool(&self, name: &str) -> Option<&crate::mcp::McpTool> {
+        self.mcp_tools.iter().find(|tool| tool.name == name)
+    }
+
+    /// Take the MCP servers' tools as they are now. Called when a turn starts, and only
+    /// then — see `mcp_tools`. `--tools` narrows these like haico's own.
+    pub(crate) fn refresh_mcp_tools(&mut self) {
+        let only = self.config.tools.as_ref();
+        self.mcp_tools = self
+            .server
+            .mcp
+            .tools()
+            .into_iter()
+            .filter(|tool| only.is_none_or(|only| only.contains(&tool.name)))
+            .collect();
+    }
+
+    /// The tools array for one request in `mode`: haico's own, then the MCP servers'. Plan
+    /// mode offers an MCP tool only if it is read-only, by the server's hint or the user's
+    /// `readOnly` list.
+    pub(crate) fn request_tools(&self, mode: Mode) -> Vec<Value> {
+        let mut tools = tools_for_mode(mode, &self.tools);
+        tools.extend(
+            self.mcp_tools
+                .iter()
+                .filter(|tool| mode != Mode::Plan || tool.read_only.is_some())
+                .map(|tool| tool.schema.clone()),
+        );
+        tools
     }
 
     pub(crate) fn plan(&self) -> Vec<crate::tools::TodoItem> {
@@ -899,7 +948,13 @@ pub(crate) async fn authorize(
     // a narrowly scoped key, or an outright refusal. The mode has the first word — plan
     // mode refuses anything that changes the machine, whatever the call would normally be
     // entitled to.
-    let gate = gate_for_mode(link.mode(), &agent.workspace, tool_name, arguments);
+    //
+    // An external server's tool has no workspace boundary to check (its arguments mean what
+    // that server says they mean) and no rule of haico's beyond its entry in mcp.json.
+    let gate = match agent.mcp_tool(tool_name) {
+        Some(tool) => crate::mcp::gate(link.mode(), tool),
+        None => gate_for_mode(link.mode(), &agent.workspace, tool_name, arguments),
+    };
 
     if let Gate::Deny(reason) = &gate {
         let _ = tx.send(Notice::Refused(reason.clone()).into());
@@ -1188,6 +1243,9 @@ pub(crate) async fn run_turn(
     // the time the model spent generating.
     let turn_started = std::time::Instant::now();
 
+    // Servers that finished loading since the last turn join here, and only here.
+    agent.refresh_mcp_tools();
+
     // Add user message, with any `@path` in it already read into it.
     let content = attach_mentions(agent, input, tx).await;
     agent.messages.push(json!({
@@ -1239,7 +1297,7 @@ pub(crate) async fn run_turn(
         // Rebuilt every round rather than once per turn: approving a plan switches the mode
         // mid-turn, and the very next request has to carry the full tool list.
         let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
-        let request_tools = tools_for_mode(link.mode(), &agent.tools);
+        let request_tools = agent.request_tools(link.mode());
         // Of the history as it stands, not of `request_messages`: the mode note is not
         // kept, and `context_used` compares against the history it will be looking at.
         let estimate_sent = estimate_tokens(&agent.messages);
@@ -1718,7 +1776,12 @@ async fn run_one_call(
     // calls tools it has seen in its training, not only the ones in the request, and
     // `--tools` is a promise about what the run may do.
     if !agent.offers(tool_name) {
-        let names: Vec<&str> = agent.tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        let names: Vec<&str> = agent
+            .tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .chain(agent.mcp_tools.iter().map(|t| t.name.as_str()))
+            .collect();
         let reason = if names.is_empty() {
             format!("There is no tool named '{}' in this run, and no tools at all. Answer in text.", tool_name)
         } else {
@@ -3735,5 +3798,71 @@ mod turn_tests {
         let ids: Vec<&str> = replies.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["slow", "never"], "every call of the reply needs its reply");
         assert!(replies[1].1.contains("Not run"), "got: {}", replies[1].1);
+    }
+
+    /// An MCP server's tool is called like haico's own: offered once the turn starts,
+    /// cleared through `authorize` (here by `autoAllow`, so nobody is asked), run by the hub.
+    #[tokio::test]
+    async fn an_auto_allowed_mcp_tool_runs_in_a_turn() {
+        let _capture = out::capture_guard();
+        let (url, served) = serve_sequence(&[
+            r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"m1","type":"function","function":{"name":"mcp__fix__calculator",
+            "arguments":"{\"operation\":\"add\",\"a\":40,\"b\":2}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"42"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        crate::mcp::fixture_hub(&agent.server.mcp, "fix", json!({"command": "unused", "autoAllow": true})).await;
+        // Loaded, but not offered until a turn starts.
+        assert!(!agent.offers("mcp__fix__calculator"));
+
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "add", false, &tx, &link).await, TurnEnd::Answered);
+        assert_eq!(*served.lock().unwrap(), 2);
+        assert!(agent.offers("mcp__fix__calculator"));
+        let replies = tool_replies(&agent.messages);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].1.contains("42"), "got: {}", replies[0].1);
+    }
+
+    /// Plan mode offers the read-only MCP tools only, and refuses the rest by name.
+    #[tokio::test]
+    async fn plan_mode_offers_only_read_only_mcp_tools() {
+        let _capture = out::capture_guard();
+        let (url, _) = serve_sequence(&[
+            r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"p1","type":"function","function":{"name":"mcp__fix__calculator",
+            "arguments":"{\"operation\":\"add\",\"a\":1,\"b\":1}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        crate::mcp::fixture_hub(
+            &agent.server.mcp,
+            "fix",
+            json!({"command": "unused", "tools": ["calculator", "get_date"], "readOnly": ["get_date"], "autoAllow": true}),
+        )
+        .await;
+        agent.refresh_mcp_tools();
+        let names = |tools: Vec<Value>| -> Vec<String> {
+            tools
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str())
+                .filter(|n| n.starts_with("mcp__"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(names(agent.request_tools(Mode::Plan)), ["mcp__fix__get_date"]);
+        assert_eq!(names(agent.request_tools(Mode::Normal)), ["mcp__fix__calculator", "mcp__fix__get_date"]);
+
+        let link = TurnLink::new(Mode::Plan);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "plan it", false, &tx, &link).await;
+        let replies = tool_replies(&agent.messages);
+        assert!(replies[0].1.contains("not available in plan mode"), "got: {}", replies[0].1);
     }
 }

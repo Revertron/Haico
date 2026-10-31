@@ -130,6 +130,21 @@ pub(crate) fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
             "{} {} {}",
             arguments["a"], text("operation"), arguments["b"]
         ),
+        // An MCP server's tool: nothing is known about which argument matters, so all of
+        // them, as `key: value`. Without it `list_tables` reads the same whichever database
+        // it was asked about. The line is cut to the screen where it is drawn.
+        name if name.starts_with(crate::mcp::PREFIX) => arguments
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .map(|(key, value)| match value {
+                        Value::String(s) => format!("{}: {}", key, s),
+                        other => format!("{}: {}", key, other),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }

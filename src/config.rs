@@ -397,7 +397,13 @@ fn tool_list(list: &str) -> Result<Vec<String>> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect();
-    let unknown: Vec<&str> = names.iter().filter(|name| !known.contains(name)).map(String::as_str).collect();
+    // An MCP server's tool cannot be checked here: the servers have not started yet, and
+    // may never. Its prefix is the one thing known about it.
+    let unknown: Vec<&str> = names
+        .iter()
+        .filter(|name| !known.contains(name) && !name.starts_with(crate::mcp::PREFIX))
+        .map(String::as_str)
+        .collect();
     if !unknown.is_empty() {
         let mut known = known;
         known.sort();
