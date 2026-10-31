@@ -25,7 +25,7 @@ pulldown-cmark = { version = "0.13", optional = true, default-features = false }
 # The server side (`--server`) needs only stdio. The rest is haico as an MCP *client*, for
 # the servers listed in mcp.json: child processes and streamable HTTP, the two transports
 # that file format names.
-rmcp = { version = "3.4.0", features = [
+rmcp = { version = "3.8.0", features = [
     "transport-io",
     "client",
     "transport-child-process",
@@ -40,19 +40,19 @@ serde = { version = "1.0", features = ["derive"] }
 schemars = "1.0"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-regex = "1.11"
+regex = "1.13"
 html2text = "0.17.1"
 url = "2.5"
-scraper = "0.27.0"
+scraper = "0.29.0"
 urlencoding = "2.1"
 crossterm = "0.29.0"
 similar = "3.1.1"
 chrono = "0.4.42"
 getopts = "0.2"
-lru = "0.18.0"
+lru = "0.19.0"
 flate2 = "1"
 public-api = "0.52"
-dom_smoothie = "0.18.0"
+dom_smoothie = "0.19.0"
 ego-tree = "0.11.0"
 ignore = "0.4.33"
 globset = "0.4.20"
