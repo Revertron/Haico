@@ -255,6 +255,23 @@ pub(crate) fn compose_system_prompt(
     }
 }
 
+/// The prompt with what the `SessionStart` hooks said at its end. Apart from
+/// `compose_system_prompt` because only the agent holds it, and it is the user's own
+/// tooling speaking: facts gathered for this session, ranked like the user's own words.
+pub(crate) fn with_session_context(prompt: Option<String>, context: Option<&str>) -> Option<String> {
+    let Some(context) = context.filter(|c| !c.trim().is_empty()) else {
+        return prompt;
+    };
+    let mut content = prompt.unwrap_or_default();
+    append_section(
+        &mut content,
+        "# Session context (SessionStart hooks)",
+        "The following was gathered for this session by the user's own hooks.",
+        context,
+    );
+    Some(content)
+}
+
 // The precedence sentence is dropped when this section is the whole message — with nothing
 // above it there is nothing for it to take precedence over, and the model would be reading
 // a reference to guidance that was never sent.

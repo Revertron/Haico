@@ -480,6 +480,33 @@ impl Presenter {
             Notice::ProjectContextReloaded(name) => {
                 outln!("\nLoaded project context from {}", name)
             }
+            Notice::HookBlocked { event, reason } => {
+                let reason = if reason.is_empty() { String::new() } else { format!(": {}", reason) };
+                outln!("\n✘ Blocked by {} hook{}\n", event, reason)
+            }
+            Notice::HookAllowed { event, reason } => {
+                let reason = if reason.is_empty() { String::new() } else { format!(": {}", reason) };
+                outln!("✓ Allowed by {} hook{}", event, reason)
+            }
+            Notice::HookRewrote { event, what } => outln!("↻ {} hook rewrote {}", event, what),
+            // Folded like a tool's output: it went to the model, and is here to be checked
+            // when the model acts on something nobody typed.
+            Notice::HookContext { event, text } => {
+                let first = text.lines().next().unwrap_or_default();
+                crate::out::foldable(
+                    &format!("{}  ⚑ {} hook: {}{}", SetForegroundColor(crate::out::DIM), event, first, ResetColor),
+                    &format!("  ⚑ {} hook:\n{}", event, text),
+                );
+            }
+            Notice::HookContinued(reason) => outln!("\n↻ Stop hook: keep going — {}\n", reason),
+            Notice::HookStopped { event, reason } => {
+                let reason = if reason.is_empty() { String::new() } else { format!(": {}", reason) };
+                outln!("\n■ Stopped by {} hook{}\n", event, reason)
+            }
+            Notice::HookMessage { event, text } => outln!("⚑ {} hook: {}", event, text),
+            Notice::HookFailed { event, command, detail } => {
+                outln!("⚠ {} hook failed ({}): {}", event, command, detail)
+            }
         }
     }
 }

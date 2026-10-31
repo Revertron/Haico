@@ -18,6 +18,7 @@ mod diff;
 #[cfg(feature = "gui")]
 mod gui;
 mod headless;
+mod hooks;
 mod input;
 mod library;
 mod llm;

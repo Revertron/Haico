@@ -47,6 +47,8 @@ use crate::prompt::{compose_system_prompt, load_project_context, load_user_conte
 // pending change, which the turn has to compute because only it has the old file.
 // How much of it to show is the frontend's, and that half lives there.
 use crate::diff::file_change_diff;
+use crate::hooks::{context_note, fire, Decision, Event, Hooks};
+use crate::prompt::with_session_context;
 use crate::repetition::Repeating;
 use crate::scratch::Scratch;
 use crate::skills;
@@ -157,6 +159,16 @@ pub(crate) struct Agent {
     /// conversation's, not the machine's: `clear` renews it, and dropping the
     /// agent takes it away.
     scratch: Scratch,
+    /// The user's hooks in force. Empty until the frontend has read the files and asked
+    /// about the project's (`hooks::Startup`), which is also why a test agent has none.
+    pub(crate) hooks: Hooks,
+    /// What the `SessionStart` hooks said, carried in the system prompt. Re-run exactly
+    /// where the prompt may be rewritten anyway — start, `/clear`, after a compaction —
+    /// so it costs no cached prefix.
+    pub(crate) session_context: Option<String>,
+    /// A hook answered `"continue": false` during this round. Checked once the round's calls
+    /// all have their replies, which is the one place a turn can end cleanly.
+    pub(crate) hook_stop: bool,
 }
 
 /// Make the user's skills directory readable, if it exists.
@@ -254,6 +266,9 @@ impl Agent {
             mode: Mode::Normal,
             workspace,
             scratch,
+            hooks: Hooks::default(),
+            session_context: None,
+            hook_stop: false,
         };
         agent.seed_system_message();
         agent
@@ -358,6 +373,7 @@ impl Agent {
             self.memory_index.as_deref(),
             &self.workspace,
         );
+        let rebuilt = with_session_context(rebuilt, self.session_context.as_deref());
         let changed = rebuilt != self.system_prompt;
         self.system_prompt = rebuilt;
         changed
@@ -415,6 +431,10 @@ impl Agent {
         // since starting one may mean asking the user about it.
         self.server.mcp.stop_all();
         self.mcp_tools.clear();
+        // The hooks for the same reason: a project's hooks were approved for that project.
+        // The frontend loads the new directory's, global ones included, as it starts servers.
+        self.hooks = Hooks::default();
+        self.session_context = None;
 
         self.workspace.set_cwd(&target);
         self.project_context = load_project_context();
@@ -664,6 +684,80 @@ impl Agent {
 
     pub(crate) fn plan(&self) -> Vec<crate::tools::TodoItem> {
         self.server.todos.lock().unwrap().clone()
+    }
+
+    /// What every hook is handed on stdin, Claude Code's common fields first, with the
+    /// event's own `fields` added.
+    ///
+    /// `transcript_path` is the saved session, which is written at the end of each turn: a
+    /// hook reading it mid-turn sees the conversation as it stood before this turn began.
+    pub(crate) fn hook_input(&self, mode: Mode, event: Event, fields: Value) -> Value {
+        let session_id = self
+            .session_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        let mut input = json!({
+            "session_id": session_id,
+            "transcript_path": self.session_path.as_deref().map(|p| p.display().to_string()),
+            "cwd": cwd,
+            "permission_mode": match mode {
+                Mode::Normal => "default",
+                Mode::Plan => "plan",
+                Mode::Auto => "auto",
+            },
+            "hook_event_name": event.name(),
+            "model": self.client.model,
+        });
+        if let (Some(input), Value::Object(fields)) = (input.as_object_mut(), fields) {
+            input.extend(fields);
+        }
+        input
+    }
+
+    /// Tell the `Notification` hooks that haico is waiting on the user, without waiting on
+    /// them in turn.
+    pub(crate) fn notify_hooks(&self, mode: Mode, notification_type: &str, message: &str) {
+        if !self.hooks.has(Event::Notification) {
+            return;
+        }
+        let input = self.hook_input(
+            mode,
+            Event::Notification,
+            json!({"notification_type": notification_type, "message": message}),
+        );
+        self.hooks.notify(input, notification_type);
+    }
+
+    /// Run the `SessionStart` hooks and put what they said into the system prompt.
+    /// `source` is Claude Code's: `startup`, `resume`, `clear` or `compact`.
+    ///
+    /// Called where the prompt may be rewritten without costing a cached prefix: before the
+    /// first request, after `/clear`, after a compaction. An interrupted run keeps whatever
+    /// the last one said.
+    pub(crate) async fn session_start(&mut self, source: &str, tx: &EventSink, link: &TurnLink) {
+        let mut context = Vec::new();
+        if self.hooks.has(Event::SessionStart) {
+            let input = self.hook_input(link.mode(), Event::SessionStart, json!({"source": source}));
+            let hooks = self.hooks.clone();
+            match fire(&hooks, tx, link, Event::SessionStart, Some(source), input).await {
+                Some(outcome) => context = outcome.context,
+                None => {
+                    let _ = tx.send(Notice::Interrupted.into());
+                    return;
+                }
+            }
+        }
+        let context = (!context.is_empty()).then(|| context.join("\n\n"));
+        if let Some(text) = &context {
+            let _ = tx.send(Notice::HookContext { event: Event::SessionStart.name(), text: text.clone() }.into());
+        }
+        if context != self.session_context {
+            self.session_context = context;
+            self.rebuild_system_prompt();
+        }
     }
 }
 
@@ -924,6 +1018,85 @@ pub(crate) struct Cleared {
     pub(crate) announced: bool,
     /// The user was prompted, and the prompt has already shown the diff.
     pub(crate) prompted: bool,
+    /// What the `PreToolUse` and `PermissionRequest` hooks added for the model, to go under
+    /// the call's result.
+    pub(crate) context: Vec<String>,
+}
+
+/// The gate for one call as its arguments stand: the MCP server's word for its own tools,
+/// haico's rules for the rest.
+fn call_gate(agent: &Agent, mode: Mode, tool_name: &str, arguments: &Value) -> Gate {
+    // An external server's tool has no workspace boundary to check (its arguments mean what
+    // that server says they mean) and no rule of haico's beyond its entry in mcp.json.
+    match agent.mcp_tool(tool_name) {
+        Some(tool) => crate::mcp::gate(mode, tool),
+        None => gate_for_mode(mode, &agent.workspace, tool_name, arguments),
+    }
+}
+
+/// Run one tool event's hooks on a call that is being cleared, and act on what can only end
+/// one way: Esc, `"continue": false`, a deny, and rewritten arguments that the gate now
+/// refuses. `Ok` hands back the verdict that is left — an allow or an ask — for `authorize`
+/// to weigh against the gate.
+///
+/// Rewritten arguments are gated again from scratch. A hook is the user's own code, but a
+/// boundary it could move a write across would not be a boundary.
+// `authorize`'s own inputs, plus the gate and the context the hooks may change.
+#[allow(clippy::too_many_arguments)]
+async fn call_hooks(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    event: Event,
+    tool_name: &str,
+    arguments: &mut Value,
+    nested: bool,
+    gate: &mut Gate,
+    context: &mut Vec<String>,
+) -> std::result::Result<Option<Decision>, String> {
+    let mut fields = json!({"tool_name": tool_name, "tool_input": arguments.clone()});
+    if nested {
+        fields["agent_type"] = json!(SUB_AGENT);
+    }
+    let input = agent.hook_input(link.mode(), event, fields);
+    let hooks = agent.hooks.clone();
+    let Some(outcome) = fire(&hooks, tx, link, event, Some(tool_name), input).await else {
+        return Err("Not run: the user interrupted the turn while this call's hooks were running.".to_string());
+    };
+    if !outcome.context.is_empty() {
+        let _ = tx.send(Notice::HookContext { event: event.name(), text: outcome.context.join("\n\n") }.into());
+    }
+    context.extend(outcome.context);
+    let with_context = |text: String| match context_note(event, context) {
+        Some(note) => format!("{}\n\n{}", text, note),
+        None => text,
+    };
+
+    if let Some(reason) = outcome.stop {
+        agent.hook_stop = true;
+        let reason = if reason.is_empty() { String::new() } else { format!(": {}", reason) };
+        return Err(with_context(format!("Not run: the user's {} hook ended the turn{}.", event.name(), reason)));
+    }
+    if let Some(Decision::Deny(reason)) = &outcome.decision {
+        let _ = tx.send(Notice::HookBlocked { event: event.name(), reason: reason.clone() }.into());
+        let reason = if reason.is_empty() { String::new() } else { format!(" ({})", reason) };
+        return Err(with_context(format!(
+            "Blocked by the user's {} hook{}, so it was not run. Do not retry it as is: take \
+             another way to the goal, or say what you needed and why.",
+            event.name(),
+            reason
+        )));
+    }
+    if let Some(updated) = outcome.updated_input {
+        *arguments = updated;
+        let _ = tx.send(Notice::HookRewrote { event: event.name(), what: "the arguments" }.into());
+        *gate = call_gate(agent, link.mode(), tool_name, arguments);
+        if let Gate::Deny(reason) = gate {
+            let _ = tx.send(Notice::Refused(reason.clone()).into());
+            return Err(with_context(reason.clone()));
+        }
+    }
+    Ok(outcome.decision)
 }
 
 /// Every gate one call has to pass before it runs: the mode, the workspace, the
@@ -941,24 +1114,29 @@ pub(crate) async fn authorize(
     tx: &EventSink,
     link: &TurnLink,
     tool_name: &str,
-    arguments: &Value,
+    arguments: &mut Value,
     nested: bool,
 ) -> std::result::Result<Cleared, String> {
     // Decide what this specific call needs: nothing (read-only), the user's consent under
     // a narrowly scoped key, or an outright refusal. The mode has the first word — plan
     // mode refuses anything that changes the machine, whatever the call would normally be
     // entitled to.
-    //
-    // An external server's tool has no workspace boundary to check (its arguments mean what
-    // that server says they mean) and no rule of haico's beyond its entry in mcp.json.
-    let gate = match agent.mcp_tool(tool_name) {
-        Some(tool) => crate::mcp::gate(link.mode(), tool),
-        None => gate_for_mode(link.mode(), &agent.workspace, tool_name, arguments),
-    };
+    let mut gate = call_gate(agent, link.mode(), tool_name, arguments);
 
     if let Gate::Deny(reason) = &gate {
         let _ = tx.send(Notice::Refused(reason.clone()).into());
         return Err(reason.clone());
+    }
+
+    // The user's PreToolUse hooks, after the boundary and plan mode — neither is theirs to
+    // lift — and before everything else, so a rewritten call is the one that is checked,
+    // reviewed and shown in the prompt.
+    let mut context = Vec::new();
+    let mut hook_verdict = None;
+    if agent.hooks.has(Event::PreToolUse) {
+        hook_verdict =
+            call_hooks(agent, tx, link, Event::PreToolUse, tool_name, arguments, nested, &mut gate, &mut context)
+                .await?;
     }
 
     // After the boundary, so a file outside it is not even opened to look; before the
@@ -982,6 +1160,47 @@ pub(crate) async fn authorize(
         _ => None,
     };
 
+    // A hook's allow answers the question the gate was going to ask; its ask puts one to the
+    // user even where the gate would not, past any earlier "allow all" and past the
+    // reviewer — a hook that wants a person to look wants a person, not a second model.
+    let mut forced = false;
+    match hook_verdict {
+        Some(Decision::Allow(reason)) => {
+            if ask.take().is_some() {
+                let _ = tx.send(Notice::HookAllowed { event: Event::PreToolUse.name(), reason }.into());
+            }
+        }
+        Some(Decision::Ask(_)) => {
+            forced = true;
+            ask = Some(match &gate {
+                Gate::Ask { keys, label } => (keys.clone(), label.clone()),
+                _ => (vec![format!("hook:{}", tool_name)], format!("Allow '{}' calls for this session", tool_name)),
+            });
+        }
+        _ => {}
+    }
+
+    // PermissionRequest: the question is about to be asked (or reviewed), and the user's
+    // hooks may answer it instead.
+    if ask.is_some() && agent.hooks.has(Event::PermissionRequest) {
+        let decided = call_hooks(
+            agent,
+            tx,
+            link,
+            Event::PermissionRequest,
+            tool_name,
+            arguments,
+            nested,
+            &mut gate,
+            &mut context,
+        )
+        .await?;
+        if let Some(Decision::Allow(reason)) = decided {
+            let _ = tx.send(Notice::HookAllowed { event: Event::PermissionRequest.name(), reason }.into());
+            ask = None;
+        }
+    }
+
     // Auto mode: the reviewer answers the routine yeses so the user does not have to.
     // Only a call that was going to interrupt is reviewed — an already-approved one costs
     // nothing and should stay free.
@@ -1003,7 +1222,7 @@ pub(crate) async fn authorize(
     // Only a review the user interrupted with Esc still reaches the prompt: that is the
     // one outcome that proves somebody is there.
     let mut announced = false;
-    if link.mode() == Mode::Auto && ask.is_some() {
+    if link.mode() == Mode::Auto && ask.is_some() && !forced {
         // The call goes on screen before the verdict rather than after it: a review takes
         // seconds, and the reader can see what is being judged while it is. Every path out
         // of the review below sends exactly one verdict to land under it.
@@ -1064,6 +1283,11 @@ pub(crate) async fn authorize(
 
     if let Some((gate_keys, allow_all_label)) = ask {
         let diff_content = file_change_diff(tool_name, arguments);
+        agent.notify_hooks(
+            link.mode(),
+            "permission_prompt",
+            &format!("Haico needs your permission to use {}", tool_name),
+        );
 
         // The call itself goes to the frontend, not a sentence about it: how much of a
         // command to show and where the reviewer's objection belongs are rendering
@@ -1111,7 +1335,58 @@ pub(crate) async fn authorize(
         }
     }
 
-    Ok(Cleared { announced, prompted })
+    Ok(Cleared { announced, prompted, context })
+}
+
+/// Run the `PostToolUse` (or, for a failed call, `PostToolUseFailure`) hooks on a finished
+/// call, and return the reply the model gets: the result, or the one a hook put in its
+/// place, with what the hooks had to say under it.
+///
+/// Esc while they run keeps the result as it is: the call did run, and the next wait of
+/// the turn sees the cancellation and ends it.
+// The call's every part is an input the hook is handed, and both loops (main, sub-agent)
+// already hold each one under its own name.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn post_tool_hooks(
+    agent: &mut Agent,
+    tx: &EventSink,
+    link: &TurnLink,
+    tool_name: &str,
+    arguments: &Value,
+    mut reply: String,
+    failed: bool,
+    nested: bool,
+) -> String {
+    let event = if failed { Event::PostToolUseFailure } else { Event::PostToolUse };
+    if !agent.hooks.has(event) {
+        return reply;
+    }
+    let mut fields = json!({"tool_name": tool_name, "tool_input": arguments});
+    fields[if failed { "error" } else { "tool_response" }] = json!(reply);
+    if nested {
+        fields["agent_type"] = json!(SUB_AGENT);
+    }
+    let input = agent.hook_input(link.mode(), event, fields);
+    let hooks = agent.hooks.clone();
+    let Some(outcome) = fire(&hooks, tx, link, event, Some(tool_name), input).await else {
+        return reply;
+    };
+    if outcome.stop.is_some() {
+        agent.hook_stop = true;
+    }
+    if let Some(output) = outcome.updated_output {
+        reply = output;
+        let _ = tx.send(Notice::HookRewrote { event: event.name(), what: "the result" }.into());
+    }
+    // A block cannot undo a call that has run; in Claude Code it is feedback for the model,
+    // and so it is here, beside the context.
+    let notes: Vec<String> = outcome.block.into_iter().filter(|b| !b.is_empty()).chain(outcome.context).collect();
+    if let Some(note) = context_note(event, &notes) {
+        let _ = tx.send(Notice::HookContext { event: event.name(), text: notes.join("\n\n") }.into());
+        reply.push_str("\n\n");
+        reply.push_str(&note);
+    }
+    reply
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1495,49 @@ struct TurnState {
     // model that fell into a loop once and went on to do an hour of real work has earned the
     // same retries the next time.
     repeating_replies: usize,
+    // Set once a Stop hook has sent the model back to work, and handed to the next Stop hook
+    // as `stop_hook_active` — Claude Code's way of letting a hook that always objects tell
+    // that it already has. There is no cap of haico's: the hook decides, and Esc ends it.
+    stop_hook_active: bool,
+}
+
+/// What the `Stop` hooks made of a reply that called nothing.
+enum AfterStop {
+    Finish,
+    /// Keep going, with this said to the model.
+    Continue(String),
+    Interrupted,
+}
+
+async fn stop_hooks(agent: &mut Agent, tx: &EventSink, link: &TurnLink, active: bool) -> AfterStop {
+    if !agent.hooks.has(Event::Stop) {
+        return AfterStop::Finish;
+    }
+    let last = agent.messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+    let input = agent.hook_input(
+        link.mode(),
+        Event::Stop,
+        json!({"stop_hook_active": active, "last_assistant_message": last}),
+    );
+    let hooks = agent.hooks.clone();
+    let Some(outcome) = fire(&hooks, tx, link, Event::Stop, None, input).await else {
+        return AfterStop::Interrupted;
+    };
+    if outcome.stop.is_some() {
+        return AfterStop::Finish;
+    }
+    // Claude Code continues on a block, and on context alone too.
+    let blocked = outcome.block.is_some();
+    let reasons: Vec<String> = outcome.block.into_iter().filter(|b| !b.is_empty()).chain(outcome.context).collect();
+    if !blocked && reasons.is_empty() {
+        return AfterStop::Finish;
+    }
+    let reason = if reasons.is_empty() {
+        "The user's Stop hook says the work is not finished. Carry on.".to_string()
+    } else {
+        reasons.join("\n\n")
+    };
+    AfterStop::Continue(reason)
 }
 
 /// One turn: the user's message in, and everything that follows from it — rounds
@@ -1245,6 +1563,37 @@ pub(crate) async fn run_turn(
 
     // Servers that finished loading since the last turn join here, and only here.
     agent.refresh_mcp_tools();
+    agent.hook_stop = false;
+
+    // Before the message joins the history: a prompt a hook blocks is never sent, and never
+    // kept either.
+    let mut prompt_context = Vec::new();
+    if agent.hooks.has(Event::UserPromptSubmit) {
+        let event_input = agent.hook_input(link.mode(), Event::UserPromptSubmit, json!({"prompt": input}));
+        let hooks = agent.hooks.clone();
+        let ended = match fire(&hooks, tx, link, Event::UserPromptSubmit, None, event_input).await {
+            None => {
+                let _ = tx.send(Notice::Interrupted.into());
+                Some(TurnEnd::Interrupted)
+            }
+            // `fire` has said so already.
+            Some(outcome) if outcome.stop.is_some() => Some(TurnEnd::Failed),
+            Some(outcome) => match outcome.block {
+                Some(reason) => {
+                    let _ = tx.send(Notice::HookBlocked { event: Event::UserPromptSubmit.name(), reason }.into());
+                    Some(TurnEnd::Failed)
+                }
+                None => {
+                    prompt_context = outcome.context;
+                    None
+                }
+            },
+        };
+        if let Some(end) = ended {
+            let _ = tx.send(AgentEvent::Finished { elapsed: turn_started.elapsed() });
+            return end;
+        }
+    }
 
     // Add user message, with any `@path` in it already read into it.
     let content = attach_mentions(agent, input, tx).await;
@@ -1252,6 +1601,12 @@ pub(crate) async fn run_turn(
         "role": "user",
         "content": content
     }));
+    if let Some(note) = context_note(Event::UserPromptSubmit, &prompt_context) {
+        let _ = tx.send(
+            Notice::HookContext { event: Event::UserPromptSubmit.name(), text: prompt_context.join("\n\n") }.into(),
+        );
+        push_user_note(&mut agent.messages, &note);
+    }
 
     let mut state = TurnState {
         round: 0,
@@ -1260,6 +1615,7 @@ pub(crate) async fn run_turn(
         just_compacted: false,
         stripped_images: false,
         repeating_replies: 0,
+        stop_hook_active: false,
     };
 
     let end = loop {
@@ -1398,7 +1754,19 @@ pub(crate) async fn run_turn(
                 push_user_note(&mut agent.messages, AFTER_COMPACTION);
                 continue;
             }
-            break TurnEnd::Answered;
+            match stop_hooks(agent, tx, link, state.stop_hook_active).await {
+                AfterStop::Finish => break TurnEnd::Answered,
+                AfterStop::Continue(reason) => {
+                    state.stop_hook_active = true;
+                    let _ = tx.send(Notice::HookContinued(reason.clone()).into());
+                    push_user_note(&mut agent.messages, &format!("[Stop hook]\n{}", reason));
+                    continue;
+                }
+                AfterStop::Interrupted => {
+                    let _ = tx.send(Notice::Interrupted.into());
+                    break TurnEnd::Interrupted;
+                }
+            }
         }
         state.just_compacted = false;
 
@@ -1529,6 +1897,8 @@ impl Agent {
         // freed nothing to go with it.
         if let Some(Ok(_)) = &compacted {
             self.review_cache.clear();
+            // Before the prompt is rebuilt below, so what the hooks say now goes in with it.
+            self.session_start("compact", tx, link).await;
             self.refresh_memory();
         }
         compacted
@@ -1795,8 +2165,14 @@ async fn run_one_call(
     // is the agent's or the frontend's, not the tool server's.
     match tool_name {
         START_PLAN => start_plan_reply(tx, link).into(),
-        PRESENT_PLAN => present_plan_reply(tx, link, &arguments).await.into(),
-        ASK_USER => ask_user_reply(tx, &arguments).await.into(),
+        PRESENT_PLAN => {
+            agent.notify_hooks(link.mode(), "plan_approval", "Haico has a plan for you to review");
+            present_plan_reply(tx, link, &arguments).await.into()
+        }
+        ASK_USER => {
+            agent.notify_hooks(link.mode(), "question", "Haico has a question for you");
+            ask_user_reply(tx, &arguments).await.into()
+        }
         SUB_AGENT => sub_agent_reply(agent, tx, link, &arguments).await,
         _ => gated_call(agent, tx, link, tool_name, arguments, &repaired, seen_images).await,
     }
@@ -1934,11 +2310,11 @@ async fn gated_call(
     tx: &EventSink,
     link: &TurnLink,
     tool_name: &str,
-    arguments: Value,
+    mut arguments: Value,
     repaired: &[String],
     seen_images: &mut Vec<Value>,
 ) -> CallReply {
-    let Cleared { announced, prompted } = match authorize(agent, tx, link, tool_name, &arguments, false).await {
+    let Cleared { announced, prompted, context } = match authorize(agent, tx, link, tool_name, &mut arguments, false).await {
         Ok(cleared) => cleared,
         Err(refusal) => return refusal.into(),
     };
@@ -1994,7 +2370,7 @@ async fn gated_call(
 
     // It ran, whatever it returned: a failed build is still the last thing that happened,
     // and the bar saying so is the point.
-    let _ = tx.send(AgentEvent::DidTool { name: tool_name.to_string(), arguments: activity_arguments });
+    let _ = tx.send(AgentEvent::DidTool { name: tool_name.to_string(), arguments: activity_arguments.clone() });
 
     let tool_result = result.unwrap_or_else(|e| {
         let _ = tx.send(Notice::ToolFailed(format!("{:?}", e)).into());
@@ -2036,6 +2412,14 @@ async fn gated_call(
         let _ = tx.send(AgentEvent::ToolResult { text: tool_result.clone(), failed });
     }
 
+    let mut tool_result =
+        post_tool_hooks(agent, tx, link, tool_name, &activity_arguments, tool_result, failed, false).await;
+    // Under the result, labeled: said before the call ran, but about what it would find.
+    if let Some(note) = context_note(Event::PreToolUse, &context) {
+        tool_result.push_str("\n\n");
+        tool_result.push_str(&note);
+    }
+
     if repaired.is_empty() {
         return tool_result.into();
     }
@@ -2052,6 +2436,11 @@ async fn gated_call(
 /// What happens once every call of a round has its reply: the loop guard, then whatever
 /// joined the conversation while the round ran. `Some` ends the turn.
 async fn after_round(agent: &mut Agent, tx: &EventSink, link: &TurnLink, guard: &mut LoopGuard) -> Option<TurnEnd> {
+    // A hook said `"continue": false` during the round, and said so on screen as it did.
+    if std::mem::take(&mut agent.hook_stop) {
+        return Some(TurnEnd::Failed);
+    }
+
     // The tool log makes a loop obvious to whoever is watching it scroll past, but the
     // model reads none of that — every round looks to it like a fresh decision, which is
     // why it can repeat one call fifty times. Saying the repetition out loud in the

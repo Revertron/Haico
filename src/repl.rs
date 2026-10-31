@@ -177,8 +177,12 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
             match job {
                 Job::Turn { input, initializing } => {
                     run_turn(agent, &input, initializing, &tx, &link).await;
+                    // The prompt is about to come back: the one moment the REPL waits on the
+                    // user that no turn asks about.
+                    agent.notify_hooks(link.mode(), "idle_prompt", "Haico is waiting for your input");
                 }
                 Job::Compact => compact_on_request(agent, &tx, &link).await,
+                Job::SessionStart(source) => agent.session_start(source, &tx, &link).await,
             }
         };
         tokio::pin!(turn);
@@ -370,6 +374,7 @@ fn describe_waiting(waiting: &Waiting) -> String {
         Waiting::CompressingReasoning => "Compressing reasoning…".to_string(),
         Waiting::ReviewingCall => "⁇ Reviewing tool call…".to_string(),
         Waiting::Tool(name) => format!("{}…", name),
+        Waiting::Hook(event) => format!("Running {} hook…", event),
     }
 }
 // Either answer the turn's question or put its output on screen.
@@ -485,6 +490,46 @@ async fn start_mcp_servers(agent: &Agent, keys: Option<&mut Keys>, cwd: &std::pa
     print_mcp_notices(agent);
 }
 
+/// Read both hooks.json files, ask about the project's hooks when they are new or changed,
+/// and put them in force. Asked before the first prompt for `start_mcp_servers`' reason: a
+/// hook is a command, and the first one may run with the first message. With no keyboard
+/// the project's hooks are left off, and the line printed says so.
+async fn load_hooks(agent: &mut Agent, keys: Option<&mut Keys>, cwd: &std::path::Path) {
+    let mut startup = crate::hooks::Startup::load(cwd);
+    if let (Some(rules), Some(keys)) = (startup.unapproved(), keys) {
+        outln!();
+        for line in crate::hooks::approval_lines(rules) {
+            outln!("{}", line);
+        }
+        let choices = vec!["Approve and run them".to_string(), "Skip for now".to_string()];
+        let answer = crate::picker::select_interactive(keys, "answer", choices, 0).await;
+        if answer.is_ok_and(|a| a.starts_with("Approve")) {
+            if let Err(e) = startup.approve() {
+                outln!("Could not save the approval ({:#}); it holds for this session only.", e);
+            }
+        }
+    }
+    let (hooks, warnings) = startup.finish();
+    for warning in warnings {
+        outln!("⚠ {}", warning);
+    }
+    let count = hooks.rules().len();
+    if count > 0 {
+        outln!("Hooks: {} in force — /hooks lists them.", count);
+    }
+    agent.hooks = hooks;
+}
+
+/// The `SessionStart` hooks for `source`, run through the pump so Esc stops them — or
+/// nothing, when none are configured.
+fn session_start_job(agent: &Agent, source: &'static str) -> Next {
+    if agent.hooks.has(crate::hooks::Event::SessionStart) {
+        Next::Run(Job::SessionStart(source))
+    } else {
+        Next::Prompt
+    }
+}
+
 /// Print what the MCP servers have to say since the last time.
 fn print_mcp_notices(agent: &Agent) {
     for notice in agent.server.mcp.take_notices() {
@@ -590,6 +635,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     }
 
     start_mcp_servers(&agent, keys.as_mut(), &cwd).await;
+    load_hooks(&mut agent, keys.as_mut(), &cwd).await;
 
     // Line editing and history. The editor holds what is being typed; the writer keeps
     // it pinned to the bottom of the screen and prints everything else above it.
@@ -609,6 +655,10 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         history_path,
     };
     io.editor.set_commands(commands::for_cwd());
+
+    if let Next::Run(job) = session_start_job(&agent, if resume_requested { "resume" } else { "startup" }) {
+        drive(&mut agent, &mut io, job).await;
+    }
 
     outln!("Type /help for commands.\n");
 
@@ -738,6 +788,8 @@ enum Next {
 enum Job {
     Turn { input: String, initializing: bool },
     Compact,
+    /// The `SessionStart` hooks, with Claude Code's name for why the session (re)started.
+    SessionStart(&'static str),
 }
 
 impl Job {
@@ -760,6 +812,7 @@ enum Cmd {
     Init,
     Tools,
     Mcp,
+    Hooks,
     Model,
     Provider,
     Config,
@@ -795,6 +848,7 @@ fn command_for(name: &str) -> Option<Cmd> {
         "init" => Cmd::Init,
         "tools" => Cmd::Tools,
         "mcp" => Cmd::Mcp,
+        "hooks" => Cmd::Hooks,
         "model" => Cmd::Model,
         "provider" => Cmd::Provider,
         "config" => Cmd::Config,
@@ -864,6 +918,7 @@ async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf
         Cmd::Init => return init(agent, cwd),
         Cmd::Tools => list_tools(agent),
         Cmd::Mcp => mcp_command(agent, io, cwd, rest).await,
+        Cmd::Hooks => return hooks_command(agent, io, cwd, rest).await,
         Cmd::Model => switch_model(agent, io, rest).await,
         Cmd::Provider => switch_provider(agent, io, rest).await,
         Cmd::Config => show_config(agent),
@@ -890,8 +945,15 @@ async fn slash_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut PathBuf
         ),
         Cmd::Reasoning => reasoning_command(agent, rest),
         Cmd::Compact => return Next::Run(Job::Compact),
-        Cmd::Resume => resume(agent),
-        Cmd::Clear => clear(agent),
+        Cmd::Resume => {
+            if resume(agent) {
+                return session_start_job(agent, "resume");
+            }
+        }
+        Cmd::Clear => {
+            clear(agent);
+            return session_start_job(agent, "clear");
+        }
         Cmd::Skills => list_skills(),
         Cmd::UpdateSkills => update_skills(agent, io),
     }
@@ -1029,8 +1091,12 @@ async fn change_directory(agent: &mut Agent, io: &mut TerminalIo, cwd: &mut Path
                 outln!("A conversation was saved here before — /resume picks it up instead.");
             }
             // `Agent::change_directory` stopped the last project's servers; these are this
-            // one's, asked about and started the way they are at startup.
+            // one's, asked about and started the way they are at startup. Its hooks likewise.
             start_mcp_servers(agent, io.keys.as_mut(), cwd).await;
+            load_hooks(agent, io.keys.as_mut(), cwd).await;
+            if let Next::Run(job) = session_start_job(agent, "startup") {
+                drive(agent, io, job).await;
+            }
             outln!();
         }
         Err(why) => outln!("{}\n", why),
@@ -1061,6 +1127,44 @@ fn list_tools(agent: &Agent) {
         outln!("  {:<14} [{}]", tool.name, gate);
     }
     outln!();
+}
+
+/// `/hooks`: every hook in force, by event. `/hooks reload` reads both files again and asks
+/// about the project's when they are new or changed — how hooks skipped at startup, or
+/// edited since, come into force.
+async fn hooks_command(agent: &mut Agent, io: &mut TerminalIo, cwd: &std::path::Path, argument: &str) -> Next {
+    match argument {
+        "reload" => {
+            load_hooks(agent, io.keys.as_mut(), cwd).await;
+            outln!();
+            return session_start_job(agent, "startup");
+        }
+        "" => {}
+        _ => {
+            outln!("Usage: /hooks [reload]\n");
+            return Next::Prompt;
+        }
+    }
+    let rules = agent.hooks.rules();
+    if rules.is_empty() {
+        outln!("No hooks in force. They go in {} or", store::display("hooks.json"));
+        outln!("{} in Claude Code's format.\n", display_path(&crate::hooks::config::project_path(cwd)));
+        return Next::Prompt;
+    }
+    for event in crate::hooks::Event::ALL {
+        let of_event: Vec<_> = rules.iter().filter(|r| r.event == event).collect();
+        if of_event.is_empty() {
+            continue;
+        }
+        outln!("{}:", event.name());
+        for rule in of_event {
+            let matcher = rule.matcher_text.as_deref().unwrap_or("*");
+            let timeout = rule.handler.timeout.map(|t| format!("  (timeout {} s)", t.as_secs())).unwrap_or_default();
+            outln!("  {:<20} {:<8} {}{}", matcher, crate::hooks::scope_label(rule), rule.handler.describe(), timeout);
+        }
+    }
+    outln!();
+    Next::Prompt
 }
 
 /// `/mcp`: every configured server, what state it is in, and each tool with how it is
@@ -1524,10 +1628,12 @@ fn reasoning_command(agent: &mut Agent, rest: &str) {
     }
 }
 
-fn resume(agent: &mut Agent) {
+/// `/resume`. Returns whether the history was replaced, which is when the `SessionStart`
+/// hooks run again.
+fn resume(agent: &mut Agent) -> bool {
     if !agent.has_saved_session() {
         outln!("No saved conversation for this directory.\n");
-        return;
+        return false;
     }
     // Dropped through `clear` rather than by emptying the history here: what goes with a
     // conversation and what survives it is the core's business, and a second answer to that
@@ -1543,6 +1649,7 @@ fn resume(agent: &mut Agent) {
         ),
         Err(e) => outln!("Could not resume: {:#}. The conversation is empty.\n", e),
     }
+    true
 }
 
 fn clear(agent: &mut Agent) {

@@ -23,8 +23,14 @@ pub(crate) struct Trust {
 
 impl Trust {
     pub(crate) fn from_store() -> Self {
+        Self::from_store_file(FILE)
+    }
+
+    /// The same bookkeeping in another file of the store, for the project's hooks: a
+    /// `.haico/hooks.json` is commands from the repository just as `mcp.json` is.
+    pub(crate) fn from_store_file(file: &str) -> Self {
         // Never the user's own file from a test binary, for `Agent::new`'s reason.
-        Self { path: if cfg!(test) { None } else { crate::store::path(FILE) } }
+        Self { path: if cfg!(test) { None } else { crate::store::path(file) } }
     }
 
     #[cfg(test)]

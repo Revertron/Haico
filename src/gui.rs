@@ -314,6 +314,14 @@ async fn converse(
     // not pass them on until the next thing was typed. A project server nobody approved is
     // skipped — the window has no dialog for it yet, and the notice says where to ask.
     if let Ok(cwd) = std::env::current_dir() {
+        // The hooks likewise: the project's are left off until approved in the terminal.
+        let (hooks, warnings) = crate::hooks::Startup::load(&cwd).finish();
+        for warning in warnings {
+            show(&handle, move |ui| line(ui, &warning, Tone::Warning));
+        }
+        agent.hooks = hooks;
+        session_start(&mut agent, &handle, "startup").await;
+
         crate::mcp::Startup::load(&cwd).start(&agent.server.mcp);
         let hub = agent.server.mcp.clone();
         let handle = handle.clone();
@@ -381,8 +389,12 @@ async fn converse(
                 input
             }
             Some(other) => {
+                let clearing = matches!(other, Command::Clear);
                 if !obey(&mut agent, &handle, &tx, &models, other) {
                     break;
+                }
+                if clearing {
+                    session_start(&mut agent, &handle, "clear").await;
                 }
                 continue;
             }
@@ -427,6 +439,7 @@ async fn converse(
         // a link nothing is waiting on.
         running.lock().unwrap().take();
         show(&handle, |ui| set_label(ui, BUSY, ""));
+        agent.notify_hooks(agent.mode, "idle_prompt", "Haico is waiting for your input");
     }
 
     // The REPL and a `-p` run both do this on the way out, and the window has to as
@@ -434,6 +447,21 @@ async fn converse(
     // with no window left to stop it from. Nothing is said — the window is gone.
     agent.server.stop_all_background().await;
     agent.server.mcp.stop_all();
+}
+
+/// The `SessionStart` hooks, shown like a turn's events. Nothing to cancel them with: the
+/// window publishes a link only for turns.
+async fn session_start(agent: &mut Agent, handle: &UiHandle, source: &'static str) {
+    if !agent.hooks.has(crate::hooks::Event::SessionStart) {
+        return;
+    }
+    let link = TurnLink::new(agent.mode);
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    agent.session_start(source, &tx, &link).await;
+    while let Ok(event) = events.try_recv() {
+        dispatch(handle, event);
+    }
+    show(handle, |ui| set_label(ui, BUSY, ""));
 }
 
 /// Hand one event to the window, or answer it if it is a question.
@@ -450,6 +478,7 @@ fn dispatch(handle: &UiHandle, event: AgentEvent) {
                 Waiting::CompressingReasoning => "compressing reasoning…".to_string(),
                 Waiting::ReviewingCall => "reviewing the call…".to_string(),
                 Waiting::Tool(name) => format!("{name}…"),
+                Waiting::Hook(event) => format!("{event} hook…"),
             };
             show(handle, move |ui| set_label(ui, BUSY, &text));
         }
@@ -971,6 +1000,16 @@ fn describe(notice: Notice) -> (String, Tone) {
         Notice::TimersFired(fired) => (crate::present::timers_fired(&fired), Tone::Muted),
         Notice::ProjectContextReloaded(name) => {
             (format!("reloaded project context from {name}"), Tone::Muted)
+        }
+        Notice::HookBlocked { event, reason } => (format!("blocked by {event} hook {reason}"), Tone::Error),
+        Notice::HookAllowed { event, reason } => (format!("allowed by {event} hook {reason}"), Tone::Muted),
+        Notice::HookRewrote { event, what } => (format!("{event} hook rewrote {what}"), Tone::Muted),
+        Notice::HookContext { event, text } => (format!("{event} hook: {text}"), Tone::Muted),
+        Notice::HookContinued(reason) => (format!("Stop hook: keep going — {reason}"), Tone::Warning),
+        Notice::HookStopped { event, reason } => (format!("stopped by {event} hook {reason}"), Tone::Warning),
+        Notice::HookMessage { event, text } => (format!("{event} hook: {text}"), Tone::Normal),
+        Notice::HookFailed { event, command, detail } => {
+            (format!("{event} hook failed ({command}): {detail}"), Tone::Warning)
         }
     }
 }

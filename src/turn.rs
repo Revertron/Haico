@@ -335,6 +335,23 @@ pub(crate) enum Notice {
     TimersFired(Vec<crate::timers::Fired>),
     /// `/init` wrote the project's instructions and they were re-read.
     ProjectContextReloaded(String),
+    /// A hook refused something: a tool call (`PreToolUse`, `PermissionRequest`) or the
+    /// prompt itself (`UserPromptSubmit`). `reason` is the hook's, possibly empty.
+    HookBlocked { event: &'static str, reason: String },
+    /// A hook allowed a call that would otherwise have asked or gone to review.
+    HookAllowed { event: &'static str, reason: String },
+    /// A hook replaced the call's arguments or its result; `what` says which.
+    HookRewrote { event: &'static str, what: &'static str },
+    /// Text a hook added for the model, shown so the user knows what it was told.
+    HookContext { event: &'static str, text: String },
+    /// A `Stop` hook sent the model back to work, with its reason.
+    HookContinued(String),
+    /// A hook said `"continue": false`: the turn ends here.
+    HookStopped { event: &'static str, reason: String },
+    /// A hook's `systemMessage`, or what it said for the user.
+    HookMessage { event: &'static str, text: String },
+    /// A hook could not start, failed, or ran out of time. Nothing was blocked by it.
+    HookFailed { event: &'static str, command: String, detail: String },
 }
 
 /// One thing the turn has to say. Everything the loop used to print, plus the
@@ -447,6 +464,8 @@ pub(crate) enum Waiting {
     ReviewingCall,
     /// A named tool is running.
     Tool(String),
+    /// The user's hooks for this event are running.
+    Hook(&'static str),
 }
 
 /// How a turn ended, handed back by `run_turn` itself.

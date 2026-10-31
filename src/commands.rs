@@ -68,6 +68,10 @@ pub(crate) const BUILT_IN: &[BuiltIn] = &[
         "in the project. 'reconnect' also asks again about a project server",
         "that was not approved.",
     ]),
+    built_in("hooks", &[], Args::Optional, "[reload]", "List the hooks in force, or read their files again", &[
+        "Hooks come from hooks.json in the data directory and .haico/hooks.json",
+        "in the project. 'reload' also asks again about the project's hooks.",
+    ]),
     built_in("model", &[], Args::Optional, "[name]", "Switch model and save it as the default", &[
         "With no name, pick from the server's list.",
     ]),

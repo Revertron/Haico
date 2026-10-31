@@ -217,12 +217,12 @@ fn shell_builder(command: &str, cwd: Option<&str>) -> Result<tokio::process::Com
 //
 // Synchronous, because `Drop` cannot await: taskkill and kill each return in milliseconds,
 // which is less than the interrupt itself takes to be noticed.
-struct KillTreeOnDrop {
-    pid: Option<u32>,
+pub(crate) struct KillTreeOnDrop {
+    pub(crate) pid: Option<u32>,
 }
 
 impl KillTreeOnDrop {
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.pid = None;
     }
 }

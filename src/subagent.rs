@@ -31,8 +31,9 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::{authorize, Agent, LoopGuard, LoopVerdict};
+use crate::agent::{authorize, post_tool_hooks, Agent, LoopGuard, LoopVerdict};
 use crate::config::autocompact_threshold;
+use crate::hooks::{context_note, Event};
 use crate::prompt::build_sub_agent_prompt;
 use crate::repetition::Repeating;
 use crate::session::{estimate_tokens, without_think_block};
@@ -206,9 +207,10 @@ pub(crate) async fn run_sub_agent(
                     ),
                     Ok(mut arguments) => {
                         repair_leaked_arguments(&mut arguments);
-                        match authorize(agent, tx, link, &name, &arguments, true).await {
+                        match authorize(agent, tx, link, &name, &mut arguments, true).await {
                             Err(refusal) => refusal,
                             Ok(cleared) => {
+                                let called_with = arguments.clone();
                                 let _ = tx.send(
                                     Notice::SubAgentStep {
                                         tool: name.clone(),
@@ -227,7 +229,8 @@ pub(crate) async fn run_sub_agent(
                                     crate::progress::reporting(tx, agent.server.execute_tool(&name, arguments)),
                                 )
                                 .await?;
-                                match executed {
+                                let failed = executed.as_ref().map_or(true, |output| output.failed);
+                                let reply = match executed {
                                     // An image cannot go into a tool reply, and the helper's
                                     // report is text anyway: it is told the picture exists.
                                     Ok(output) if !output.images.is_empty() => format!(
@@ -237,7 +240,14 @@ pub(crate) async fn run_sub_agent(
                                     ),
                                     Ok(output) => output.text,
                                     Err(e) => format!("Error: {}", e),
+                                };
+                                let mut reply =
+                                    post_tool_hooks(agent, tx, link, &name, &called_with, reply, failed, true).await;
+                                if let Some(note) = context_note(Event::PreToolUse, &cleared.context) {
+                                    reply.push_str("\n\n");
+                                    reply.push_str(&note);
                                 }
+                                reply
                             }
                         }
                     }
@@ -245,6 +255,11 @@ pub(crate) async fn run_sub_agent(
             };
 
             messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+        }
+
+        // Left set for the main loop, which ends the turn once this call has its reply.
+        if agent.hook_stop {
+            break "A hook of the user's has stopped the work.";
         }
 
         match guard.verdict() {

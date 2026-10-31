@@ -103,6 +103,15 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     print_mcp_notices(&agent);
     agent.server.mcp.wait_loaded().await;
     print_mcp_notices(&agent);
+    // The project's hooks only once approved at the prompt, for the servers' reason.
+    let (hooks, warnings) = crate::hooks::Startup::load(&cwd).finish();
+    for warning in warnings {
+        outln!("⚠ {}", warning);
+    }
+    agent.hooks = hooks;
+    if agent.hooks.has(crate::hooks::Event::SessionStart) {
+        session_start(&mut agent, if resume { "resume" } else { "startup" }).await;
+    }
     outln!("Running unattended in {} (auto mode).\n", display_path(&cwd));
 
     let mut input = first_message(&cwd, &task);
@@ -219,6 +228,18 @@ async fn drive(agent: &mut Agent, input: &str) -> TurnEnd {
     // A plan approved mid-turn hands the mode back through the link.
     agent.mode = link.mode();
     end
+}
+
+/// The `SessionStart` hooks, before the task, rendered like a turn. Not cancellable: no
+/// Ctrl+C handler is installed until the first turn, so Ctrl+C here ends the process.
+async fn session_start(agent: &mut Agent, source: &'static str) {
+    let link = TurnLink::new(agent.mode);
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut presenter = Presenter::new();
+    agent.session_start(source, &tx, &link).await;
+    while let Ok(event) = events.try_recv() {
+        show(&mut presenter, event);
+    }
 }
 
 fn show(presenter: &mut Presenter, event: AgentEvent) {
