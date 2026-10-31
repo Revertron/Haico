@@ -400,8 +400,12 @@ impl MyMcpServer {
     // `library` with no articles, `sub_agent` in server mode — reached whichever did not.
     pub(crate) async fn execute_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
         // An external server's tool. Its result is already in this shape.
+        //
+        // Boxed: rmcp's call future is nearly 4 KB, and inlined it made every tool call's
+        // future that size, nested a dozen deep under `run_turn`. A debug build then
+        // overflowed Windows' 1 MB main-thread stack on the first `crate_search`.
         if name.starts_with(crate::mcp::PREFIX) && !self.tool_router.has_route(name) {
-            return self.mcp.call(name, arguments).await;
+            return Box::pin(self.mcp.call(name, arguments)).await;
         }
         if !self.tool_router.has_route(name) {
             return Err(anyhow::anyhow!("Unknown tool: {}", name));
