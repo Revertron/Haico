@@ -10,6 +10,9 @@ pub(crate) struct Chrome<'a> {
     // What the top bar says when nothing is running. Ignored while `busy` is set, since
     // what is happening now always beats what happened last.
     pub(crate) last: Option<&'a str>,
+    // The right-hand end of the activity bar: news from outside the session, today a newer
+    // release. Kept off the left, which is the session's own and changes all the time.
+    pub(crate) notice: Option<&'a str>,
     // The right-hand end of the status bar: which model, and how full its context is.
     pub(crate) status: &'a str,
     // The plan as todo_write last left it, drawn above everything else. Empty until the
@@ -101,10 +104,29 @@ pub(crate) fn busy_label(busy: &str, characters: usize) -> String {
 //
 // It used to exist only while something was running, which meant the input box jumped a
 // row every time work started or stopped. Always drawn, so it does not.
-fn activity_bar(chrome: &Chrome, width: usize) -> String {
+pub(super) fn activity_bar(chrome: &Chrome, width: usize) -> String {
     let text = chrome.busy.or(chrome.last).unwrap_or("ready");
-    bar(&format!("○ {}", text), width)
+    let activity = format!("○ {}", text);
+    let room = width.saturating_sub(1);
+    let Some(notice) = chrome.notice else {
+        return bar(&activity, width);
+    };
+
+    // The activity gives way first, down to `ACTIVITY_MIN_COLUMNS`: it is what is
+    // happening now, and the notice can wait. Below that the notice is left out
+    // whole — half of "haico --update" tells no one anything.
+    let notice_length = notice.chars().count();
+    let room_for_activity = room.saturating_sub(notice_length + 1);
+    if room_for_activity < ACTIVITY_MIN_COLUMNS.min(activity.chars().count()) {
+        return bar(&activity, width);
+    }
+    let activity = fit(&activity, room_for_activity);
+    let gap = room.saturating_sub(activity.chars().count() + notice_length).max(1);
+    bar(&format!("{}{}{}", activity, " ".repeat(gap), notice), width)
 }
+
+// The least of the activity text a notice may leave on the bar.
+const ACTIVITY_MIN_COLUMNS: usize = 16;
 
 // One row: the mode on the left, the model and context on the right. Kept a column
 // short of the terminal width so it can never be the thing that wraps — a row the

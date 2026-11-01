@@ -49,6 +49,7 @@ mod timers;
 mod tools;
 mod trace;
 mod turn;
+mod update;
 mod util;
 mod workspace;
 
@@ -115,6 +116,12 @@ async fn main() -> Result<()> {
     let config = parse_config()?;
     // Before anything is rendered: NO_COLOR is haico's to apply, not crossterm's.
     out::own_colors();
+
+    // Before `--dir`, the traces and everything else: updating touches only the binary,
+    // and a run that also asked for a trace or a directory gets neither — it exits here.
+    if config.update {
+        return update::run().await;
+    }
 
     // The process moves, rather than the directory being handed to whatever needs it:
     // the project's instructions, memory, skills, the workspace, the session path, the

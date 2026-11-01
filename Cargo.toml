@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
@@ -73,6 +73,12 @@ base64 = "0.23"
 # bytes at all without an optional ffmpeg build. Re-encoding to PNG is the only answer
 # that is true on both. Default features off: this is a converter, not an image library.
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+# `--update`: which release is newer, and putting the new binary where the running one is.
+# Replacing a running exe is the part that differs by platform — Windows refuses to
+# overwrite one but lets it be renamed, and the renamed file then has to be deleted once
+# nothing holds it — and self-replace is that dance, done once and tested.
+semver = "1"
+self-replace = "1.5"
 
 # Windows only, and only for the full-screen renderer's mouse.
 #
@@ -95,3 +101,11 @@ clipboard-win = "5"
 # console mode haico's VT input depends on. Same version process-wrap uses, so its
 # `CreationFlags` wrapper takes the type.
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+# The Windows release is a .zip, and `--update` unpacks it. Deflate only, through the
+# flate2 already here: that is all 7-Zip's default zip is.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+# The Linux release is a .tar.gz; flate2 does the gzip half. No xattr: one file is read
+# into memory, nothing is unpacked to disk.
+[target.'cfg(unix)'.dependencies]
+tar = { version = "0.4", default-features = false }

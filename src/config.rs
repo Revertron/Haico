@@ -105,6 +105,8 @@ pub(crate) struct Config {
     // with the `gui` feature; without it `main` says so and exits rather than
     // silently falling back to the REPL, which would look like the flag worked.
     pub(crate) gui: bool,
+    // Replace this binary with the latest GitHub release's, then exit.
+    pub(crate) update: bool,
     pub(crate) url_supplied: bool,
     pub(crate) search: Option<crate::tools::SearchBackend>,
     // The model's context window, in tokens. Only used to tell the user how close the
@@ -182,6 +184,7 @@ pub(crate) fn parse_config() -> Result<Config> {
     opts.optopt("d", "dir", "Work in DIR instead of the current directory", "DIR");
     opts.optflag("", "server", "Run as an stdio MCP server (no REPL, no prompts)");
     opts.optflag("", "gui", "Open a window instead of using the terminal");
+    opts.optflag("", "update", "Update haico to the latest release from GitHub, then exit");
     opts.optflag("h", "help", "Print this help message");
 
     let matches = match opts.parse(&args[1..]) {
@@ -352,6 +355,7 @@ pub(crate) fn parse_config() -> Result<Config> {
         model,
         server,
         gui,
+        update: matches.opt_present("update"),
         url_supplied,
         search,
         context_arg,
@@ -640,6 +644,9 @@ pub(crate) struct FileConfig {
     pub(crate) tui: Option<Tui>,
     // "scroll" (default) or "off".
     pub(crate) mouse: Option<Mouse>,
+    // Whether the REPL asks GitHub for a newer release shortly after it starts. On unless
+    // set to false: the notice is the only way most people would learn there is one.
+    pub(crate) check_updates: Option<bool>,
 
     // Top-level fallbacks, used when the selected model has no entry of its own.
     pub(crate) context: Option<usize>,
@@ -689,7 +696,7 @@ pub(crate) const CONFIG_VERSION: u32 = 1;
 // section would be taken for the setting, or the setting for its section.
 const RESERVED_KEYS: &[&str] = &[
     "version", "providers", "provider", "url", "token", "model", "searxng", "tinyfish",
-    "system_prompt", "read_paths", "tui", "mouse", "context", "temperature", "max_tokens", "top_p", "top_k",
+    "system_prompt", "read_paths", "tui", "mouse", "check_updates", "context", "temperature", "max_tokens", "top_p", "top_k",
     "min_p", "repeat_penalty", "reasoning_effort", "reasoning", "reasoning_threshold", "repetition_retries", "extra_body", "extra_headers", "models",
 ];
 
@@ -828,6 +835,10 @@ version = 1
 # tui = "fullscreen"
 # mouse = "scroll"
 
+# Look for a newer haico on GitHub shortly after starting, and say so on the bar above
+# the input box; `haico --update` installs it. false never asks.
+# check_updates = true
+
 # Fallbacks for every model without a section of its own. The sampling settings are left
 # to the server unless given.
 # context = 131072
@@ -848,7 +859,8 @@ version = 1
 # repetition_retries = 3
 
 # Per-model settings, keyed by the name the server reports. Takes every setting above
-# except providers, provider, searxng, tinyfish, system_prompt, read_paths, tui and mouse, plus:
+# except providers, provider, searxng, tinyfish, system_prompt, read_paths, tui, mouse and
+# check_updates, plus:
 #   use_system_prompt = false     for a model trained with instructions of its own
 #   sub_agent_effort = "low"      reasoning_effort for research, review and summaries
 
@@ -1542,6 +1554,7 @@ mod tests {
             model: None,
             server: false,
             gui: false,
+            update: false,
             url_supplied: false,
             search: None,
             context_arg: None,
@@ -1926,6 +1939,7 @@ mod tests {
         assert!(parsed.providers.is_empty() && parsed.provider_sections.is_empty());
         assert!(parsed.context.is_none() && parsed.temperature.is_none());
         assert!(parsed.read_paths.is_empty() && parsed.tui.is_none());
+        assert!(parsed.check_updates.is_none());
         assert_eq!(parsed.models.len(), 1);
 
         let tiel = &parsed.models["tiel-coder-35b-a3b-mtp"];
@@ -1959,6 +1973,17 @@ mod tests {
         let local = &parsed.provider_sections["local"];
         assert!(local.url.is_some() && local.token.is_some() && local.model.is_some());
         assert_eq!(parsed.active_provider(), Some("local"));
+    }
+
+    #[test]
+    fn check_updates_is_a_top_level_switch() {
+        assert_eq!(parse_file_config("check_updates = false\n").unwrap().check_updates, Some(false));
+        assert_eq!(parse_file_config("").unwrap().check_updates, None);
+        // A quoted "false" is a string, and turning the check off by accident of quoting
+        // would be as wrong as leaving it on: refused, so the user sees which.
+        assert!(parse_file_config("check_updates = \"false\"\n").is_err());
+        // It is about the session, not a model, so a model's section does not take it.
+        assert!(parse_file_config("[models.\"m\"]\ncheck_updates = false\n").is_err());
     }
 
     #[test]

@@ -463,6 +463,7 @@ pub(crate) fn test_config(url: &str) -> crate::Config {
         model: None,
         server: false,
         gui: false,
+        update: false,
         url_supplied: true,
         search: None,
         context_arg: None,

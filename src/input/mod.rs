@@ -212,11 +212,12 @@ pub(crate) async fn read_command(
     mode: &mut Mode,
     status: &str,
     last: Option<&str>,
+    notice: Option<&str>,
     todos: &[TodoItem],
     plan: &mut PlanView,
     wake: Option<std::time::Instant>,
-    // Something outside the keyboard has news for the prompt — today the MCP servers
-    // finishing loading. Answered with `Wake` like a timer, and the caller looks.
+    // Something outside the keyboard has news for the prompt — the MCP servers finishing
+    // loading, a newer release. Answered with `Wake` like a timer, and the caller looks.
     news: impl std::future::Future<Output = ()>,
 ) -> Input {
     // Made once rather than per keystroke: typing must not keep pushing the deadline back.
@@ -235,6 +236,7 @@ pub(crate) async fn read_command(
                 mode: *mode,
                 busy: None,
                 last,
+                notice,
                 status,
                 todos,
                 // Nothing can be waiting here: a queued message becomes the next prompt
@@ -522,6 +524,54 @@ mod tests {
         }
     }
 
+    fn activity_with(busy: Option<&str>, notice: Option<&str>, width: usize) -> String {
+        let bar = activity_bar(
+            &Chrome {
+                mode: Mode::Normal,
+                busy,
+                last: None,
+                notice,
+                status: "",
+                todos: &[],
+                queued: &[],
+                plan: PlanView::Windowed,
+            },
+            width,
+        );
+        crate::util::strip_ansi(&bar)
+    }
+
+    #[test]
+    fn the_update_notice_sits_at_the_right_end_of_the_activity_bar() {
+        let notice = "↑ v0.4.0 available: haico --update";
+        let row = activity_with(None, Some(notice), 80);
+        assert!(row.starts_with("○ ready "), "{row:?}");
+        // Right-aligned against the column the bar stops short at.
+        assert!(row.ends_with(notice), "{row:?}");
+        assert_eq!(row.chars().count(), 79);
+    }
+
+    #[test]
+    fn a_long_activity_gives_way_to_the_notice_and_a_narrow_bar_drops_it() {
+        let notice = "↑ v0.4.0 available: haico --update";
+        let busy = "running cargo test --features gui --all-targets -- --nocapture";
+        let row = activity_with(Some(busy), Some(notice), 60);
+        assert!(row.ends_with(notice), "{row:?}");
+        assert!(row.starts_with("○ running cargo"), "{row:?}");
+        assert!(row.contains('…'), "the activity should be cut: {row:?}");
+        assert_eq!(row.chars().count(), 59);
+
+        // No room for the notice beside even a little of the activity: the activity wins.
+        let row = activity_with(Some(busy), Some(notice), 40);
+        assert!(!row.contains("update"), "{row:?}");
+        assert!(row.starts_with("○ running cargo"), "{row:?}");
+
+        for width in [1usize, 10, 40, 51, 52, 80] {
+            let row = activity_with(Some(busy), Some(notice), width);
+            assert!(row.chars().count() < width.max(1), "width {width}: {row:?}");
+        }
+    }
+
     #[test]
     fn the_status_bar_never_reaches_the_edge_of_the_screen() {
         // A row exactly as wide as the terminal wraps, and a wrapped row is one the
@@ -573,6 +623,7 @@ mod tests {
             mode: Mode::Plan,
             busy: Some("thinking"),
             last: Some("ran cargo build"),
+            notice: None,
             status: "a-model  ctx 3%",
             todos: &[],
             queued: &[],
@@ -598,6 +649,7 @@ mod tests {
             mode: Mode::Plan,
             busy: None,
             last: Some("ran cargo build"),
+            notice: None,
             status: "a-model  ctx 3%",
             todos: &[],
             queued: &[],
@@ -610,6 +662,7 @@ mod tests {
             mode: Mode::Plan,
             busy: None,
             last: None,
+            notice: None,
             status: "a-model  ctx 3%",
             todos: &[],
             queued: &[],
@@ -659,6 +712,7 @@ mod tests {
                 mode: Mode::Normal,
                 busy: Some("thinking"),
                 last: None,
+                notice: None,
                 status: "a-model  ctx 3%",
                 todos: &[],
                 queued: &["ask about the tests".to_string()],
@@ -813,6 +867,7 @@ mod tests {
                 mode: Mode::Normal,
                 busy: Some("thinking"),
                 last: None,
+                notice: None,
                 status: "a-model  ctx 3%",
                 todos: &todos,
                 queued: &[],
@@ -1021,6 +1076,7 @@ mod tests {
                 mode: Mode::Normal,
                 busy: None,
                 last: None,
+                notice: None,
                 status: "a-model  ctx 3%",
                 todos: &[],
                 queued: &[],

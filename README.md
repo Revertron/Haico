@@ -61,6 +61,14 @@ It's designed primarily for efficient coding in Rust, but maybe used for other l
 
 ## Installation
 
+Prebuilt binaries for Linux and Windows (x86_64) are attached to each
+[release](https://github.com/Revertron/Haico/releases). Unpack one anywhere on your `PATH`;
+`haico --update` later replaces it with the newest release in place. The interactive session
+also checks for one about 20 seconds after it starts and says so on the bar above the input box
+(`check_updates = false` in the config turns that off).
+
+To build from source instead:
+
 ### Prerequisites
 - A recent stable Rust toolchain (installed via `rustup`).
 - An OpenAI-compatible LLM server: **Ollama**, **LM Studio**, **llama-server**, or similar.
@@ -132,6 +140,7 @@ searxng    = "http://127.0.0.1:8888"  # or tinyfish = "your-api-key", not both
 read_paths = ["C:/src/shared-lib"]  # readable by the file tools, never writable
 tui        = "fullscreen"           # or "inline"
 mouse      = "scroll"               # or "off"
+check_updates = true                # say on the bar when a newer release is out
 
 [lmstudio]
 url   = "http://127.0.0.1:1234"
@@ -188,6 +197,7 @@ window set with `/set context`. Other `/set` changes last for the session.
     --trace-gaps FILE     Append each question the library could not answer to FILE
     --server              Run as a stdio MCP server (no REPL, no prompts)
     --gui                 Open a window instead of the terminal (needs --features gui)
+    --update              Update haico to the latest release from GitHub, then exit
 -h, --help                Print help, including a commented config example
 ```
 

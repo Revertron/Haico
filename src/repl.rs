@@ -195,6 +195,9 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
         // is traffic and flicker bought for nothing.
         let mut shown: Option<String> = None;
         let mut shown_plan: Vec<TodoItem> = Vec::new();
+        // The update notice can land in the middle of a long tool call, which moves no
+        // counter; the tick that sees it first is the one that draws it.
+        let mut shown_notice: Option<String> = None;
         let mut dirty = true;
         // The turn's last act is to narrate its own ending, so every exit drains
         // what is still queued before leaving. The channel cannot close while the
@@ -226,7 +229,8 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
 
             let label = busy_label(&busy, if counting { streamed } else { 0 });
             let plan = todos.lock().unwrap().clone();
-            if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan {
+            let notice = io.update.notice();
+            if dirty || shown.as_deref() != Some(label.as_str()) || shown_plan != plan || shown_notice != notice {
                 let queued = link.queued();
                 draw(
                     &io.editor,
@@ -237,6 +241,7 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
                         // to show. The last thing that happened goes there at the
                         // next prompt instead, which is drawn once this returns.
                         last: None,
+                        notice: notice.as_deref(),
                         status: &status,
                         todos: &plan,
                         queued: &queued,
@@ -245,6 +250,7 @@ async fn drive(agent: &mut Agent, io: &mut TerminalIo, job: Job) {
                 );
                 shown = Some(label);
                 shown_plan = plan;
+                shown_notice = notice;
                 dirty = false;
             }
 
@@ -565,6 +571,15 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
+    // Counted from here, so the model picker and the MCP approvals do not push it back.
+    // Only with a keyboard: the notice lives on the bar above the box, and a piped
+    // session draws no bar. `check_updates = false` means GitHub is never asked at all,
+    // not that the answer goes unshown.
+    let update = if interactive && config.file.check_updates.unwrap_or(true) {
+        crate::update::check_in_background()
+    } else {
+        crate::update::Available::default()
+    };
 
     outln!("{:^37}", concat!("Welcome to Haico v", env!("CARGO_PKG_VERSION"), "!"));
     outln!("=====================================\n");
@@ -653,6 +668,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         plan_view: PlanView::default(),
         last_activity: None,
         history_path,
+        update,
     };
     io.editor.set_commands(commands::for_cwd());
 
@@ -689,16 +705,29 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                         status.push_str(&format!(" • MCP {}/{}", total - loading, total));
                     }
                     let plan = agent.plan();
+                    let notice = io.update.notice();
+                    let update = io.update.clone();
+                    let waiting_for_update = notice.is_none();
+                    let mcp_news = agent.server.mcp.changed();
+                    let news = async move {
+                        tokio::select! {
+                            _ = mcp_news => {}
+                            // Only until it has said its piece: it never fires again, and
+                            // once it has, the notice is already on the bar.
+                            _ = update.changed(), if waiting_for_update => {}
+                        }
+                    };
                     match read_command(
                         keys,
                         &mut io.editor,
                         &mut agent.mode,
                         &status,
                         io.last_activity.as_deref(),
+                        notice.as_deref(),
                         &plan,
                         &mut io.plan_view,
                         agent.server.next_timer_wake(),
-                        agent.server.mcp.changed(),
+                        news,
                     )
                     .await
                     {
@@ -1684,6 +1713,9 @@ struct TerminalIo {
     /// actually happened, rather than an empty row.
     last_activity: Option<String>,
     history_path: Option<PathBuf>,
+    /// A newer release, once the background check has found one; the right-hand end
+    /// of the bar above the box.
+    update: crate::update::Available,
 }
 
 #[cfg(test)]

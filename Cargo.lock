@@ -1575,6 +1575,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2019,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "haico"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2044,9 +2054,12 @@ dependencies = [
  "rmcp",
  "schemars",
  "scraper",
+ "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "similar 3.2.1",
+ "tar",
  "terminput",
  "terminput-crossterm",
  "tokio",
@@ -2056,6 +2069,7 @@ dependencies = [
  "url",
  "urlencoding",
  "windows",
+ "zip",
 ]
 
 [[package]]
@@ -4523,6 +4537,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "self-replace"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609c5606d9d357b26e4ee1a7a01beac396628d0fa01ebbade2a09cefb88e65af"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4990,6 +5015,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5410,6 +5445,12 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "uds_windows"
@@ -6421,6 +6462,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "zip"
+version = "9.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "848dad21639597378c3be94c59fd4de683f0f6d8a5387575896e1245737d4f37"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "getrandom 0.4.3",
+ "indexmap",
+ "memchr",
+ "nix",
+ "typed-path",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
