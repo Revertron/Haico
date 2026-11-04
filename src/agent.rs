@@ -349,6 +349,8 @@ impl Agent {
 
         self.messages.clear();
         self.seed_system_message();
+        // Of the history just cleared; see `compact`.
+        self.measured = None;
         self.review_cache.clear();
         self.server.todos.lock().unwrap().clear();
         // The timers go with the conversation that set them: a reminder to "check the
@@ -622,8 +624,10 @@ impl Agent {
     /// reply was cut off mid-tool-call and the next request was refused outright.
     ///
     /// The measurement is trusted only while the history has grown since it was taken. A
-    /// history that shrank (compaction, `/clear`) is a different history, and falls back to
-    /// the estimate, with the tools array counted, until the next reply measures it again.
+    /// history that shrank is a different history, and falls back to the estimate, with the
+    /// tools array counted, until the next reply measures it again. Compaction and `/clear`
+    /// drop the measurement outright rather than rely on that: the notes can estimate larger
+    /// than the history the count was taken on, and then the old count was read as theirs.
     pub(crate) fn context_used(&self) -> usize {
         let estimate = estimate_tokens(&self.messages);
         match self.measured {
@@ -1897,6 +1901,12 @@ impl Agent {
         // freed nothing to go with it.
         if let Some(Ok(_)) = &compacted {
             self.review_cache.clear();
+            // The server's count is of the history that just went. Left in place, it was
+            // trusted whenever the notes estimated at least as large as the history it was
+            // taken on, so the check after an auto-compaction read the old count, said the
+            // summary was still over the line, and switched auto-compaction off for the
+            // rest of the turn — which in auto mode is the rest of the job.
+            self.measured = None;
             // Before the prompt is rebuilt below, so what the hooks say now goes in with it.
             self.session_start("compact", tx, link).await;
             self.refresh_memory();
@@ -3446,6 +3456,61 @@ mod turn_tests {
                 && m["content"].as_str().is_some_and(|c| c.contains("You replied without calling a tool"))),
             "the note is missing"
         );
+    }
+
+    /// Auto-compaction keeps working after the first one. The server's count of the history
+    /// before a compaction used to survive it, and was trusted whenever the notes estimated at
+    /// least as large as the history it was taken on (here: a short history and a large
+    /// count). The check after the compaction then read the old count as the notes', said
+    /// they were still over the line, and turned auto-compaction off for the rest of the turn.
+    #[tokio::test]
+    async fn auto_compaction_runs_again_when_the_context_fills_again() {
+        let _capture = out::capture_guard();
+        const DONE: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#;
+        const NOTES: &str =
+            r#"{"choices":[{"message":{"role":"assistant","content":"Task: x\nCurrent state: y\nNext step: z"}}]}"#;
+        // A tool call, with the server counting `prompt_tokens` for the request it answers.
+        macro_rules! call {
+            ($id:literal, $prompt:literal) => {
+                concat!(
+                    r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":""#,
+                    $id,
+                    r#"","type":"function","function":{"name":"get_date","arguments":"{}"}}]}}],"usage":{"prompt_tokens":"#,
+                    $prompt,
+                    r#","completion_tokens":3,"total_tokens":0}}"#
+                )
+            };
+        }
+        let (url, served) = serve_sequence(&[
+            call!("c1", 95000),
+            NOTES,
+            call!("c2", 20000),
+            call!("c3", 95000),
+            NOTES,
+            call!("c4", 20000),
+            DONE,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        agent.context_tokens = 100_000;
+        let link = TurnLink::new(Mode::Auto);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        drop(tx);
+
+        let (mut compacted, mut still_large) = (0, false);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::Notice(Notice::Compacted(_)) => compacted += 1,
+                AgentEvent::Notice(Notice::CompactionStillLarge(_)) => still_large = true,
+                _ => {}
+            }
+        }
+        assert!(!still_large, "the old count was read as the notes'");
+        assert_eq!(compacted, 2);
+        assert_eq!(*served.lock().unwrap(), 7);
     }
 
     /// The size of the history comes from the server's count once one has arrived, plus an
