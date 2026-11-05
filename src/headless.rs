@@ -83,6 +83,13 @@ pub(crate) async fn run(config: Config, task: String) -> Result<i32> {
     if let Some((name, _)) = &agent.project_context {
         outln!("Loaded project context from {}", name);
     }
+    // Before the first request: an unattended run with the configured window over the
+    // loaded one has its first refusal to waste otherwise.
+    if let Some(crate::turn::Notice::ContextWindowLearned { configured, actual }) =
+        agent.probe_context_window().await
+    {
+        outln!("{}", crate::present::window_learned(configured, actual));
+    }
     // Saved only when continuing one. The session file is per directory, and a fresh
     // run saving would replace whatever conversation the user left here at the prompt —
     // on every run, for a task on a schedule. `--resume` is the opt-in: it says this

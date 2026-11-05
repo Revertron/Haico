@@ -233,6 +233,9 @@ pub(crate) enum Notice {
     /// be tried again this turn. Carries the percentage of the window.
     CompactionStillLarge(usize),
     CompactionFailed(String),
+    /// The server refused a request for size and said how large its window really is,
+    /// smaller than the one configured. `actual` is used from here on, this session only.
+    ContextWindowLearned { configured: usize, actual: usize },
     /// The conversation could not be saved at the end of the turn, so `--resume`
     /// would bring back an older one. Carries the reason.
     SessionNotSaved(String),

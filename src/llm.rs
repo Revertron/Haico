@@ -33,7 +33,8 @@ pub(crate) struct ModelInfo {
 // See `apply_settings` for why both fields are sent.
 fn thinking_switch(effort: Option<&str>) -> Option<bool> {
     match effort {
-        Some(e) if e.eq_ignore_ascii_case("off") => Some(false),
+        // "none" is LM Studio's word for off, and llama.cpp's template only hears the switch.
+        Some(e) if e.eq_ignore_ascii_case("off") || e.eq_ignore_ascii_case("none") => Some(false),
         Some(e) if e.eq_ignore_ascii_case("on") => Some(true),
         _ => None,
     }
@@ -119,10 +120,23 @@ fn status_is_transient(status: u16) -> bool {
 // server's side, since that is what an error that arrives after a 200 has nearly always been;
 // the retry count bounds the cost of being wrong.
 fn error_object_is_transient(error: &Value) -> bool {
-    match error.get("code").and_then(|c| c.as_u64()) {
+    let code = error.get("code").and_then(|c| c.as_u64());
+    match code.or_else(|| error.get("http_status").and_then(|c| c.as_u64())).or_else(|| status_in_message(error)) {
         Some(code) => status_is_transient(code as u16),
         None => true,
     }
+}
+
+// The status of the engine behind the server, when the server only quotes it. LM Studio's
+// mid-stream error has no `code`, just "Engine protocol predict request returned 400: …"
+// with llama.cpp's own error inside; read as transient, a request refused for its size was
+// sent unchanged five more times, a minute of backoff, before the turn could compact.
+fn status_in_message(error: &Value) -> Option<u64> {
+    let message = error.get("message")?.as_str()?;
+    let (_, rest) = message.split_once(" returned ")?;
+    let digits = rest.get(..3).filter(|d| d.bytes().all(|b| b.is_ascii_digit()))?;
+    let after = rest[3..].chars().next();
+    (after.is_none_or(|c| !c.is_ascii_alphanumeric())).then(|| digits.parse().ok()).flatten()
 }
 
 fn error_object_message(error: &Value) -> String {
@@ -212,6 +226,8 @@ pub(crate) struct LMStudioClient {
     // The level a sub-agent's own conversation asks for, straight from the config. Read
     // only by `for_sub_agent` — the main conversation never sends this one.
     pub(crate) sub_agent_effort: Option<String>,
+    // The compactor's level, likewise read only by `for_compactor`.
+    pub(crate) compactor_effort: Option<String>,
     // The config's `extra_body` and `extra_headers`, merged for the model in use. Carried
     // to the sub-agents unchanged: they talk to the same service, and a reviewer routed
     // past the user's `data_collection = "deny"` would be the leak the setting is there for.
@@ -249,6 +265,7 @@ impl LMStudioClient {
             reasoning_effort: None,
             enable_thinking: None,
             sub_agent_effort: None,
+            compactor_effort: None,
             extra_body: serde_json::Map::new(),
             extra_headers: reqwest::header::HeaderMap::new(),
             retry_delays: if cfg!(test) { Vec::new() } else { RETRY_DELAYS.to_vec() },
@@ -279,6 +296,15 @@ impl LMStudioClient {
         client
     }
 
+    /// The copy the compactor writes its notes through: `compactor_effort`, or nothing —
+    /// never the main conversation's level, as for every helper of haico's own.
+    pub(crate) fn for_compactor(&self) -> Self {
+        let mut client = self.clone();
+        client.reasoning_effort = self.compactor_effort.clone();
+        client.enable_thinking = thinking_switch(client.reasoning_effort.as_deref());
+        client
+    }
+
     // Apply the settings resolved for the model currently in use.
     pub(crate) fn apply_settings(&mut self, settings: &ResolvedSettings) {
         self.temperature = settings.temperature.value;
@@ -287,20 +313,20 @@ impl LMStudioClient {
         self.top_k = settings.top_k.value;
         self.min_p = settings.min_p.value;
         self.repeat_penalty = settings.repeat_penalty.value;
-        // The effort always goes out as typed. "on" and "off" are also sent as the template
-        // switch, because the two servers read different fields for the same thing: LM Studio
-        // takes them from `reasoning_effort` (for a Qwen3-style model it accepts exactly those
-        // two and logs "'medium' is not supported ... Falling back to 'on'" for anything
-        // else), while llama.cpp passes `reasoning_effort` to a template that ignores it and
-        // obeys only chat_template_kwargs.enable_thinking. Sending one field would leave the
-        // setting doing nothing on one of the two servers. A real level ("medium") goes into
-        // the kwargs as itself (`set_thinking`).
+        // The effort goes out in `reasoning_effort` as typed, save on and off (`set_thinking`).
+        // On, off and none are also sent as the template switch, because the two servers read
+        // different fields for the same thing: LM Studio reads `reasoning_effort` (its own
+        // levels, "none" for off), while llama.cpp passes `reasoning_effort` to a template
+        // that ignores it and obeys only chat_template_kwargs.enable_thinking. Sending one
+        // field would leave the setting doing nothing on one of the two servers. A real level
+        // ("medium") goes into the kwargs as itself (`set_thinking`).
         // Done here rather than in `set_knob` so the config file's `reasoning_effort = "off"`
         // means the same as `/effort off`.
         self.reasoning_effort = settings.reasoning_effort.value.clone();
         self.enable_thinking = thinking_switch(self.reasoning_effort.as_deref());
         // Not applied to this client's own requests — `for_sub_agent` is what reads it.
         self.sub_agent_effort = settings.sub_agent_effort.clone();
+        self.compactor_effort = settings.compactor_effort.clone();
         self.extra_body = settings.extra_body.clone();
         self.extra_headers = settings.extra_headers.clone();
     }
@@ -322,8 +348,17 @@ impl LMStudioClient {
     pub(crate) fn set_thinking(&self, body: &mut Value) {
         // Sent as the user typed it, for the same reason it is stored as a string: the level
         // names are the template's, so a value haico does not recognize is far more likely to
-        // be a model it has not met than a typo worth refusing to send.
-        if let Some(reasoning_effort) = &self.reasoning_effort {
+        // be a model it has not met than a typo worth refusing to send. Except on and off,
+        // which are haico's own words for the switch: LM Studio refuses both in this field
+        // ("Supported values: none, minimal, low, medium, high, xhigh") with a 400, so "off"
+        // goes as its "none" and "on" as nothing — thinking is what a thinking model does
+        // unasked. The switch itself still goes to the template below.
+        let field = match self.reasoning_effort.as_deref() {
+            Some(e) if e.eq_ignore_ascii_case("off") => Some("none"),
+            Some(e) if e.eq_ignore_ascii_case("on") => None,
+            other => other,
+        };
+        if let Some(reasoning_effort) = field {
             body["reasoning_effort"] = json!(reasoning_effort);
         }
         // The same choice again as template variables, because the server's own reading of
@@ -411,10 +446,18 @@ impl LMStudioClient {
             return Err(status_error(response).await);
         }
 
-        response
-            .json::<Value>()
-            .await
-            .context("Failed to parse response")
+        let status = response.status();
+        let mut reply = response.json::<Value>().await.context("Failed to parse response")?;
+        // The status goes into the error object it came with, because the retry decision is
+        // made from that object alone and LM Studio's has no numeric `code` — "type":
+        // "invalid_request_error" — which reads as transient, so a request the server refused
+        // as invalid was sent five more times, refused each time within milliseconds.
+        if !status.is_success() {
+            if let Some(error) = reply.get_mut("error").and_then(Value::as_object_mut) {
+                error.entry("http_status").or_insert(json!(status.as_u16()));
+            }
+        }
+        Ok(reply)
     }
 
     // `post_chat`, recorded in the trace when there is one. The reply is recorded as the
@@ -1247,6 +1290,86 @@ pub(crate) async fn fetch_loaded_models(base_url: &str, token: Option<&str>) -> 
     Vec::new()
 }
 
+// How long the window probe waits on each endpoint. It runs before the first prompt and
+// after a model switch, with nothing on screen saying so, and a server busy on another job
+// can sit on a request without answering — the refusal recovery in `run_turn` is still there
+// behind a probe that gave up.
+const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The context window `model` is loaded with on the server, when the server says.
+///
+/// The config's number, or the 131,072 default for a model with none, is only what haico
+/// was told; a llama-server at 65,536 refused a 69,109-token request that haico thought was
+/// half its window. LM Studio's v1 API gives each loaded instance's `context_length`;
+/// llama-server's `/props` gives its `n_ctx`. `None` for anything else, a model that is not
+/// loaded yet (LM Studio picks the size when it loads one on demand), or no answer in time.
+pub(crate) async fn fetch_context_window(base_url: &str, token: Option<&str>, model: &str) -> Option<usize> {
+    #[derive(Deserialize)]
+    struct LmStudioV1 {
+        models: Vec<LmStudioV1Model>,
+    }
+    #[derive(Deserialize)]
+    struct LmStudioV1Model {
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        loaded_instances: Vec<LmStudioInstance>,
+    }
+    #[derive(Deserialize)]
+    struct LmStudioInstance {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        config: LmStudioInstanceConfig,
+    }
+    #[derive(Deserialize, Default)]
+    struct LmStudioInstanceConfig {
+        context_length: Option<usize>,
+    }
+
+    let base = normalize_base_url(base_url);
+    let client = http_client();
+    let get = |path: &str| {
+        let request = client.get(format!("{}{}", base, path)).timeout(WINDOW_PROBE_TIMEOUT);
+        match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+        .send()
+    };
+
+    // A request may name the instance (`nail-qwen3.6-35b`), the entry's key, or the key with
+    // its quantization (`…@q4_k_xl`); see `fetch_loaded_models`.
+    let bare = model.split('@').next().unwrap_or(model);
+    let names = |name: &str| !name.is_empty() && (name == model || name == bare);
+
+    let response = get("/api/v1/models").await.ok()?;
+    if response.status().is_success() {
+        // LM Studio answered: its word is final, and a model it has not loaded has no window yet.
+        let listed = response.json::<LmStudioV1>().await.ok()?;
+        return listed
+            .models
+            .into_iter()
+            .flat_map(|entry| {
+                let key = entry.key;
+                entry.loaded_instances.into_iter().map(move |instance| (key.clone(), instance))
+            })
+            .find(|(key, instance)| names(&instance.id) || names(key))
+            .and_then(|(_, instance)| instance.config.context_length);
+    }
+
+    let response = get("/props").await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let props = response.json::<Value>().await.ok()?;
+    props["default_generation_settings"]["n_ctx"]
+        .as_u64()
+        .or_else(|| props["n_ctx"].as_u64())
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
+}
+
 pub(crate) async fn fetch_available_models(base_url: &str, token: Option<&str>) -> Result<Vec<String>> {
     let client = http_client();
     let request = client.get(format!("{}/v1/models", normalize_base_url(base_url)));
@@ -1653,6 +1776,35 @@ mod tests {
         assert_eq!(fetch_loaded_models(&url, None).await, ["qwen2.5-14b"]);
     }
 
+    /// The window a model is loaded with: LM Studio's per instance, by any name a request
+    /// may use for it; llama-server's `n_ctx`; nothing for a model LM Studio has not loaded
+    /// or a server that has neither endpoint.
+    #[tokio::test]
+    async fn the_loaded_context_window_is_read_from_the_server() {
+        const LM_STUDIO_V1: &str = r#"{"models":[
+            {"key":"ornith-1.5-9b","type":"llm",
+             "loaded_instances":[{"id":"ornith-1.5-9b","config":{"context_length":32768,"parallel":4}}]},
+            {"key":"google/gemma-4-31b-qat","type":"llm",
+             "loaded_instances":[{"id":"google/gemma-4-31b-qat","config":{"context_length":65536}}]},
+            {"key":"llama-3.1-8b@q8_0","type":"llm","loaded_instances":[]}
+        ]}"#;
+        let url = serve_routes(&[("/api/v1/models", LM_STUDIO_V1)]).await;
+        assert_eq!(fetch_context_window(&url, None, "ornith-1.5-9b").await, Some(32768));
+        assert_eq!(fetch_context_window(&url, None, "google/gemma-4-31b-qat@q4_0").await, Some(65536));
+        assert_eq!(fetch_context_window(&url, None, "llama-3.1-8b@q8_0").await, None);
+
+        // The shape as llama-server sends it.
+        let url = serve_routes(&[(
+            "/props",
+            r#"{"default_generation_settings":{"n_ctx":65536},"total_slots":1}"#,
+        )])
+        .await;
+        assert_eq!(fetch_context_window(&url, None, "iq3_s").await, Some(65536));
+
+        let url = serve_routes(&[("/v1/models", r#"{"data":[{"id":"m"}]}"#)]).await;
+        assert_eq!(fetch_context_window(&url, None, "m").await, None);
+    }
+
     #[tokio::test]
     async fn an_lm_studio_too_old_for_v1_is_still_asked_the_old_way() {
         // v1 arrived in LM Studio 0.4.0; anything older 404s it and answers v0. Falling
@@ -1797,6 +1949,21 @@ mod tests {
         assert_eq!(*served.lock().unwrap(), 2);
     }
 
+    /// A plain completion the server refuses with a 400 is not asked again, however its error
+    /// object is shaped — LM Studio's has a `type` and no numeric `code` — and its message is
+    /// what the caller reports.
+    #[tokio::test]
+    async fn a_plain_completion_refused_as_invalid_is_not_asked_again() {
+        let (url, served) = crate::testutil::serve_sequence(&[
+            r#"400 {"error":{"message":"Invalid 'reasoning_effort' value: 'off'. Supported values: none, minimal, low, medium, high, xhigh.","type":"invalid_request_error","param":"reasoning_effort"}}"#,
+        ])
+        .await;
+        let client = retrying_client(url, 3);
+        let error = client.simple_completion(Caller::Compactor, "system", "user").await.unwrap_err();
+        assert!(format!("{error:#}").contains("Invalid 'reasoning_effort'"), "{error:#}");
+        assert_eq!(*served.lock().unwrap(), 1);
+    }
+
     /// The retries are bounded, and the error that is finally returned is the server's own.
     #[tokio::test]
     async fn retries_run_out_and_the_last_error_is_reported() {
@@ -1898,6 +2065,11 @@ mod tests {
         assert!(error_object_is_transient(&json!({"message": "x"})));
         assert!(error_object_is_transient(&json!({"code": "server_error"})));
         assert!(!error_object_is_transient(&json!({"code": 400})));
+        // LM Studio quotes the engine's status instead of giving a code: as captured.
+        assert!(!error_object_is_transient(&json!({"message":
+            "Engine protocol predict request returned 400: {\"error\":{\"code\":400,\"message\":\"request (59717 tokens) exceeds the available context size (32768 tokens), try increasing it\"}}"})));
+        assert!(error_object_is_transient(&json!({"message": "Engine protocol predict request returned 503: busy"})));
+        assert!(error_object_is_transient(&json!({"message": "the model returned 4000 tokens"})));
 
         // A Retry-After longer than the schedule is waited out, up to the cap; never less
         // than the schedule.
@@ -2083,11 +2255,11 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"], json!({"reasoning_effort": "high"}));
     }
 
-    /// "on" and "off" go out in both fields: LM Studio reads them from `reasoning_effort`
-    /// (and only them, for a Qwen3-style model), llama.cpp's template only from
-    /// chat_template_kwargs. A sub-agent's copy does not inherit the main "off", for the
-    /// compressor's sake above, but its own configured "off" is sent the same way, and any
-    /// other level clears the switch again.
+    /// "on" and "off" reach both servers: LM Studio as `reasoning_effort` in its own words
+    /// ("none" for off, nothing for on — it refuses "on"/"off" there with a 400), llama.cpp's
+    /// template as the chat_template_kwargs switch, which "none" sets too. A sub-agent's copy
+    /// does not inherit the main "off", for the compressor's sake above, but its own
+    /// configured "off" is sent the same way, and any other level clears the switch again.
     #[test]
     fn effort_on_and_off_are_sent_to_both_servers_fields() {
         use crate::LMStudioClient;
@@ -2099,7 +2271,7 @@ mod tests {
 
         let mut body = json!({"messages": []});
         client.set_thinking(&mut body);
-        assert_eq!(body["reasoning_effort"], "Off", "LM Studio's field, as typed");
+        assert_eq!(body["reasoning_effort"], "none", "LM Studio's word for off");
         assert_eq!(body["chat_template_kwargs"], json!({"enable_thinking": false}));
 
         let mut body = json!({"messages": []});
@@ -2110,14 +2282,34 @@ mod tests {
         client.apply_settings(&settings);
         let mut body = json!({"messages": []});
         client.for_sub_agent().set_thinking(&mut body);
-        assert_eq!(body["reasoning_effort"], "off");
+        assert_eq!(body["reasoning_effort"], "none");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false, "unless told so");
+
+        // The compactor has its own level: neither the main one nor the sub-agents' reaches
+        // it, and its own does.
+        let mut body = json!({"messages": []});
+        client.for_compactor().set_thinking(&mut body);
+        assert!(body.get("reasoning_effort").is_none() && body.get("chat_template_kwargs").is_none(), "{body}");
+        settings.compactor_effort = Some("off".to_string());
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.for_compactor().set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+
+        // "none" typed as such is off on both servers too.
+        settings.compactor_effort = Some("none".to_string());
+        client.apply_settings(&settings);
+        let mut body = json!({"messages": []});
+        client.for_compactor().set_thinking(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
 
         settings.reasoning_effort = crate::Setting { value: Some("on".to_string()), source: "test" };
         client.apply_settings(&settings);
         let mut body = json!({"messages": []});
         client.set_thinking(&mut body);
-        assert_eq!(body["reasoning_effort"], "on");
+        assert!(body.get("reasoning_effort").is_none(), "on is the default, and refused as a word: {body}");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
 
         settings.reasoning_effort = crate::Setting { value: Some("low".to_string()), source: "test" };

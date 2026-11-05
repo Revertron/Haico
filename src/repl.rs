@@ -625,6 +625,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     if agent.user_context.is_some() {
         outln!("Loaded user context from {}", user_context_file());
     }
+    probe_window(&mut agent).await;
     if resume_requested {
         match agent.resume() {
             Ok(restored) => outln!(
@@ -1333,10 +1334,11 @@ async fn switch_model(agent: &mut Agent, io: &mut TerminalIo, requested: &str) {
     if let Kept::Failed(why) = &kept {
         outln!("  [warning] not saved as the default: {}", why);
     }
+    probe_window(agent).await;
     outln!(
         "  context {} ({}){}\n",
         agent.context_tokens,
-        agent.settings.context_source,
+        context_source(agent),
         match agent.settings.temperature.value {
             Some(t) => format!(", temperature {}", t),
             None => String::new(),
@@ -1424,7 +1426,26 @@ async fn switch_provider(agent: &mut Agent, io: &mut TerminalIo, requested: &str
     if let Kept::Failed(why) = &kept {
         outln!("  [warning] not saved as the default: {}", why);
     }
-    outln!("  context {} ({})\n", agent.context_tokens, agent.settings.context_source);
+    probe_window(agent).await;
+    outln!("  context {} ({})\n", agent.context_tokens, context_source(agent));
+}
+
+/// Ask the server what window the model is loaded with, and say so when it is smaller than
+/// the configured one (`Agent::probe_context_window`).
+async fn probe_window(agent: &mut Agent) {
+    if let Some(Notice::ContextWindowLearned { configured, actual }) = agent.probe_context_window().await {
+        outln!("{}", crate::present::window_learned(configured, actual));
+    }
+}
+
+/// Where the window in use came from: the setting's own source, or the server when the
+/// probe or a refusal lowered it below that.
+fn context_source(agent: &Agent) -> String {
+    if agent.context_tokens < agent.settings.context_tokens {
+        "loaded on the server".to_string()
+    } else {
+        agent.settings.context_source.to_string()
+    }
 }
 
 fn show_config(agent: &Agent) {
@@ -1451,6 +1472,13 @@ fn show_config(agent: &Agent) {
     outln!(
         "  sub_agent_effort  {}",
         match &agent.settings.sub_agent_effort {
+            Some(effort) => format!("{}  [config [models]]", effort),
+            None => "-  [unset (the model's own default, never the level above)]".to_string(),
+        }
+    );
+    outln!(
+        "  compactor_effort  {}",
+        match &agent.settings.compactor_effort {
             Some(effort) => format!("{}  [config [models]]", effort),
             None => "-  [unset (the model's own default, never the level above)]".to_string(),
         }

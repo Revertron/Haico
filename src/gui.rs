@@ -308,6 +308,7 @@ async fn converse(
     running: Arc<Mutex<Option<TurnLink>>>,
 ) {
     show(&handle, |ui| line(ui, "Ready. Type below, then Send or Ctrl+Enter.", Tone::Muted));
+    probe_window(&mut agent, &handle).await;
 
     // The MCP servers, in the background. Their notices go straight to the window from a
     // task of their own: this thread blocks on the input channel while idle, so it could
@@ -390,11 +391,15 @@ async fn converse(
             }
             Some(other) => {
                 let clearing = matches!(other, Command::Clear);
+                let switching = matches!(other, Command::SwitchModel(_));
                 if !obey(&mut agent, &handle, &tx, &models, other) {
                     break;
                 }
                 if clearing {
                     session_start(&mut agent, &handle, "clear").await;
+                }
+                if switching {
+                    probe_window(&mut agent, &handle).await;
                 }
                 continue;
             }
@@ -451,6 +456,15 @@ async fn converse(
 
 /// The `SessionStart` hooks, shown like a turn's events. Nothing to cancel them with: the
 /// window publishes a link only for turns.
+/// The window the server has the model loaded with, at startup and after a switch
+/// (`Agent::probe_context_window`); said only when it lowered the configured one.
+async fn probe_window(agent: &mut Agent, handle: &UiHandle) {
+    if let Some(notice) = agent.probe_context_window().await {
+        let (text, tone) = describe(notice);
+        show(handle, move |ui| line(ui, &text, tone));
+    }
+}
+
 async fn session_start(agent: &mut Agent, handle: &UiHandle, source: &'static str) {
     if !agent.hooks.has(crate::hooks::Event::SessionStart) {
         return;
@@ -900,6 +914,10 @@ fn describe(notice: Notice) -> (String, Tone) {
             (format!("still over {percent}% of the window; not compacting again"), Tone::Warning)
         }
         Notice::CompactionFailed(e) => (format!("could not compact: {e}"), Tone::Error),
+        Notice::ContextWindowLearned { configured, actual } => (
+            format!("the server's window is {actual} tokens, not {configured}; using {actual} this session"),
+            Tone::Warning,
+        ),
         Notice::SessionNotSaved(e) => (format!("the session was not saved: {e}"), Tone::Error),
         // The summary the terminal folds away is not shown here: there is nothing
         // to fold it into, and the window shows a chain of thought in full or not
@@ -2443,6 +2461,7 @@ mod tests {
             Notice::Compacted("r".into()),
             Notice::CompactionStillLarge(90),
             Notice::CompactionFailed("e".into()),
+            Notice::ContextWindowLearned { configured: 131072, actual: 65536 },
             Notice::SessionNotSaved("e".into()),
             Notice::ReasoningCompressed { before: 10, after: 2, summary: "s".into() },
             Notice::ReasoningDropped { tokens: 10 },

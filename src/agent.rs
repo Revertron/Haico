@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{
     autocompact_threshold, resolve_settings, save_active_provider, save_default_model,
     save_model_context, save_provider_model, Config,
-    Reasoning, ResolvedSettings, Setting, AUTOCOMPACT_FRACTION, FROM_UNSET,
+    Reasoning, ResolvedSettings, Setting, FROM_UNSET,
 };
 use crate::ask::{self, ASK_USER};
 use crate::llm::{Chunk, LMStudioClient};
@@ -632,11 +632,32 @@ impl Agent {
         let estimate = estimate_tokens(&self.messages);
         match self.measured {
             Some(Measured { prompt_tokens, estimate: then }) if estimate >= then => prompt_tokens + (estimate - then),
-            _ => {
-                let mcp: Vec<Value> = self.mcp_tools.iter().map(|t| t.schema.clone()).collect();
-                estimate + estimate_tokens(&self.tools) + estimate_tokens(&mcp)
-            }
+            _ => estimate + self.tools_estimate(),
         }
+    }
+
+    /// The tools array every request carries, haico's and the MCP servers', estimated.
+    fn tools_estimate(&self) -> usize {
+        let mcp: Vec<Value> = self.mcp_tools.iter().map(|t| t.schema.clone()).collect();
+        estimate_tokens(&self.tools) + estimate_tokens(&mcp)
+    }
+
+    /// Ask the server what window the model is loaded with, and use it when it is smaller
+    /// than the configured one. At startup and after a model or provider switch, by each
+    /// frontend; the notice is for it to word.
+    ///
+    /// Only ever lowered: the window that matters is the smaller of the two — a model loaded
+    /// at 64k refuses anything over it, and a configured 32k on a 128k load is the user
+    /// choosing to compact early. Never written to the config; the load is the server's,
+    /// and changes with it.
+    pub(crate) async fn probe_context_window(&mut self) -> Option<Notice> {
+        let model = self.client.model.clone();
+        let window =
+            crate::llm::fetch_context_window(&self.client.base_url, self.client.token.as_deref(), &model).await?;
+        (window < self.context_tokens).then(|| {
+            let configured = std::mem::replace(&mut self.context_tokens, window);
+            Notice::ContextWindowLearned { configured, actual: window }
+        })
     }
 
     /// Whether `context_used` rests on a measurement right now, for saying so.
@@ -1494,6 +1515,10 @@ struct TurnState {
     // Set once the image recovery has run, so a failure that has nothing to do with images
     // cannot make the turn retry forever.
     stripped_images: bool,
+    // Set when a request refused for size is retried behind a compaction, and cleared by the
+    // next reply that arrives: a second refusal in a row means compacting did not get the
+    // history under the window, and asking again would only be refused again.
+    overflow_retried: bool,
     // Replies in a row cut off for repeating themselves (see `repetition`), against
     // `repetition_retries`. In a row, not per turn: an auto-mode turn lives for hours, and a
     // model that fell into a loop once and went on to do an hour of real work has earned the
@@ -1618,6 +1643,7 @@ pub(crate) async fn run_turn(
         autocompact: true,
         just_compacted: false,
         stripped_images: false,
+        overflow_retried: false,
         repeating_replies: 0,
         stop_hook_active: false,
     };
@@ -1713,6 +1739,7 @@ pub(crate) async fn run_turn(
         let mut message = match result {
             Ok((message, ending)) => {
                 state.repeating_replies = 0;
+                state.overflow_retried = false;
                 if let Some(prompt_tokens) = ending.usage.as_ref().and_then(|u| u["prompt_tokens"].as_u64()) {
                     agent.measured = Some(Measured { prompt_tokens: prompt_tokens as usize, estimate: estimate_sent });
                 }
@@ -1720,7 +1747,7 @@ pub(crate) async fn run_turn(
             }
             Err(e) => {
                 let _ = tx.send(AgentEvent::ReplyEnd);
-                match recover_from_failed_request(agent, tx, &mut state, e) {
+                match recover_from_failed_request(agent, tx, link, &mut state, estimate_sent, e) {
                     Some(end) => break end,
                     None => continue,
                 }
@@ -1851,16 +1878,21 @@ async fn autocompact_if_due(
             // itself. This says the one thing the notes cannot: the task was mid-flight
             // when the summarizer ran, and it is the same task that continues.
             state.just_compacted = true;
-            agent.messages.push(json!({
-                "role": "user",
-                "content": "Your context was compacted mid-task. Continue the \
-                            work described in the notes above from where it left \
-                            off; do not start over."
-            }));
+            // Onto the last message when that is the user's: the kept rounds can end on
+            // one (a note, the message that started this turn), and two in a row are
+            // refused by templates that insist on alternating roles.
+            push_user_note(
+                &mut agent.messages,
+                "Your context was compacted mid-task. Continue the work described in the \
+                 notes above from where it left off; do not start over.",
+            );
 
             if agent.context_used() > autocompact_threshold(agent.context_tokens) {
                 state.autocompact = false;
-                let _ = tx.send(Notice::CompactionStillLarge((AUTOCOMPACT_FRACTION * 100.0) as usize).into());
+                // The line's share of this window: the reply reserve moves it below 90% on a
+                // small one.
+                let percent = autocompact_threshold(agent.context_tokens) * 100 / agent.context_tokens.max(1);
+                let _ = tx.send(Notice::CompactionStillLarge(percent).into());
             }
             None
         }
@@ -1889,12 +1921,12 @@ impl Agent {
     /// REPL's `/compact` used to make its own call and its own copy of the reclaim, and it
     /// ran outside the pump, so Esc could not stop it.
     pub(crate) async fn compact(&mut self, tx: &EventSink, link: &TurnLink) -> Option<anyhow::Result<String>> {
-        let (context_tokens, before) = (self.context_tokens, self.context_used());
+        let (context_tokens, before, overhead) = (self.context_tokens, self.context_used(), self.tools_estimate());
         let compacted = interruptible(
             tx,
             link,
             Waiting::Compacting,
-            compact_history(&self.client, &mut self.messages, context_tokens, before),
+            compact_history(&self.client, &mut self.messages, context_tokens, before, overhead),
         )
         .await;
         // On the one path that actually shrank the session. A compaction that failed
@@ -1928,9 +1960,32 @@ pub(crate) async fn compact_on_request(agent: &mut Agent, tx: &EventSink, link: 
 fn recover_from_failed_request(
     agent: &mut Agent,
     tx: &EventSink,
+    link: &TurnLink,
     state: &mut TurnState,
+    // `estimate_tokens` of the history the refused request was built from.
+    estimate_sent: usize,
     e: anyhow::Error,
 ) -> Option<TurnEnd> {
+    // Refused for size. The model's window comes from the config, or from a 131,072 default
+    // when the model has no `context` there, and nothing checks it against what the server
+    // loaded: a llama-server at 65,536 refused a 69,109-token request while haico still
+    // thought it had used half its window, so auto-compaction never started. The refusal says
+    // both numbers, and they are used rather than reported: the window from here on, and the
+    // request's exact size as the measurement, which puts the next round over the line.
+    if let Some((prompt, window)) = context_overflow(&format!("{:#}", e)) {
+        if window < agent.context_tokens {
+            let _ = tx.send(Notice::ContextWindowLearned { configured: agent.context_tokens, actual: window }.into());
+            agent.context_tokens = window;
+        }
+        agent.measured = Some(Measured { prompt_tokens: prompt, estimate: estimate_sent });
+        // Auto mode compacts at the top of the next round and asks again. Elsewhere the
+        // turn ends as before, now with a window that makes the /compact hint show.
+        if link.mode() == Mode::Auto && state.autocompact && !state.overflow_retried {
+            state.overflow_retried = true;
+            return None;
+        }
+    }
+
     // The stream was cut off because the reply had gone into a loop. The partial reply is
     // dropped, exactly as an interrupt drops one — it is the loop, and half a tool call in
     // the history is worse than none. The history is as consistent as it was before the
@@ -1967,6 +2022,24 @@ fn recover_from_failed_request(
     // consistent: drop back to the prompt.
     let _ = tx.send(Notice::RequestFailed(format!("{:#}", e)).into());
     Some(TurnEnd::Failed)
+}
+
+/// The size of a refused request and the server's window, from llama.cpp's
+/// `exceed_context_size_error`: "request (69109 tokens) exceeds the available context size
+/// (65536 tokens)". llama-server sends it as the 400's body; LM Studio passes the same text
+/// on, JSON-escaped, in its stream's error event — so the prose is read, not the JSON.
+fn context_overflow(error: &str) -> Option<(usize, usize)> {
+    const REQUEST: &str = "request (";
+    const EXCEEDS: &str = " tokens) exceeds the available context size (";
+    let digits = |text: &str| -> Option<usize> {
+        let end = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+        text[..end].parse().ok()
+    };
+    let at = error.find(EXCEEDS)?;
+    let window = digits(&error[at + EXCEEDS.len()..])?;
+    let before = &error[..at];
+    let prompt = digits(&before[before.rfind(REQUEST)? + REQUEST.len()..])?;
+    Some((prompt, window))
 }
 
 /// The one place the reasoning policy is applied, on the reply just finished and before it
@@ -2044,6 +2117,43 @@ impl From<&str> for CallReply {
     }
 }
 
+// The share of the window one `read` may fill, and the bytes a token is counted at for it
+// (code and its line-number prefixes; `compact`'s figure, not `estimate_tokens`' four).
+// The tool's own cap is 2,000 lines of up to 2,000 characters, with no byte limit: 2,000
+// lines of agent.rs are ~30k tokens, a 32k window by themselves. Over the window, the request
+// is refused, compacted and retried — and a model that reads the same range again after the
+// compaction is refused again, and the turn ends.
+const READ_WINDOW_SHARE: usize = 4;
+const READ_BYTES_PER_TOKEN: usize = 3;
+
+/// A `read` result cut to a quarter of the window, at a line, with the offset to go on from;
+/// `None` when it fits, or is not numbered lines (an error, a picture's note).
+///
+/// The start is kept rather than the middle cut out: the model asked for these lines in
+/// order, and an offset it can continue from is worth more than both ends of a range.
+fn fit_read(content: &str, context_tokens: usize) -> Option<String> {
+    let budget = context_tokens / READ_WINDOW_SHARE * READ_BYTES_PER_TOKEN;
+    if content.len() <= budget {
+        return None;
+    }
+    let number = |line: &str| line.split_once('→').and_then(|(n, _)| n.trim().parse::<usize>().ok());
+    let mut kept = 0;
+    let mut last = None;
+    for line in content.split_inclusive('\n') {
+        if kept + line.len() > budget {
+            break;
+        }
+        kept += line.len();
+        last = number(line).or(last);
+    }
+    let last = last?;
+    Some(format!(
+        "{}[Cut after line {last}: the rest of this range would take more than a quarter of the \
+         {context_tokens}-token context window. Read on with offset={last} and a smaller limit.]",
+        &content[..kept]
+    ))
+}
+
 /// Answer every call of one reply, in order.
 ///
 /// **Every `tool_call_id` gets its `role:"tool"` reply here and nowhere else.** An
@@ -2069,11 +2179,16 @@ async fn run_tool_calls(
 
     for tool_call in calls {
         let tool_call_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
-        let reply = if round == Round::Interrupted {
+        let mut reply = if round == Round::Interrupted {
             CallReply::from("Not run: the user interrupted the turn before this call was reached.")
         } else {
             run_one_call(agent, tx, link, tool_call, guard, &mut seen_images).await
         };
+        if tool_call["function"]["name"] == "read" {
+            if let Some(cut) = fit_read(&reply.content, agent.context_tokens) {
+                reply.content = cut;
+            }
+        }
         if reply.interrupted {
             round = Round::Interrupted;
         }
@@ -3511,6 +3626,121 @@ mod turn_tests {
         assert!(!still_large, "the old count was read as the notes'");
         assert_eq!(compacted, 2);
         assert_eq!(*served.lock().unwrap(), 7);
+    }
+
+    /// Both shapes the refusal arrives in: llama-server's 400 body, and LM Studio's stream
+    /// error event carrying the same text JSON-escaped, both as they were captured.
+    #[test]
+    fn a_refusal_for_size_gives_the_request_and_the_window() {
+        let llama = r#"LLM server returned 400 Bad Request: {"error":{"code":400,"message":"request (69109 tokens) exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":69109,"n_ctx":65536}}"#;
+        assert_eq!(context_overflow(llama), Some((69109, 65536)));
+        let lm_studio = r#"{"error":{"message":"Engine protocol predict request returned 400: {\"error\":{\"code\":400,\"message\":\"request (108903 tokens) exceeds the available context size (32768 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":108903,\"n_ctx\":32768}}"}}"#;
+        assert_eq!(context_overflow(lm_studio), Some((108903, 32768)));
+        assert_eq!(context_overflow("LLM server returned 500: out of memory"), None);
+    }
+
+    /// A model with no `context` in the config is sized at the 131,072 default; a
+    /// llama-server loaded at 65,536 refused a 69,109-token request, haico thought half the
+    /// window was left, and auto-compaction never started. The refusal now sets the window
+    /// and, in auto mode, compacts and asks again.
+    #[tokio::test]
+    async fn a_refusal_for_size_sets_the_window_and_compacts_in_auto_mode() {
+        let _capture = out::capture_guard();
+        let (url, served) = serve_sequence(&[
+            r#"400 {"error":{"code":400,"message":"request (69109 tokens) exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":69109,"n_ctx":65536}}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"Task: x\nCurrent state: y\nNext step: z"}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"}}]}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.mode = Mode::Auto;
+        assert_eq!(agent.context_tokens, crate::DEFAULT_CONTEXT_TOKENS);
+        agent.messages.push(serde_json::json!({"role": "user", "content": "build it"}));
+        agent.messages.push(serde_json::json!({"role": "assistant", "content": "Built half of it."}));
+        let link = TurnLink::new(Mode::Auto);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Answered);
+        drop(tx);
+
+        assert_eq!(agent.context_tokens, 65536);
+        // Refused, compacted, and "done" twice: the first reply after a compaction that
+        // calls nothing is sent back once (`AFTER_COMPACTION`).
+        assert_eq!(*served.lock().unwrap(), 4);
+        let mut notices = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let AgentEvent::Notice(notice) = event {
+                notices.push(notice);
+            }
+        }
+        assert!(notices.contains(&Notice::ContextWindowLearned { configured: 131072, actual: 65536 }));
+        assert!(notices.iter().any(|n| matches!(n, Notice::Compacted(_))), "{notices:?}");
+        assert!(!notices.iter().any(|n| matches!(n, Notice::RequestFailed(_))), "{notices:?}");
+    }
+
+    /// Outside auto mode the turn still ends on the refusal, but the window is set, so the
+    /// /compact hint and the status bar say how full it really is.
+    #[tokio::test]
+    async fn a_refusal_for_size_ends_the_turn_outside_auto_mode() {
+        let _capture = out::capture_guard();
+        let (url, served) = serve_sequence(&[
+            r#"400 {"error":{"code":400,"message":"request (69109 tokens) exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":69109,"n_ctx":65536}}"#,
+        ])
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(run_turn(&mut agent, "go", false, &tx, &link).await, TurnEnd::Failed);
+        assert_eq!(*served.lock().unwrap(), 1);
+        assert_eq!(agent.context_tokens, 65536);
+        assert!(agent.context_used() >= 69109);
+    }
+
+    /// A read over a quarter of the window keeps whole lines from the start and says where
+    /// to go on; one that fits, and a reply that is not numbered lines, are left alone.
+    #[test]
+    fn a_read_too_large_for_the_window_is_cut_at_a_line() {
+        let content: String = (1..=100).map(|n| format!("{:6}→{}\n", n, "x".repeat(50))).collect();
+        // 1,000 tokens: a budget of 250 tokens, 750 bytes, which is 12 lines of 58 bytes.
+        let cut = fit_read(&content, 1000).expect("not cut");
+        assert!(cut.starts_with(&content[..12 * 58]), "{cut}");
+        assert!(!cut.contains("    13→"), "{cut}");
+        assert!(cut.contains("offset=12"), "{cut}");
+        assert_eq!(fit_read(&content, 131_072), None);
+        assert_eq!(fit_read(&"no line numbers here ".repeat(100), 1000), None);
+    }
+
+    /// The cut is applied to the reply the model gets, through a real `read`.
+    #[tokio::test]
+    async fn a_large_read_reaches_the_model_cut_to_fit() {
+        let _capture = out::capture_guard();
+        let dir = testutil::TempDir::new("read-cut");
+        let file = dir.join("big.rs");
+        std::fs::write(&file, (1..=500).map(|n| format!("let line_{n} = {n};\n")).collect::<String>()).unwrap();
+        let call = format!(
+            r#"{{"choices":[{{"message":{{"role":"assistant","content":null,
+            "tool_calls":[{{"id":"c1","type":"function","function":{{"name":"read","arguments":{}}}}}]}}}}]}}"#,
+            serde_json::to_string(&serde_json::json!({"file_path": file.display().to_string()}).to_string()).unwrap()
+        );
+        let (url, _) = serve_sequence(Box::leak(Box::new([
+            &*Box::leak(call.into_boxed_str()),
+            r#"{"choices":[{"message":{"role":"assistant","content":"read"}}]}"#,
+        ])))
+        .await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "m".to_string(), &cwd);
+        agent.workspace.attach(&file);
+        agent.context_tokens = 4096;
+        let link = TurnLink::new(Mode::Normal);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        run_turn(&mut agent, "read it", false, &tx, &link).await;
+
+        let reply = agent.messages.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap();
+        assert!(reply.len() <= 4096 / 4 * 3 + 300, "{} bytes", reply.len());
+        assert!(reply.contains("     1→let line_1 = 1;"), "{reply}");
+        assert!(reply.contains("Read on with offset="), "{reply}");
+        assert!(!reply.contains("line_500"), "{reply}");
     }
 
     /// The size of the history comes from the server's count once one has arrived, plus an

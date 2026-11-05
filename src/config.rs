@@ -497,6 +497,12 @@ pub(crate) struct ModelSettingsFile {
     // Per model only, like `use_system_prompt`: whether a template takes a level at all,
     // and what it calls it, is a property of the model rather than of the machine.
     pub(crate) sub_agent_effort: Option<String>,
+    // The same for the compactor alone, kept apart from the sub-agents because it is the one
+    // an unattended run waits on again and again: on a small window it runs every few
+    // minutes, and most of each run is its chain of thought before a page of notes. Turning
+    // it down there should not also turn down research and the reviewer. Unset sends
+    // nothing, like `sub_agent_effort`, and never the main conversation's level.
+    pub(crate) compactor_effort: Option<String>,
     // "keep" (default), "compress" or "drop". Layered like the sampling settings rather
     // than per-model only, but it belongs here first: whether a model even produces a
     // chain of thought is a property of the model, so the useful setting is usually the
@@ -863,6 +869,7 @@ version = 1
 # check_updates, plus:
 #   use_system_prompt = false     for a model trained with instructions of its own
 #   sub_agent_effort = "low"      reasoning_effort for research, review and summaries
+#   compactor_effort = "off"      reasoning_effort for compacting the conversation
 
 # One section per provider: the server — Ollama (11434), LM Studio (1234), llama-server
 # (8080) — its token if it wants one, and the model to start with there, skipping the
@@ -1186,6 +1193,8 @@ pub(crate) struct ResolvedSettings {
     // it can have come from. `None` means the sub-agents say nothing about thinking, and get
     // whatever the model does by default.
     pub(crate) sub_agent_effort: Option<String>,
+    // The compactor's, by the same rules.
+    pub(crate) compactor_effort: Option<String>,
     // Not layered like the rest: it only exists per model, so there is nothing to fall
     // through to. Absent means true.
     pub(crate) use_system_prompt: bool,
@@ -1300,6 +1309,7 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
             config.file.reasoning_effort.clone(),
         ),
         sub_agent_effort: per_model.sub_agent_effort,
+        compactor_effort: per_model.compactor_effort,
         use_system_prompt: per_model.use_system_prompt.unwrap_or(true),
         // No command-line layer for either: both are properties of the model and of what
         // the user wants done with its output, neither of which is worth a flag when the
@@ -1323,11 +1333,6 @@ pub(crate) fn resolve_settings(config: &Config, model: &str) -> ResolvedSettings
 // small one.
 pub(crate) const DEFAULT_CONTEXT_TOKENS: usize = 131_072;
 
-// Fraction of the window at which compaction is worth suggesting. Late enough not to nag,
-// early enough to leave room for the summarization round-trip itself.
-
-pub(crate) const COMPACT_HINT_FRACTION: f64 = 0.75;
-
 // Estimated tokens of chain of thought below which compressing it is not worth the round
 // trip. Set by the arithmetic rather than by taste: compression pays off when the tokens
 // saved, multiplied by the turns that will carry them, beat one extra generation. A few
@@ -1344,8 +1349,13 @@ pub(crate) const DEFAULT_REASONING_THRESHOLD: usize = 800;
 pub(crate) const DEFAULT_REPETITION_RETRIES: usize = 3;
 
 
+// Where compaction is worth suggesting: late enough not to nag, early enough to leave room
+// for the summarization round-trip itself. 5/6 of the auto-compaction line, which is 75% of
+// the window wherever the reply reserve does not bite, and moves down with the line where it
+// does — on 32k the reserve puts the line at 75%, and a hint there would have said nothing
+// before auto mode acted.
 pub(crate) fn compact_hint_threshold(context_tokens: usize) -> usize {
-    (context_tokens as f64 * COMPACT_HINT_FRACTION) as usize
+    autocompact_threshold(context_tokens) * 5 / 6
 }
 
 
@@ -1353,13 +1363,21 @@ pub(crate) fn compact_hint_threshold(context_tokens: usize) -> usize {
 // the hint above because this one throws detail away with nobody consulted: everything
 // under it is still a conversation the user could have chosen to keep whole. It does not
 // need to leave room for the summarization request itself — that goes out as a fresh two
-// message conversation whose transcript `render_transcript` caps at 60k characters, not as
+// message conversation whose transcript `transcript_budget` caps at half the window, not as
 // the history it is about to replace.
 
 pub(crate) const AUTOCOMPACT_FRACTION: f64 = 0.90;
 
+// Room kept for the reply itself, chain of thought included: the line is checked before a
+// request, and what the model then writes lands in the same window. 10% of 32k is 3.3k
+// tokens, less than a thinking model often spends before its first word, and a reply that
+// reaches `n_ctx` is cut off mid-thought. A quarter of the window at most, so a tiny one
+// still has a line to compact at.
+pub(crate) const REPLY_RESERVE_TOKENS: usize = 8_192;
+
 pub(crate) fn autocompact_threshold(context_tokens: usize) -> usize {
-    (context_tokens as f64 * AUTOCOMPACT_FRACTION) as usize
+    let reserve = REPLY_RESERVE_TOKENS.min(context_tokens / 4);
+    ((context_tokens as f64 * AUTOCOMPACT_FRACTION) as usize).min(context_tokens - reserve)
 }
 
 
@@ -1404,6 +1422,7 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("  repeat_penalty = 1.1");
     println!("  reasoning_effort = \"high\"  # how hard to think, if the model takes it");
     println!("  sub_agent_effort = \"low\"   # haico's own sub-agents; unset follows the model");
+    println!("  compactor_effort = \"off\"   # compaction alone; unset follows the model");
     println!("  use_system_prompt = false  # send only the project's own instructions");
     println!("  reasoning      = \"keep\"    # keep | compress | drop the chain of thought");
     println!("  reasoning_threshold = 800  # tokens of thinking before compressing is worth it");
@@ -1414,16 +1433,18 @@ pub(crate) fn print_usage(program: &str, opts: Options) {
     println!("'compress' replaces it with its hard points, at the cost of one extra request");
     println!("per reply. /reasoning switches it for one session.");
     println!("\nreasoning_effort is sent to the server verbatim, so the levels are whatever that");
-    println!("model's chat template accepts — commonly low, medium and high. Left out, the");
-    println!("field is omitted and the model thinks as much as it thinks. It is also handed to");
-    println!("the chat template in chat_template_kwargs, \"on\"/\"off\" as enable_thinking and any");
-    println!("other level as reasoning_effort, since a server may read the top-level field");
-    println!("itself (LM Studio checks it against the model's metadata) or not at all");
-    println!("(llama.cpp). /effort switches it for one session.");
+    println!("model's chat template accepts — commonly low, medium and high. \"off\" and \"on\"");
+    println!("are haico's switch: \"off\" goes as \"none\" (LM Studio's word for it) and \"on\" as");
+    println!("no level at all. Left out, the field is omitted and the model thinks as much as it");
+    println!("thinks. It is also handed to the chat template in chat_template_kwargs, on/off/none");
+    println!("as enable_thinking and any other level as reasoning_effort, since a server may read");
+    println!("the top-level field itself (LM Studio) or not at all (llama.cpp). /effort switches");
+    println!("it for one session.");
     println!("\nsub_agent_effort is the same setting for haico's own sub-agents — research, the");
     println!("auto-mode reviewer and the reasoning compressor. Left out, nothing is sent and");
     println!("they think as much as the model thinks; the main conversation's level is never");
-    println!("carried over to them.");
+    println!("carried over to them. compactor_effort is the same again for compaction alone,");
+    println!("which an unattended run on a small window waits on every few minutes.");
     println!("\nInstructions: {} holds preferences that apply everywhere; a", crate::store::display("HAICO.md"));
     println!("HAICO.md, AGENTS.md or CLAUDE.md in the working directory holds the project's");
     println!("own, and takes precedence over both. Both are sent even to a model configured");
@@ -1636,6 +1657,7 @@ mod tests {
             repeat_penalty = 1.15
             reasoning_effort = "high"
             sub_agent_effort = "low"
+            compactor_effort = "off"
         "#;
 
         // A model with its own section beats the file's top level.
@@ -1665,6 +1687,9 @@ mod tests {
         // gets None — which is not "inherit", it is the setting that means no thinking.
         assert_eq!(small.sub_agent_effort.as_deref(), Some("low"));
         assert_eq!(big.sub_agent_effort, None);
+        // The compactor's is its own, by the same rules.
+        assert_eq!(small.compactor_effort.as_deref(), Some("off"));
+        assert_eq!(big.compactor_effort, None);
         // ...and a model that does not name them leaves them unset, not inherited from a
         // sibling model's section.
         assert_eq!(big.top_k.value, None);
@@ -1795,6 +1820,11 @@ mod tests {
             // ...and while there is still window left for the turn to carry on into.
             assert!(autocompact_threshold(window) < window);
         }
+        // Room for a thinking reply on a small window; a large one is unchanged at 90%.
+        assert_eq!(autocompact_threshold(32_768), 32_768 - 8_192);
+        assert_eq!(autocompact_threshold(DEFAULT_CONTEXT_TOKENS), 117_964);
+        assert_eq!(compact_hint_threshold(DEFAULT_CONTEXT_TOKENS), 98_303);
+        assert_eq!(autocompact_threshold(8_192), 6_144);
     }
 
 

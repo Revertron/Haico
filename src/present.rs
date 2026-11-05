@@ -281,6 +281,9 @@ impl Presenter {
                 percent
             ),
             Notice::CompactionFailed(e) => outln!("\n[error] could not compact: {}\n", e),
+            Notice::ContextWindowLearned { configured, actual } => {
+                outln!("\n{}", window_learned(configured, actual))
+            }
             Notice::SessionNotSaved(e) => outln!("\n[error] the session was not saved: {}\n", e),
             // The figures are shown rather than folded: the whole point of
             // compressing is to find out whether it is paying for itself, which
@@ -597,6 +600,15 @@ pub(crate) fn timers_fired(fired: &[crate::timers::Fired]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The line for `Notice::ContextWindowLearned`. Shared by the notice and the frontends'
+/// own startup and model-switch output, where the probe runs with no turn to send it.
+pub(crate) fn window_learned(configured: usize, actual: usize) -> String {
+    format!(
+        "[the server has the model loaded with a {actual}-token window, not the {configured} configured; \
+         using {actual} for this session — `/set context {actual}` keeps it]"
+    )
 }
 
 /// What /context says: how full the window is, and whether reasoning compression is paying.

@@ -256,7 +256,7 @@ mod tests {
         ];
         let before = estimate_tokens(&messages);
 
-        let report = compact_history(&client, &mut messages, 131_072, 0).await.unwrap();
+        let report = compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
         assert!(report.contains("Compacted"), "got: {}", report);
 
         // System prompt survives verbatim; the summary carries the rest.
@@ -347,7 +347,7 @@ mod tests {
         let (url, served) = serve_sequence(bodies).await;
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
 
-        let report = compact_history(&client, &mut messages, 131_072, 118_000).await.unwrap();
+        let report = compact_history(&client, &mut messages, 131_072, 118_000, 0).await.unwrap();
         let requests = *served.lock().unwrap();
         // Some traces were compressed — not all thirteen, only until it fit — then the notes.
         assert!(requests > 1 && requests < 14, "{requests} requests");
@@ -372,7 +372,7 @@ mod tests {
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut messages = long_session(3, "thinking");
 
-        compact_history(&client, &mut messages, 131_072, 0).await.unwrap();
+        compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
         assert_eq!(*served.lock().unwrap(), 2, "the continuation was not asked for again");
         let first = messages[1]["content"].as_str().unwrap().to_string();
         assert!(first.starts_with("The task, as it was given:\n\nTHE TASK: build a p2p node"), "{first}");
@@ -380,7 +380,7 @@ mod tests {
 
         // A second compaction carries the task as it was given, not the first one's notes.
         messages.push(json!({"role": "assistant", "content": "Fixed one."}));
-        compact_history(&client, &mut messages, 131_072, 0).await.unwrap();
+        compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
         let first = messages[1]["content"].as_str().unwrap();
         assert!(first.starts_with("The task, as it was given:\n\nTHE TASK: build a p2p node\n\nNotes"), "{first}");
         assert!(first.contains("Current state: 1 error") && !first.contains("2 errors"), "{first}");
@@ -394,7 +394,7 @@ mod tests {
         let url = serve_once("{}", "application/json").await;
         let client = crate::LMStudioClient::new(url, "m".to_string(), None);
         let mut messages = vec![json!({"role": "system", "content": "s"})];
-        assert!(compact_history(&client, &mut messages, 131_072, 0).await.is_err());
+        assert!(compact_history(&client, &mut messages, 131_072, 0, 0).await.is_err());
         assert_eq!(messages.len(), 1);
 
         // An empty summary must not wipe a real conversation either.
@@ -406,9 +406,153 @@ mod tests {
             json!({"role": "user", "content": "important context"}),
             json!({"role": "assistant", "content": "noted"}),
         ];
-        assert!(compact_history(&client, &mut messages, 131_072, 0).await.is_err());
+        assert!(compact_history(&client, &mut messages, 131_072, 0, 0).await.is_err());
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["content"], "important context");
+    }
+
+    /// The newest rounds are carried over as they happened, each tool reply with its call,
+    /// straight after the notes; older ones become notes.
+    #[tokio::test]
+    async fn compaction_keeps_the_last_rounds_as_they_were() {
+        use crate::session::compact_history;
+        let notes = "Task: a p2p node\nCurrent state: bob_pk\nNext step: rename";
+        let url = serve_once(Box::leak(reply(notes).to_string().into_boxed_str()), "application/json").await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        let mut messages = long_session(10, "thinking");
+
+        // 32k with nothing else in the window: a third of the ~24k below the line, room for
+        // three of these rounds.
+        let report = compact_history(&client, &mut messages, 32_768, 0, 0).await.unwrap();
+        assert!(report.contains("the last 3 rounds kept as they were"), "{report}");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(messages[1]["content"].as_str().unwrap().ends_with("The most recent steps follow as they happened."));
+        // No agreement in between: the notes run straight into the rounds.
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["tool_calls"].is_array());
+        assert_eq!(messages.iter().filter(|m| m["role"] == "assistant").count(), 3);
+        // The latest build, word for word, and the thinking that went with it.
+        assert!(messages.iter().any(|m| m["content"] == "error[E0425]: cannot find value `bob_pk` in this scope"));
+        assert!(messages.iter().any(|m| m["reasoning_content"] == "LATEST THOUGHT"));
+        // Every reply kept answers a call that was kept.
+        let ids: Vec<&Value> = messages
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flatten()
+            .map(|call| &call["id"])
+            .collect();
+        for reply in messages.iter().filter(|m| m["role"] == "tool") {
+            assert!(ids.contains(&&reply["tool_call_id"]), "orphaned: {reply}");
+        }
+        // An old build is not among them.
+        assert!(!messages.iter().any(|m| m["content"].as_str().is_some_and(|c| c.contains("OLD BUILD 0 "))));
+    }
+
+    /// The kept rounds are sized by the room the window has left after the tools, not by the
+    /// window: on a small one the tools alone can take most of it.
+    #[tokio::test]
+    async fn the_kept_rounds_fit_the_room_left_after_the_tools() {
+        use crate::session::compact_history;
+        let notes = "Task: a p2p node\nCurrent state: bob_pk\nNext step: rename";
+        let body: &'static str = Box::leak(reply(notes).to_string().into_boxed_str());
+
+        // ~4.4k left below the line, a third of it ~1.5k: the small last round and one build.
+        let client = crate::LMStudioClient::new(serve_once(body, "application/json").await, "m".to_string(), None);
+        let mut messages = long_session(10, "thinking");
+        let report = compact_history(&client, &mut messages, 32_768, 0, 20_000).await.unwrap();
+        assert!(report.contains("the last 2 rounds kept as they were"), "{report}");
+
+        // Nothing left at all: notes only, bridged as before.
+        let client = crate::LMStudioClient::new(serve_once(body, "application/json").await, "m".to_string(), None);
+        let mut messages = long_session(10, "thinking");
+        let report = compact_history(&client, &mut messages, 32_768, 0, 24_576).await.unwrap();
+        assert!(!report.contains("kept as"), "{report}");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["content"], "Understood — I have the context above and will continue from there.");
+    }
+
+    /// Facts are kept by haico across compactions: each compactor adds new ones and names
+    /// stale ones by number, and the rest is carried word for word.
+    #[tokio::test]
+    async fn established_facts_survive_compactions_until_called_obsolete() {
+        use crate::session::compact_history;
+        let first = "Task: a chat server\nDone: lib.rs\nCurrent state: builds\n\
+                     Established:\n- mio 1.x renamed `poll_timeout` to `poll`\n- the server binds 0.0.0.0:8080\n\
+                     Obsolete: none\nNext step: tests";
+        let second = "Task: a chat server\nCurrent state: 2 tests fail\n\
+                      Established:\n- the tests need --test-threads=1\nObsolete: 2\nNext step: fix them";
+        let third = "Task: a chat server\nCurrent state: all pass\nNext step: done";
+        let bodies: &'static [&'static str] = Box::leak(Box::new([
+            &*Box::leak(reply(first).to_string().into_boxed_str()),
+            &*Box::leak(reply(second).to_string().into_boxed_str()),
+            &*Box::leak(reply(third).to_string().into_boxed_str()),
+        ]));
+        let (url, _) = serve_sequence(bodies).await;
+        let client = crate::LMStudioClient::new(url, "m".to_string(), None);
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "THE TASK: a chat server"}),
+            json!({"role": "assistant", "content": "Working."}),
+        ];
+
+        let report = compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
+        assert!(report.contains("2 established facts (+2, -0)"), "{report}");
+        let text = messages[1]["content"].as_str().unwrap().to_string();
+        assert!(text.starts_with("The task, as it was given:\n\nTHE TASK: a chat server\n\n"), "{text}");
+        assert!(text.contains("[1] mio 1.x renamed `poll_timeout` to `poll`\n[2] the server binds 0.0.0.0:8080"), "{text}");
+        // The facts are in their own block, not repeated in the notes.
+        let notes = text.split("Notes from the conversation so far:").nth(1).unwrap();
+        assert!(notes.contains("Current state: builds") && !notes.contains("mio") && !notes.contains("Obsolete"), "{notes}");
+
+        messages.push(json!({"role": "assistant", "content": "Ran the tests."}));
+        let report = compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
+        assert!(report.contains("2 established facts (+1, -1)"), "{report}");
+        let text = messages[1]["content"].as_str().unwrap().to_string();
+        assert!(text.contains("[1] mio 1.x renamed `poll_timeout` to `poll`\n[2] the tests need --test-threads=1"), "{text}");
+        assert!(!text.contains("0.0.0.0"), "{text}");
+        // The task is still the task, not the task with the facts glued on.
+        assert!(text.starts_with("The task, as it was given:\n\nTHE TASK: a chat server\n\nEstablished facts"), "{text}");
+
+        // A compactor that says nothing about facts leaves them as they were.
+        messages.push(json!({"role": "assistant", "content": "Fixed."}));
+        compact_history(&client, &mut messages, 131_072, 0, 0).await.unwrap();
+        let text = messages[1]["content"].as_str().unwrap();
+        assert!(text.contains("[1] mio") && text.contains("[2] the tests need"), "{text}");
+        assert!(text.contains("Current state: all pass"), "{text}");
+    }
+
+    /// The notes as small models actually format them: markdown headings, numbered and
+    /// wrapped facts, a placeholder for "nothing new", obsolete numbers in brackets.
+    #[test]
+    fn the_notes_are_taken_apart_however_they_are_marked_up() {
+        let notes = "**Task:** a server\n## Done\n- Done with the parser\n**Established facts:**\n\
+                     1. a fact that\n   wraps\n* another one\n- [2] a kept fact repeated\n\
+                     ## Obsolete\n[3], 5\n**Next steps:** go";
+        let split = super::compact::split_notes_for_test(notes);
+        assert_eq!(split.0, ["a fact that wraps", "another one", "a kept fact repeated"]);
+        assert_eq!(split.1, [3, 5]);
+        assert!(split.2.contains("- Done with the parser") && split.2.contains("Next steps:** go"), "{}", split.2);
+        assert!(!split.2.contains("another one"), "{}", split.2);
+
+        let none = super::compact::split_notes_for_test("Task: x\nEstablished: none\nObsolete: none\nNext step: y");
+        assert!(none.0.is_empty() && none.1.is_empty(), "{:?}", none.0);
+
+        // Both as a 9B model writes them: a placeholder dressed as a fact, and bullets quoted
+        // whole. A fact that merely starts with the letters stays.
+        let live = super::compact::split_notes_for_test(
+            "Established:\n- none new this session — [1]–[48] already cover it\n\
+             \"- repl.rs /bg lists jobs as id [status] command\"\n- nonexistent paths are refused\n\
+             - no newline is added after the last line\n- \"- `;` does not chain commands in cmd\"",
+        );
+        assert_eq!(
+            live.0,
+            [
+                "repl.rs /bg lists jobs as id [status] command",
+                "nonexistent paths are refused",
+                "no newline is added after the last line",
+                "`;` does not chain commands in cmd"
+            ]
+        );
     }
 
 

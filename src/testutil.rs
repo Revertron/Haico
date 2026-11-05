@@ -226,9 +226,16 @@ pub(crate) async fn serve_sequence(
                     index
                 };
                 let body = bodies[index.min(bodies.len() - 1)];
+                // A body that starts with `400 ` is served as a 400 Bad Request, for the
+                // refusals a real server sends that way.
+                let (status, body) = match body.strip_prefix("400 ") {
+                    Some(rest) => ("400 Bad Request", rest),
+                    None => ("200 OK", body),
+                };
 
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    status,
                     body.len(),
                     body
                 );
@@ -436,6 +443,7 @@ pub(crate) fn settings_of(
         // serve the one test that cares, which sets the field on the result instead.
         reasoning_effort: at(None),
         sub_agent_effort: None,
+        compactor_effort: None,
         use_system_prompt: true,
         reasoning_setting: at(None),
         reasoning_threshold_setting: at(None),
