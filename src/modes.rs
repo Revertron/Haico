@@ -107,11 +107,16 @@ understand the actual code involved rather than guessing at it. Then call `prese
 with your plan.\n\n\
 A good plan names the specific files and functions it will touch, says what will change in \
 each, and calls out anything you are unsure about. It is for a human to read and correct, \
-so keep it concrete and short enough to check.\n\n\
+so keep it concrete and short enough to check.";
+
+// Its own paragraph so an unattended run, which offers no `ask_user`, can leave it out.
+const PLAN_MODE_ASK: &str = "\n\n\
 If a choice would change the shape of the plan — which of two designs, which dependency, \
 which of two readings of the request is meant — call `ask_user` and settle it now. A plan \
 built on a guess is a plan the user has to correct, and this is the cheapest moment to \
-find out you guessed wrong.\n\n\
+find out you guessed wrong.";
+
+const PLAN_MODE_END: &str = "\n\n\
 The user will approve the plan or send back corrections. Do not begin work until they have \
 approved it — you will be told when they do.";
 
@@ -165,12 +170,16 @@ pub(crate) fn tools_for_mode(mode: Mode, tools: &[Value]) -> Vec<Value> {
 // Appended to the system message rather than pushed as a trailing one: a system message in
 // last position is handled inconsistently across local servers, and the note has to be
 // reliable to be worth having.
-pub(crate) fn with_mode_note(mode: Mode, workspace: &Workspace, messages: &[Value]) -> Vec<Value> {
+pub(crate) fn with_mode_note(mode: Mode, workspace: &Workspace, interactive: bool, messages: &[Value]) -> Vec<Value> {
     let mut request = messages.to_vec();
 
     let mut note = workspace.note();
     if mode == Mode::Plan {
         note.push_str(PLAN_MODE_NOTE);
+        if interactive {
+            note.push_str(PLAN_MODE_ASK);
+        }
+        note.push_str(PLAN_MODE_END);
     }
 
     // With no system message to append to — a model configured with `use_system_prompt =
@@ -683,10 +692,19 @@ mod tests {
             json!({"role": "user", "content": "do a thing"}),
         ];
 
-        let planning = with_mode_note(Mode::Plan, &ws(), &messages);
+        let planning = with_mode_note(Mode::Plan, &ws(), true, &messages);
         let system = planning[0]["content"].as_str().unwrap();
         assert!(system.starts_with("base prompt"));
         assert!(system.contains("Plan mode is active"));
+        assert!(system.contains("`ask_user`"));
+        assert!(system.ends_with("you will be told when they do."));
+
+        // With nobody to ask, the note does not mention the tool the run does not offer.
+        let unattended = with_mode_note(Mode::Plan, &ws(), false, &messages);
+        let system = unattended[0]["content"].as_str().unwrap();
+        assert!(system.contains("Plan mode is active"));
+        assert!(!system.contains("ask_user"), "got: {}", system);
+        assert!(system.contains("short enough to check.\n\nThe user will approve"), "got: {}", system);
         // The rest of the conversation is untouched...
         assert_eq!(planning[1], messages[1]);
         // ...and so is the caller's history, or the note would be persisted and outlive
@@ -697,7 +715,7 @@ mod tests {
         // plan is being written, and discovering it through refusals costs a round each
         // time. Only the plan note is conditional.
         for mode in [Mode::Normal, Mode::Auto] {
-            let request = with_mode_note(mode, &ws(), &messages);
+            let request = with_mode_note(mode, &ws(), true, &messages);
             let system = request[0]["content"].as_str().unwrap();
             assert!(system.starts_with("base prompt"));
             assert!(system.contains("# Workspace"), "got: {}", system);
@@ -708,7 +726,7 @@ mod tests {
         // A model configured without haico's prompt still has to be told the boundary and
         // the mode, so the note becomes the system message rather than being dropped.
         let bare = vec![json!({"role": "user", "content": "do a thing"})];
-        let planning = with_mode_note(Mode::Plan, &ws(), &bare);
+        let planning = with_mode_note(Mode::Plan, &ws(), true, &bare);
         assert_eq!(planning[0]["role"], "system");
         let system = planning[0]["content"].as_str().unwrap();
         assert!(system.starts_with("# Workspace"), "got: {}", system);

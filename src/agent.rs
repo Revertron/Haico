@@ -42,7 +42,7 @@ use crate::modes::{
 };
 use crate::permissions::{Gate, PermissionManager, PermissionResponse};
 use crate::memory;
-use crate::prompt::{compose_system_prompt, load_project_context, load_user_context};
+use crate::prompt::{compose_system_prompt, load_project_context, load_user_context, unattended};
 // The one `render` import, and it earns its place: a diff is the *content* of a
 // pending change, which the turn has to compute because only it has the old file.
 // How much of it to show is the frontend's, and that half lives there.
@@ -169,6 +169,11 @@ pub(crate) struct Agent {
     /// A hook answered `"continue": false` during this round. Checked once the round's calls
     /// all have their replies, which is the one place a turn can end cleanly.
     pub(crate) hook_stop: bool,
+    /// Someone is there to answer `ask_user` and review a plan. False for a `-p` run,
+    /// which then neither offers those tools nor tells the model to use them: there a
+    /// question only ever came back "decide it yourself" and a plan was approved unread,
+    /// rounds spent for nothing.
+    pub(crate) interactive: bool,
 }
 
 /// Make the user's skills directory readable, if it exists.
@@ -193,13 +198,16 @@ impl Agent {
         client.apply_settings(&settings);
 
         let server = MyMcpServer::new(client.clone(), true, config.search.clone(), true);
+        // A task given with `-p` runs unattended (`headless`).
+        let interactive = config.prompt.is_none();
         // `--tools` narrows what is offered, not what the server can run: `research` still
         // drives `web_search` and `web_get` itself when only `research` was asked for.
         let tools = mcp_tools_to_openai_format(&server)
             .into_iter()
             .filter(|tool| {
                 let name = tool["function"]["name"].as_str().unwrap_or_default();
-                config.tools.as_ref().is_none_or(|only| only.iter().any(|n| n == name))
+                (interactive || ![ASK_USER, START_PLAN, PRESENT_PLAN].contains(&name))
+                    && config.tools.as_ref().is_none_or(|only| only.iter().any(|n| n == name))
             })
             .collect();
 
@@ -228,6 +236,7 @@ impl Agent {
             memory_index.as_deref(),
             &workspace,
         );
+        let system_prompt = if interactive { system_prompt } else { unattended(system_prompt) };
 
         let context_tokens = settings.context_tokens;
         let reasoning = settings.reasoning();
@@ -269,6 +278,7 @@ impl Agent {
             hooks: Hooks::default(),
             session_context: None,
             hook_stop: false,
+            interactive,
         };
         agent.seed_system_message();
         agent
@@ -375,6 +385,7 @@ impl Agent {
             self.memory_index.as_deref(),
             &self.workspace,
         );
+        let rebuilt = if self.interactive { rebuilt } else { unattended(rebuilt) };
         let rebuilt = with_session_context(rebuilt, self.session_context.as_deref());
         let changed = rebuilt != self.system_prompt;
         self.system_prompt = rebuilt;
@@ -1682,7 +1693,7 @@ pub(crate) async fn run_turn(
         //
         // Rebuilt every round rather than once per turn: approving a plan switches the mode
         // mid-turn, and the very next request has to carry the full tool list.
-        let request_messages = with_mode_note(link.mode(), &agent.workspace, &agent.messages);
+        let request_messages = with_mode_note(link.mode(), &agent.workspace, agent.interactive, &agent.messages);
         let request_tools = agent.request_tools(link.mode());
         // Of the history as it stands, not of `request_messages`: the mode note is not
         // kept, and `context_used` compares against the history it will be looking at.
@@ -3186,6 +3197,39 @@ mod scratch_tests {
 
     fn system_message(agent: &Agent) -> String {
         agent.messages[0]["content"].as_str().unwrap_or_default().to_string()
+    }
+
+    // A `-p` run has nobody to answer or review, so the model is neither offered `ask_user`
+    // and the plan tools nor told to use them — and `/clear`'s rebuild of the prompt must
+    // not bring the sections back.
+    #[test]
+    fn an_unattended_run_neither_offers_nor_mentions_asking_or_planning() {
+        let cwd = std::env::current_dir().unwrap();
+        let interactive_tools = [ASK_USER, START_PLAN, PRESENT_PLAN];
+        let offers = |agent: &Agent, name: &str| agent.tools.iter().any(|t| t["function"]["name"] == name);
+
+        let attended = Agent::new(test_config("http://127.0.0.1:1"), "m".to_string(), &cwd);
+        assert!(attended.interactive);
+        for name in interactive_tools {
+            assert!(offers(&attended, name), "{name} is not offered");
+            assert!(system_message(&attended).contains(name), "{name} is not in the prompt");
+        }
+
+        let mut config = test_config("http://127.0.0.1:1");
+        config.prompt = Some("do the task".to_string());
+        let mut agent = Agent::new(config, "m".to_string(), &cwd);
+        assert!(!agent.interactive);
+        for cleared in [false, true] {
+            if cleared {
+                agent.clear();
+            }
+            for name in interactive_tools {
+                assert!(!offers(&agent, name), "{name} is offered");
+                assert!(!system_message(&agent).contains(name), "{name}: {}", system_message(&agent));
+            }
+        }
+        // The tool list sent is `agent.tools` filtered by mode, so nothing puts them back.
+        assert!(!agent.request_tools(Mode::Auto).iter().any(|t| interactive_tools.contains(&t["function"]["name"].as_str().unwrap_or_default())));
     }
 
     #[test]

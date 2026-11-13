@@ -46,6 +46,40 @@ pub(crate) fn build_system_prompt(model: &str, workspace: &Workspace) -> String 
     fill_prompt(SYSTEM_PROMPT, model, workspace)
 }
 
+// The built-in prompt's sections about `start_plan`/`present_plan` and `ask_user`.
+const UNATTENDED_CUT_SECTIONS: &[&str] = &["# Planning\n", "# When you are not sure, ask\n"];
+// And the passing mentions of plan mode and of asking outside them, with what each is
+// replaced by.
+const PLAN_MODE_HINT: (&str, &str) =
+    ("- Plan the task thoroughly (big task - use plan mode)\n", "- Plan the task thoroughly\n");
+const ASK_FOR_COMMAND: (&str, &str) = (
+    " If you are unable to find the correct command, ask the user for the command to run and if \
+     they supply it, proactively suggest writing it to README.md so that you will know to run it \
+     next time.",
+    "",
+);
+const UNATTENDED_REPLACEMENTS: &[(&str, &str)] = &[PLAN_MODE_HINT, ASK_FOR_COMMAND];
+
+/// The system prompt for a run with nobody watching: what tells the model to plan for
+/// review or to ask is cut, headings and all. An unattended run offers neither the plan
+/// tools nor `ask_user`, and a prompt that keeps urging them on a model that cannot see
+/// them gets rounds spent calling tools that are not there.
+pub(crate) fn unattended(prompt: Option<String>) -> Option<String> {
+    let mut prompt = prompt?;
+    for heading in UNATTENDED_CUT_SECTIONS {
+        if let Some(start) = prompt.find(heading) {
+            let body = start + heading.len();
+            // Up to the next heading, which keeps the blank line in front of it.
+            let end = prompt[body..].find("\n# ").map_or(prompt.len(), |i| body + i + 1);
+            prompt.replace_range(start..end, "");
+        }
+    }
+    for (text, replacement) in UNATTENDED_REPLACEMENTS {
+        prompt = prompt.replacen(text, replacement, 1);
+    }
+    Some(prompt)
+}
+
 // The sub-agent's system message. No instruction files and no memory: its task arrives
 // written out in full by a model that has read them, and every token of a sub-agent's
 // context is one it could have spent on the log it was sent to read.
@@ -708,6 +742,30 @@ mod tests {
         assert!(!prompt.contains("`HAICO.md`"));
         assert!(prompt.contains("Never touch generated code."));
         assert!(prompt.contains("Improve it instead of starting over"));
+    }
+
+    #[test]
+    fn an_unattended_prompt_says_nothing_about_asking_or_plan_mode() {
+        let full = build_system_prompt("some-model", &ws());
+        // Each is in the template, or the cut below proves nothing.
+        for text in ["ask_user", "start_plan", "present_plan", PLAN_MODE_HINT.0, ASK_FOR_COMMAND.0] {
+            assert!(full.contains(text), "{text:?} is gone from the template");
+        }
+
+        let cut = unattended(Some(full.clone())).unwrap();
+        for text in [
+            "ask_user", "start_plan", "present_plan", "plan mode", "# Planning", "When you are not sure",
+            "ask the user",
+        ] {
+            assert!(!cut.contains(text), "{text:?} survived:\n{}", cut);
+        }
+        // Only those: the text around them stays, still separated as it was.
+        assert!(cut.contains("\n\n# Following conventions"), "got: {}", cut);
+        assert!(cut.contains("- Plan the task thoroughly\n- Don't try"), "got: {}", cut);
+        assert!(cut.contains("to ensure your code is correct.\n"), "got: {}", cut);
+
+        assert_eq!(unattended(Some("CUSTOM".to_string())).as_deref(), Some("CUSTOM"));
+        assert_eq!(unattended(None), None);
     }
 
     // An empty file is not instructions; load_project_context skips it, so this must too,
