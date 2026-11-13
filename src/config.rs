@@ -291,14 +291,18 @@ pub(crate) fn parse_config() -> Result<Config> {
         })
     };
 
-    // Parse model
-    let model = matches
-        .opt_str("m")
-        .or_else(|| section.and_then(|s| s.model.clone()))
-        .or_else(|| file_config.model.clone());
-
     // Run as an stdio MCP server instead of the interactive REPL
     let server = matches.opt_present("server");
+
+    // Parse model. The MCP server takes it from --model only: a model saved by the REPL's
+    // /model was sent with every web_fetch, making LM Studio load or switch to it instead
+    // of summarizing with the one already loaded.
+    let model = matches.opt_str("m").or_else(|| {
+        if server {
+            return None;
+        }
+        section.and_then(|s| s.model.clone()).or_else(|| file_config.model.clone())
+    });
     let gui = matches.opt_present("gui");
 
     let tools = matches.opt_str("tools").map(|list| tool_list(&list)).transpose()?;

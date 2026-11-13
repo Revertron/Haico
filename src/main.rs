@@ -75,8 +75,9 @@ async fn run_mcp_server(config: Config) -> Result<()> {
 exposing web_get (raw page text) and hiding web_fetch (summarization).");
     }
 
-    // --model is optional here: with none given we omit the "model" field from requests,
-    // so the LLM server uses whatever model it already has loaded.
+    // --model is optional here, and the config's model is ignored (see `parse_config`): with
+    // none given we omit the "model" field from requests, so the LLM server uses whatever
+    // model it already has loaded.
     let model = config.model.clone().unwrap_or_default();
     if config.url_supplied && model.is_empty() {
         eprintln!("[haico] no --model given; using the model already loaded on the LLM server.");
