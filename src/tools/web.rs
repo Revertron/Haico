@@ -670,8 +670,10 @@ impl MyMcpServer {
         };
 
         // Use LLM to extract information based on the prompt
-        let system_prompt = "You are a helpful assistant that extracts specific information from web page content. \
-                            Be concise and focus only on answering the user's query based on the provided content.";
+        let system_prompt = "You are a helpful assistant that extracts specific information from web page content.\
+                            Be concise and focus only on answering the user's query based on the provided content.\
+                            If the data doesn't contain the answer - just say so.\
+                            Don't invent things and be quick.";
 
         let user_prompt = format!(
             "Web page URL: {}\n\nContent:\n{}\n\n---\n\nTask: {}",
