@@ -2,7 +2,6 @@
 
 use crate::util::{display_path, run_git_command, truncate_at_boundary};
 use crate::workspace::Workspace;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,9 +13,9 @@ pub(crate) const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 pub(crate) const SUB_AGENT_PROMPT: &str = include_str!("sub_agent_prompt.txt");
 
 
-pub(crate) fn get_main_branch() -> String {
+pub(crate) fn get_main_branch(root: &str) -> String {
     // Try to get the default branch from the remote
-    if let Some(remote_head) = run_git_command(&["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+    if let Some(remote_head) = run_git_command(&["-C", root, "symbolic-ref", "refs/remotes/origin/HEAD"]) {
         // Output format: "refs/remotes/origin/main"
         if let Some(branch) = remote_head.strip_prefix("refs/remotes/origin/") {
             return branch.to_string();
@@ -24,7 +23,7 @@ pub(crate) fn get_main_branch() -> String {
     }
 
     // Try to get from git config
-    if let Some(default_branch) = run_git_command(&["config", "--get", "init.defaultBranch"]) {
+    if let Some(default_branch) = run_git_command(&["-C", root, "config", "--get", "init.defaultBranch"]) {
         if !default_branch.is_empty() {
             return default_branch;
         }
@@ -32,7 +31,7 @@ pub(crate) fn get_main_branch() -> String {
 
     // Fallback: check if common branches exist
     for branch in &["main", "master"] {
-        if run_git_command(&["rev-parse", "--verify", branch]).is_some() {
+        if run_git_command(&["-C", root, "rev-parse", "--verify", branch]).is_some() {
             return branch.to_string();
         }
     }
@@ -88,12 +87,14 @@ pub(crate) fn build_sub_agent_prompt(model: &str, workspace: &Workspace) -> Stri
 }
 
 fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
-    let pwd = env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| ".".to_string());
+    // The workspace's directory, not the process's. In a session they are the same — the
+    // agent moves the process when it moves the workspace — but a prompt built for any other
+    // directory used to describe the process's: the tests built theirs for empty fixtures
+    // and still got this repository's commits, one of which names ask_user.
+    let root = workspace.cwd().to_string_lossy().to_string();
+    let pwd = display_path(workspace.cwd());
 
-    let is_repo = run_git_command(&["rev-parse", "--git-dir"]).is_some();
+    let is_repo = run_git_command(&["-C", &root, "rev-parse", "--git-dir"]).is_some();
 
     let platform = if cfg!(target_os = "windows") {
         "win32"
@@ -120,13 +121,13 @@ fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
 
     // Five git commands, so asked only by a template that shows their answers.
     let (branch, git_status, last_5_commits) = if is_repo && template.contains("$branch") {
-        let branch = run_git_command(&["rev-parse", "--abbrev-ref", "HEAD"])
+        let branch = run_git_command(&["-C", &root, "rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap_or_else(|| "unknown".to_string());
 
-        let status = run_git_command(&["status", "--short"])
+        let status = run_git_command(&["-C", &root, "status", "--short"])
             .unwrap_or_default();
 
-        let commits = run_git_command(&["log", "--oneline", "-5"])
+        let commits = run_git_command(&["-C", &root, "log", "--oneline", "-5"])
             .unwrap_or_default();
 
         (branch, status, commits)
@@ -134,7 +135,7 @@ fn fill_prompt(template: &str, model: &str, workspace: &Workspace) -> String {
         ("N/A".to_string(), "".to_string(), "".to_string())
     };
 
-    let main_branch = if template.contains("$main_branch") { get_main_branch() } else { String::new() };
+    let main_branch = if template.contains("$main_branch") { get_main_branch(&root) } else { String::new() };
 
     // Named because it is otherwise unguessable. A model told to write a throwaway script
     // and given nowhere to put it picks "C:\Temp" or "/tmp" — a path the workspace then
@@ -607,6 +608,7 @@ fn readme(root: &Path) -> Option<(&'static str, String)> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use std::env;
 
     // Its own directory rather than testutil::scratch, because build_init_prompt lists the
     // whole directory and one test's fixture would show up in another's listing.
@@ -746,7 +748,11 @@ mod tests {
 
     #[test]
     fn an_unattended_prompt_says_nothing_about_asking_or_plan_mode() {
-        let full = build_system_prompt("some-model", &ws());
+        // An empty directory rather than the current one: the prompt carries the project's
+        // recent commits, and this repository's own history has a commit naming ask_user,
+        // which failed the test for a reason that had nothing to do with the cut.
+        let dir = init_dir("unattended");
+        let full = build_system_prompt("some-model", &Workspace::new(dir.path(), &[]));
         // Each is in the template, or the cut below proves nothing.
         for text in ["ask_user", "start_plan", "present_plan", PLAN_MODE_HINT.0, ASK_FOR_COMMAND.0] {
             assert!(full.contains(text), "{text:?} is gone from the template");

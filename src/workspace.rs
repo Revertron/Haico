@@ -109,6 +109,11 @@ impl Workspace {
         self.writable.insert(0, resolved);
     }
 
+    // The working directory: always the first writable root.
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.writable[0]
+    }
+
     pub(crate) fn scratch(&self) -> Option<&Path> {
         self.scratch.as_deref()
     }

@@ -3204,7 +3204,10 @@ mod scratch_tests {
     // not bring the sections back.
     #[test]
     fn an_unattended_run_neither_offers_nor_mentions_asking_or_planning() {
-        let cwd = std::env::current_dir().unwrap();
+        // Not the current directory: its git log lands in the prompt, and a commit in this
+        // repository that names ask_user failed the test from there.
+        let dir = crate::testutil::TempDir::new("unattended-run");
+        let cwd = dir.path().to_path_buf();
         let interactive_tools = [ASK_USER, START_PLAN, PRESENT_PLAN];
         let offers = |agent: &Agent, name: &str| agent.tools.iter().any(|t| t["function"]["name"] == name);
 
