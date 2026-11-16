@@ -177,6 +177,13 @@ pub(super) struct Screen {
     // The size the frame was laid out for. A different one means every row has moved and
     // none of them can be patched.
     pub(super) drawn_size: (usize, usize),
+    // Which line and row each screen row of the last frame showed, `None` for anything
+    // that is not transcript, and the width those rows were wrapped at. What turns a
+    // mouse position back into a place in the text.
+    pub(super) drawn_ids: Vec<Option<RowId>>,
+    pub(super) drawn_wrap: usize,
+    // What the mouse has selected, kept until a click clears it or a new drag replaces it.
+    pub(super) selection: Option<Selection>,
     // Whether mouse reporting was asked for, so leaving can turn off exactly what
     // entering turned on.
     pub(super) mouse: bool,
@@ -198,6 +205,9 @@ impl Screen {
             drawn: Vec::new(),
             drawn_caret: (0, 0),
             drawn_size: (0, 0),
+            drawn_ids: Vec::new(),
+            drawn_wrap: 1,
+            selection: None,
             mouse: false,
             #[cfg(windows)]
             console_mode: None,
@@ -287,6 +297,7 @@ impl Screen {
         // longer on the screen to expand.
         self.writing = Kind::Normal;
         self.scroll = None;
+        self.selection = None;
     }
 
     pub(super) fn shows(&self, kind: Kind) -> bool {
@@ -513,15 +524,30 @@ impl Screen {
         // to be one to spare for it.
         let held = self.scroll.filter(|_| body >= 2);
         let content = body - usize::from(held.is_some());
-        let transcript = match held {
+        let mut transcript = match held {
             Some(anchor) => self.rows_from(anchor, wrap, content),
             None => self.rows(wrap, content),
         };
+        // Which line each of those rows belongs to, walked from the same top. A count that
+        // disagrees would point every click at the wrong row, so it is dropped instead:
+        // nothing can be selected in that frame, and nothing wrong is highlighted.
+        let mut ids = self.row_ids_from(held.unwrap_or_else(|| self.bottom_anchor(wrap, content)), wrap, content);
+        if ids.len() != transcript.len() {
+            ids.clear();
+        }
+        self.highlighted(&mut transcript, &ids, wrap);
+        let padding = content - transcript.len();
+        self.drawn_ids = std::iter::repeat_n(None, padding)
+            .chain(ids.iter().copied().map(Some))
+            .chain(std::iter::repeat(None))
+            .take(height)
+            .collect();
+        self.drawn_wrap = wrap;
 
         let mut rows = Vec::with_capacity(height);
         // A transcript shorter than the viewport sits against the bottom, the way a shell
         // leaves one, rather than at the top with the input box stranded in the middle.
-        rows.extend(std::iter::repeat_n(String::new(), content - transcript.len()));
+        rows.extend(std::iter::repeat_n(String::new(), padding));
         rows.extend(transcript);
         if let Some(anchor) = held {
             let index = anchor.seq.saturating_sub(self.dropped) as usize;

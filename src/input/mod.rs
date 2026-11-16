@@ -9,7 +9,7 @@
 use crate::modes::Mode;
 use crate::out;
 use crate::tools::TodoItem;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crate::commands::{self, Args, Command, Suggestion};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::tty::IsTty;
@@ -179,8 +179,7 @@ pub(crate) async fn read_text(keys: &mut Keys, editor: &mut Editor, prompt: &str
         let Some(event) = keys.next().await else {
             return Input::Eof;
         };
-        if let Some(delta) = scroll_rows(&event) {
-            out::scroll(delta);
+        if pointer(&event) {
             continue;
         }
         match event {
@@ -253,8 +252,7 @@ pub(crate) async fn read_command(
         let Some(event) = event else {
             return Input::Eof;
         };
-        if let Some(delta) = scroll_rows(&event) {
-            out::scroll(delta);
+        if pointer(&event) {
             continue;
         }
         match event {
@@ -299,8 +297,7 @@ pub(crate) fn while_working(
     // Reading back through the transcript while the model works is the whole point of
     // being able to scroll at all, so this comes before anything that might consume the
     // key. What arrives while the view is held back leaves it where it is.
-    if let Some(delta) = scroll_rows(&event) {
-        out::scroll(delta);
+    if pointer(&event) {
         return WhileWorking::Nothing;
     }
 

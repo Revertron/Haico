@@ -364,16 +364,16 @@ const END_SYNC: &str = "\x1b[?2026l";
 const WRAP_OFF: &str = "\x1b[?7l";
 const WRAP_ON: &str = "\x1b[?7h";
 
-// Wheel and button reporting with SGR coordinates, and deliberately nothing else.
+// Buttons, the wheel, and motion while a button is held (1002), with SGR coordinates.
 //
-// 1002 (drag) and 1003 (any motion) are the two that make a terminal hand every mouse
-// movement to the application, and a terminal that is reporting motion has stopped doing
-// its own drag-selection. Asking for 1000 alone leaves selecting and copying where they
-// belong — with the terminal — while the wheel still reaches the transcript here. Where a
-// terminal does it differently, holding Shift while dragging is the usual way back to
-// native selection.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+// There is no mode that reports the wheel without the buttons, so asking for the wheel at
+// all already took plain drag-selection away from the terminal. 1000 alone left it behind
+// Shift, and a selection made that way could not be cleared: the plain click that would
+// have cleared it went to haico instead. 1002 adds the drag itself, and `selection` does
+// the selecting. Never 1003, which reports every movement of a mouse nobody is pressing.
+// Shift+drag still reaches the terminal's own selection.
+const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l";
 
 // Ask the terminal to say which modifiers were held, for the keys that otherwise cannot
 // carry them.
@@ -419,7 +419,9 @@ pub(crate) fn reassert_input_mode() {
 }
 
 mod screen;
+mod selection;
 mod wrap;
+use selection::*;
 pub(crate) use screen::*;
 pub(crate) use wrap::*;
 
@@ -925,6 +927,55 @@ pub(crate) fn scroll(delta: isize) {
         screen.scroll_by(delta, wrap, body);
     }
     state.screen_paint();
+}
+
+// The left button went down on a cell: a new selection starts there if it is transcript,
+// and whatever was selected before is cleared either way.
+pub(crate) fn select_press(column: u16, row: u16) {
+    let mut state = lock();
+    let Some(screen) = &mut state.screen else {
+        return;
+    };
+    let had = screen.selection.is_some();
+    screen.press(column as usize, row as usize);
+    if had || screen.selection.is_some() {
+        state.screen_paint();
+    }
+}
+
+pub(crate) fn select_drag(column: u16, row: u16) {
+    let mut state = lock();
+    let Some(screen) = &mut state.screen else {
+        return;
+    };
+    screen.drag(column as usize, row as usize);
+    state.screen_paint();
+}
+
+// The button came up. Gives back the text to copy, or `None` when it was a click — which
+// has just cleared the selection — or nothing selectable was under the drag.
+pub(crate) fn select_release() -> Option<String> {
+    let mut state = lock();
+    let screen = state.screen.as_mut()?;
+    let had = screen.selection.is_some();
+    let text = screen.release();
+    if had && screen.selection.is_none() {
+        state.screen_paint();
+    }
+    text
+}
+
+// Put text on the clipboard of the terminal itself (OSC 52), for where haico cannot reach
+// one of its own. A terminal that does not support it ignores the sequence.
+#[cfg(not(windows))]
+pub(crate) fn copy_through_terminal(text: &str) {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut state = lock();
+    state.write_out(&format!("\x1b]52;c;{}\x07", encoded));
+    if state.capture.is_none() {
+        let _ = io::stdout().flush();
+    }
 }
 
 // Go back to the end and stay there. What the user has just sent is about to be answered,

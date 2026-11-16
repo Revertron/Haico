@@ -9,7 +9,7 @@
 //! `Keys`, and the tool body runs in both the REPL and an MCP server, where there is
 //! nobody on the other end at all.
 
-use crate::input::{echo, read_text, scroll_rows, Editor, Input, Keys};
+use crate::input::{echo, pointer, read_text, Editor, Input, Keys};
 use crate::modes::PlanDecision;
 use crate::permissions::PermissionResponse;
 use anyhow::{anyhow, Result};
@@ -254,6 +254,9 @@ pub(crate) async fn ask_question(
             crate::out::clear_region();
             return Err(anyhow!("no interactive terminal to ask the user"));
         };
+        if pointer(&event) {
+            continue;
+        }
         let Event::Key(key) = event else {
             // A resize or a paste: redrawn at the top of the loop, at the new width.
             continue;
@@ -346,8 +349,7 @@ pub(crate) async fn ask_permission(
             crate::out::clear_region();
             return Err(anyhow!("no interactive terminal to ask for permission"));
         };
-        if let Some(delta) = scroll_rows(&event) {
-            crate::out::scroll(delta);
+        if pointer(&event) {
             continue;
         }
 
@@ -460,8 +462,7 @@ pub(crate) async fn review_plan(keys: &mut Keys, plan: &str) -> Result<PlanDecis
             crate::out::clear_region();
             return Err(anyhow!("no interactive terminal to review the plan"));
         };
-        if let Some(delta) = scroll_rows(&event) {
-            crate::out::scroll(delta);
+        if pointer(&event) {
             continue;
         }
         // A focus change or a resize is not a decision, but it is not a missing terminal

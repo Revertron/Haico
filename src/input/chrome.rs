@@ -308,7 +308,7 @@ pub(crate) fn plan_rows(
 // button reporting; under the inline renderer the terminal keeps the wheel to itself and
 // `out::scroll` does nothing anyway. Home and End are already the editor's, so paging is
 // on PageUp and PageDown, which nothing else wanted.
-pub(crate) fn scroll_rows(event: &Event) -> Option<isize> {
+fn scroll_rows(event: &Event) -> Option<isize> {
     // A page is a screenful less two rows, so a couple of lines of context carry over and
     // the reader can see where they were.
     let page = || out::viewport_rows().saturating_sub(2).max(1) as isize;
@@ -325,6 +325,33 @@ pub(crate) fn scroll_rows(event: &Event) -> Option<isize> {
         },
         _ => None,
     }
+}
+
+// Everything the transcript does with the mouse and the paging keys: scrolling, and
+// selecting with the left button, copied when it comes up. `true` when the event was one of
+// those and is used up, which every mouse event is — the input box has no use for them.
+//
+// One function for every prompt that reads the keyboard, so a selection made while the
+// model works can still be cleared at the permission prompt that follows.
+pub(crate) fn pointer(event: &Event) -> bool {
+    if let Some(delta) = scroll_rows(event) {
+        out::scroll(delta);
+        return true;
+    }
+    let Event::Mouse(mouse) = event else {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => out::select_press(mouse.column, mouse.row),
+        MouseEventKind::Drag(MouseButton::Left) => out::select_drag(mouse.column, mouse.row),
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(text) = out::select_release() {
+                super::clipboard::write(&text);
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 pub(crate) fn draw(editor: &Editor, chrome: &Chrome) {

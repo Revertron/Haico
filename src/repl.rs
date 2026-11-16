@@ -1028,8 +1028,8 @@ fn print_repl_help() {
     outln!("               stays put while output arrives and follows again at the end.");
     outln!("               Set tui = \"inline\" in the config, or HAICO_TUI=inline, to go");
     outln!("               back to the terminal's own scrollback.");
-    outln!("               On Windows the wheel needs Shift held to select text; set");
-    outln!("               mouse = \"off\" to keep plain drag-selection instead.");
+    outln!("               Drag to select transcript text and copy it; click to clear.");
+    outln!("               Shift+drag uses the terminal's own selection instead.");
     outln!("Project rules:  HAICO.md, AGENTS.md or CLAUDE.md is appended to the system prompt.");
     outln!("Skills:         <name>/SKILL.md under .haico/skills, .agents/skills or .claude/skills");
     outln!("                in the project, or under {}.", crate::store::display("skills"));

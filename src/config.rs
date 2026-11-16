@@ -33,11 +33,11 @@ pub(crate) enum Tui {
 
 // Whether the full-screen renderer asks the terminal for the mouse wheel.
 //
-// `Scroll` asks for wheel and button reporting and nothing else — never motion reporting,
-// which is what would take drag-selection away from the terminal. On Windows this also
-// means turning on the console's VT input mode, and there selecting text needs Shift held
-// while dragging. `Off` leaves the mouse entirely to the terminal; PageUp and PageDown
-// still scroll.
+// `Scroll` asks for the wheel, the buttons and drags (never bare motion), and haico does
+// the selecting itself: a plain drag selects transcript text and copies it, a click clears
+// it, and Shift+drag still reaches the terminal's own selection. On Windows this also means
+// turning on the console's VT input mode. `Off` leaves the mouse entirely to the terminal;
+// PageUp and PageDown still scroll.
 #[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mouse {

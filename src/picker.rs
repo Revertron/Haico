@@ -84,6 +84,9 @@ pub(crate) async fn select_interactive(
             crate::out::clear_region();
             return Err(anyhow::anyhow!("no interactive terminal to pick a {noun}"));
         };
+        if crate::input::pointer(&event) {
+            continue;
+        }
         // Anything that is not a keystroke redraws the list at the top of the loop instead
         // of ending the picker: a window losing focus is not a choice of model.
         let Event::Key(key_event) = event else {
