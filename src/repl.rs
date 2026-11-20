@@ -24,7 +24,7 @@ use crate::{commands, out, skills, store, timers, trace};
 use anyhow::Result;
 use rmcp::handler::server::wrapper::Parameters;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 
 
@@ -672,6 +672,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         update,
     };
     io.editor.set_commands(commands::for_cwd());
+    // Before the first prompt too: a session-start hook's turn can be typed into.
+    io.editor.set_image_dir(agent.workspace.scratch().map(Path::to_path_buf));
 
     if let Next::Run(job) = session_start_job(&agent, if resume_requested { "resume" } else { "startup" }) {
         drive(&mut agent, &mut io, job).await;
@@ -710,6 +712,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                     let update = io.update.clone();
                     let waiting_for_update = notice.is_none();
                     let mcp_news = agent.server.mcp.changed();
+                    io.editor.set_image_dir(agent.workspace.scratch().map(Path::to_path_buf));
                     let news = async move {
                         tokio::select! {
                             _ = mcp_news => {}
@@ -1017,7 +1020,8 @@ fn print_repl_help() {
     outln!("               A PNG, JPEG, GIF or WEBP goes as a picture, for a model that");
     outln!("               can see one; a model that cannot will say so.");
     outln!("At the prompt: up/down for history, Shift+Enter for another line,");
-    outln!("               Ctrl+V or Shift+Insert to paste,");
+    outln!("               Ctrl+V or Shift+Insert to paste, Alt+V to paste a picture");
+    outln!("               (it stands in the line as [Image-0001] until it is sent),");
     outln!("               Shift+Tab to change mode, Ctrl+C to abandon the line.");
     outln!("While working: keep typing — Enter queues the message for when the turn");
     outln!("               ends. Esc interrupts and returns to the prompt.");

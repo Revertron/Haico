@@ -358,10 +358,11 @@ mod vt;
 
 // Reading the clipboard, for the paste the terminal is no longer doing for us.
 //
-// Windows only, and deliberately so: this exists because VT input mode stops the console
-// acting on Shift+Insert itself. Every other terminal still handles that key on its own
-// and never forwards it, so there is nothing here to do and no dependency worth taking on
-// to do it.
+// Text is Windows only, and deliberately so: this exists because VT input mode stops the
+// console acting on Shift+Insert itself. Every other terminal still handles that key on its
+// own and never forwards it, so there is nothing here to do and no dependency worth taking
+// on to do it. A picture is another matter — no terminal pastes one — so that is read
+// everywhere.
 mod clipboard;
 
 
@@ -519,6 +520,23 @@ mod tests {
             Some(Input::Text(text)) => assert_eq!(text, "one\ntwo\nthree"),
             _ => panic!("Enter should submit"),
         }
+    }
+
+    #[test]
+    fn a_pasted_picture_is_saved_and_typed_as_its_token() {
+        let dir = crate::testutil::TempDir::new("editor-paste-image");
+        let mut editor = Editor::new(Vec::new());
+        editor.paste("what is wrong here: ");
+        assert!(editor.insert_image(dir.path(), b"\x89PNG"));
+        editor.paste(" and ");
+        assert!(editor.insert_image(dir.path(), b"\x89PNG"));
+        assert_eq!(editor.lines, ["what is wrong here: [Image-0001] and [Image-0002]"]);
+        assert!(dir.join("image-0002.png").is_file());
+
+        // Nowhere to save it, so no token: one with no file behind it would be sent as
+        // words and the picture lost without a word.
+        assert!(!editor.insert_image(&dir.join("missing"), b"\x89PNG"));
+        assert_eq!(editor.lines, ["what is wrong here: [Image-0001] and [Image-0002]"]);
     }
 
     fn activity_with(busy: Option<&str>, notice: Option<&str>, width: usize) -> String {

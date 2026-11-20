@@ -28,6 +28,7 @@ mod memory;
 mod mcp;
 mod mention;
 mod modes;
+mod pasted;
 mod permissions;
 mod picker;
 mod present;

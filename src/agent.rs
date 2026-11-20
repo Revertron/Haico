@@ -842,14 +842,44 @@ impl Agent {
 /// OpenAI-compatible endpoint reports it. So the image is sent, and a text-only
 /// model's server says so in its own words — which is a clearer answer than a
 /// guess of haico's would be.
+///
+/// A **pasted** picture (`[Image-0001]`, see `pasted`) goes the same way as a mentioned one,
+/// with its token as a text part right in front of it. A mentioned picture is tied to its
+/// `@name` by the order alone, which is fine for one; two pasted screenshots compared in one
+/// sentence need each to say which it is.
 async fn attach_mentions(agent: &mut Agent, input: &str, tx: &EventSink) -> Value {
     let mentions = crate::mention::find(input);
-    if mentions.is_empty() {
+    let pasted = match agent.workspace.scratch() {
+        Some(dir) => crate::pasted::find(input, dir),
+        None => Vec::new(),
+    };
+    if mentions.is_empty() && pasted.is_empty() {
         return json!(input);
     }
 
     let mut blocks = String::new();
     let mut images: Vec<Value> = Vec::new();
+
+    for (token, path) in pasted {
+        let shown = display_path(&path);
+        match crate::mention::sendable_image(&path) {
+            Some((mime, bytes)) => {
+                // Never outside: the scratch directory is one of the workspace's own roots.
+                let _ = tx.send(
+                    Notice::ImageAttached { path: shown, bytes: bytes.len(), outside: false }.into(),
+                );
+                images.push(json!({"type": "text", "text": token}));
+                images.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": data_url(&mime, &bytes) }
+                }));
+            }
+            None => {
+                let reason = "the pasted picture could not be read".to_string();
+                let _ = tx.send(Notice::FileNotAttached { path: shown, reason }.into());
+            }
+        }
+    }
 
     for mention in mentions {
         let shown = display_path(&mention.path);
@@ -3519,6 +3549,44 @@ mod turn_tests {
             agent.server.check_may_modify(&file).is_none(),
             "the mentioned file was not marked read — the saved round is spent re-reading it"
         );
+    }
+
+    /// A pasted picture is a file in the scratch directory and a token in the text; sending
+    /// the message is what turns the one into the other. Each picture goes with its token in
+    /// front of it, so "compare [Image-0001] with [Image-0002]" says which is which.
+    #[tokio::test]
+    async fn a_pasted_image_is_sent_behind_its_token() {
+        let (url, served) = serve_sequence(&[]).await;
+        let cwd = env::current_dir().unwrap();
+        let mut agent = Agent::new(test_config(&url), "test-model".to_string(), &cwd);
+        let scratch = agent.workspace.scratch().expect("a session has one").to_path_buf();
+        let first = crate::pasted::save(&scratch, b"\x89PNG\r\n\x1a\n\x00\x01").unwrap();
+        let second = crate::pasted::save(&scratch, b"\x89PNG\r\n\x1a\n\x02\x03").unwrap();
+
+        // The second token named twice and one with no file behind it: one picture each,
+        // and the stray stays words.
+        let input = format!("compare {} with {} ({} again), not [Image-0099]", first, second, second);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let content = attach_mentions(&mut agent, &input, &tx).await;
+
+        let parts = content.as_array().expect("content should be a parts array");
+        let kinds: Vec<&str> = parts.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["text", "image_url", "text", "image_url", "text"]);
+        assert_eq!(parts[0]["text"], "[Image-0001]");
+        assert_eq!(parts[2]["text"], "[Image-0002]");
+        assert!(parts[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        // The request is untouched and last, tokens and all.
+        assert_eq!(parts[4]["text"], input.as_str());
+
+        let mut attached = 0;
+        while let Ok(event) = events.try_recv() {
+            if let AgentEvent::Notice(Notice::ImageAttached { outside, .. }) = event {
+                assert!(!outside, "the scratch directory is inside the workspace");
+                attached += 1;
+            }
+        }
+        assert_eq!(attached, 2);
+        assert_eq!(*served.lock().unwrap(), 0);
     }
 
     /// A mentioned image cannot go in the text, so the message stops being

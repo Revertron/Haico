@@ -2,6 +2,7 @@
 //! suggestions above it.
 
 use super::*;
+use std::path::PathBuf;
 
 pub(crate) struct Editor {
     // One entry per logical line: Shift+Enter adds one, Enter submits them all.
@@ -24,6 +25,10 @@ pub(crate) struct Editor {
     // The entry as it stood when Esc closed the list. It stays closed until the entry
     // changes, rather than reopening on the very next redraw.
     dismissed: Option<String>,
+    // Where a pasted picture is saved: the session's scratch directory. `None` for the
+    // dialogs' editors, whose answers never reach the model as a message, so a picture
+    // pasted into one would be a file nothing ever reads.
+    image_dir: Option<PathBuf>,
 }
 
 // How many suggestions show at once. The list scrolls to keep the picked one in view.
@@ -50,7 +55,14 @@ impl Editor {
             commands: Vec::new(),
             picked: 0,
             dismissed: None,
+            image_dir: None,
         }
+    }
+
+    // Set before every prompt rather than once: `/clear` replaces the scratch directory, and
+    // a picture saved into the old one would be deleted out from under its token.
+    pub(crate) fn set_image_dir(&mut self, dir: Option<PathBuf>) {
+        self.image_dir = dir;
     }
 
     // Re-read where the skills could have changed: at startup, after /update-skills, and
@@ -246,10 +258,49 @@ impl Editor {
     // instead of one long one with the breaks swallowed.
     //
     // Nothing happens where there is no clipboard to read — see the `clipboard` module for
-    // why that is only Windows.
+    // why text is only read on Windows.
+    //
+    // Text is tried before a picture because Word and Excel put both on the clipboard for a
+    // copied paragraph or range, and the text is what was meant. Alt+V asks the other way
+    // round (`paste_image_first`), for the chart copied out of that same spreadsheet.
     fn paste_from_clipboard(&mut self) {
         if let Some(text) = clipboard::read() {
             self.paste(&text);
+        } else {
+            self.paste_image();
+        }
+    }
+
+    // Alt+V, and the one paste Windows Terminal lets through with a picture on the
+    // clipboard: it keeps Ctrl+V for itself and, finding no text, sends nothing at all.
+    fn paste_image_first(&mut self) {
+        if !self.paste_image() {
+            if let Some(text) = clipboard::read() {
+                self.paste(&text);
+            }
+        }
+    }
+
+    // Whether there was a picture to paste. Nothing is inserted when saving it fails, since
+    // a token with no file behind it would be sent as plain text and the picture silently
+    // dropped.
+    fn paste_image(&mut self) -> bool {
+        let Some(dir) = self.image_dir.clone() else {
+            return false;
+        };
+        let Some(png) = clipboard::read_image() else {
+            return false;
+        };
+        self.insert_image(&dir, &png)
+    }
+
+    pub(super) fn insert_image(&mut self, dir: &Path, png: &[u8]) -> bool {
+        match crate::pasted::save(dir, png) {
+            Ok(token) => {
+                self.paste(&token);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -509,6 +560,7 @@ impl Editor {
             KeyCode::Char('k') if control => self.kill_to_end(),
             KeyCode::Char('w') if control => self.delete_word_back(),
             KeyCode::Char('v') if control => self.paste_from_clipboard(),
+            KeyCode::Char('v') if alt => self.paste_image_first(),
             KeyCode::Char('o') if control => return Some(Input::ToggleExpand),
             KeyCode::Char(ch) if !control => self.insert(ch),
             // Shift+Insert is how a terminal has always pasted, and in the console it

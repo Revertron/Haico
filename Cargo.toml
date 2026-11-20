@@ -1,6 +1,6 @@
 [package]
 name = "haico"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "HAICO (Home AI Coder) - Interactive CLI coding assistant for local LLMs with a custom MCP-server."
 
@@ -72,7 +72,9 @@ base64 = "0.23"
 # happily, and llama.cpp is the mirror image — it takes the label and cannot decode the
 # bytes at all without an optional ffmpeg build. Re-encoding to PNG is the only answer
 # that is true on both. Default features off: this is a converter, not an image library.
-image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+# BMP is the other format read: a picture pasted from the Windows clipboard arrives as one
+# when the program that copied it offered no PNG.
+image = { version = "0.25", default-features = false, features = ["webp", "png", "bmp"] }
 # `--update`: which release is newer, and putting the new binary where the running one is.
 # Replacing a running exe is the part that differs by platform — Windows refuses to
 # overwrite one but lets it be renamed, and the renamed file then has to be deleted once
